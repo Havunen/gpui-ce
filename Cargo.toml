@@ -1,10 +1,10 @@
 [workspace]
 members = [
-    ".",           
+    ".",
     "tooling/macros",
 ]
 default-members = [
-    ".",       
+    ".",
 ]
 resolver = "3"
 
@@ -157,7 +157,7 @@ oo7 = { version = "0.6", default-features = false, features = [
     "async-std",
     "native_crypto",
 ] }
-wgpu = "29"
+wgpu = { git = "https://github.com/zed-industries/wgpu.git", branch = "v29" }
 cosmic-text = "0.18"
 swash = "0.2"
 bytemuck = "1"
