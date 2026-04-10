@@ -161,19 +161,23 @@ impl GPUState {
 
 impl DirectWriteTextSystem {
     pub(crate) fn new(directx_devices: &DirectXDevices) -> Result<Self> {
-        let factory: IDWriteFactory5 = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)? };
+        let factory: IDWriteFactory5 = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }
+            .context("Creating DirectWrite factory")?;
         // The `IDWriteInMemoryFontFileLoader` here is supported starting from
         // Windows 10 Creators Update, which consequently requires the entire
         // `DirectWriteTextSystem` to run on `win10 1703`+.
-        let in_memory_loader = unsafe { factory.CreateInMemoryFontFileLoader()? };
-        unsafe { factory.RegisterFontFileLoader(&in_memory_loader)? };
-        let builder = unsafe { factory.CreateFontSetBuilder()? };
+        let in_memory_loader = unsafe { factory.CreateInMemoryFontFileLoader() }
+            .context("Creating in-memory DirectWrite font file loader")?;
+        unsafe { factory.RegisterFontFileLoader(&in_memory_loader) }
+            .context("Registering DirectWrite font file loader")?;
+        let builder = unsafe { factory.CreateFontSetBuilder() }
+            .context("Creating DirectWrite font set builder")?;
         let mut locale = [0u16; LOCALE_NAME_MAX_LENGTH as usize];
         unsafe { GetUserDefaultLocaleName(&mut locale) };
         let locale = HSTRING::from_wide(&locale);
         let text_renderer = TextRendererWrapper::new(locale.clone());
 
-        let gpu_state = GPUState::new(directx_devices)?;
+        let gpu_state = GPUState::new(directx_devices).context("Creating DirectWrite GPU state")?;
 
         let system_subpixel_rendering = get_system_subpixel_rendering();
         let system_ui_font_name = get_system_ui_font_name();
@@ -194,11 +198,13 @@ impl DirectWriteTextSystem {
                 .GetSystemFontCollection(false, &mut result, true)?;
             result.context("Failed to get system font collection")?
         };
-        let custom_font_set = unsafe { components.builder.CreateFontSet()? };
+        let custom_font_set = unsafe { components.builder.CreateFontSet() }
+            .context("Creating DirectWrite custom font set")?;
         let custom_font_collection = unsafe {
             components
                 .factory
-                .CreateFontCollectionFromFontSet(&custom_font_set)?
+                .CreateFontCollectionFromFontSet(&custom_font_set)
+                .context("Creating DirectWrite custom font collection from font set")?
         };
 
         Ok(Self {
