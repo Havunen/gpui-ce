@@ -2,6 +2,7 @@ use super::{
     BackgroundExecutor, Clock, ForegroundExecutor, Instant, Priority, RunnableMeta, Scheduler,
     SessionId, TestClock, Timer,
 };
+use crate::collections::{BTreeMap, HashSet, VecDeque};
 use async_task::Runnable;
 use backtrace::{Backtrace, BacktraceFrame};
 use futures::channel::oneshot;
@@ -12,7 +13,6 @@ use rand::{
 };
 use std::{
     any::type_name_of_val,
-    collections::{BTreeMap, HashSet, VecDeque},
     env,
     fmt::Write,
     future::Future,
@@ -31,6 +31,7 @@ use std::{
 
 const PENDING_TRACES_VAR_NAME: &str = "PENDING_TRACES";
 
+/// Deterministic scheduler used to drive asynchronous code in tests.
 pub struct TestScheduler {
     clock: Arc<TestClock>,
     rng: Arc<Mutex<StdRng>>,
@@ -80,6 +81,7 @@ impl TestScheduler {
         result
     }
 
+    /// Create a test scheduler with the given configuration.
     pub fn new(config: TestSchedulerConfig) -> Self {
         Self {
             rng: Arc::new(Mutex::new(StdRng::seed_from_u64(config.seed))),
@@ -105,6 +107,7 @@ impl TestScheduler {
         }
     }
 
+    /// Mark the test as finished and panic if non-determinism was detected.
     pub fn end_test(&self) {
         let mut state = self.state.lock();
         if let Some((message, backtrace)) = &state.non_determinism_error {
@@ -113,32 +116,39 @@ impl TestScheduler {
         state.finished = true;
     }
 
+    /// Returns the simulated clock used by this scheduler.
     pub fn clock(&self) -> Arc<TestClock> {
         self.clock.clone()
     }
 
+    /// Returns the scheduler's shared deterministic random number generator.
     pub fn rng(&self) -> SharedRng {
         SharedRng(self.rng.clone())
     }
 
+    /// Set the inclusive range of ticks allowed before a blocked task times out.
     pub fn set_timeout_ticks(&self, timeout_ticks: RangeInclusive<usize>) {
         self.state.lock().timeout_ticks = timeout_ticks;
     }
 
+    /// Allow the scheduler to park the current thread while waiting for work.
     pub fn allow_parking(&self) {
         let mut state = self.state.lock();
         state.allow_parking = true;
         state.parking_allowed_once = true;
     }
 
+    /// Prevent the scheduler from parking the current thread while waiting for work.
     pub fn forbid_parking(&self) {
         self.state.lock().allow_parking = false;
     }
 
+    /// Returns whether parking is currently allowed.
     pub fn parking_allowed(&self) -> bool {
         self.state.lock().allow_parking
     }
 
+    /// Returns whether the scheduler is currently running foreground work.
     pub fn is_main_thread(&self) -> bool {
         self.state.lock().is_main_thread
     }
@@ -162,6 +172,7 @@ impl TestScheduler {
         BackgroundExecutor::new(self.clone())
     }
 
+    /// Create a future that yields for a deterministic random number of polls.
     pub fn yield_random(&self) -> Yield {
         let rng = &mut *self.rng.lock();
         if rng.random_bool(0.1) {
@@ -171,12 +182,14 @@ impl TestScheduler {
         }
     }
 
+    /// Run scheduled tasks until no immediately runnable work remains.
     pub fn run(&self) {
         while self.step() {
             // Continue until no work remains
         }
     }
 
+    /// Run scheduled tasks and advance the simulated clock until no work remains.
     pub fn run_with_clock_advancement(&self) {
         while self.step() || self.advance_clock_to_next_timer() {
             // Continue until no work remains
@@ -262,7 +275,7 @@ impl TestScheduler {
             // - For background tasks (no session_id), all are candidates
             // - Tasks from blocked sessions are excluded
             // - If background_only is true, skip foreground tasks entirely
-            let mut seen_sessions = HashSet::new();
+            let mut seen_sessions = HashSet::default();
             let candidate_indices: Vec<usize> = state
                 .runnables
                 .iter()
@@ -353,6 +366,7 @@ impl TestScheduler {
         }
     }
 
+    /// Advance the simulated clock to the next scheduled timer.
     pub fn advance_clock_to_next_timer(&self) -> bool {
         if let Some(timer) = self.state.lock().timers.first() {
             self.clock.advance(timer.expiration - self.clock.now());
@@ -362,6 +376,7 @@ impl TestScheduler {
         }
     }
 
+    /// Advance the simulated clock by the given duration, running elapsed timers on the way.
     pub fn advance_clock(&self, duration: Duration) {
         let debug = std::env::var("DEBUG_SCHEDULER").is_ok();
         let start = self.clock.now();
@@ -653,16 +668,23 @@ impl Scheduler for TestScheduler {
     }
 }
 
+/// Configuration for a test scheduler.
 #[derive(Clone, Debug)]
 pub struct TestSchedulerConfig {
+    /// Seed used to initialize the deterministic random number generator.
     pub seed: u64,
+    /// Whether runnable task order is randomized using deterministic randomness.
     pub randomize_order: bool,
+    /// Whether the scheduler may park the current thread while waiting for work.
     pub allow_parking: bool,
+    /// Whether pending waker traces are captured for debugging blocked tests.
     pub capture_pending_traces: bool,
+    /// Inclusive tick range used to time out blocked tasks.
     pub timeout_ticks: RangeInclusive<usize>,
 }
 
 impl TestSchedulerConfig {
+    /// Create a default test scheduler configuration with the given seed.
     pub fn with_seed(seed: u64) -> Self {
         Self {
             seed,
@@ -810,6 +832,7 @@ impl TracingWaker {
     }
 }
 
+/// Future returned by `TestScheduler::yield_random`.
 pub struct Yield(usize);
 
 /// A wrapper around `Arc<Mutex<StdRng>>` that provides convenient methods

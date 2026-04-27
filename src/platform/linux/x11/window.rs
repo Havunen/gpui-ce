@@ -11,9 +11,9 @@ use gpui::{
     WindowDecorations, WindowKind, WindowParams, px,
 };
 
-use collections::FxHashSet;
+use crate::collections::FxHashSet;
+use crate::util::{ResultExt, maybe};
 use raw_window_handle as rwh;
-use util::{ResultExt, maybe};
 use x11rb::{
     connection::Connection,
     cookie::{Cookie, VoidCookie},

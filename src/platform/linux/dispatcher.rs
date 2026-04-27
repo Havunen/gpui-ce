@@ -1,9 +1,9 @@
+use crate::util::ResultExt;
 use calloop::{
     EventLoop, PostAction,
     channel::{self, Sender},
     timer::TimeoutAction,
 };
-use util::ResultExt;
 
 use std::{
     mem::MaybeUninit,

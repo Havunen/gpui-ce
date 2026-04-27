@@ -4,6 +4,8 @@ use std::{
     ops::Range,
 };
 
+use crate::collections::HashSet;
+use crate::refineable::Refineable;
 use crate::{
     AbsoluteLength, App, Background, BackgroundTag, BorderStyle, Bounds, ContentMask, Corners,
     CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font,
@@ -11,8 +13,6 @@ use crate::{
     PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun, Window, black, phi,
     point, quad, rems, size,
 };
-use collections::HashSet;
-use refineable::Refineable;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -1347,8 +1347,7 @@ mod tests {
     use crate::{blue, green, px, red, yellow};
 
     use super::*;
-
-    use util_macros::perf;
+    use gpui_macros::perf;
 
     #[perf]
     fn test_basic_highlight_style_combination() {

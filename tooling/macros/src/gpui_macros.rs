@@ -1,6 +1,14 @@
+#![allow(clippy::test_attr_in_doctest)]
+#![allow(unexpected_cfgs)]
+#![cfg_attr(not(target_os = "windows"), allow(unused))]
+
+include!("../../../src/util/util_macros.rs");
+
 mod derive_action;
 mod derive_app_context;
 mod derive_into_element;
+#[path = "../../../src/refineable/derive_refineable.rs"]
+mod derive_refineable;
 mod derive_render;
 mod derive_visual_context;
 mod property_test;
@@ -11,8 +19,45 @@ mod test;
 #[cfg(any(feature = "inspector", debug_assertions))]
 mod derive_inspector_reflection;
 
-use proc_macro::TokenStream;
 use syn::{DeriveInput, Ident};
+
+#[allow(dead_code)]
+mod perf {
+    pub mod consts {
+        pub const SUF_NORMAL: &str = "__ZED_PERF_FN";
+        pub const SUF_MDATA: &str = "__ZED_PERF_MDATA";
+        pub const ITER_ENV_VAR: &str = "ZED_PERF_ITER";
+        pub const MDATA_LINE_PREF: &str = "ZED_MDATA_";
+        pub const MDATA_VER: u32 = 0;
+        pub const WEIGHT_DEFAULT: u8 = 50;
+        pub const ITER_COUNT_LINE_NAME: &str = "iter_count";
+        pub const WEIGHT_LINE_NAME: &str = "weight";
+        pub const IMPORTANCE_LINE_NAME: &str = "importance";
+        pub const VERSION_LINE_NAME: &str = "version";
+    }
+
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+    pub enum Importance {
+        Critical = 4,
+        Important = 3,
+        #[default]
+        Average = 2,
+        Iffy = 1,
+        Fluff = 0,
+    }
+
+    impl std::fmt::Display for Importance {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Importance::Critical => f.write_str("critical"),
+                Importance::Important => f.write_str("important"),
+                Importance::Average => f.write_str("average"),
+                Importance::Iffy => f.write_str("iffy"),
+                Importance::Fluff => f.write_str("fluff"),
+            }
+        }
+    }
+}
 
 /// `Action` derive macro - see the trait documentation for details.
 #[proc_macro_derive(Action, attributes(action))]
@@ -39,6 +84,12 @@ pub fn derive_into_element(input: TokenStream) -> TokenStream {
 #[doc(hidden)]
 pub fn derive_render(input: TokenStream) -> TokenStream {
     derive_render::derive_render(input)
+}
+
+/// `Refineable` derive macro - see the trait documentation for details.
+#[proc_macro_derive(Refineable, attributes(refineable))]
+pub fn derive_refineable(input: TokenStream) -> TokenStream {
+    derive_refineable::derive_refineable(input)
 }
 
 /// #[derive(AppContext)] is used to create a context out of anything that holds a `&mut App`

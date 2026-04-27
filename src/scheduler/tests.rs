@@ -1,4 +1,5 @@
 use super::*;
+use crate::collections::{BTreeSet, HashSet};
 use futures::{
     FutureExt,
     channel::{mpsc, oneshot},
@@ -9,7 +10,6 @@ use futures::{
 };
 use std::{
     cell::RefCell,
-    collections::{BTreeSet, HashSet},
     pin::Pin,
     rc::Rc,
     sync::Arc,
@@ -36,7 +36,7 @@ fn test_background_executor_spawn() {
 
 #[test]
 fn test_foreground_ordering() {
-    let mut traces = HashSet::new();
+    let mut traces = HashSet::default();
 
     TestScheduler::many(100, async |scheduler| {
         #[derive(Hash, PartialEq, Eq)]
@@ -151,7 +151,7 @@ fn test_send_from_bg_to_fg() {
 #[test]
 fn test_randomize_order() {
     // Test deterministic mode: different seeds should produce same execution order
-    let mut deterministic_results = HashSet::new();
+    let mut deterministic_results = HashSet::default();
     for seed in 0..10 {
         let config = TestSchedulerConfig {
             seed,
@@ -171,7 +171,7 @@ fn test_randomize_order() {
     );
 
     // Test randomized mode: different seeds can produce different execution orders
-    let mut randomized_results = HashSet::new();
+    let mut randomized_results = HashSet::default();
     for seed in 0..20 {
         let config = TestSchedulerConfig::with_seed(seed);
         let order = block_on(capture_execution_order(config));

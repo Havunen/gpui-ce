@@ -1,6 +1,6 @@
+use crate::collections::HashMap;
 use anyhow::anyhow;
 use cocoa::appkit::CGFloat;
-use collections::HashMap;
 use core_foundation::{
     array::{CFArray, CFArrayRef},
     attributed_string::CFMutableAttributedString,

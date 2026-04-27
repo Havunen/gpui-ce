@@ -1,5 +1,6 @@
 use crate::scheduler::Instant;
 use crate::scheduler::Scheduler;
+use crate::util::TryFutureExt;
 use crate::{App, PlatformDispatcher, PlatformScheduler};
 use futures::channel::mpsc;
 use futures::prelude::*;
@@ -7,7 +8,6 @@ use std::{
     fmt::Debug, future::Future, marker::PhantomData, mem, pin::Pin, rc::Rc, sync::Arc,
     time::Duration,
 };
-use util::TryFutureExt;
 
 pub use crate::scheduler::{
     FallibleTask, ForegroundExecutor as SchedulerForegroundExecutor, Priority,

@@ -1,7 +1,7 @@
+use crate::collections::HashMap;
 use crate::scheduler::Instant;
 use std::{
     cell::LazyCell,
-    collections::HashMap,
     hash::Hasher,
     hash::{DefaultHasher, Hash},
     sync::Arc,

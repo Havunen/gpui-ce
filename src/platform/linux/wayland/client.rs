@@ -7,17 +7,17 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::collections::HashMap;
+use crate::util::ResultExt as _;
 use ashpd::WindowIdentifier;
 use calloop::{
     EventLoop, LoopHandle,
     timer::{TimeoutAction, Timer},
 };
 use calloop_wayland_source::WaylandSource;
-use collections::HashMap;
 use filedescriptor::Pipe;
 use http_client::Url;
 use smallvec::SmallVec;
-use util::ResultExt as _;
 use wayland_backend::client::ObjectId;
 use wayland_backend::protocol::WEnum;
 use wayland_client::event_created_child;

@@ -1,10 +1,11 @@
+use crate::collections::{BTreeMap, HashMap, HashSet};
+use crate::util::ResultExt as _;
 use anyhow::{Context as _, anyhow};
 use ashpd::WindowIdentifier;
 use calloop::{
     EventLoop, LoopHandle, RegistrationToken,
     generic::{FdWrapper, Generic},
 };
-use collections::HashMap;
 use core::str;
 use gpui::{Capslock, TaskTiming, profiler};
 use http_client::Url;
@@ -12,13 +13,11 @@ use log::Level;
 use smallvec::SmallVec;
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, HashSet},
     ops::Deref,
     path::PathBuf,
     rc::{Rc, Weak},
     time::{Duration, Instant},
 };
-use util::ResultExt as _;
 
 use x11rb::{
     connection::{Connection, RequestConnection},
@@ -537,7 +536,7 @@ impl X11Client {
     ) -> Result<(), EventHandlerError> {
         loop {
             let mut events = Vec::new();
-            let mut windows_to_refresh = HashSet::new();
+            let mut windows_to_refresh = HashSet::default();
 
             let mut last_key_release = None;
 
@@ -2508,7 +2507,7 @@ fn legacy_get_randr_scale_factor(connection: &XCBConnection, root: u32) -> Optio
     }
 
     let mut crtc_infos: HashMap<randr::Crtc, randr::GetCrtcInfoReply> = HashMap::default();
-    let mut valid_outputs: HashSet<randr::Output> = HashSet::new();
+    let mut valid_outputs: HashSet<randr::Output> = HashSet::default();
     for (crtc, cookie) in crtc_cookies {
         if let Ok(reply) = cookie.reply()
             && reply.width > 0

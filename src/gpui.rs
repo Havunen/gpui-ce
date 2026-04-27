@@ -4,8 +4,8 @@
 #![allow(clippy::collapsible_else_if)] // False positives in platform specific code
 #![allow(unused_mut)] // False positives in platform specific code
 
-extern crate self as gpui;
 extern crate gpui_ce_macros as gpui_macros;
+extern crate self as gpui;
 
 #[macro_use]
 mod action;
@@ -15,6 +15,8 @@ mod arena;
 mod asset_cache;
 mod assets;
 mod bounds_tree;
+#[path = "collections/collections.rs"]
+pub(crate) mod collections;
 mod color;
 /// The default colors used by GPUI.
 pub mod colors;
@@ -39,6 +41,8 @@ pub mod profiler;
 #[cfg(any(target_os = "windows", target_os = "linux", target_family = "wasm"))]
 #[expect(missing_docs)]
 pub mod queue;
+#[path = "refineable/refineable.rs"]
+mod refineable;
 mod scene;
 /// The scheduler module provides task scheduling, execution, and timing primitives.
 pub mod scheduler;
@@ -47,6 +51,9 @@ mod shared_uri;
 mod style;
 mod styled;
 mod subscription;
+#[allow(dead_code, unused_imports)]
+#[path = "sum_tree/sum_tree.rs"]
+mod sum_tree;
 mod svg_renderer;
 mod tab_stop;
 mod taffy;
@@ -61,6 +68,8 @@ pub use proptest;
 
 #[cfg(doc)]
 pub mod _ownership_and_data_flow;
+#[path = "util/lib.rs"]
+mod util;
 
 /// Do not touch, here be dragons for use by gpui_macros and such.
 #[doc(hidden)]
@@ -78,6 +87,7 @@ mod seal {
     pub trait Sealed {}
 }
 
+pub use crate::util::arc_cow::ArcCow;
 pub use action::*;
 pub use anyhow::Result;
 pub use app::*;
@@ -122,7 +132,6 @@ pub use taffy::{AvailableSpace, LayoutId};
 #[cfg(any(test, feature = "test-support"))]
 pub use test::*;
 pub use text_system::*;
-pub use util::arc_cow::ArcCow;
 pub use view::*;
 pub use window::*;
 

@@ -22,8 +22,9 @@ use itertools::Itertools;
 use parking_lot::RwLock;
 use slotmap::SlotMap;
 
+use crate::collections::{FxHashMap, FxHashSet, HashMap, VecDeque};
+use crate::util::{ResultExt, debug_panic};
 pub use async_context::*;
-use collections::{FxHashMap, FxHashSet, HashMap, VecDeque};
 pub use context::*;
 pub use entity_map::*;
 #[cfg(any(test, feature = "test-support"))]
@@ -34,7 +35,6 @@ use smallvec::SmallVec;
 pub use test_app::*;
 #[cfg(any(test, feature = "test-support"))]
 pub use test_context::*;
-use util::{ResultExt, debug_panic};
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 pub use visual_test_context::*;
 
@@ -2578,10 +2578,6 @@ pub struct KeystrokeEvent {
 struct NullHttpClient;
 
 impl HttpClient for NullHttpClient {
-    fn type_name(&self) -> &'static str {
-        "NullHttpClient"
-    }
-
     fn send(
         &self,
         _req: http_client::Request<http_client::AsyncBody>,

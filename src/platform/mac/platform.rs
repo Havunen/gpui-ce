@@ -3,6 +3,7 @@ use super::{
     events::key_to_native, ns_string, pasteboard::Pasteboard, renderer,
 };
 use crate::command::{new_command, new_std_command};
+use crate::util::ResultExt;
 use anyhow::{Context as _, anyhow};
 use block::ConcreteBlock;
 use cocoa::{
@@ -54,7 +55,6 @@ use std::{
     slice, str,
     sync::{Arc, OnceLock},
 };
-use util::ResultExt;
 
 #[allow(non_upper_case_globals)]
 const NSUTF8StringEncoding: NSUInteger = 4;
