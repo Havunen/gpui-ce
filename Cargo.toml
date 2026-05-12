@@ -2,11 +2,20 @@
 members = [
     ".",
     "tooling/macros",
+    "tooling/perf",
 ]
 default-members = [
     ".",
 ]
 resolver = "3"
+
+[workspace.package]
+edition = "2024"
+
+[workspace.dependencies]
+collections = { package = "gpui_collections", version = "0.2.2" }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 
 [package]
 name = "gpui-ce"

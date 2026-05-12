@@ -1347,6 +1347,7 @@ mod tests {
     use crate::{blue, green, px, red, yellow};
 
     use super::*;
+    use std::hint::black_box;
 
     use util_macros::perf;
 
@@ -1522,6 +1523,39 @@ mod tests {
                 )
             ]
         );
+    }
+
+    #[perf(important)]
+    fn perf_combine_highlights_many_overlaps() {
+        const RANGE_COUNT: usize = 4_096;
+
+        let a = (0..RANGE_COUNT)
+            .map(|ix| {
+                let start = ix * 3;
+                (start..start + 8, green().into())
+            })
+            .collect::<Vec<_>>();
+        let b = (0..RANGE_COUNT)
+            .map(|ix| {
+                let start = ix * 3 + 1;
+                let style: HighlightStyle = if ix % 2 == 0 {
+                    FontStyle::Italic.into()
+                } else {
+                    FontWeight::BOLD.into()
+                };
+                (start..start + 11, style)
+            })
+            .collect::<Vec<_>>();
+
+        let combined = combine_highlights(a, b).collect::<Vec<_>>();
+
+        assert!(!combined.is_empty());
+        assert!(
+            combined
+                .windows(2)
+                .all(|window| window[0].0.end <= window[1].0.start)
+        );
+        black_box(combined.len());
     }
 
     #[perf]

@@ -894,3 +894,190 @@ impl PathVertex<Pixels> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AtlasTextureKind, DevicePixels, TileId, px, size};
+    use std::hint::black_box;
+    use util_macros::perf;
+
+    fn sp(value: f32) -> ScaledPixels {
+        ScaledPixels::from(value)
+    }
+
+    fn scaled_bounds(ix: usize) -> Bounds<ScaledPixels> {
+        let x = (ix % 128) as f32 * 3.0;
+        let y = (ix / 128) as f32 * 3.0;
+        Bounds::new(point(sp(x), sp(y)), size(sp(16.0), sp(16.0)))
+    }
+
+    fn scaled_mask(ix: usize) -> ContentMask<ScaledPixels> {
+        ContentMask {
+            bounds: scaled_bounds(ix),
+        }
+    }
+
+    fn pixel_mask() -> ContentMask<Pixels> {
+        ContentMask {
+            bounds: Bounds::new(
+                point(px(-10_000.0), px(-10_000.0)),
+                size(px(20_000.0), px(20_000.0)),
+            ),
+        }
+    }
+
+    fn test_quad(ix: usize) -> Quad {
+        Quad {
+            bounds: scaled_bounds(ix),
+            content_mask: scaled_mask(ix),
+            ..Default::default()
+        }
+    }
+
+    fn test_underline(ix: usize) -> Underline {
+        Underline {
+            order: 0,
+            pad: 0,
+            bounds: scaled_bounds(ix),
+            content_mask: scaled_mask(ix),
+            color: Hsla::default(),
+            thickness: sp(1.0),
+            wavy: 0,
+        }
+    }
+
+    fn test_tile(ix: usize, kind: AtlasTextureKind) -> AtlasTile {
+        AtlasTile {
+            texture_id: AtlasTextureId {
+                index: (ix % 8) as u32,
+                kind,
+            },
+            tile_id: TileId(ix as u32),
+            padding: 0,
+            bounds: Bounds::new(
+                point(DevicePixels::from(0), DevicePixels::from(0)),
+                size(DevicePixels::from(16), DevicePixels::from(16)),
+            ),
+        }
+    }
+
+    fn test_monochrome_sprite(ix: usize) -> MonochromeSprite {
+        MonochromeSprite {
+            order: 0,
+            pad: 0,
+            bounds: scaled_bounds(ix),
+            content_mask: scaled_mask(ix),
+            color: Hsla::default(),
+            tile: test_tile(ix, AtlasTextureKind::Monochrome),
+            transformation: TransformationMatrix::default(),
+        }
+    }
+
+    fn test_polychrome_sprite(ix: usize) -> PolychromeSprite {
+        PolychromeSprite {
+            order: 0,
+            pad: 0,
+            grayscale: false,
+            opacity: 1.0,
+            bounds: scaled_bounds(ix),
+            content_mask: scaled_mask(ix),
+            corner_radii: Corners::default(),
+            tile: test_tile(ix, AtlasTextureKind::Polychrome),
+        }
+    }
+
+    fn test_path(ix: usize, segments: usize) -> Path<ScaledPixels> {
+        let offset = ix as f32 * 0.25;
+        let mut path = Path::new(point(px(offset), px(offset)));
+        path.content_mask = pixel_mask();
+        for segment in 0..segments {
+            let x = offset + (segment % 17) as f32;
+            let y = offset + (segment % 11) as f32;
+            path.line_to(point(px(x), px(y)));
+        }
+        path.scale(1.0)
+    }
+
+    fn build_mixed_scene(primitive_count: usize) -> Scene {
+        let mut scene = Scene::default();
+        for ix in 0..primitive_count {
+            if ix % 128 == 0 {
+                scene.push_layer(Bounds::new(
+                    point(sp(-100.0), sp(-100.0)),
+                    size(sp(10_000.0), sp(10_000.0)),
+                ));
+            }
+
+            match ix % 5 {
+                0 => scene.insert_primitive(test_quad(ix)),
+                1 => scene.insert_primitive(test_path(ix, 18)),
+                2 => scene.insert_primitive(test_underline(ix)),
+                3 => scene.insert_primitive(test_monochrome_sprite(ix)),
+                _ => scene.insert_primitive(test_polychrome_sprite(ix)),
+            }
+
+            if ix % 128 == 127 {
+                scene.pop_layer();
+            }
+        }
+        scene
+    }
+
+    #[perf(important)]
+    fn perf_scene_insert_many_primitives() {
+        const PRIMITIVES: usize = 2_048;
+
+        let mut scene = build_mixed_scene(PRIMITIVES);
+        scene.finish();
+        let batch_count = scene.batches().count();
+
+        assert_eq!(scene.len(), PRIMITIVES + (PRIMITIVES / 128) * 2);
+        assert!(batch_count > 0);
+        black_box(batch_count);
+        black_box(scene.quads.len() + scene.paths.len() + scene.monochrome_sprites.len());
+    }
+
+    #[perf(important)]
+    fn perf_scene_replay_large_range() {
+        let previous_scene = build_mixed_scene(2_048);
+        let mut scene = Scene::default();
+
+        scene.replay(0..previous_scene.len(), &previous_scene);
+        scene.finish();
+
+        assert_eq!(scene.len(), previous_scene.len());
+        black_box(scene.batches().count());
+    }
+
+    #[perf]
+    fn perf_path_scale_many_vertices() {
+        let mut path = Path::new(point(px(0.0), px(0.0)));
+        path.content_mask = pixel_mask();
+        for ix in 0..2_000 {
+            path.line_to(point(px((ix % 64) as f32), px((ix / 64) as f32)));
+        }
+
+        let mut vertex_count = 0;
+        for scale in 1..64 {
+            let scaled = path.scale(scale as f32 * 0.125);
+            vertex_count += scaled.vertices.len();
+            black_box(scaled);
+        }
+
+        assert!(vertex_count > 0);
+    }
+
+    #[perf]
+    fn perf_scene_many_paths_finish() {
+        let mut scene = Scene::default();
+        for ix in 0..1_024 {
+            scene.insert_primitive(test_path(ix, 24));
+        }
+
+        scene.finish();
+
+        assert_eq!(scene.paths.len(), 1_024);
+        black_box(scene.batches().count());
+    }
+}

@@ -940,6 +940,15 @@ impl IntoElement for InteractiveText {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::{
+        FontId, FontWeight, GlyphId, HighlightStyle, LineLayout, ShapedGlyph, ShapedRun,
+        SharedString, TextStyle, WrapBoundary, WrappedLine, WrappedLineLayout, point, px,
+    };
+    use smallvec::SmallVec;
+    use std::{hint::black_box, sync::Arc};
+    use util_macros::perf;
+
     #[test]
     fn test_into_element_for() {
         use crate::{ParentElement as _, SharedString, div};
@@ -949,5 +958,98 @@ mod tests {
         let _ = div().child("String".to_string());
         let _ = div().child(Cow::Borrowed("Cow"));
         let _ = div().child(SharedString::from("SharedString"));
+    }
+
+    #[perf(important)]
+    fn perf_compute_runs_many_highlights() {
+        const HIGHLIGHTS: usize = 4_096;
+
+        let mut text = String::with_capacity(HIGHLIGHTS * 2);
+        for _ in 0..HIGHLIGHTS {
+            text.push_str("ab");
+        }
+
+        let highlights = (0..HIGHLIGHTS)
+            .map(|ix| {
+                let start = ix * 2;
+                let style: HighlightStyle = if ix % 2 == 0 {
+                    FontWeight::BOLD.into()
+                } else {
+                    HighlightStyle {
+                        color: Some(crate::red()),
+                        ..Default::default()
+                    }
+                };
+                (start..start + 1, style)
+            })
+            .collect::<Vec<_>>();
+
+        let runs = StyledText::compute_runs(&text, &TextStyle::default(), highlights);
+
+        assert_eq!(runs.iter().map(|run| run.len).sum::<usize>(), text.len());
+        black_box(runs.len());
+    }
+
+    #[perf(important)]
+    fn perf_wrapped_text_many_soft_wraps() {
+        const LINE_COUNT: usize = 256;
+        const LINE_LEN: usize = 128;
+        const WRAP_STEP: usize = 8;
+
+        let layout = TextLayout::default();
+        let mut lines = SmallVec::<[WrappedLine; 1]>::new();
+
+        for line_ix in 0..LINE_COUNT {
+            let text = SharedString::from("x".repeat(LINE_LEN));
+            let glyphs = (0..LINE_LEN)
+                .map(|ix| ShapedGlyph {
+                    id: GlyphId((line_ix + ix) as u32),
+                    position: point(px(ix as f32), px(0.0)),
+                    index: ix,
+                    is_emoji: false,
+                })
+                .collect::<Vec<_>>();
+            let wrap_boundaries = (WRAP_STEP..LINE_LEN)
+                .step_by(WRAP_STEP)
+                .map(|glyph_ix| WrapBoundary {
+                    run_ix: 0,
+                    glyph_ix,
+                })
+                .collect::<SmallVec<[_; 1]>>();
+
+            lines.push(WrappedLine {
+                layout: Arc::new(WrappedLineLayout {
+                    unwrapped_layout: Arc::new(LineLayout {
+                        font_size: px(16.0),
+                        width: px(LINE_LEN as f32),
+                        ascent: px(12.0),
+                        descent: px(4.0),
+                        runs: vec![ShapedRun {
+                            font_id: FontId(0),
+                            glyphs,
+                        }],
+                        len: LINE_LEN,
+                    }),
+                    wrap_boundaries,
+                    wrap_width: Some(px(WRAP_STEP as f32)),
+                }),
+                text,
+                decoration_runs: Vec::new(),
+            });
+        }
+
+        *layout.0.borrow_mut() = Some(TextLayoutInner {
+            len: LINE_COUNT * LINE_LEN,
+            lines,
+            line_height: px(16.0),
+            wrap_width: Some(px(WRAP_STEP as f32)),
+            size: None,
+            bounds: None,
+        });
+
+        let wrapped_text = layout.wrapped_text();
+
+        assert!(wrapped_text.len() > LINE_COUNT * LINE_LEN);
+        black_box(wrapped_text.len());
     }
 }
