@@ -418,6 +418,34 @@ mod tests {
     }
 
     #[test]
+    fn non_forced_present_after_atlas_reset_can_redraw_stale_scene() -> Result<()> {
+        let atlas = Arc::new(ResettableAtlas::default());
+        let renderer_atlas = atlas.clone();
+        let mut cx = HeadlessAppContext::with_platform(
+            Arc::new(NoopTextSystem::new()),
+            Arc::new(()),
+            move || {
+                Some(Box::new(CheckingHeadlessRenderer {
+                    atlas: renderer_atlas.clone(),
+                }))
+            },
+        );
+
+        let image = test_image();
+        let window = cx.open_window(size(px(10.0), px(10.0)), move |_window, cx| {
+            cx.new(|_| ImageRoot { image })
+        })?;
+
+        cx.capture_screenshot(window.into())?;
+        atlas.reset_device_resources_for_test();
+
+        // This models a non-forced Windows paint/present after DirectX device
+        // recovery cleared the atlas, but before the forced full redraw happens.
+        cx.capture_screenshot(window.into())?;
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "known failing repro for stale atlas texture IDs after renderer reset"]
     fn stale_atlas_texture_ids_after_renderer_reset_are_not_redrawn_from_old_frame() -> Result<()> {
         let atlas = Arc::new(ResettableAtlas::default());
