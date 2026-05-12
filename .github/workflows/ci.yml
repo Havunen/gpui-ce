@@ -14,16 +14,25 @@ env:
 
 jobs:
   build-and-test:
-    name: ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-latest
+          - name: Linux aarch64
+            runner: ubuntu-24.04-arm
+          - name: macOS x86_64
+            runner: macos-15-intel
+          - name: macOS aarch64
+            runner: macos-15
+          - name: Windows x86_64
+            runner: windows-latest
+          - name: Windows aarch64
+            runner: windows-11-arm
 
     steps:
       - name: Checkout

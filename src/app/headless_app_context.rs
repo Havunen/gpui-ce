@@ -273,3 +273,176 @@ impl AppContext for HeadlessAppContext {
         app.read_global(callback)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels, IntoElement, NoopTextSystem,
+        ParentElement as _, PlatformAtlas, PrimitiveBatch, RenderImage, Scene, Styled as _, TileId,
+        div, img, px, size,
+    };
+    use anyhow::Result;
+    use image::{Frame as ImageFrame, ImageBuffer, Rgba, RgbaImage};
+    use parking_lot::Mutex;
+    use smallvec::SmallVec;
+    use std::{
+        borrow::Cow,
+        collections::{HashMap, HashSet},
+    };
+
+    #[derive(Default)]
+    struct ResettableAtlas {
+        state: Mutex<ResettableAtlasState>,
+    }
+
+    #[derive(Default)]
+    struct ResettableAtlasState {
+        tiles_by_key: HashMap<AtlasKey, AtlasTile>,
+        live_textures: HashSet<AtlasTextureId>,
+        next_texture_index: u32,
+        next_tile_id: u32,
+    }
+
+    impl ResettableAtlas {
+        fn reset_device_resources_for_test(&self) {
+            let mut state = self.state.lock();
+            state.tiles_by_key.clear();
+            state.live_textures.clear();
+            state.next_texture_index = 0;
+            state.next_tile_id = 0;
+        }
+
+        fn has_texture(&self, id: AtlasTextureId) -> bool {
+            self.state.lock().live_textures.contains(&id)
+        }
+    }
+
+    impl PlatformAtlas for ResettableAtlas {
+        fn get_or_insert_with<'a>(
+            &self,
+            key: &AtlasKey,
+            build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
+        ) -> Result<Option<AtlasTile>> {
+            if let Some(tile) = self.state.lock().tiles_by_key.get(key).cloned() {
+                return Ok(Some(tile));
+            }
+
+            let Some((size, _bytes)) = build()? else {
+                return Ok(None);
+            };
+
+            let mut state = self.state.lock();
+            if let Some(tile) = state.tiles_by_key.get(key).cloned() {
+                return Ok(Some(tile));
+            }
+
+            let texture_id = AtlasTextureId {
+                index: state.next_texture_index,
+                kind: key.texture_kind(),
+            };
+            state.next_texture_index += 1;
+
+            let tile = AtlasTile {
+                texture_id,
+                tile_id: TileId(state.next_tile_id),
+                padding: 0,
+                bounds: Bounds {
+                    origin: Default::default(),
+                    size,
+                },
+            };
+            state.next_tile_id += 1;
+            state.live_textures.insert(texture_id);
+            state.tiles_by_key.insert(key.clone(), tile.clone());
+            Ok(Some(tile))
+        }
+
+        fn remove(&self, key: &AtlasKey) {
+            let mut state = self.state.lock();
+            if let Some(tile) = state.tiles_by_key.remove(key) {
+                state.live_textures.remove(&tile.texture_id);
+            }
+        }
+    }
+
+    struct CheckingHeadlessRenderer {
+        atlas: Arc<ResettableAtlas>,
+    }
+
+    impl PlatformHeadlessRenderer for CheckingHeadlessRenderer {
+        fn render_scene_to_image(
+            &mut self,
+            scene: &Scene,
+            size: Size<DevicePixels>,
+        ) -> Result<RgbaImage> {
+            for batch in scene.batches() {
+                let texture_id = match batch {
+                    PrimitiveBatch::MonochromeSprites { texture_id, .. }
+                    | PrimitiveBatch::SubpixelSprites { texture_id, .. }
+                    | PrimitiveBatch::PolychromeSprites { texture_id, .. } => texture_id,
+                    _ => continue,
+                };
+
+                assert!(
+                    self.atlas.has_texture(texture_id),
+                    "stale atlas texture id after renderer reset: {texture_id:?}",
+                );
+            }
+
+            Ok(RgbaImage::from_pixel(
+                size.width.0.max(1) as u32,
+                size.height.0.max(1) as u32,
+                Rgba([0, 0, 0, 0]),
+            ))
+        }
+
+        fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
+            self.atlas.clone()
+        }
+    }
+
+    struct ImageRoot {
+        image: Arc<RenderImage>,
+    }
+
+    impl Render for ImageRoot {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().child(img(self.image.clone()).size(px(1.0)))
+        }
+    }
+
+    fn test_image() -> Arc<RenderImage> {
+        let frame = ImageFrame::new(ImageBuffer::from_pixel(1, 1, Rgba([0, 0, 0, 255])));
+        Arc::new(RenderImage::new(SmallVec::from_iter([frame])))
+    }
+
+    #[test]
+    #[ignore = "known failing repro for stale atlas texture IDs after renderer reset"]
+    fn stale_atlas_texture_ids_after_renderer_reset_are_not_redrawn_from_old_frame() -> Result<()> {
+        let atlas = Arc::new(ResettableAtlas::default());
+        let renderer_atlas = atlas.clone();
+        let mut cx = HeadlessAppContext::with_platform(
+            Arc::new(NoopTextSystem::new()),
+            Arc::new(()),
+            move || {
+                Some(Box::new(CheckingHeadlessRenderer {
+                    atlas: renderer_atlas.clone(),
+                }))
+            },
+        );
+
+        let image = test_image();
+        let window = cx.open_window(size(px(10.0), px(10.0)), move |_window, cx| {
+            cx.new(|_| ImageRoot { image })
+        })?;
+
+        cx.capture_screenshot(window.into())?;
+        atlas.reset_device_resources_for_test();
+
+        // This models the Windows crash: the renderer resources have been reset,
+        // but the high-level window still owns the previously rendered scene.
+        cx.capture_screenshot(window.into())?;
+        Ok(())
+    }
+}
