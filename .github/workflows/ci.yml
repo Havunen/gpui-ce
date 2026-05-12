@@ -64,6 +64,7 @@ jobs:
             libxcb1-dev \
             libxkbcommon-dev \
             libxkbcommon-x11-dev \
+            lld \
             zlib1g-dev
 
       - name: Build workspace
