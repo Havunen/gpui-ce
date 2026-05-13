@@ -13,7 +13,6 @@ resolver = "3"
 edition = "2024"
 
 [workspace.dependencies]
-collections = { package = "gpui_collections", version = "0.2.2" }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 
@@ -37,8 +36,6 @@ default = ["font-kit", "wayland", "x11", "windows-manifest"]
 test-support = [
     "leak-detection",
     "backtrace",
-    "collections/test-support",
-    "util/test-support",
     "http_client/test-support",
     "wayland",
     "x11",
@@ -84,15 +81,16 @@ anyhow = "1"
 async-task = "4.7"
 backtrace = { version = "0.3", optional = true }
 circular-buffer = "1.2"
-collections = { package = "gpui_collections", version = "0.2.2" }
-ctor = "0.9"
-derive_more = "0.99.17"
+ctor = "0.10"
+derive_more = { version = "2", features = ["full"] }
 etagere = "0.3"
 futures = "0.3"
 futures-concurrency = "7"
 gpui-ce-macros = { path = "./tooling/macros", features = ["inspector"] }
-http_client = { package = "gpui_http_client", version = "0.2.2" }
+heapless = "0.9"
+http_client = { package = "http-client-gpui-unofficial", version = "0.233.10" }
 image = "0.25"
+indexmap = "2.14"
 inventory = "0.3"
 itertools = "0.14"
 libc = "0.2"
@@ -106,14 +104,15 @@ postage = { version = "0.5", features = ["futures-traits"] }
 profiling = "1"
 proptest = "1"
 rand = "0.10"
+rayon = "1"
 raw-window-handle = "0.6"
-refineable = { package = "gpui_refineable", version = "0.2.2" }
 regex = "1"
 resvg = { version = "0.47", default-features = false, features = [
     "text",
     "system-fonts",
     "memmap-fonts",
 ] }
+rustc-hash = "2.1"
 schemars = { version = "1.2", features = ["indexmap2"] }
 seahash = "4"
 semver = { version = "1", features = ["serde"] }
@@ -125,12 +124,9 @@ smol = "2"
 spin = "0.10"
 stacksafe = "1"
 strum = { version = "0.28", features = ["derive"] }
-sum_tree = { package = "gpui_sum_tree", version = "0.2.2" }
-taffy = "=0.9"
+taffy = "0.10"
 thiserror = "2"
 ttf-parser = "0.25"
-util = { package = "gpui_util", version = "0.2.2" }
-util_macros = { package = "gpui_util_macros", version = "0.2.2" }
 usvg = { version = "0.47", default-features = false }
 url = "2"
 uuid = { version = "1.23", features = ["v4", "v5", "v7", "serde"] }
@@ -142,11 +138,11 @@ chrono = "0.4"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block = "0.1"
-cocoa = "=0.26.0"
-cocoa-foundation = "=0.2.0"
-core-foundation = "=0.10.0"
+cocoa = "0.26"
+cocoa-foundation = "0.2"
+core-foundation = "0.10"
 core-foundation-sys = "0.8.7"
-core-graphics = "0.24"
+core-graphics = "0.25"
 core-text = "21"
 core-video = { version = "0.5", features = ["metal"] }
 dispatch2 = "0.3"
@@ -168,8 +164,8 @@ oo7 = { version = "0.6", default-features = false, features = [
     "async-std",
     "native_crypto",
 ] }
-wgpu = { git = "https://github.com/zed-industries/wgpu.git", branch = "v29" }
-cosmic-text = "0.18"
+wgpu = "29"
+cosmic-text = "0.19"
 swash = "0.2"
 bytemuck = "1"
 
@@ -224,6 +220,7 @@ x11-clipboard = { version = "0.9", optional = true }
 bitflags = { version = "2", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+dunce = "1"
 flume = "0.12"
 rand = "0.10"
 windows = { version = "0.62", features = [
@@ -281,15 +278,13 @@ windows-registry = "0.6"
 
 [dev-dependencies]
 backtrace = "0.3"
-collections = { package = "gpui_collections", version = "0.2.2", features = ["test-support"] }
 env_logger = "0.11"
-http_client = { package = "gpui_http_client", version = "0.2.2", features = ["test-support"] }
+http_client = { package = "http-client-gpui-unofficial", version = "0.233.10", features = ["test-support"] }
 lyon = { version = "1", features = ["extra"] }
 pretty_assertions = { version = "1.4", features = ["unstable"] }
 proptest = "1"
 rand = "0.10"
 unicode-segmentation = "1.13"
-util = { package = "gpui_util", version = "0.2.2", features = ["test-support"] }
 
 [target.'cfg(target_os = "windows")'.build-dependencies]
 embed-resource = "3"

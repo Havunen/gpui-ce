@@ -1,5 +1,5 @@
+use crate::collections::HashMap;
 use anyhow::{Context as _, Ok, Result};
-use collections::HashMap;
 use cosmic_text::{
     Attrs, AttrsList, Ellipsize, Family, Font as CosmicTextFont,
     FontFeatures as CosmicFontFeatures, FontSystem, ShapeBuffer, ShapeLine,

@@ -17,6 +17,9 @@
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::PinchEvent;
+use crate::collections::HashMap;
+use crate::refineable::Refineable;
+use crate::util::ResultExt;
 use crate::{
     AbsoluteLength, Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent,
     DispatchPhase, Display, Element, ElementId, Entity, FocusHandle, Global, GlobalElementId,
@@ -27,8 +30,6 @@ use crate::{
     StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
     size,
 };
-use collections::HashMap;
-use refineable::Refineable;
 use smallvec::SmallVec;
 use stacksafe::{StackSafe, stacksafe};
 use std::{
@@ -42,7 +43,6 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use util::ResultExt;
 
 use super::ImageCacheProvider;
 

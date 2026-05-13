@@ -10,8 +10,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ::util::ResultExt;
-use ::windows::{
+use crate::util::ResultExt;
+use anyhow::{Context as _, Result};
+use futures::channel::oneshot::{self, Receiver};
+use raw_window_handle as rwh;
+use smallvec::SmallVec;
+use windows::{
     Win32::{
         Foundation::*,
         Graphics::Dwm::*,
@@ -21,10 +25,6 @@ use ::windows::{
     },
     core::*,
 };
-use anyhow::{Context as _, Result};
-use futures::channel::oneshot::{self, Receiver};
-use raw_window_handle as rwh;
-use smallvec::SmallVec;
 
 use super::{
     DirectXDevices, DirectXRenderer, WindowCreationInfo, WindowsDisplay, WindowsSystemSettings,

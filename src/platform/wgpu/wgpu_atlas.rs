@@ -1,5 +1,5 @@
+use crate::collections::FxHashMap;
 use anyhow::{Context as _, Result};
-use collections::FxHashMap;
 use etagere::{BucketedAtlasAllocator, size2};
 use gpui::{
     AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTextureList, AtlasTile, Bounds, DevicePixels,

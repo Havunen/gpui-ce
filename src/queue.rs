@@ -1,5 +1,5 @@
+use crate::collections::VecDeque;
 use std::{
-    collections::VecDeque,
     fmt,
     iter::FusedIterator,
     sync::{Arc, atomic::AtomicUsize},
@@ -388,7 +388,7 @@ impl<T> FusedIterator for TryIter<T> {}
 
 #[cfg(test)]
 mod tests {
-    use collections::HashSet;
+    use crate::collections::HashSet;
 
     use super::*;
 

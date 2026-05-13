@@ -49,11 +49,11 @@
 //!
 //!  KeyBinding::new("cmd-k left", pane::SplitLeft, Some("Pane"))
 
+use crate::collections::FxHashMap;
 use crate::{
     Action, ActionRegistry, App, DispatchPhase, EntityId, FocusId, KeyBinding, KeyContext, Keymap,
     Keystroke, ModifiersChangedEvent, Window,
 };
-use collections::FxHashMap;
 use smallvec::SmallVec;
 use std::{
     any::{Any, TypeId},
@@ -625,9 +625,9 @@ mod tests {
         InspectorElementId, Keystroke, LayoutId, Style,
     };
     use core::panic;
+    use gpui_macros::perf;
     use smallvec::SmallVec;
     use std::{any::TypeId, cell::RefCell, hint::black_box, ops::Range, rc::Rc};
-    use util_macros::perf;
 
     use crate::{
         ActionRegistry, App, Bounds, Context, DispatchTree, FocusHandle, InputHandler, IntoElement,

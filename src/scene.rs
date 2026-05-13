@@ -899,8 +899,8 @@ impl PathVertex<Pixels> {
 mod tests {
     use super::*;
     use crate::{AtlasTextureKind, DevicePixels, TileId, px, size};
+    use gpui_macros::perf;
     use std::hint::black_box;
-    use util_macros::perf;
 
     fn sp(value: f32) -> ScaledPixels {
         ScaledPixels::from(value)

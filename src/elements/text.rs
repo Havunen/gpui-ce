@@ -1,3 +1,4 @@
+use crate::util::ResultExt;
 use crate::{
     ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
     HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
@@ -16,7 +17,6 @@ use std::{
     rc::Rc,
     sync::Arc,
 };
-use util::ResultExt;
 
 impl Element for &'static str {
     type RequestLayoutState = TextLayout;
@@ -983,9 +983,9 @@ mod tests {
         FontId, FontWeight, GlyphId, HighlightStyle, LineLayout, ShapedGlyph, ShapedRun,
         SharedString, TextStyle, WrapBoundary, WrappedLine, WrappedLineLayout, point, px,
     };
+    use gpui_macros::perf;
     use smallvec::SmallVec;
     use std::{hint::black_box, sync::Arc};
-    use util_macros::perf;
 
     #[test]
     fn test_into_element_for() {

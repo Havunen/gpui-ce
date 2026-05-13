@@ -1,5 +1,5 @@
+use crate::collections::FxHashMap;
 use crate::{FontId, GlyphId, Pixels, PlatformTextSystem, Point, SharedString, Size, point, px};
-use collections::FxHashMap;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use smallvec::SmallVec;
 use std::{
@@ -954,8 +954,8 @@ impl AsHashedCacheKeyRef for HashedCacheKeyRef<'_> {
 mod tests {
     use super::*;
     use crate::{GlyphId, NoopTextSystem};
+    use gpui_macros::perf;
     use std::{cell::Cell, hint::black_box, sync::Arc};
-    use util_macros::perf;
 
     fn glyph_at(x: f32, index: usize) -> ShapedGlyph {
         ShapedGlyph {

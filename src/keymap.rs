@@ -4,8 +4,8 @@ mod context;
 pub use binding::*;
 pub use context::*;
 
+use crate::collections::{HashMap, HashSet};
 use crate::{Action, AsKeystroke, Keystroke, Unbind, is_no_action, is_unbind};
-use collections::{HashMap, HashSet};
 use smallvec::SmallVec;
 use std::any::TypeId;
 
@@ -295,8 +295,8 @@ mod tests {
     use super::*;
     use crate as gpui;
     use gpui::{NoAction, Unbind};
+    use gpui_macros::perf;
     use std::hint::black_box;
-    use util_macros::perf;
 
     actions!(
         test_only,

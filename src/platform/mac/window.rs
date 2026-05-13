@@ -34,6 +34,7 @@ use gpui::{
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
 
+use crate::util::ResultExt;
 use core_graphics::display::{CGDirectDisplayID, CGPoint, CGRect};
 use ctor::ctor;
 use futures::channel::oneshot;
@@ -58,7 +59,6 @@ use std::{
     sync::{Arc, Weak},
     time::Duration,
 };
-use util::ResultExt;
 
 const WINDOW_STATE_IVAR: &str = "windowState";
 

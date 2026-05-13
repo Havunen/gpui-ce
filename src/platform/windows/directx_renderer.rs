@@ -3,8 +3,9 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use ::util::ResultExt;
-use ::windows::{
+use crate::util::ResultExt;
+use anyhow::{Context, Result};
+use windows::{
     Win32::{
         Foundation::HWND,
         Graphics::{
@@ -17,7 +18,6 @@ use ::windows::{
     },
     core::Interface,
 };
-use anyhow::{Context, Result};
 
 use self::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
 use super::{DirectXAtlas, DirectXDevices, try_to_recover_from_device_lost};

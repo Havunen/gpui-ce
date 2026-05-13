@@ -5,7 +5,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ::windows::{
+use crate::util::ResultExt;
+use anyhow::Context;
+use windows::{
     System::Threading::{
         ThreadPool, ThreadPoolTimer, TimerElapsedHandler, WorkItemHandler, WorkItemPriority,
     },
@@ -19,8 +21,6 @@ use ::windows::{
         UI::WindowsAndMessaging::PostMessageW,
     },
 };
-use anyhow::Context;
-use util::ResultExt;
 
 use super::{HWND, SafeHwnd, WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD};
 use gpui::{
@@ -202,7 +202,7 @@ impl PlatformDispatcher for WindowsDispatcher {
         unsafe {
             timeBeginPeriod(1);
         }
-        util::defer(Box::new(|| unsafe {
+        crate::util::defer(Box::new(|| unsafe {
             timeEndPeriod(1);
         }))
     }

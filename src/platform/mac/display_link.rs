@@ -1,10 +1,10 @@
+use crate::util::ResultExt;
 use anyhow::Result;
 use core_graphics::display::CGDirectDisplayID;
 use dispatch2::{
     _dispatch_source_type_data_add, DispatchObject, DispatchQueue, DispatchRetained, DispatchSource,
 };
 use std::ffi::c_void;
-use util::ResultExt;
 
 pub struct DisplayLink {
     display_link: Option<sys::DisplayLink>,

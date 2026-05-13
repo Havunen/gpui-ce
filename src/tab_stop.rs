@@ -1,8 +1,7 @@
 use std::fmt::Debug;
 
-use ::sum_tree::SumTree;
-use collections::FxHashMap;
-use sum_tree::Bias;
+use crate::collections::FxHashMap;
+use crate::sum_tree::{Bias, SumTree};
 
 use crate::{FocusHandle, FocusId};
 
@@ -214,7 +213,7 @@ impl TabStopMap {
 }
 
 mod sum_tree_impl {
-    use sum_tree::SeekTarget;
+    use crate::sum_tree::{self, SeekTarget};
 
     use crate::tab_stop::{TabStopNode, TabStopPath};
 

@@ -7,6 +7,7 @@ use crate::{
 use anyhow::Result;
 
 use crate::scheduler::Instant;
+use crate::util::ResultExt;
 use futures::Future;
 use image::{
     AnimationDecoder, DynamicImage, Frame, ImageError, ImageFormat, Rgba,
@@ -23,7 +24,6 @@ use std::{
     time::Duration,
 };
 use thiserror::Error;
-use util::ResultExt;
 
 use super::{Stateful, StatefulInteractiveElement};
 

@@ -374,8 +374,8 @@ impl PathBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui_macros::perf;
     use std::hint::black_box;
-    use util_macros::perf;
 
     #[test]
     fn build_path_handles_empty_buffers() {

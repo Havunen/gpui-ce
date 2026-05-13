@@ -724,7 +724,7 @@ mod test {
         self as gpui, AppContext as _, Context, FocusHandle, InteractiveElement, IntoElement,
         KeyBinding, Keystroke, ParentElement, Render, TestAppContext, Window, div,
     };
-    use util_macros::perf;
+    use gpui_macros::perf;
 
     struct TestView {
         saw_key_down: bool,

@@ -1,7 +1,8 @@
 use std::sync::OnceLock;
 
-use ::util::ResultExt;
-use ::windows::{
+use crate::util::ResultExt;
+use anyhow::Context;
+use windows::{
     UI::{
         Color,
         ViewManagement::{UIColorType, UISettings},

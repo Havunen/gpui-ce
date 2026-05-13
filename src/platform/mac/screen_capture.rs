@@ -1,11 +1,11 @@
 use super::ns_string;
+use crate::collections::HashMap;
 use anyhow::{Result, anyhow};
 use block::ConcreteBlock;
 use cocoa::{
     base::{YES, id, nil},
     foundation::NSArray,
 };
-use collections::HashMap;
 use core_foundation::base::TCFType;
 use core_graphics::display::{
     CGDirectDisplayID, CGDisplayCopyDisplayMode, CGDisplayModeGetPixelHeight,

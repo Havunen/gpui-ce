@@ -1,5 +1,5 @@
+use crate::collections::HashMap;
 use crate::{FontId, Pixels, SharedString, TextRun, TextSystem, px};
-use collections::HashMap;
 use std::{borrow::Cow, iter, sync::Arc};
 
 /// Determines whether to truncate text from the start or end.
@@ -408,8 +408,8 @@ mod tests {
     use crate::{Font, FontFeatures, FontStyle, FontWeight, TestAppContext, TestDispatcher, font};
     #[cfg(target_os = "macos")]
     use crate::{TextRun, WindowTextSystem, WrapBoundary};
+    use gpui_macros::perf;
     use std::hint::black_box;
-    use util_macros::perf;
 
     fn build_wrapper() -> LineWrapper {
         let dispatcher = TestDispatcher::new(0);

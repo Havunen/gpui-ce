@@ -9,8 +9,13 @@ use std::{
     },
 };
 
-use ::util::{ResultExt, paths::SanitizedPath};
-use ::windows::{
+use crate::util::{ResultExt, paths::SanitizedPath};
+use anyhow::{Context as _, Result, anyhow};
+use futures::channel::oneshot::{self, Receiver};
+use itertools::Itertools;
+use parking_lot::RwLock;
+use smallvec::SmallVec;
+use windows::{
     UI::ViewManagement::UISettings,
     Win32::{
         Foundation::*,
@@ -21,11 +26,6 @@ use ::windows::{
     },
     core::*,
 };
-use anyhow::{Context as _, Result, anyhow};
-use futures::channel::oneshot::{self, Receiver};
-use itertools::Itertools;
-use parking_lot::RwLock;
-use smallvec::SmallVec;
 
 use super::{
     DISABLE_DIRECT_COMPOSITION, DirectWriteTextSystem, DirectXDevices, DockMenuItem, JumpList,
