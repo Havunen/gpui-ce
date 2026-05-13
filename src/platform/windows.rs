@@ -15,7 +15,7 @@ mod vsync;
 mod window;
 mod wrapper;
 
-pub(crate) use crate::util::*;
+pub(crate) use self::util::*;
 pub(crate) use clipboard::*;
 pub(crate) use destination_list::*;
 pub(crate) use direct_write::*;

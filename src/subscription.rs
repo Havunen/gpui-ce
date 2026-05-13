@@ -122,11 +122,11 @@ where
         };
 
         subscribers.retain(|_, subscriber| {
-            if !subscriber.active.get() {
-                return true;
-            }
             if subscriber.dropped.get() {
                 return false;
+            }
+            if !subscriber.active.get() {
+                return true;
             }
             let keep = f(&mut subscriber.callback);
             keep && !subscriber.dropped.get()
@@ -285,6 +285,52 @@ mod tests {
             observer_b_count.get(),
             0,
             "B should not fire after A dropped its subscription"
+        );
+    }
+
+    #[test]
+    fn test_inactive_subscriber_dropped_during_retain_is_removed() {
+        let subscribers = SubscriberSet::<(), Box<dyn FnMut()>>::new();
+
+        let inactive_subscription: Rc<RefCell<Option<Subscription>>> = Default::default();
+        let inactive_count = Rc::new(Cell::new(0usize));
+
+        let (_active_subscription, activate_active) = subscribers.insert(
+            (),
+            Box::new({
+                let inactive_subscription = inactive_subscription.clone();
+                move || {
+                    inactive_subscription.borrow_mut().take();
+                }
+            }),
+        );
+        activate_active();
+
+        let (subscription, activate_inactive) = subscribers.insert(
+            (),
+            Box::new({
+                let inactive_count = inactive_count.clone();
+                move || {
+                    inactive_count.set(inactive_count.get() + 1);
+                }
+            }),
+        );
+        *inactive_subscription.borrow_mut() = Some(subscription);
+
+        subscribers.retain(&(), |callback| {
+            callback();
+            true
+        });
+        activate_inactive();
+
+        for mut callback in subscribers.remove(&()) {
+            callback();
+        }
+
+        assert_eq!(
+            inactive_count.get(),
+            0,
+            "dropped inactive subscriber should not survive deferred activation"
         );
     }
 
