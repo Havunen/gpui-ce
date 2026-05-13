@@ -20,6 +20,7 @@ impl MetalAtlas {
             monochrome_textures: Default::default(),
             polychrome_textures: Default::default(),
             tiles_by_key: Default::default(),
+            generation: 0,
         }))
     }
 
@@ -34,6 +35,7 @@ struct MetalAtlasState {
     monochrome_textures: AtlasTextureList<MetalAtlasTexture>,
     polychrome_textures: AtlasTextureList<MetalAtlasTexture>,
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
+    generation: u64,
 }
 
 impl PlatformAtlas for MetalAtlas {
@@ -65,29 +67,41 @@ impl PlatformAtlas for MetalAtlas {
             return;
         };
 
-        let textures = match id.kind {
-            AtlasTextureKind::Monochrome => &mut lock.monochrome_textures,
-            AtlasTextureKind::Polychrome => &mut lock.polychrome_textures,
-            AtlasTextureKind::Subpixel => unreachable!(),
-        };
+        let mut freed_texture = false;
+        {
+            let textures = match id.kind {
+                AtlasTextureKind::Monochrome => &mut lock.monochrome_textures,
+                AtlasTextureKind::Polychrome => &mut lock.polychrome_textures,
+                AtlasTextureKind::Subpixel => unreachable!(),
+            };
 
-        let Some(texture_slot) = textures
-            .textures
-            .iter_mut()
-            .find(|texture| texture.as_ref().is_some_and(|v| v.id == id))
-        else {
-            return;
-        };
+            let Some(texture_slot) = textures
+                .textures
+                .iter_mut()
+                .find(|texture| texture.as_ref().is_some_and(|v| v.id == id))
+            else {
+                return;
+            };
 
-        if let Some(mut texture) = texture_slot.take() {
-            texture.decrement_ref_count();
+            if let Some(mut texture) = texture_slot.take() {
+                texture.decrement_ref_count();
 
-            if texture.is_unreferenced() {
-                textures.free_list.push(id.index as usize);
-            } else {
-                *texture_slot = Some(texture);
+                if texture.is_unreferenced() {
+                    textures.free_list.push(id.index as usize);
+                    freed_texture = true;
+                } else {
+                    *texture_slot = Some(texture);
+                }
             }
         }
+
+        if freed_texture {
+            lock.generation = lock.generation.wrapping_add(1);
+        }
+    }
+
+    fn generation(&self) -> u64 {
+        self.0.lock().generation
     }
 }
 

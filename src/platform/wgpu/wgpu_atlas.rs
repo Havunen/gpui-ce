@@ -34,6 +34,7 @@ struct WgpuAtlasState {
     storage: WgpuAtlasStorage,
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
     pending_uploads: Vec<PendingUpload>,
+    generation: u64,
 }
 
 pub struct WgpuTextureInfo {
@@ -50,6 +51,7 @@ impl WgpuAtlas {
             storage: WgpuAtlasStorage::default(),
             tiles_by_key: Default::default(),
             pending_uploads: Vec::new(),
+            generation: 0,
         }))
     }
 
@@ -75,6 +77,7 @@ impl WgpuAtlas {
         lock.storage = WgpuAtlasStorage::default();
         lock.tiles_by_key.clear();
         lock.pending_uploads.clear();
+        lock.generation = lock.generation.wrapping_add(1);
     }
 }
 
@@ -108,22 +111,35 @@ impl PlatformAtlas for WgpuAtlas {
             return;
         };
 
-        let Some(texture_slot) = lock.storage[id.kind].textures.get_mut(id.index as usize) else {
-            return;
-        };
+        let mut freed_texture = None;
+        {
+            let Some(texture_slot) = lock.storage[id.kind].textures.get_mut(id.index as usize)
+            else {
+                return;
+            };
 
-        if let Some(mut texture) = texture_slot.take() {
-            texture.decrement_ref_count();
-            if texture.is_unreferenced() {
-                lock.pending_uploads
-                    .retain(|upload| upload.id != texture.id);
-                lock.storage[id.kind]
-                    .free_list
-                    .push(texture.id.index as usize);
-            } else {
-                *texture_slot = Some(texture);
+            if let Some(mut texture) = texture_slot.take() {
+                texture.decrement_ref_count();
+                if texture.is_unreferenced() {
+                    freed_texture = Some(texture.id);
+                } else {
+                    *texture_slot = Some(texture);
+                }
             }
         }
+
+        if let Some(texture_id) = freed_texture {
+            lock.pending_uploads
+                .retain(|upload| upload.id != texture_id);
+            lock.storage[texture_id.kind]
+                .free_list
+                .push(texture_id.index as usize);
+            lock.generation = lock.generation.wrapping_add(1);
+        }
+    }
+
+    fn generation(&self) -> u64 {
+        self.0.lock().generation
     }
 }
 

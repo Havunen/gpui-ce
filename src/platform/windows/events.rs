@@ -1147,10 +1147,11 @@ impl WindowsWindowInner {
     fn draw_window(&self, handle: HWND, force_render: bool) -> Option<isize> {
         let mut request_frame = self.state.callbacks.request_frame.take()?;
 
-        // we are instructing gpui to force render a frame, this will
-        // re-populate all the gpu textures for us so we can resume drawing in
-        // case we disabled drawing earlier due to a device loss
-        self.state.renderer.borrow_mut().mark_drawable();
+        if force_render {
+            // Force rendering repopulates GPU textures after device loss, so only
+            // forced draws should resume the DirectX renderer.
+            self.state.renderer.borrow_mut().mark_drawable();
+        }
         request_frame(RequestFrameOptions {
             require_presentation: false,
             force_render,

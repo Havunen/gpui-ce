@@ -23,6 +23,7 @@ struct DirectXAtlasState {
     polychrome_textures: AtlasTextureList<DirectXAtlasTexture>,
     subpixel_textures: AtlasTextureList<DirectXAtlasTexture>,
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
+    generation: u64,
 }
 
 struct DirectXAtlasTexture {
@@ -43,16 +44,19 @@ impl DirectXAtlas {
             polychrome_textures: Default::default(),
             subpixel_textures: Default::default(),
             tiles_by_key: Default::default(),
+            generation: 0,
         }))
     }
 
     pub(crate) fn get_texture_view(
         &self,
         id: AtlasTextureId,
-    ) -> [Option<ID3D11ShaderResourceView>; 1] {
+    ) -> anyhow::Result<[Option<ID3D11ShaderResourceView>; 1]> {
         let lock = self.0.lock();
-        let tex = lock.texture(id);
-        tex.view.clone()
+        let tex = lock
+            .texture(id)
+            .ok_or_else(|| anyhow::anyhow!("missing DirectX atlas texture {id:?}"))?;
+        Ok(tex.view.clone())
     }
 
     pub(crate) fn handle_device_lost(
@@ -67,6 +71,7 @@ impl DirectXAtlas {
         lock.polychrome_textures = AtlasTextureList::default();
         lock.subpixel_textures = AtlasTextureList::default();
         lock.tiles_by_key.clear();
+        lock.generation = lock.generation.wrapping_add(1);
     }
 }
 
@@ -88,7 +93,12 @@ impl PlatformAtlas for DirectXAtlas {
             let tile = lock
                 .allocate(size, key.texture_kind())
                 .ok_or_else(|| anyhow::anyhow!("failed to allocate"))?;
-            let texture = lock.texture(tile.texture_id);
+            let texture = lock.texture(tile.texture_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "missing newly allocated DirectX atlas texture {:?}",
+                    tile.texture_id
+                )
+            })?;
             texture.upload(&lock.device_context, tile.bounds, &bytes);
             lock.tiles_by_key.insert(key.clone(), tile.clone());
             Ok(Some(tile))
@@ -102,25 +112,36 @@ impl PlatformAtlas for DirectXAtlas {
             return;
         };
 
-        let textures = match id.kind {
-            AtlasTextureKind::Monochrome => &mut lock.monochrome_textures,
-            AtlasTextureKind::Polychrome => &mut lock.polychrome_textures,
-            AtlasTextureKind::Subpixel => &mut lock.subpixel_textures,
-        };
+        let mut freed_texture = false;
+        {
+            let textures = match id.kind {
+                AtlasTextureKind::Monochrome => &mut lock.monochrome_textures,
+                AtlasTextureKind::Polychrome => &mut lock.polychrome_textures,
+                AtlasTextureKind::Subpixel => &mut lock.subpixel_textures,
+            };
 
-        let Some(texture_slot) = textures.textures.get_mut(id.index as usize) else {
-            return;
-        };
+            let Some(texture_slot) = textures.textures.get_mut(id.index as usize) else {
+                return;
+            };
 
-        if let Some(mut texture) = texture_slot.take() {
-            texture.decrement_ref_count();
-            if texture.is_unreferenced() {
-                textures.free_list.push(texture.id.index as usize);
-                lock.tiles_by_key.remove(key);
-            } else {
-                *texture_slot = Some(texture);
+            if let Some(mut texture) = texture_slot.take() {
+                texture.decrement_ref_count();
+                if texture.is_unreferenced() {
+                    textures.free_list.push(texture.id.index as usize);
+                    freed_texture = true;
+                } else {
+                    *texture_slot = Some(texture);
+                }
             }
         }
+
+        if freed_texture {
+            lock.generation = lock.generation.wrapping_add(1);
+        }
+    }
+
+    fn generation(&self) -> u64 {
+        self.0.lock().generation
     }
 }
 
@@ -244,18 +265,17 @@ impl DirectXAtlasState {
         }
     }
 
-    fn texture(&self, id: AtlasTextureId) -> &DirectXAtlasTexture {
+    fn texture(&self, id: AtlasTextureId) -> Option<&DirectXAtlasTexture> {
         match id.kind {
-            AtlasTextureKind::Monochrome => &self.monochrome_textures[id.index as usize]
-                .as_ref()
-                .unwrap(),
-            AtlasTextureKind::Polychrome => &self.polychrome_textures[id.index as usize]
-                .as_ref()
-                .unwrap(),
-            AtlasTextureKind::Subpixel => {
-                &self.subpixel_textures[id.index as usize].as_ref().unwrap()
+            AtlasTextureKind::Monochrome => {
+                self.monochrome_textures.textures.get(id.index as usize)
             }
+            AtlasTextureKind::Polychrome => {
+                self.polychrome_textures.textures.get(id.index as usize)
+            }
+            AtlasTextureKind::Subpixel => self.subpixel_textures.textures.get(id.index as usize),
         }
+        .and_then(|texture| texture.as_ref())
     }
 }
 

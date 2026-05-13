@@ -745,6 +745,7 @@ pub(crate) struct DeferredDraw {
 }
 
 pub(crate) struct Frame {
+    pub(crate) atlas_generation: u64,
     pub(crate) focus: Option<FocusId>,
     pub(crate) window_active: bool,
     pub(crate) element_states: FxHashMap<(GlobalElementId, TypeId), ElementStateBox>,
@@ -791,6 +792,7 @@ pub(crate) struct PaintIndex {
 impl Frame {
     pub(crate) fn new(dispatch_tree: DispatchTree) -> Self {
         Frame {
+            atlas_generation: 0,
             focus: None,
             window_active: false,
             element_states: FxHashMap::default(),
@@ -831,6 +833,7 @@ impl Frame {
         self.deferred_draws.clear();
         self.tab_stops.clear();
         self.focus = None;
+        self.atlas_generation = 0;
 
         #[cfg(any(test, feature = "test-support"))]
         {
@@ -1946,8 +1949,30 @@ impl Window {
     /// to capture what would be rendered without displaying it or requiring the window to be visible.
     #[cfg(any(test, feature = "test-support"))]
     pub fn render_to_image(&self) -> anyhow::Result<image::RgbaImage> {
+        if self.rendered_frame_atlas_is_stale() {
+            anyhow::bail!(
+                "rendered frame uses stale atlas textures: frame generation {}, atlas generation {}",
+                self.rendered_frame.atlas_generation,
+                self.sprite_atlas.generation(),
+            );
+        }
         self.platform_window
             .render_to_image(&self.rendered_frame.scene)
+    }
+
+    fn rendered_frame_atlas_is_stale(&self) -> bool {
+        self.rendered_frame.atlas_generation != self.sprite_atlas.generation()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn redraw_if_rendered_frame_atlas_is_stale(
+        &mut self,
+        cx: &mut App,
+    ) -> Option<ArenaClearNeeded> {
+        self.rendered_frame_atlas_is_stale().then(|| {
+            self.refreshing = true;
+            self.draw(cx)
+        })
     }
 
     /// Set the content size of the window.
@@ -2227,6 +2252,10 @@ impl Window {
         // Set up the per-App arena for element allocation during this draw.
         // This ensures that multiple test Apps have isolated arenas.
         let _arena_scope = ElementArenaScope::enter(&cx.element_arena);
+        let current_atlas_generation = self.sprite_atlas.generation();
+        if self.rendered_frame.atlas_generation != current_atlas_generation {
+            self.refreshing = true;
+        }
 
         self.invalidate_entities();
         cx.entities.clear_accessed();
@@ -2252,6 +2281,7 @@ impl Window {
 
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
+        self.next_frame.atlas_generation = current_atlas_generation;
         self.next_frame.finish(&mut self.rendered_frame);
 
         self.invalidator.set_phase(DrawPhase::Focus);
@@ -2322,6 +2352,12 @@ impl Window {
 
     #[profiling::function]
     fn present(&self) {
+        if self.rendered_frame_atlas_is_stale() {
+            self.invalidator.set_dirty(true);
+            self.needs_present.set(true);
+            profiling::finish_frame!();
+            return;
+        }
         self.platform_window.draw(&self.rendered_frame.scene);
         self.needs_present.set(false);
         profiling::finish_frame!();

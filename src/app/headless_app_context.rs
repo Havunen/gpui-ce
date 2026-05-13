@@ -167,7 +167,15 @@ impl HeadlessAppContext {
     /// returns `Some` via [`HeadlessAppContext::with_platform`].
     pub fn capture_screenshot(&mut self, window: AnyWindowHandle) -> Result<RgbaImage> {
         let mut app = self.app.borrow_mut();
-        app.update_window(window, |_, window, _| window.render_to_image())?
+        app.update_window(window, |_, window, cx| {
+            if let Some(arena_clear_needed) = window.redraw_if_rendered_frame_atlas_is_stale(cx) {
+                let image = window.render_to_image();
+                arena_clear_needed.clear();
+                image
+            } else {
+                window.render_to_image()
+            }
+        })?
     }
 
     /// Returns the text system.
@@ -278,9 +286,9 @@ impl AppContext for HeadlessAppContext {
 mod tests {
     use super::*;
     use crate::{
-        AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels, IntoElement, NoopTextSystem,
-        ParentElement as _, PlatformAtlas, PrimitiveBatch, RenderImage, Scene, Styled as _, TileId,
-        div, img, px, size,
+        AnyView, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels, IntoElement,
+        NoopTextSystem, ParentElement as _, PlatformAtlas, PrimitiveBatch, RenderImage, Scene,
+        StyleRefinement, Styled as _, TileId, div, img, px, size,
     };
     use anyhow::Result;
     use image::{Frame as ImageFrame, ImageBuffer, Rgba, RgbaImage};
@@ -302,6 +310,7 @@ mod tests {
         live_textures: HashSet<AtlasTextureId>,
         next_texture_index: u32,
         next_tile_id: u32,
+        generation: u64,
     }
 
     impl ResettableAtlas {
@@ -311,6 +320,7 @@ mod tests {
             state.live_textures.clear();
             state.next_texture_index = 0;
             state.next_tile_id = 0;
+            state.generation = state.generation.wrapping_add(1);
         }
 
         fn has_texture(&self, id: AtlasTextureId) -> bool {
@@ -362,7 +372,12 @@ mod tests {
             let mut state = self.state.lock();
             if let Some(tile) = state.tiles_by_key.remove(key) {
                 state.live_textures.remove(&tile.texture_id);
+                state.generation = state.generation.wrapping_add(1);
             }
+        }
+
+        fn generation(&self) -> u64 {
+            self.state.lock().generation
         }
     }
 
@@ -406,6 +421,16 @@ mod tests {
         image: Arc<RenderImage>,
     }
 
+    struct CachedImageRoot {
+        child: Entity<ImageRoot>,
+    }
+
+    impl Render for CachedImageRoot {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            AnyView::from(self.child.clone()).cached(StyleRefinement::default().size(px(1.0)))
+        }
+    }
+
     impl Render for ImageRoot {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             div().child(img(self.image.clone()).size(px(1.0)))
@@ -446,8 +471,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known failing repro for stale atlas texture IDs after renderer reset"]
-    fn stale_atlas_texture_ids_after_renderer_reset_are_not_redrawn_from_old_frame() -> Result<()> {
+    fn non_forced_redraw_after_atlas_reset_must_not_reuse_cached_sprite_scene() -> Result<()> {
         let atlas = Arc::new(ResettableAtlas::default());
         let renderer_atlas = atlas.clone();
         let mut cx = HeadlessAppContext::with_platform(
@@ -462,15 +486,25 @@ mod tests {
 
         let image = test_image();
         let window = cx.open_window(size(px(10.0), px(10.0)), move |_window, cx| {
-            cx.new(|_| ImageRoot { image })
+            let child = cx.new(|_| ImageRoot { image });
+            cx.new(|_| CachedImageRoot { child })
         })?;
 
-        cx.capture_screenshot(window.into())?;
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear();
+            window.render_to_image()
+        })??;
+
         atlas.reset_device_resources_for_test();
 
-        // This models the Windows crash: the renderer resources have been reset,
-        // but the high-level window still owns the previously rendered scene.
-        cx.capture_screenshot(window.into())?;
+        cx.update_window(window.into(), |_, window, cx| {
+            window.invalidator.set_dirty(true);
+            let arena_clear_needed = window.draw(cx);
+            let image = window.render_to_image();
+            arena_clear_needed.clear();
+            image
+        })??;
+
         Ok(())
     }
 }
