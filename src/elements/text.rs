@@ -350,30 +350,6 @@ struct TextLayoutLineMetric {
     height: Pixels,
 }
 
-fn text_layout_line_metrics(
-    lines: &SmallVec<[WrappedLine; 1]>,
-    line_height: Pixels,
-) -> SmallVec<[TextLayoutLineMetric; 1]> {
-    let mut metrics = SmallVec::new();
-    let mut start_ix = 0;
-    let mut origin_y = px(0.);
-
-    for line in lines {
-        let height = line.size(line_height).height;
-        let end_ix = start_ix + line.len();
-        metrics.push(TextLayoutLineMetric {
-            start_ix,
-            end_ix,
-            origin_y,
-            height,
-        });
-        start_ix = end_ix + 1;
-        origin_y += height;
-    }
-
-    metrics
-}
-
 impl TextLayout {
     fn layout(
         &self,
@@ -986,6 +962,30 @@ mod tests {
     use gpui_macros::perf;
     use smallvec::SmallVec;
     use std::{hint::black_box, sync::Arc};
+
+    fn text_layout_line_metrics(
+        lines: &SmallVec<[WrappedLine; 1]>,
+        line_height: Pixels,
+    ) -> SmallVec<[TextLayoutLineMetric; 1]> {
+        let mut metrics = SmallVec::new();
+        let mut start_ix = 0;
+        let mut origin_y = px(0.);
+
+        for line in lines {
+            let height = line.size(line_height).height;
+            let end_ix = start_ix + line.len();
+            metrics.push(TextLayoutLineMetric {
+                start_ix,
+                end_ix,
+                origin_y,
+                height,
+            });
+            start_ix = end_ix + 1;
+            origin_y += height;
+        }
+
+        metrics
+    }
 
     #[test]
     fn test_into_element_for() {

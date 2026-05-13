@@ -277,15 +277,6 @@ impl LineWrapper {
     }
 }
 
-fn update_runs_after_truncation(
-    result: &str,
-    ellipsis: &str,
-    runs: &mut Vec<TextRun>,
-    truncate_from: TruncateFrom,
-) {
-    *runs = truncated_runs(runs, result, ellipsis, truncate_from);
-}
-
 fn truncated_runs(
     runs: &[TextRun],
     result: &str,
@@ -844,22 +835,34 @@ mod tests {
 
     #[test]
     fn update_runs_after_truncation_start_and_empty_affix() {
-        let mut start_runs = generate_test_runs(&[4, 4, 4]);
-        update_runs_after_truncation("…efghijkl", "…", &mut start_runs, TruncateFrom::Start);
+        let start_runs = truncated_runs(
+            &generate_test_runs(&[4, 4, 4]),
+            "…efghijkl",
+            "…",
+            TruncateFrom::Start,
+        );
         assert_eq!(
             start_runs.iter().map(|run| run.len).collect::<Vec<_>>(),
             vec![3, 4, 4]
         );
 
-        let mut end_runs = generate_test_runs(&[4, 4, 4]);
-        update_runs_after_truncation("abcdef", "", &mut end_runs, TruncateFrom::End);
+        let end_runs = truncated_runs(
+            &generate_test_runs(&[4, 4, 4]),
+            "abcdef",
+            "",
+            TruncateFrom::End,
+        );
         assert_eq!(
             end_runs.iter().map(|run| run.len).collect::<Vec<_>>(),
             vec![4, 2]
         );
 
-        let mut start_runs = generate_test_runs(&[4, 4, 4]);
-        update_runs_after_truncation("ghijkl", "", &mut start_runs, TruncateFrom::Start);
+        let start_runs = truncated_runs(
+            &generate_test_runs(&[4, 4, 4]),
+            "ghijkl",
+            "",
+            TruncateFrom::Start,
+        );
         assert_eq!(
             start_runs.iter().map(|run| run.len).collect::<Vec<_>>(),
             vec![2, 4]
@@ -873,7 +876,7 @@ mod tests {
         runs[1].font.family = "run-1".into();
         runs[2].font.family = "run-2".into();
 
-        update_runs_after_truncation("abcdef…", "…", &mut runs, TruncateFrom::End);
+        let runs = truncated_runs(&runs, "abcdef…", "…", TruncateFrom::End);
         assert_eq!(
             runs.iter()
                 .map(|run| (run.font.family.as_ref(), run.len))
@@ -886,7 +889,7 @@ mod tests {
         runs[1].font.family = "run-1".into();
         runs[2].font.family = "run-2".into();
 
-        update_runs_after_truncation("ghijkl", "", &mut runs, TruncateFrom::Start);
+        let runs = truncated_runs(&runs, "ghijkl", "", TruncateFrom::Start);
         assert_eq!(
             runs.iter()
                 .map(|run| (run.font.family.as_ref(), run.len))
@@ -898,8 +901,12 @@ mod tests {
     #[test]
     fn test_update_run_after_truncation_end() {
         fn perform_test(result: &str, run_lens: &[usize], result_run_lens: &[usize]) {
-            let mut dummy_runs = generate_test_runs(run_lens);
-            update_runs_after_truncation(result, "…", &mut dummy_runs, TruncateFrom::End);
+            let dummy_runs = truncated_runs(
+                &generate_test_runs(run_lens),
+                result,
+                "…",
+                TruncateFrom::End,
+            );
             for (run, result_len) in dummy_runs.iter().zip(result_run_lens) {
                 assert_eq!(run.len, *result_len);
             }

@@ -165,11 +165,6 @@ pub(crate) fn round_half_toward_zero(value: f32) -> f32 {
 }
 
 #[inline]
-pub(crate) fn round_half_toward_zero_f64(value: f64) -> f64 {
-    (value.abs() - 0.5).ceil().copysign(value)
-}
-
-#[inline]
 pub(crate) fn round_to_device_pixel(logical: f32, scale_factor: f32) -> f32 {
     round_half_toward_zero(logical * scale_factor)
 }
@@ -181,11 +176,6 @@ pub(crate) fn round_stroke_to_device_pixel(logical: f32, scale_factor: f32) -> f
     } else {
         round_to_device_pixel(logical.max(0.0), scale_factor).max(1.0)
     }
-}
-
-#[inline]
-pub(crate) fn floor_to_device_pixel(logical: f32, scale_factor: f32) -> f32 {
-    (logical * scale_factor).floor()
 }
 
 #[inline]
@@ -237,25 +227,13 @@ mod tests {
         assert_eq!(round_stroke_to_device_pixel(1.0, 1.5), 1.0);
         assert_eq!(round_stroke_to_device_pixel(1.6, 1.0), 2.0);
 
-        // Cover's near edge floors, far edge ceils. Together they form a strict superset.
-        assert_eq!(floor_to_device_pixel(0.3, 2.0), 0.0);
+        // Ceil expands the far edge to cover partially occupied device pixels.
         assert_eq!(ceil_to_device_pixel(0.3, 2.0), 1.0);
-        assert_eq!(floor_to_device_pixel(2.1, 1.0), 2.0);
         assert_eq!(ceil_to_device_pixel(2.1, 1.0), 3.0);
 
         // Integer device-pixel inputs are stable under all three.
         assert_eq!(round_to_device_pixel(2.0, 2.0), 4.0);
-        assert_eq!(floor_to_device_pixel(2.0, 2.0), 4.0);
         assert_eq!(ceil_to_device_pixel(2.0, 2.0), 4.0);
-    }
-
-    #[test]
-    fn test_round_half_toward_zero_f64() {
-        assert_eq!(round_half_toward_zero_f64(0.5), 0.0);
-        assert_eq!(round_half_toward_zero_f64(-0.5), 0.0);
-        assert_eq!(round_half_toward_zero_f64(1.5), 1.0);
-        assert_eq!(round_half_toward_zero_f64(-1.5), -1.0);
-        assert_eq!(round_half_toward_zero_f64(2.5001), 3.0);
     }
 
     #[gpui::test]

@@ -186,7 +186,7 @@ impl SvgRenderer {
                 }
             }
 
-            let mut image = RenderImage::new(SmallVec::from_const([Frame::new(buffer)]));
+            let mut image = RenderImage::new(SmallVec::from_buf([Frame::new(buffer)]));
             image.scale_factor = SMOOTH_SVG_SCALE_FACTOR;
             Arc::new(image)
         })
