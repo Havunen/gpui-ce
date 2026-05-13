@@ -197,16 +197,22 @@ impl LineWrapper {
             self.should_truncate_line(&line, truncate_width, truncation_affix, truncate_from)
         {
             let result = match truncate_from {
-                TruncateFrom::Start => SharedString::from(format!(
-                    "{truncation_affix}{}",
-                    &line[line.ceil_char_boundary(truncate_ix + 1)..]
-                )),
+                TruncateFrom::Start => {
+                    let suffix = &line[line.ceil_char_boundary(truncate_ix + 1)..];
+                    let mut result = String::with_capacity(truncation_affix.len() + suffix.len());
+                    result.push_str(truncation_affix);
+                    result.push_str(suffix);
+                    SharedString::from(result)
+                }
                 TruncateFrom::End => {
-                    SharedString::from(format!("{}{truncation_affix}", &line[..truncate_ix]))
+                    let prefix = &line[..truncate_ix];
+                    let mut result = String::with_capacity(prefix.len() + truncation_affix.len());
+                    result.push_str(prefix);
+                    result.push_str(truncation_affix);
+                    SharedString::from(result)
                 }
             };
-            let mut runs = runs.to_vec();
-            update_runs_after_truncation(&result, truncation_affix, &mut runs, truncate_from);
+            let runs = truncated_runs(runs, &result, truncation_affix, truncate_from);
             (result, Cow::Owned(runs))
         } else {
             (line, Cow::Borrowed(runs))
@@ -277,29 +283,47 @@ fn update_runs_after_truncation(
     runs: &mut Vec<TextRun>,
     truncate_from: TruncateFrom,
 ) {
+    *runs = truncated_runs(runs, result, ellipsis, truncate_from);
+}
+
+fn truncated_runs(
+    runs: &[TextRun],
+    result: &str,
+    ellipsis: &str,
+    truncate_from: TruncateFrom,
+) -> Vec<TextRun> {
     let mut truncate_at = result.len() - ellipsis.len();
     match truncate_from {
         TruncateFrom::Start => {
-            for (run_index, run) in runs.iter_mut().enumerate().rev() {
+            let mut truncated_runs = Vec::new();
+            for run in runs.iter().rev() {
                 if run.len <= truncate_at {
+                    truncated_runs.push(run.clone());
                     truncate_at -= run.len;
                 } else {
+                    let mut run = run.clone();
                     run.len = truncate_at + ellipsis.len();
-                    runs.splice(..run_index, std::iter::empty());
+                    truncated_runs.push(run);
                     break;
                 }
             }
+            truncated_runs.reverse();
+            truncated_runs
         }
         TruncateFrom::End => {
-            for (run_index, run) in runs.iter_mut().enumerate() {
+            let mut truncated_runs = Vec::new();
+            for run in runs {
                 if run.len <= truncate_at {
+                    truncated_runs.push(run.clone());
                     truncate_at -= run.len;
                 } else {
+                    let mut run = run.clone();
                     run.len = truncate_at + ellipsis.len();
-                    runs.truncate(run_index + 1);
+                    truncated_runs.push(run);
                     break;
                 }
             }
+            truncated_runs
         }
     }
 }
@@ -384,6 +408,8 @@ mod tests {
     use crate::{Font, FontFeatures, FontStyle, FontWeight, TestAppContext, TestDispatcher, font};
     #[cfg(target_os = "macos")]
     use crate::{TextRun, WindowTextSystem, WrapBoundary};
+    use std::hint::black_box;
+    use util_macros::perf;
 
     fn build_wrapper() -> LineWrapper {
         let dispatcher = TestDispatcher::new(0);
@@ -767,6 +793,105 @@ mod tests {
             &[4, 4, 4],
             &[3, 4, 4],
             px(90.),
+        );
+    }
+
+    #[perf(important)]
+    fn perf_truncate_line_many_runs() {
+        const RUN_COUNT: usize = 2_048;
+        const RUN_LEN: usize = 2;
+
+        let mut wrapper = build_wrapper();
+        let mut text = String::with_capacity(RUN_COUNT * RUN_LEN);
+        for _ in 0..RUN_COUNT {
+            text.push_str("aa");
+        }
+
+        let run_lens = vec![RUN_LEN; RUN_COUNT];
+        let dummy_runs = generate_test_runs(&run_lens);
+        let line = SharedString::from(text);
+
+        let (end_result, end_runs) =
+            wrapper.truncate_line(line.clone(), px(320.), "…", &dummy_runs, TruncateFrom::End);
+        let (start_result, start_runs) =
+            wrapper.truncate_line(line, px(320.), "…", &dummy_runs, TruncateFrom::Start);
+
+        assert!(end_result.len() < RUN_COUNT * RUN_LEN);
+        assert!(start_result.len() < RUN_COUNT * RUN_LEN);
+        black_box(end_runs.len());
+        black_box(start_runs.len());
+    }
+
+    #[test]
+    fn truncate_line_multibyte_runs_preserve_byte_lengths() {
+        let mut wrapper = build_wrapper();
+        let text = SharedString::from("aa 🦀🦀 bb");
+        let dummy_runs = generate_test_runs(&[3, "🦀🦀".len(), 3]);
+
+        for truncate_from in [TruncateFrom::End, TruncateFrom::Start] {
+            let (result, runs) =
+                wrapper.truncate_line(text.clone(), px(30.), "…", &dummy_runs, truncate_from);
+
+            assert!(result.contains('…'));
+            assert_eq!(runs.iter().map(|run| run.len).sum::<usize>(), result.len());
+            let mut boundary = 0;
+            for run in runs.iter() {
+                boundary += run.len;
+                assert!(result.is_char_boundary(boundary));
+            }
+        }
+    }
+
+    #[test]
+    fn update_runs_after_truncation_start_and_empty_affix() {
+        let mut start_runs = generate_test_runs(&[4, 4, 4]);
+        update_runs_after_truncation("…efghijkl", "…", &mut start_runs, TruncateFrom::Start);
+        assert_eq!(
+            start_runs.iter().map(|run| run.len).collect::<Vec<_>>(),
+            vec![3, 4, 4]
+        );
+
+        let mut end_runs = generate_test_runs(&[4, 4, 4]);
+        update_runs_after_truncation("abcdef", "", &mut end_runs, TruncateFrom::End);
+        assert_eq!(
+            end_runs.iter().map(|run| run.len).collect::<Vec<_>>(),
+            vec![4, 2]
+        );
+
+        let mut start_runs = generate_test_runs(&[4, 4, 4]);
+        update_runs_after_truncation("ghijkl", "", &mut start_runs, TruncateFrom::Start);
+        assert_eq!(
+            start_runs.iter().map(|run| run.len).collect::<Vec<_>>(),
+            vec![2, 4]
+        );
+    }
+
+    #[test]
+    fn update_runs_after_truncation_preserves_retained_run_styles() {
+        let mut runs = generate_test_runs(&[4, 4, 4]);
+        runs[0].font.family = "run-0".into();
+        runs[1].font.family = "run-1".into();
+        runs[2].font.family = "run-2".into();
+
+        update_runs_after_truncation("abcdef…", "…", &mut runs, TruncateFrom::End);
+        assert_eq!(
+            runs.iter()
+                .map(|run| (run.font.family.as_ref(), run.len))
+                .collect::<Vec<_>>(),
+            vec![("run-0", 4), ("run-1", 5)]
+        );
+
+        let mut runs = generate_test_runs(&[4, 4, 4]);
+        runs[0].font.family = "run-0".into();
+        runs[1].font.family = "run-1".into();
+        runs[2].font.family = "run-2".into();
+
+        update_runs_after_truncation("ghijkl", "", &mut runs, TruncateFrom::Start);
+        assert_eq!(
+            runs.iter()
+                .map(|run| (run.font.family.as_ref(), run.len))
+                .collect::<Vec<_>>(),
+            vec![("run-1", 2), ("run-2", 4)]
         );
     }
 
