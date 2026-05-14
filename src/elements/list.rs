@@ -801,7 +801,12 @@ impl StateInner {
             });
         }
 
-        if delta.y > px(0.) {
+        let scrolled_away_from_tail = if self.items.summary().has_unknown_height {
+            delta.y > px(0.)
+        } else {
+            new_scroll_top < scroll_max
+        };
+        if scrolled_away_from_tail {
             self.follow_state.stop_following();
         }
 
@@ -1075,11 +1080,14 @@ impl StateInner {
         // (is_following is false), check whether the current scroll
         // position has returned to the bottom.
         if self.follow_state.has_stopped_following() {
-            let padding = self.last_padding.unwrap_or_default();
-            let total_height = self.items.summary().height + padding.top + padding.bottom;
-            let scroll_offset = self.scroll_top(&scroll_top);
-            if scroll_offset + available_height >= total_height - px(1.0) {
-                self.follow_state.start_following();
+            let summary = self.items.summary();
+            if !summary.has_unknown_height {
+                let padding = self.last_padding.unwrap_or_default();
+                let total_height = summary.height + padding.top + padding.bottom;
+                let scroll_offset = self.scroll_top(&scroll_top);
+                if scroll_offset + available_height >= total_height - px(1.0) {
+                    self.follow_state.start_following();
+                }
             }
         }
 
@@ -1895,6 +1903,52 @@ mod test {
     }
 
     #[gpui::test]
+    fn test_follow_tail_stays_engaged_when_scroll_does_not_move_from_tail(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        let state = ListState::new(1, crate::ListAlignment::Top, px(0.));
+
+        struct TestView(ListState);
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |_, _, _| {
+                    div().h(px(50.)).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+
+        let view = cx.update(|_, cx| cx.new(|_| TestView(state.clone())));
+
+        state.set_follow_mode(FollowMode::Tail);
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, _| {
+            view.clone().into_any_element()
+        });
+        assert!(state.is_following_tail());
+
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(50.), px(100.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(100.))),
+            ..Default::default()
+        });
+
+        assert!(
+            state.is_following_tail(),
+            "follow-tail should remain engaged when scrolling cannot move away from the tail"
+        );
+
+        state.splice(1..1, 10);
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, _| {
+            view.into_any_element()
+        });
+        assert!(
+            state.is_following_tail(),
+            "follow-tail should keep following after the list becomes scrollable"
+        );
+    }
+
+    #[gpui::test]
     fn test_follow_tail_disengages_on_scrollbar_reposition(cx: &mut TestAppContext) {
         let cx = cx.add_empty_window();
 
@@ -2046,7 +2100,7 @@ mod test {
         let cx = cx.add_empty_window();
 
         // 10 items × 50px = 500px total, 200px viewport.
-        let state = ListState::new(10, crate::ListAlignment::Top, px(0.));
+        let state = ListState::new(10, crate::ListAlignment::Top, px(0.)).measure_all();
 
         struct TestView(ListState);
         impl Render for TestView {
@@ -2152,6 +2206,48 @@ mod test {
             !state.is_following_tail(),
             "follow_tail should not falsely re-engage due to an unmeasured item \
              reducing items.summary().height"
+        );
+    }
+
+    #[gpui::test]
+    fn test_follow_tail_reengagement_waits_for_known_item_heights(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+
+        let state = ListState::new(20, crate::ListAlignment::Top, px(0.)).measure_all();
+
+        struct TestView(ListState);
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |_, _, _| {
+                    div().h(px(50.)).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+
+        let view = cx.update(|_, cx| cx.new(|_| TestView(state.clone())));
+
+        state.set_follow_mode(FollowMode::Tail);
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, _| {
+            view.clone().into_any_element()
+        });
+        assert!(state.is_following_tail());
+
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(50.), px(100.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(200.))),
+            ..Default::default()
+        });
+        assert!(!state.is_following_tail());
+
+        state.splice(16..20, 4);
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, _| {
+            view.into_any_element()
+        });
+        assert!(
+            !state.is_following_tail(),
+            "follow-tail should not re-engage while tail item heights are unknown"
         );
     }
 

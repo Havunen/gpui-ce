@@ -107,9 +107,10 @@ impl PlatformAtlas for WgpuAtlas {
     fn remove(&self, key: &AtlasKey) {
         let mut lock = self.0.lock();
 
-        let Some(id) = lock.tiles_by_key.remove(key).map(|tile| tile.texture_id) else {
+        let Some(tile) = lock.tiles_by_key.remove(key) else {
             return;
         };
+        let id = tile.texture_id;
 
         let mut freed_texture = None;
         {
@@ -119,6 +120,7 @@ impl PlatformAtlas for WgpuAtlas {
             };
 
             if let Some(mut texture) = texture_slot.take() {
+                texture.allocator.deallocate(tile.tile_id.into());
                 texture.decrement_ref_count();
                 if texture.is_unreferenced() {
                     freed_texture = Some(texture.id);
@@ -451,6 +453,80 @@ mod tests {
             .expect("tile should be created");
         atlas.remove(&key);
         atlas.before_frame();
+        Ok(())
+    }
+
+    #[test]
+    fn remove_reclaims_tile_space_in_live_texture() -> anyhow::Result<()> {
+        let Some((device, queue)) = test_device_and_queue()? else {
+            return Ok(());
+        };
+
+        let atlas = WgpuAtlas::new(device, queue);
+        let large = Size {
+            width: DevicePixels(1024),
+            height: DevicePixels(512),
+        };
+        let small = Size {
+            width: DevicePixels(1),
+            height: DevicePixels(1),
+        };
+
+        let key_a = AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(1),
+            frame_index: 0,
+        });
+        let key_b = AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(2),
+            frame_index: 0,
+        });
+        let key_c = AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(3),
+            frame_index: 0,
+        });
+
+        let tile_a = atlas
+            .get_or_insert_with(&key_a, &mut || {
+                Ok(Some((
+                    large,
+                    Cow::Owned(vec![
+                        0;
+                        large.width.0 as usize * large.height.0 as usize * 4
+                    ]),
+                )))
+            })?
+            .expect("large tile should be created");
+        let tile_b = atlas
+            .get_or_insert_with(&key_b, &mut || {
+                Ok(Some((
+                    small,
+                    Cow::Owned(vec![
+                        0;
+                        small.width.0 as usize * small.height.0 as usize * 4
+                    ]),
+                )))
+            })?
+            .expect("small tile should be created");
+        assert_eq!(tile_a.texture_id, tile_b.texture_id);
+
+        atlas.remove(&key_a);
+
+        let tile_c = atlas
+            .get_or_insert_with(&key_c, &mut || {
+                Ok(Some((
+                    large,
+                    Cow::Owned(vec![
+                        0;
+                        large.width.0 as usize * large.height.0 as usize * 4
+                    ]),
+                )))
+            })?
+            .expect("replacement tile should be created");
+        assert_eq!(
+            tile_c.texture_id, tile_a.texture_id,
+            "removed tile space should be reused before allocating another texture"
+        );
+
         Ok(())
     }
 
