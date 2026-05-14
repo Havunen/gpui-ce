@@ -147,7 +147,7 @@ core-text = "22"
 core-video = { version = "0.5", features = ["metal"] }
 dispatch2 = "0.3"
 flume = "0.12"
-font-kit = { git = "https://github.com/zed-industries/font-kit", rev = "110523127440aefb11ce0cf280ae7c5071337ec5", package = "zed-font-kit", version = "0.14.1-zed", optional = true }
+font-kit = { git = "https://github.com/Havunen/font-kit", rev = "ad0ac1df3affdd7265eb005350dc97b46d54786b", package = "font-kit", version = "0.14.3", optional = true }
 foreign-types = "0.5"
 mach2 = "0.6"
 metal = "0.33"
@@ -170,7 +170,7 @@ swash = "0.2"
 bytemuck = "1"
 
 ashpd = { version = "0.13", default-features = false, features = ["async-io", "file_chooser", "open_uri", "settings"], optional = true }
-font-kit = { git = "https://github.com/zed-industries/font-kit", rev = "110523127440aefb11ce0cf280ae7c5071337ec5", package = "zed-font-kit", version = "0.14.1-zed", features = [
+font-kit = { git = "https://github.com/Havunen/font-kit", rev = "ad0ac1df3affdd7265eb005350dc97b46d54786b", package = "font-kit", version = "0.14.3", features = [
     "source-fontconfig-dlopen",
 ], optional = true }
 
