@@ -112,6 +112,7 @@ impl PlatformAtlas for WgpuAtlas {
         };
         let id = tile.texture_id;
 
+        let mut deallocated_tile = false;
         let mut freed_texture = None;
         {
             let Some(texture_slot) = lock.storage[id.kind].textures.get_mut(id.index as usize)
@@ -121,6 +122,7 @@ impl PlatformAtlas for WgpuAtlas {
 
             if let Some(mut texture) = texture_slot.take() {
                 texture.allocator.deallocate(tile.tile_id.into());
+                deallocated_tile = true;
                 texture.decrement_ref_count();
                 if texture.is_unreferenced() {
                     freed_texture = Some(texture.id);
@@ -136,6 +138,9 @@ impl PlatformAtlas for WgpuAtlas {
             lock.storage[texture_id.kind]
                 .free_list
                 .push(texture_id.index as usize);
+        }
+
+        if deallocated_tile {
             lock.generation = lock.generation.wrapping_add(1);
         }
     }
@@ -509,7 +514,13 @@ mod tests {
             .expect("small tile should be created");
         assert_eq!(tile_a.texture_id, tile_b.texture_id);
 
+        let generation_before_remove = atlas.generation();
         atlas.remove(&key_a);
+        assert_eq!(
+            atlas.generation(),
+            generation_before_remove.wrapping_add(1),
+            "removing a tile from a live texture should invalidate cached atlas generations"
+        );
 
         let tile_c = atlas
             .get_or_insert_with(&key_c, &mut || {
