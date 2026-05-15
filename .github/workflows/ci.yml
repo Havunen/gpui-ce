@@ -72,6 +72,9 @@ jobs:
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+          cache-bin: false
 
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
@@ -158,6 +161,9 @@ jobs:
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+          cache-bin: false
 
       - name: Build workspace
         run: cargo build --workspace --all-targets --target x86_64-unknown-linux-gnu
@@ -217,6 +223,9 @@ jobs:
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+          cache-bin: false
 
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
