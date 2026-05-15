@@ -14,16 +14,52 @@ env:
 
 jobs:
   build-and-test:
-    name: ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
+        include:
+          - name: Ubuntu 22.04 x86_64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - name: Ubuntu 24.04 x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - name: Ubuntu 22.04 aarch64
+            runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - name: Ubuntu 24.04 aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - name: macOS 14 aarch64
+            runner: macos-14
+            target: aarch64-apple-darwin
+          - name: macOS 15 x86_64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - name: macOS 15 aarch64
+            runner: macos-15
+            target: aarch64-apple-darwin
+          - name: macOS 26 x86_64
+            runner: macos-26-intel
+            target: x86_64-apple-darwin
+          - name: macOS 26 aarch64
+            runner: macos-26
+            target: aarch64-apple-darwin
+          - name: Windows Server 2022 x86_64
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+          - name: Windows Server 2025 x86_64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - name: Windows Server 2025 VS2026 x86_64
+            runner: windows-2025-vs2026
+            target: x86_64-pc-windows-msvc
+          - name: Windows 11 aarch64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
 
     steps:
       - name: Checkout
@@ -31,9 +67,14 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+          cache-bin: false
 
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
@@ -55,10 +96,163 @@ jobs:
             libxcb1-dev \
             libxkbcommon-dev \
             libxkbcommon-x11-dev \
+            lld \
             zlib1g-dev
 
       - name: Build workspace
-        run: cargo build --workspace --all-targets
+        run: cargo build --workspace --all-targets --target ${{ matrix.target }}
 
       - name: Run tests
-        run: cargo test --workspace --lib --tests
+        run: cargo test --workspace --lib --tests --target ${{ matrix.target }}
+
+  ubuntu-container-build:
+    name: Ubuntu ${{ matrix.ubuntu_version }} container x86_64
+    runs-on: ubuntu-24.04
+    container:
+      image: ubuntu:${{ matrix.ubuntu_version }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu_version:
+          - "26.04"
+    env:
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Install bootstrap and system dependencies
+        run: |
+          apt-get update
+          apt-get install -y \
+            build-essential \
+            ca-certificates \
+            cmake \
+            curl \
+            git \
+            libasound2-dev \
+            libdrm-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libgbm-dev \
+            libssl-dev \
+            libva-dev \
+            libvulkan-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            lld \
+            pkg-config \
+            zlib1g-dev \
+            zstd
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- \
+            -y \
+            --profile minimal \
+            --default-toolchain stable \
+            --target x86_64-unknown-linux-gnu
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+          cache-bin: false
+
+      - name: Build workspace
+        run: cargo build --workspace --all-targets --target x86_64-unknown-linux-gnu
+
+      - name: Run tests
+        run: cargo test --workspace --lib --tests --target x86_64-unknown-linux-gnu
+
+  check-target-variations:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Ubuntu 22.04 x86_64 headless
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            check_targets: --lib
+            cargo_args: --no-default-features
+          - name: Ubuntu 24.04 x86_64 Wayland
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            check_targets: --all-targets
+            cargo_args: --no-default-features --features wayland
+          - name: Ubuntu 24.04 x86_64 X11
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            check_targets: --all-targets
+            cargo_args: --no-default-features --features x11
+          - name: Ubuntu 22.04 aarch64 headless
+            runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            check_targets: --lib
+            cargo_args: --no-default-features
+          - name: Ubuntu 24.04 x86_64 musl headless
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            check_targets: --lib
+            target_cc: musl-gcc
+            target_linker: musl-gcc
+            cargo_args: --no-default-features
+          - name: Windows Server 2022 i686 MSVC headless
+            runner: windows-2022
+            target: i686-pc-windows-msvc
+            check_targets: --lib
+            cargo_args: --no-default-features
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v1-rust
+          cache-bin: false
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            pkg-config \
+            libasound2-dev \
+            libdrm-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libgbm-dev \
+            libssl-dev \
+            libva-dev \
+            libvulkan-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            lld \
+            musl-tools \
+            zlib1g-dev
+
+      - name: Check workspace
+        env:
+          CC_x86_64_unknown_linux_musl: ${{ matrix.target_cc || '' }}
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.target_linker || '' }}
+        run: cargo check --workspace ${{ matrix.check_targets }} --target ${{ matrix.target }} ${{ matrix.cargo_args }}

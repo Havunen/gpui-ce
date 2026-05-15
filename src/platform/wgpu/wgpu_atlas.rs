@@ -1,5 +1,5 @@
+use crate::collections::FxHashMap;
 use anyhow::{Context as _, Result};
-use collections::FxHashMap;
 use etagere::{BucketedAtlasAllocator, size2};
 use gpui::{
     AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTextureList, AtlasTile, Bounds, DevicePixels,
@@ -34,6 +34,7 @@ struct WgpuAtlasState {
     storage: WgpuAtlasStorage,
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
     pending_uploads: Vec<PendingUpload>,
+    generation: u64,
 }
 
 pub struct WgpuTextureInfo {
@@ -50,6 +51,7 @@ impl WgpuAtlas {
             storage: WgpuAtlasStorage::default(),
             tiles_by_key: Default::default(),
             pending_uploads: Vec::new(),
+            generation: 0,
         }))
     }
 
@@ -75,6 +77,7 @@ impl WgpuAtlas {
         lock.storage = WgpuAtlasStorage::default();
         lock.tiles_by_key.clear();
         lock.pending_uploads.clear();
+        lock.generation = lock.generation.wrapping_add(1);
     }
 }
 
@@ -104,24 +107,46 @@ impl PlatformAtlas for WgpuAtlas {
     fn remove(&self, key: &AtlasKey) {
         let mut lock = self.0.lock();
 
-        let Some(id) = lock.tiles_by_key.remove(key).map(|tile| tile.texture_id) else {
+        let Some(tile) = lock.tiles_by_key.remove(key) else {
             return;
         };
+        let id = tile.texture_id;
 
-        let Some(texture_slot) = lock.storage[id.kind].textures.get_mut(id.index as usize) else {
-            return;
-        };
+        let mut deallocated_tile = false;
+        let mut freed_texture = None;
+        {
+            let Some(texture_slot) = lock.storage[id.kind].textures.get_mut(id.index as usize)
+            else {
+                return;
+            };
 
-        if let Some(mut texture) = texture_slot.take() {
-            texture.decrement_ref_count();
-            if texture.is_unreferenced() {
-                lock.storage[id.kind]
-                    .free_list
-                    .push(texture.id.index as usize);
-            } else {
-                *texture_slot = Some(texture);
+            if let Some(mut texture) = texture_slot.take() {
+                texture.allocator.deallocate(tile.tile_id.into());
+                deallocated_tile = true;
+                texture.decrement_ref_count();
+                if texture.is_unreferenced() {
+                    freed_texture = Some(texture.id);
+                } else {
+                    *texture_slot = Some(texture);
+                }
             }
         }
+
+        if let Some(texture_id) = freed_texture {
+            lock.pending_uploads
+                .retain(|upload| upload.id != texture_id);
+            lock.storage[texture_id.kind]
+                .free_list
+                .push(texture_id.index as usize);
+        }
+
+        if deallocated_tile {
+            lock.generation = lock.generation.wrapping_add(1);
+        }
+    }
+
+    fn generation(&self) -> u64 {
+        self.0.lock().generation
     }
 }
 
@@ -219,16 +244,21 @@ impl WgpuAtlasState {
     }
 
     fn upload_texture(&mut self, id: AtlasTextureId, bounds: Bounds<DevicePixels>, bytes: &[u8]) {
-        self.pending_uploads.push(PendingUpload {
-            id,
-            bounds,
-            data: bytes.to_vec(),
-        });
+        let data = self
+            .storage
+            .get(id)
+            .map(|texture| swizzle_upload_data(bytes, texture.format))
+            .unwrap_or_else(|| bytes.to_vec());
+
+        self.pending_uploads
+            .push(PendingUpload { id, bounds, data });
     }
 
     fn flush_uploads(&mut self) {
         for upload in self.pending_uploads.drain(..) {
-            let texture = &self.storage[upload.id];
+            let Some(texture) = self.storage.get(upload.id) else {
+                continue;
+            };
             let bytes_per_pixel = texture.bytes_per_pixel();
 
             self.queue.write_texture(
@@ -286,6 +316,15 @@ impl ops::IndexMut<AtlasTextureKind> for WgpuAtlasStorage {
     }
 }
 
+impl WgpuAtlasStorage {
+    fn get(&self, id: AtlasTextureId) -> Option<&WgpuAtlasTexture> {
+        self[id.kind]
+            .textures
+            .get(id.index as usize)
+            .and_then(|t| t.as_ref())
+    }
+}
+
 impl ops::Index<AtlasTextureId> for WgpuAtlasStorage {
     type Output = WgpuAtlasTexture;
     fn index(&self, id: AtlasTextureId) -> &Self::Output {
@@ -328,7 +367,7 @@ impl WgpuAtlasTexture {
     fn bytes_per_pixel(&self) -> u8 {
         match self.format {
             wgpu::TextureFormat::R8Unorm => 1,
-            wgpu::TextureFormat::Bgra8Unorm => 4,
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm => 4,
             _ => 4,
         }
     }
@@ -339,5 +378,184 @@ impl WgpuAtlasTexture {
 
     fn is_unreferenced(&self) -> bool {
         self.live_atlas_keys == 0
+    }
+}
+
+fn swizzle_upload_data(bytes: &[u8], format: wgpu::TextureFormat) -> Vec<u8> {
+    match format {
+        wgpu::TextureFormat::Rgba8Unorm => {
+            let mut data = bytes.to_vec();
+            for pixel in data.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+            data
+        }
+        _ => bytes.to_vec(),
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tests {
+    use super::*;
+    use gpui::{ImageId, RenderImageParams};
+
+    fn test_device_and_queue() -> anyhow::Result<Option<(Arc<wgpu::Device>, Arc<wgpu::Queue>)>> {
+        pollster::block_on(async {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::all(),
+                flags: wgpu::InstanceFlags::default(),
+                backend_options: wgpu::BackendOptions::default(),
+                memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+                display: None,
+            });
+            let Some(adapter) = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::LowPower,
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                })
+                .await
+                .ok()
+            else {
+                return Ok(None);
+            };
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor {
+                    label: Some("wgpu_atlas_test_device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::downlevel_defaults()
+                        .using_resolution(adapter.limits())
+                        .using_alignment(adapter.limits()),
+                    memory_hints: wgpu::MemoryHints::MemoryUsage,
+                    trace: wgpu::Trace::Off,
+                    experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!("failed to request device: {error}"))?;
+            Ok(Some((Arc::new(device), Arc::new(queue))))
+        })
+    }
+
+    #[test]
+    fn before_frame_skips_uploads_for_removed_texture() -> anyhow::Result<()> {
+        let Some((device, queue)) = test_device_and_queue()? else {
+            return Ok(());
+        };
+
+        let atlas = WgpuAtlas::new(device, queue);
+        let key = AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(1),
+            frame_index: 0,
+        });
+        let size = Size {
+            width: DevicePixels(1),
+            height: DevicePixels(1),
+        };
+        let mut build = || Ok(Some((size, Cow::Owned(vec![0, 0, 0, 255]))));
+
+        atlas
+            .get_or_insert_with(&key, &mut build)?
+            .expect("tile should be created");
+        atlas.remove(&key);
+        atlas.before_frame();
+        Ok(())
+    }
+
+    #[test]
+    fn remove_reclaims_tile_space_in_live_texture() -> anyhow::Result<()> {
+        let Some((device, queue)) = test_device_and_queue()? else {
+            return Ok(());
+        };
+
+        let atlas = WgpuAtlas::new(device, queue);
+        let large = Size {
+            width: DevicePixels(1024),
+            height: DevicePixels(512),
+        };
+        let small = Size {
+            width: DevicePixels(1),
+            height: DevicePixels(1),
+        };
+
+        let key_a = AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(1),
+            frame_index: 0,
+        });
+        let key_b = AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(2),
+            frame_index: 0,
+        });
+        let key_c = AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(3),
+            frame_index: 0,
+        });
+
+        let tile_a = atlas
+            .get_or_insert_with(&key_a, &mut || {
+                Ok(Some((
+                    large,
+                    Cow::Owned(vec![
+                        0;
+                        large.width.0 as usize * large.height.0 as usize * 4
+                    ]),
+                )))
+            })?
+            .expect("large tile should be created");
+        let tile_b = atlas
+            .get_or_insert_with(&key_b, &mut || {
+                Ok(Some((
+                    small,
+                    Cow::Owned(vec![
+                        0;
+                        small.width.0 as usize * small.height.0 as usize * 4
+                    ]),
+                )))
+            })?
+            .expect("small tile should be created");
+        assert_eq!(tile_a.texture_id, tile_b.texture_id);
+
+        let generation_before_remove = atlas.generation();
+        atlas.remove(&key_a);
+        assert_eq!(
+            atlas.generation(),
+            generation_before_remove.wrapping_add(1),
+            "removing a tile from a live texture should invalidate cached atlas generations"
+        );
+
+        let tile_c = atlas
+            .get_or_insert_with(&key_c, &mut || {
+                Ok(Some((
+                    large,
+                    Cow::Owned(vec![
+                        0;
+                        large.width.0 as usize * large.height.0 as usize * 4
+                    ]),
+                )))
+            })?
+            .expect("replacement tile should be created");
+        assert_eq!(
+            tile_c.texture_id, tile_a.texture_id,
+            "removed tile space should be reused before allocating another texture"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn swizzle_upload_data_preserves_bgra_uploads() {
+        let input = vec![0x10, 0x20, 0x30, 0x40];
+        assert_eq!(
+            swizzle_upload_data(&input, wgpu::TextureFormat::Bgra8Unorm),
+            input
+        );
+    }
+
+    #[test]
+    fn swizzle_upload_data_converts_bgra_to_rgba() {
+        let input = vec![0x10, 0x20, 0x30, 0x40, 0xAA, 0xBB, 0xCC, 0xDD];
+        assert_eq!(
+            swizzle_upload_data(&input, wgpu::TextureFormat::Rgba8Unorm),
+            vec![0x30, 0x20, 0x10, 0x40, 0xCC, 0xBB, 0xAA, 0xDD]
+        );
     }
 }

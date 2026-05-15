@@ -1,4 +1,4 @@
-use collections::FxHashMap;
+use crate::collections::FxHashMap;
 use etagere::BucketedAtlasAllocator;
 use parking_lot::Mutex;
 use windows::Win32::Graphics::{
@@ -23,6 +23,7 @@ struct DirectXAtlasState {
     polychrome_textures: AtlasTextureList<DirectXAtlasTexture>,
     subpixel_textures: AtlasTextureList<DirectXAtlasTexture>,
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
+    generation: u64,
 }
 
 struct DirectXAtlasTexture {
@@ -43,16 +44,19 @@ impl DirectXAtlas {
             polychrome_textures: Default::default(),
             subpixel_textures: Default::default(),
             tiles_by_key: Default::default(),
+            generation: 0,
         }))
     }
 
     pub(crate) fn get_texture_view(
         &self,
         id: AtlasTextureId,
-    ) -> [Option<ID3D11ShaderResourceView>; 1] {
+    ) -> anyhow::Result<[Option<ID3D11ShaderResourceView>; 1]> {
         let lock = self.0.lock();
-        let tex = lock.texture(id);
-        tex.view.clone()
+        let tex = lock
+            .texture(id)
+            .ok_or_else(|| anyhow::anyhow!("missing DirectX atlas texture {id:?}"))?;
+        Ok(tex.view.clone())
     }
 
     pub(crate) fn handle_device_lost(
@@ -67,6 +71,7 @@ impl DirectXAtlas {
         lock.polychrome_textures = AtlasTextureList::default();
         lock.subpixel_textures = AtlasTextureList::default();
         lock.tiles_by_key.clear();
+        lock.generation = lock.generation.wrapping_add(1);
     }
 }
 
@@ -88,7 +93,12 @@ impl PlatformAtlas for DirectXAtlas {
             let tile = lock
                 .allocate(size, key.texture_kind())
                 .ok_or_else(|| anyhow::anyhow!("failed to allocate"))?;
-            let texture = lock.texture(tile.texture_id);
+            let texture = lock.texture(tile.texture_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "missing newly allocated DirectX atlas texture {:?}",
+                    tile.texture_id
+                )
+            })?;
             texture.upload(&lock.device_context, tile.bounds, &bytes);
             lock.tiles_by_key.insert(key.clone(), tile.clone());
             Ok(Some(tile))
@@ -98,29 +108,42 @@ impl PlatformAtlas for DirectXAtlas {
     fn remove(&self, key: &AtlasKey) {
         let mut lock = self.0.lock();
 
-        let Some(id) = lock.tiles_by_key.remove(key).map(|tile| tile.texture_id) else {
+        let Some(tile) = lock.tiles_by_key.remove(key) else {
             return;
         };
+        let id = tile.texture_id;
 
-        let textures = match id.kind {
-            AtlasTextureKind::Monochrome => &mut lock.monochrome_textures,
-            AtlasTextureKind::Polychrome => &mut lock.polychrome_textures,
-            AtlasTextureKind::Subpixel => &mut lock.subpixel_textures,
-        };
+        let mut deallocated_tile = false;
+        {
+            let textures = match id.kind {
+                AtlasTextureKind::Monochrome => &mut lock.monochrome_textures,
+                AtlasTextureKind::Polychrome => &mut lock.polychrome_textures,
+                AtlasTextureKind::Subpixel => &mut lock.subpixel_textures,
+            };
 
-        let Some(texture_slot) = textures.textures.get_mut(id.index as usize) else {
-            return;
-        };
+            let Some(texture_slot) = textures.textures.get_mut(id.index as usize) else {
+                return;
+            };
 
-        if let Some(mut texture) = texture_slot.take() {
-            texture.decrement_ref_count();
-            if texture.is_unreferenced() {
-                textures.free_list.push(texture.id.index as usize);
-                lock.tiles_by_key.remove(key);
-            } else {
-                *texture_slot = Some(texture);
+            if let Some(mut texture) = texture_slot.take() {
+                texture.allocator.deallocate(tile.tile_id.into());
+                deallocated_tile = true;
+                texture.decrement_ref_count();
+                if texture.is_unreferenced() {
+                    textures.free_list.push(texture.id.index as usize);
+                } else {
+                    *texture_slot = Some(texture);
+                }
             }
         }
+
+        if deallocated_tile {
+            lock.generation = lock.generation.wrapping_add(1);
+        }
+    }
+
+    fn generation(&self) -> u64 {
+        self.0.lock().generation
     }
 }
 
@@ -244,18 +267,17 @@ impl DirectXAtlasState {
         }
     }
 
-    fn texture(&self, id: AtlasTextureId) -> &DirectXAtlasTexture {
+    fn texture(&self, id: AtlasTextureId) -> Option<&DirectXAtlasTexture> {
         match id.kind {
-            AtlasTextureKind::Monochrome => &self.monochrome_textures[id.index as usize]
-                .as_ref()
-                .unwrap(),
-            AtlasTextureKind::Polychrome => &self.polychrome_textures[id.index as usize]
-                .as_ref()
-                .unwrap(),
-            AtlasTextureKind::Subpixel => {
-                &self.subpixel_textures[id.index as usize].as_ref().unwrap()
+            AtlasTextureKind::Monochrome => {
+                self.monochrome_textures.textures.get(id.index as usize)
             }
+            AtlasTextureKind::Polychrome => {
+                self.polychrome_textures.textures.get(id.index as usize)
+            }
+            AtlasTextureKind::Subpixel => self.subpixel_textures.textures.get(id.index as usize),
         }
+        .and_then(|texture| texture.as_ref())
     }
 }
 
@@ -317,5 +339,96 @@ fn etagere_point_to_device(value: etagere::Point) -> Point<DevicePixels> {
     Point {
         x: DevicePixels::from(value.x),
         y: DevicePixels::from(value.y),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{ImageId, PlatformAtlas, RenderImageParams};
+    use std::borrow::Cow;
+    use windows::Win32::{
+        Foundation::HMODULE,
+        Graphics::{
+            Direct3D::{D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0},
+            Direct3D11::{D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11CreateDevice},
+            Dxgi::IDXGIAdapter,
+        },
+    };
+
+    fn create_atlas() -> anyhow::Result<DirectXAtlas> {
+        let mut device = None;
+        let mut device_context = None;
+        unsafe {
+            D3D11CreateDevice(
+                None::<&IDXGIAdapter>,
+                D3D_DRIVER_TYPE_WARP,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&[D3D_FEATURE_LEVEL_11_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut device_context),
+            )?;
+        }
+        Ok(DirectXAtlas::new(
+            &device.expect("D3D11CreateDevice should return a device"),
+            &device_context.expect("D3D11CreateDevice should return a device context"),
+        ))
+    }
+
+    fn make_image_key(image_id: usize, frame_index: usize) -> AtlasKey {
+        AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(image_id),
+            frame_index,
+        })
+    }
+
+    fn insert_tile(atlas: &DirectXAtlas, key: &AtlasKey, size: Size<DevicePixels>) -> AtlasTile {
+        atlas
+            .get_or_insert_with(key, &mut || {
+                let byte_count = (size.width.0 as usize) * (size.height.0 as usize) * 4;
+                Ok(Some((size, Cow::Owned(vec![0u8; byte_count]))))
+            })
+            .expect("allocation should succeed")
+            .expect("callback returns Some")
+    }
+
+    #[test]
+    fn test_remove_bumps_generation_for_tile_in_live_texture() -> anyhow::Result<()> {
+        let atlas = create_atlas()?;
+        let large = Size {
+            width: DevicePixels(1024),
+            height: DevicePixels(512),
+        };
+        let small = Size {
+            width: DevicePixels(1),
+            height: DevicePixels(1),
+        };
+
+        let key_a = make_image_key(1, 0);
+        let key_b = make_image_key(2, 0);
+        let key_c = make_image_key(3, 0);
+
+        let tile_a = insert_tile(&atlas, &key_a, large);
+        let tile_b = insert_tile(&atlas, &key_b, small);
+        assert_eq!(tile_a.texture_id, tile_b.texture_id);
+
+        let generation_before_remove = atlas.generation();
+        atlas.remove(&key_a);
+        assert_eq!(
+            atlas.generation(),
+            generation_before_remove.wrapping_add(1),
+            "removing a tile from a live texture should invalidate cached atlas generations"
+        );
+
+        let tile_c = insert_tile(&atlas, &key_c, large);
+        assert_eq!(
+            tile_c.texture_id, tile_a.texture_id,
+            "removed tile space should be reused before allocating another texture"
+        );
+
+        Ok(())
     }
 }

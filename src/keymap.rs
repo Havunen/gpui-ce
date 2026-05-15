@@ -4,8 +4,8 @@ mod context;
 pub use binding::*;
 pub use context::*;
 
+use crate::collections::{HashMap, HashSet};
 use crate::{Action, AsKeystroke, Keystroke, Unbind, is_no_action, is_unbind};
-use collections::{HashMap, HashSet};
 use smallvec::SmallVec;
 use std::any::TypeId;
 
@@ -295,11 +295,87 @@ mod tests {
     use super::*;
     use crate as gpui;
     use gpui::{NoAction, Unbind};
+    use gpui_macros::perf;
+    use std::hint::black_box;
 
     actions!(
         test_only,
         [ActionAlpha, ActionBeta, ActionGamma, ActionDelta,]
     );
+
+    fn perf_keymap() -> (Keymap, Vec<KeyContext>) {
+        const BINDING_COUNT: usize = 2_048;
+
+        let keystrokes = [
+            "ctrl-x", "ctrl-x a", "ctrl-x b", "ctrl-x c", "ctrl-y", "ctrl-y a", "ctrl-z",
+            "ctrl-z a",
+        ];
+        let contexts = [
+            "Workspace",
+            "Pane",
+            "Editor && mode == insert",
+            "Editor && mode == normal",
+            "Terminal && vim_mode == normal",
+            "Terminal && vim_mode == insert",
+        ];
+
+        let mut keymap = Keymap::default();
+        let mut bindings = Vec::with_capacity(BINDING_COUNT);
+        for ix in 0..BINDING_COUNT {
+            let keystroke = keystrokes[ix % keystrokes.len()];
+            let context = Some(contexts[ix % contexts.len()]);
+            let mut binding = match ix % 8 {
+                0 => KeyBinding::new(keystroke, ActionAlpha, context),
+                1 => KeyBinding::new(keystroke, ActionBeta, context),
+                2 => KeyBinding::new(keystroke, ActionGamma, context),
+                3 => KeyBinding::new(keystroke, ActionDelta, context),
+                4 => KeyBinding::new(keystroke, NoAction, context),
+                5 => KeyBinding::new(keystroke, Unbind("test_only::ActionAlpha".into()), context),
+                6 => KeyBinding::new(keystroke, ActionAlpha, None),
+                _ => KeyBinding::new(keystroke, ActionBeta, None),
+            };
+            if is_no_action(binding.action()) {
+                binding.set_meta(KeyBindingMetaIndex(3));
+            }
+            bindings.push(binding);
+        }
+        keymap.add_bindings(bindings);
+
+        let context_stack = [
+            "Workspace",
+            "Pane",
+            "Editor mode=insert",
+            "Terminal vim_mode=normal",
+        ]
+        .into_iter()
+        .map(|context| KeyContext::parse(context).unwrap())
+        .collect();
+
+        (keymap, context_stack)
+    }
+
+    #[perf(important)]
+    fn perf_bindings_for_input_large_keymap() {
+        let (keymap, context_stack) = perf_keymap();
+        let input = [Keystroke::parse("ctrl-x").unwrap()];
+
+        let (bindings, pending) = keymap.bindings_for_input(&input, &context_stack);
+
+        assert!(pending || !bindings.is_empty());
+        black_box(bindings.len());
+        black_box(pending);
+    }
+
+    #[perf(important)]
+    fn perf_possible_next_bindings_large_keymap() {
+        let (keymap, context_stack) = perf_keymap();
+        let input = [Keystroke::parse("ctrl-x").unwrap()];
+
+        let bindings = keymap.possible_next_bindings_for_input(&input, &context_stack);
+
+        assert!(!bindings.is_empty());
+        black_box(bindings.len());
+    }
 
     #[test]
     fn test_keymap() {

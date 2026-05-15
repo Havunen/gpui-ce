@@ -167,7 +167,15 @@ impl HeadlessAppContext {
     /// returns `Some` via [`HeadlessAppContext::with_platform`].
     pub fn capture_screenshot(&mut self, window: AnyWindowHandle) -> Result<RgbaImage> {
         let mut app = self.app.borrow_mut();
-        app.update_window(window, |_, window, _| window.render_to_image())?
+        app.update_window(window, |_, window, cx| {
+            if let Some(arena_clear_needed) = window.redraw_if_rendered_frame_atlas_is_stale(cx) {
+                let image = window.render_to_image();
+                arena_clear_needed.clear();
+                image
+            } else {
+                window.render_to_image()
+            }
+        })?
     }
 
     /// Returns the text system.
@@ -271,5 +279,232 @@ impl AppContext for HeadlessAppContext {
     {
         let app = self.app.borrow();
         app.read_global(callback)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        AnyView, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels, IntoElement,
+        NoopTextSystem, ParentElement as _, PlatformAtlas, PrimitiveBatch, RenderImage, Scene,
+        StyleRefinement, Styled as _, TileId, div, img, px, size,
+    };
+    use anyhow::Result;
+    use image::{Frame as ImageFrame, ImageBuffer, Rgba, RgbaImage};
+    use parking_lot::Mutex;
+    use smallvec::SmallVec;
+    use std::{
+        borrow::Cow,
+        collections::{HashMap, HashSet},
+    };
+
+    #[derive(Default)]
+    struct ResettableAtlas {
+        state: Mutex<ResettableAtlasState>,
+    }
+
+    #[derive(Default)]
+    struct ResettableAtlasState {
+        tiles_by_key: HashMap<AtlasKey, AtlasTile>,
+        live_textures: HashSet<AtlasTextureId>,
+        next_texture_index: u32,
+        next_tile_id: u32,
+        generation: u64,
+    }
+
+    impl ResettableAtlas {
+        fn reset_device_resources_for_test(&self) {
+            let mut state = self.state.lock();
+            state.tiles_by_key.clear();
+            state.live_textures.clear();
+            state.next_texture_index = 0;
+            state.next_tile_id = 0;
+            state.generation = state.generation.wrapping_add(1);
+        }
+
+        fn has_texture(&self, id: AtlasTextureId) -> bool {
+            self.state.lock().live_textures.contains(&id)
+        }
+    }
+
+    impl PlatformAtlas for ResettableAtlas {
+        fn get_or_insert_with<'a>(
+            &self,
+            key: &AtlasKey,
+            build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
+        ) -> Result<Option<AtlasTile>> {
+            if let Some(tile) = self.state.lock().tiles_by_key.get(key).cloned() {
+                return Ok(Some(tile));
+            }
+
+            let Some((size, _bytes)) = build()? else {
+                return Ok(None);
+            };
+
+            let mut state = self.state.lock();
+            if let Some(tile) = state.tiles_by_key.get(key).cloned() {
+                return Ok(Some(tile));
+            }
+
+            let texture_id = AtlasTextureId {
+                index: state.next_texture_index,
+                kind: key.texture_kind(),
+            };
+            state.next_texture_index += 1;
+
+            let tile = AtlasTile {
+                texture_id,
+                tile_id: TileId(state.next_tile_id),
+                padding: 0,
+                bounds: Bounds {
+                    origin: Default::default(),
+                    size,
+                },
+            };
+            state.next_tile_id += 1;
+            state.live_textures.insert(texture_id);
+            state.tiles_by_key.insert(key.clone(), tile.clone());
+            Ok(Some(tile))
+        }
+
+        fn remove(&self, key: &AtlasKey) {
+            let mut state = self.state.lock();
+            if let Some(tile) = state.tiles_by_key.remove(key) {
+                state.live_textures.remove(&tile.texture_id);
+                state.generation = state.generation.wrapping_add(1);
+            }
+        }
+
+        fn generation(&self) -> u64 {
+            self.state.lock().generation
+        }
+    }
+
+    struct CheckingHeadlessRenderer {
+        atlas: Arc<ResettableAtlas>,
+    }
+
+    impl PlatformHeadlessRenderer for CheckingHeadlessRenderer {
+        fn render_scene_to_image(
+            &mut self,
+            scene: &Scene,
+            size: Size<DevicePixels>,
+        ) -> Result<RgbaImage> {
+            for batch in scene.batches() {
+                let texture_id = match batch {
+                    PrimitiveBatch::MonochromeSprites { texture_id, .. }
+                    | PrimitiveBatch::SubpixelSprites { texture_id, .. }
+                    | PrimitiveBatch::PolychromeSprites { texture_id, .. } => texture_id,
+                    _ => continue,
+                };
+
+                assert!(
+                    self.atlas.has_texture(texture_id),
+                    "stale atlas texture id after renderer reset: {texture_id:?}",
+                );
+            }
+
+            Ok(RgbaImage::from_pixel(
+                size.width.0.max(1) as u32,
+                size.height.0.max(1) as u32,
+                Rgba([0, 0, 0, 0]),
+            ))
+        }
+
+        fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
+            self.atlas.clone()
+        }
+    }
+
+    struct ImageRoot {
+        image: Arc<RenderImage>,
+    }
+
+    struct CachedImageRoot {
+        child: Entity<ImageRoot>,
+    }
+
+    impl Render for CachedImageRoot {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            AnyView::from(self.child.clone()).cached(StyleRefinement::default().size(px(1.0)))
+        }
+    }
+
+    impl Render for ImageRoot {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().child(img(self.image.clone()).size(px(1.0)))
+        }
+    }
+
+    fn test_image() -> Arc<RenderImage> {
+        let frame = ImageFrame::new(ImageBuffer::from_pixel(1, 1, Rgba([0, 0, 0, 255])));
+        Arc::new(RenderImage::new(SmallVec::from_iter([frame])))
+    }
+
+    #[test]
+    fn non_forced_present_after_atlas_reset_can_redraw_stale_scene() -> Result<()> {
+        let atlas = Arc::new(ResettableAtlas::default());
+        let renderer_atlas = atlas.clone();
+        let mut cx = HeadlessAppContext::with_platform(
+            Arc::new(NoopTextSystem::new()),
+            Arc::new(()),
+            move || {
+                Some(Box::new(CheckingHeadlessRenderer {
+                    atlas: renderer_atlas.clone(),
+                }))
+            },
+        );
+
+        let image = test_image();
+        let window = cx.open_window(size(px(10.0), px(10.0)), move |_window, cx| {
+            cx.new(|_| ImageRoot { image })
+        })?;
+
+        cx.capture_screenshot(window.into())?;
+        atlas.reset_device_resources_for_test();
+
+        // This models a non-forced Windows paint/present after DirectX device
+        // recovery cleared the atlas, but before the forced full redraw happens.
+        cx.capture_screenshot(window.into())?;
+        Ok(())
+    }
+
+    #[test]
+    fn non_forced_redraw_after_atlas_reset_must_not_reuse_cached_sprite_scene() -> Result<()> {
+        let atlas = Arc::new(ResettableAtlas::default());
+        let renderer_atlas = atlas.clone();
+        let mut cx = HeadlessAppContext::with_platform(
+            Arc::new(NoopTextSystem::new()),
+            Arc::new(()),
+            move || {
+                Some(Box::new(CheckingHeadlessRenderer {
+                    atlas: renderer_atlas.clone(),
+                }))
+            },
+        );
+
+        let image = test_image();
+        let window = cx.open_window(size(px(10.0), px(10.0)), move |_window, cx| {
+            let child = cx.new(|_| ImageRoot { image });
+            cx.new(|_| CachedImageRoot { child })
+        })?;
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.draw(cx).clear();
+            window.render_to_image()
+        })??;
+
+        atlas.reset_device_resources_for_test();
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.invalidator.set_dirty(true);
+            let arena_clear_needed = window.draw(cx);
+            let image = window.render_to_image();
+            arena_clear_needed.clear();
+            image
+        })??;
+
+        Ok(())
     }
 }

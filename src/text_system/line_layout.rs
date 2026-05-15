@@ -1,5 +1,5 @@
+use crate::collections::FxHashMap;
 use crate::{FontId, GlyphId, Pixels, PlatformTextSystem, Point, SharedString, Size, point, px};
-use collections::FxHashMap;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use smallvec::SmallVec;
 use std::{
@@ -186,7 +186,7 @@ impl LineLayout {
             if width > wrap_width && boundary > last_boundary {
                 // When used line_clamp, we should limit the number of lines.
                 if let Some(max_lines) = max_lines
-                    && boundaries.len() >= max_lines - 1
+                    && boundaries.len() >= max_lines.saturating_sub(1)
                 {
                     break;
                 }
@@ -265,6 +265,12 @@ impl WrappedLineLayout {
     /// The wrap boundaries in this layout
     pub fn wrap_boundaries(&self) -> &[WrapBoundary] {
         &self.wrap_boundaries
+    }
+
+    fn wrap_boundary_index_and_x(&self, wrap_boundary: WrapBoundary) -> (usize, Pixels) {
+        let run = &self.unwrapped_layout.runs[wrap_boundary.run_ix];
+        let glyph = &run.glyphs[wrap_boundary.glyph_ix];
+        (glyph.index, glyph.position.x)
     }
 
     /// The font size of this layout
@@ -360,32 +366,31 @@ impl WrappedLineLayout {
 
     /// Returns the pixel position for the given byte index.
     pub fn position_for_index(&self, index: usize, line_height: Pixels) -> Option<Point<Pixels>> {
-        let mut line_start_ix = 0;
-        let mut line_end_indices = self
-            .wrap_boundaries
-            .iter()
-            .map(|wrap_boundary| {
-                let run = &self.unwrapped_layout.runs[wrap_boundary.run_ix];
-                let glyph = &run.glyphs[wrap_boundary.glyph_ix];
-                glyph.index
-            })
-            .chain([self.len()])
-            .enumerate();
-        for (ix, line_end_ix) in line_end_indices {
-            let line_y = ix as f32 * line_height;
-            if index < line_start_ix {
-                break;
-            } else if index > line_end_ix {
-                line_start_ix = line_end_ix;
-                continue;
-            } else {
-                let line_start_x = self.unwrapped_layout.x_for_index(line_start_ix);
-                let x = self.unwrapped_layout.x_for_index(index) - line_start_x;
-                return Some(point(x, line_y));
-            }
+        let line_ix = self.wrap_boundaries.partition_point(|wrap_boundary| {
+            self.wrap_boundary_index_and_x(*wrap_boundary).0 < index
+        });
+
+        let (line_start_ix, line_start_x) = if line_ix == 0 {
+            (0, Pixels::ZERO)
+        } else {
+            self.wrap_boundary_index_and_x(self.wrap_boundaries[line_ix - 1])
+        };
+
+        if index < line_start_ix {
+            return None;
         }
 
-        None
+        let line_end_ix = self.wrap_boundaries.get(line_ix).map_or_else(
+            || self.len(),
+            |wrap_boundary| self.wrap_boundary_index_and_x(*wrap_boundary).0,
+        );
+        if index > line_end_ix {
+            return None;
+        }
+
+        let line_y = line_ix as f32 * line_height;
+        let x = self.unwrapped_layout.x_for_index(index) - line_start_x;
+        Some(point(x, line_y))
     }
 }
 
@@ -610,15 +615,7 @@ impl LineLayoutCache {
                 .layout_line(&text, font_size, runs);
 
             if let Some(force_width) = force_width {
-                let mut glyph_pos = 0;
-                for run in layout.runs.iter_mut() {
-                    for glyph in run.glyphs.iter_mut() {
-                        if (glyph.position.x - glyph_pos * force_width).abs() > px(1.) {
-                            glyph.position.x = glyph_pos * force_width;
-                        }
-                        glyph_pos += 1;
-                    }
-                }
+                apply_force_width_to_layout(&mut layout, force_width);
             }
 
             let key = Arc::new(CacheKey {
@@ -660,31 +657,15 @@ impl LineLayoutCache {
             force_width,
         };
 
+        let key_ref = &key_ref as &dyn AsHashedCacheKeyRef;
+
         let current_frame = self.current_frame.read();
-        if let Some((_, layout)) = current_frame.lines_by_hash.iter().find(|(key, _)| {
-            HashedCacheKeyRef {
-                text_hash: key.text_hash,
-                text_len: key.text_len,
-                font_size: key.font_size,
-                runs: key.runs.as_slice(),
-                wrap_width: key.wrap_width,
-                force_width: key.force_width,
-            } == key_ref
-        }) {
+        if let Some(layout) = current_frame.lines_by_hash.get(key_ref) {
             return Some(layout.clone());
         }
 
         let previous_frame = self.previous_frame.lock();
-        if let Some((_, layout)) = previous_frame.lines_by_hash.iter().find(|(key, _)| {
-            HashedCacheKeyRef {
-                text_hash: key.text_hash,
-                text_len: key.text_len,
-                font_size: key.font_size,
-                runs: key.runs.as_slice(),
-                wrap_width: key.wrap_width,
-                force_width: key.force_width,
-            } == key_ref
-        }) {
+        if let Some(layout) = previous_frame.lines_by_hash.get(key_ref) {
             return Some(layout.clone());
         }
 
@@ -718,47 +699,23 @@ impl LineLayoutCache {
         };
 
         // Fast path: already cached (no allocation).
+        let key_ref = &key_ref as &dyn AsHashedCacheKeyRef;
+
         let current_frame = self.current_frame.upgradable_read();
-        if let Some((_, layout)) = current_frame.lines_by_hash.iter().find(|(key, _)| {
-            HashedCacheKeyRef {
-                text_hash: key.text_hash,
-                text_len: key.text_len,
-                font_size: key.font_size,
-                runs: key.runs.as_slice(),
-                wrap_width: key.wrap_width,
-                force_width: key.force_width,
-            } == key_ref
-        }) {
+        if let Some(layout) = current_frame.lines_by_hash.get(key_ref) {
             return layout.clone();
         }
 
         let mut current_frame = RwLockUpgradableReadGuard::upgrade(current_frame);
 
-        // Try to reuse from previous frame without allocating; do a linear scan to find a matching key.
-        // (We avoid `drain()` here because it would eagerly move all entries.)
+        // Try to reuse from previous frame without allocating.
         let mut previous_frame = self.previous_frame.lock();
-        if let Some(existing_key) = previous_frame
-            .used_lines_by_hash
-            .iter()
-            .find(|key| {
-                HashedCacheKeyRef {
-                    text_hash: key.text_hash,
-                    text_len: key.text_len,
-                    font_size: key.font_size,
-                    runs: key.runs.as_slice(),
-                    wrap_width: key.wrap_width,
-                    force_width: key.force_width,
-                } == key_ref
-            })
-            .cloned()
-        {
-            if let Some((key, layout)) = previous_frame.lines_by_hash.remove_entry(&existing_key) {
-                current_frame
-                    .lines_by_hash
-                    .insert(key.clone(), layout.clone());
-                current_frame.used_lines_by_hash.push(key);
-                return layout;
-            }
+        if let Some((key, layout)) = previous_frame.lines_by_hash.remove_entry(key_ref) {
+            current_frame
+                .lines_by_hash
+                .insert(key.clone(), layout.clone());
+            current_frame.used_lines_by_hash.push(key);
+            return layout;
         }
 
         let text = materialize_text();
@@ -767,15 +724,7 @@ impl LineLayoutCache {
             .layout_line(&text, font_size, runs);
 
         if let Some(force_width) = force_width {
-            let mut glyph_pos = 0;
-            for run in layout.runs.iter_mut() {
-                for glyph in run.glyphs.iter_mut() {
-                    if (glyph.position.x - glyph_pos * force_width).abs() > px(1.) {
-                        glyph.position.x = glyph_pos * force_width;
-                    }
-                    glyph_pos += 1;
-                }
-            }
+            apply_force_width_to_layout(&mut layout, force_width);
         }
 
         let key = Arc::new(HashedCacheKey {
@@ -795,6 +744,35 @@ impl LineLayoutCache {
     }
 }
 
+fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
+    let mut glyph_pos: usize = 0;
+    let mut last_base_shaped_x = px(f32::NEG_INFINITY);
+    let mut last_base_actual_x = px(0.);
+    let mut last_base_index = None;
+
+    for run in layout.runs.iter_mut() {
+        for glyph in run.glyphs.iter_mut() {
+            let shaped_x = glyph.position.x;
+            let shaped_x_advanced = shaped_x > last_base_shaped_x;
+            let starts_new_cluster = last_base_index != Some(glyph.index);
+            let advanced_far_enough = shaped_x > last_base_shaped_x + force_width * 0.5;
+
+            if shaped_x_advanced && (starts_new_cluster || advanced_far_enough) {
+                let forced_x = glyph_pos * force_width;
+                if (shaped_x - forced_x).abs() > px(1.) {
+                    glyph.position.x = forced_x;
+                }
+                last_base_shaped_x = shaped_x;
+                last_base_actual_x = glyph.position.x;
+                last_base_index = Some(glyph.index);
+                glyph_pos += 1;
+            } else {
+                glyph.position.x = last_base_actual_x + (shaped_x - last_base_shaped_x);
+            }
+        }
+    }
+}
+
 /// A run of text with a single font.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 #[expect(missing_docs)]
@@ -805,6 +783,10 @@ pub struct FontRun {
 
 trait AsCacheKeyRef {
     fn as_cache_key_ref(&self) -> CacheKeyRef<'_>;
+}
+
+trait AsHashedCacheKeyRef {
+    fn as_hashed_cache_key_ref(&self) -> HashedCacheKeyRef<'_>;
 }
 
 #[derive(Clone, Debug, Eq)]
@@ -851,14 +833,16 @@ impl PartialEq for dyn AsCacheKeyRef + '_ {
     }
 }
 
+impl PartialEq for dyn AsHashedCacheKeyRef + '_ {
+    fn eq(&self, other: &dyn AsHashedCacheKeyRef) -> bool {
+        self.as_hashed_cache_key_ref() == other.as_hashed_cache_key_ref()
+    }
+}
+
 impl PartialEq for HashedCacheKey {
     fn eq(&self, other: &Self) -> bool {
-        self.text_hash == other.text_hash
-            && self.text_len == other.text_len
-            && self.font_size == other.font_size
-            && self.runs.as_slice() == other.runs.as_slice()
-            && self.wrap_width == other.wrap_width
-            && self.force_width == other.force_width
+        self.as_hashed_cache_key_ref()
+            .eq(&other.as_hashed_cache_key_ref())
     }
 }
 
@@ -866,12 +850,7 @@ impl Eq for HashedCacheKey {}
 
 impl Hash for HashedCacheKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.text_hash.hash(state);
-        self.text_len.hash(state);
-        self.font_size.hash(state);
-        self.runs.as_slice().hash(state);
-        self.wrap_width.hash(state);
-        self.force_width.hash(state);
+        self.as_hashed_cache_key_ref().hash(state);
     }
 }
 
@@ -907,10 +886,31 @@ impl Hash for dyn AsCacheKeyRef + '_ {
     }
 }
 
+impl Eq for dyn AsHashedCacheKeyRef + '_ {}
+
+impl Hash for dyn AsHashedCacheKeyRef + '_ {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_hashed_cache_key_ref().hash(state)
+    }
+}
+
 impl AsCacheKeyRef for CacheKey {
     fn as_cache_key_ref(&self) -> CacheKeyRef<'_> {
         CacheKeyRef {
             text: &self.text,
+            font_size: self.font_size,
+            runs: self.runs.as_slice(),
+            wrap_width: self.wrap_width,
+            force_width: self.force_width,
+        }
+    }
+}
+
+impl AsHashedCacheKeyRef for HashedCacheKey {
+    fn as_hashed_cache_key_ref(&self) -> HashedCacheKeyRef<'_> {
+        HashedCacheKeyRef {
+            text_hash: self.text_hash,
+            text_len: self.text_len,
             font_size: self.font_size,
             runs: self.runs.as_slice(),
             wrap_width: self.wrap_width,
@@ -940,5 +940,404 @@ impl<'a> Borrow<dyn AsCacheKeyRef + 'a> for Arc<CacheKey> {
 impl AsCacheKeyRef for CacheKeyRef<'_> {
     fn as_cache_key_ref(&self) -> CacheKeyRef<'_> {
         *self
+    }
+}
+
+impl<'a> Borrow<dyn AsHashedCacheKeyRef + 'a> for Arc<HashedCacheKey> {
+    fn borrow(&self) -> &(dyn AsHashedCacheKeyRef + 'a) {
+        self.as_ref() as &dyn AsHashedCacheKeyRef
+    }
+}
+
+impl AsHashedCacheKeyRef for HashedCacheKeyRef<'_> {
+    fn as_hashed_cache_key_ref(&self) -> HashedCacheKeyRef<'_> {
+        *self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{GlyphId, NoopTextSystem};
+    use gpui_macros::perf;
+    use std::{cell::Cell, hint::black_box, sync::Arc};
+
+    fn glyph_at(x: f32, index: usize) -> ShapedGlyph {
+        ShapedGlyph {
+            id: GlyphId(0),
+            position: point(px(x), px(0.)),
+            index,
+            is_emoji: false,
+        }
+    }
+
+    fn make_layout(glyphs: Vec<ShapedGlyph>) -> LineLayout {
+        LineLayout {
+            font_size: px(16.),
+            width: px(100.),
+            ascent: px(12.),
+            descent: px(4.),
+            runs: vec![ShapedRun {
+                font_id: FontId(0),
+                glyphs,
+            }],
+            len: 0,
+        }
+    }
+
+    #[perf(important)]
+    fn perf_hashed_line_layout_previous_frame_cache_hits() {
+        const LINE_COUNT: usize = 4_096;
+        const REPEATS: usize = 8;
+        const TEXT_SUFFIX: &str = "abcdefghijklmnop";
+
+        let cache = LineLayoutCache::new(Arc::new(NoopTextSystem::new()));
+        let text_len = "line-0000-abcdefghijklmnop".len();
+        let runs = [FontRun {
+            len: text_len,
+            font_id: FontId(0),
+        }];
+
+        for ix in 0..LINE_COUNT {
+            cache.layout_line_by_hash(ix as u64, text_len, px(16.), &runs, None, || {
+                SharedString::from(format!("line-{ix:04}-{TEXT_SUFFIX}"))
+            });
+        }
+
+        let mut total_width = px(0.);
+        for _ in 0..REPEATS {
+            cache.finish_frame();
+            for ix in 0..LINE_COUNT {
+                let layout =
+                    cache.layout_line_by_hash(ix as u64, text_len, px(16.), &runs, None, || {
+                        panic!("hashed line layout cache should hit")
+                    });
+                total_width += layout.width;
+            }
+        }
+
+        black_box(total_width);
+    }
+
+    fn glyph_x_positions(layout: &LineLayout) -> Vec<f32> {
+        layout.runs[0]
+            .glyphs
+            .iter()
+            .map(|g| f32::from(g.position.x))
+            .collect()
+    }
+
+    #[test]
+    fn wrapped_line_position_for_index_handles_boundaries() {
+        let no_wrap = WrappedLineLayout {
+            unwrapped_layout: Arc::new(LineLayout {
+                font_size: px(16.),
+                width: px(3.),
+                ascent: px(12.),
+                descent: px(4.),
+                runs: vec![ShapedRun {
+                    font_id: FontId(0),
+                    glyphs: vec![glyph_at(0., 0), glyph_at(1., 1), glyph_at(2., 2)],
+                }],
+                len: 3,
+            }),
+            wrap_boundaries: SmallVec::new(),
+            wrap_width: None,
+        };
+
+        assert_eq!(
+            no_wrap.position_for_index(0, px(10.)),
+            Some(point(px(0.), px(0.)))
+        );
+        assert_eq!(
+            no_wrap.position_for_index(3, px(10.)),
+            Some(point(px(3.), px(0.)))
+        );
+        assert_eq!(no_wrap.position_for_index(4, px(10.)), None);
+
+        let mut wrap_boundaries = SmallVec::new();
+        wrap_boundaries.push(WrapBoundary {
+            run_ix: 1,
+            glyph_ix: 0,
+        });
+        let wrapped = WrappedLineLayout {
+            unwrapped_layout: Arc::new(LineLayout {
+                font_size: px(16.),
+                width: px(6.),
+                ascent: px(12.),
+                descent: px(4.),
+                runs: vec![
+                    ShapedRun {
+                        font_id: FontId(0),
+                        glyphs: vec![glyph_at(0., 0), glyph_at(1., 1), glyph_at(2., 2)],
+                    },
+                    ShapedRun {
+                        font_id: FontId(1),
+                        glyphs: vec![glyph_at(3., 3), glyph_at(4., 4), glyph_at(5., 5)],
+                    },
+                ],
+                len: 6,
+            }),
+            wrap_boundaries,
+            wrap_width: Some(px(3.)),
+        };
+
+        assert_eq!(
+            wrapped.position_for_index(2, px(10.)),
+            Some(point(px(2.), px(0.)))
+        );
+        assert_eq!(
+            wrapped.position_for_index(3, px(10.)),
+            Some(point(px(3.), px(0.)))
+        );
+        assert_eq!(
+            wrapped.position_for_index(4, px(10.)),
+            Some(point(px(1.), px(10.)))
+        );
+        assert_eq!(
+            wrapped.position_for_index(6, px(10.)),
+            Some(point(px(3.), px(10.)))
+        );
+        assert_eq!(wrapped.position_for_index(7, px(10.)), None);
+    }
+
+    #[test]
+    fn wrapped_line_position_for_index_handles_duplicate_boundary_indices() {
+        let mut wrap_boundaries = SmallVec::new();
+        wrap_boundaries.push(WrapBoundary {
+            run_ix: 0,
+            glyph_ix: 2,
+        });
+        wrap_boundaries.push(WrapBoundary {
+            run_ix: 0,
+            glyph_ix: 3,
+        });
+        let wrapped = WrappedLineLayout {
+            unwrapped_layout: Arc::new(LineLayout {
+                font_size: px(16.),
+                width: px(5.),
+                ascent: px(12.),
+                descent: px(4.),
+                runs: vec![ShapedRun {
+                    font_id: FontId(0),
+                    glyphs: vec![
+                        glyph_at(0., 0),
+                        glyph_at(1., 1),
+                        glyph_at(2., 2),
+                        glyph_at(3., 2),
+                        glyph_at(4., 3),
+                    ],
+                }],
+                len: 4,
+            }),
+            wrap_boundaries,
+            wrap_width: Some(px(2.)),
+        };
+
+        assert_eq!(
+            wrapped.position_for_index(2, px(10.)),
+            Some(point(px(2.), px(0.)))
+        );
+        assert_eq!(
+            wrapped.position_for_index(3, px(10.)),
+            Some(point(px(1.), px(20.)))
+        );
+    }
+
+    #[test]
+    fn hashed_line_layout_cache_hits_and_misses_use_borrowed_lookup() {
+        let cache = LineLayoutCache::new(Arc::new(NoopTextSystem::new()));
+        let runs = [FontRun {
+            len: 3,
+            font_id: FontId(0),
+        }];
+        let materialize_calls = Cell::new(0);
+
+        let layout = cache.layout_line_by_hash(7, 3, px(16.), &runs, None, || {
+            materialize_calls.set(materialize_calls.get() + 1);
+            SharedString::from("abc")
+        });
+        assert_eq!(materialize_calls.get(), 1);
+
+        let current_hit = cache.layout_line_by_hash(7, 3, px(16.), &runs, None, || {
+            panic!("current-frame hash hit should not materialize text")
+        });
+        assert!(Arc::ptr_eq(&layout, &current_hit));
+        assert!(
+            cache
+                .try_layout_line_by_hash(7, 3, px(16.), &runs, None)
+                .is_some_and(|candidate| Arc::ptr_eq(&candidate, &layout))
+        );
+
+        cache.finish_frame();
+
+        assert!(
+            cache
+                .try_layout_line_by_hash(7, 3, px(16.), &runs, None)
+                .is_some_and(|candidate| Arc::ptr_eq(&candidate, &layout))
+        );
+
+        let previous_hit = cache.layout_line_by_hash(7, 3, px(16.), &runs, None, || {
+            panic!("previous-frame hash hit should not materialize text")
+        });
+        assert!(Arc::ptr_eq(&layout, &previous_hit));
+
+        let different_runs = [FontRun {
+            len: 3,
+            font_id: FontId(1),
+        }];
+        assert!(
+            cache
+                .try_layout_line_by_hash(7, 4, px(16.), &runs, None)
+                .is_none()
+        );
+        assert!(
+            cache
+                .try_layout_line_by_hash(7, 3, px(17.), &runs, None)
+                .is_none()
+        );
+        assert!(
+            cache
+                .try_layout_line_by_hash(7, 3, px(16.), &different_runs, None)
+                .is_none()
+        );
+        assert!(
+            cache
+                .try_layout_line_by_hash(7, 3, px(16.), &runs, Some(px(10.)))
+                .is_none()
+        );
+
+        let miss_calls = Cell::new(0);
+        let missed = cache.layout_line_by_hash(8, 3, px(16.), &runs, None, || {
+            miss_calls.set(miss_calls.get() + 1);
+            SharedString::from("abd")
+        });
+        assert_eq!(miss_calls.get(), 1);
+        assert!(!Arc::ptr_eq(&layout, &missed));
+    }
+
+    #[perf(important)]
+    fn perf_wrapped_line_position_for_index_many_soft_wraps() {
+        const LINE_LEN: usize = 8_192;
+        const WRAP_STEP: usize = 8;
+
+        let glyphs = (0..LINE_LEN)
+            .map(|ix| glyph_at(ix as f32, ix))
+            .collect::<Vec<_>>();
+        let wrap_boundaries = (WRAP_STEP..LINE_LEN)
+            .step_by(WRAP_STEP)
+            .map(|glyph_ix| WrapBoundary {
+                run_ix: 0,
+                glyph_ix,
+            })
+            .collect();
+        let layout = WrappedLineLayout {
+            unwrapped_layout: Arc::new(LineLayout {
+                font_size: px(16.),
+                width: px(LINE_LEN as f32),
+                ascent: px(12.),
+                descent: px(4.),
+                runs: vec![ShapedRun {
+                    font_id: FontId(0),
+                    glyphs,
+                }],
+                len: LINE_LEN,
+            }),
+            wrap_boundaries,
+            wrap_width: Some(px(WRAP_STEP as f32)),
+        };
+
+        let mut total_x = px(0.);
+        for ix in (0..LINE_LEN).step_by(17) {
+            let position = layout.position_for_index(ix, px(16.)).unwrap();
+            total_x += position.x;
+        }
+
+        black_box(total_x);
+    }
+
+    #[test]
+    fn test_force_width_latin_unchanged() {
+        let cell_width = px(8.);
+        let mut layout = make_layout(vec![glyph_at(0., 0), glyph_at(8., 1), glyph_at(16., 2)]);
+
+        apply_force_width_to_layout(&mut layout, cell_width);
+
+        assert_eq!(glyph_x_positions(&layout), vec![0., 8., 16.]);
+    }
+
+    #[test]
+    fn test_force_width_advances_narrow_base_glyphs() {
+        let cell_width = px(8.);
+        let mut layout = make_layout(vec![glyph_at(0., 0), glyph_at(3., 1), glyph_at(6., 2)]);
+
+        apply_force_width_to_layout(&mut layout, cell_width);
+
+        assert_eq!(glyph_x_positions(&layout), vec![0., 8., 16.]);
+    }
+
+    #[test]
+    fn test_force_width_same_cluster_glyph_offsets_not_advanced() {
+        let cell_width = px(8.);
+        let mut layout = make_layout(vec![glyph_at(0., 0), glyph_at(3., 0), glyph_at(8., 3)]);
+
+        apply_force_width_to_layout(&mut layout, cell_width);
+
+        assert_eq!(glyph_x_positions(&layout), vec![0., 3., 8.]);
+    }
+
+    #[test]
+    fn test_force_width_combining_marks_not_advanced() {
+        let cell_width = px(8.);
+        let mut layout = make_layout(vec![glyph_at(0., 0), glyph_at(0., 3)]);
+
+        apply_force_width_to_layout(&mut layout, cell_width);
+
+        assert_eq!(glyph_x_positions(&layout), vec![0., 0.]);
+    }
+
+    #[test]
+    fn test_force_width_base_after_combining_mark() {
+        let cell_width = px(8.);
+        let mut layout = make_layout(vec![glyph_at(0., 0), glyph_at(0., 3), glyph_at(8., 6)]);
+
+        apply_force_width_to_layout(&mut layout, cell_width);
+
+        assert_eq!(glyph_x_positions(&layout), vec![0., 0., 8.]);
+    }
+
+    #[test]
+    fn test_force_width_multiple_combining_marks() {
+        let cell_width = px(8.);
+        let mut layout = make_layout(vec![
+            glyph_at(0., 0),
+            glyph_at(0., 3),
+            glyph_at(0., 6),
+            glyph_at(8., 9),
+        ]);
+
+        apply_force_width_to_layout(&mut layout, cell_width);
+
+        assert_eq!(glyph_x_positions(&layout), vec![0., 0., 0., 8.]);
+    }
+
+    #[test]
+    fn test_force_width_corrects_drifted_base_positions() {
+        let cell_width = px(8.);
+        let mut layout = make_layout(vec![glyph_at(0.5, 0), glyph_at(10.2, 1), glyph_at(19.8, 2)]);
+
+        apply_force_width_to_layout(&mut layout, cell_width);
+
+        assert_eq!(glyph_x_positions(&layout), vec![0.5, 8., 16.]);
+    }
+
+    #[test]
+    fn test_force_width_combining_mark_after_within_tolerance_base() {
+        let cell_width = px(8.);
+        let mut layout = make_layout(vec![glyph_at(0.5, 0), glyph_at(0.5, 3)]);
+
+        apply_force_width_to_layout(&mut layout, cell_width);
+
+        assert_eq!(glyph_x_positions(&layout), vec![0.5, 0.5]);
     }
 }

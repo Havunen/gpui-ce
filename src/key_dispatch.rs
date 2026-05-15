@@ -49,11 +49,11 @@
 //!
 //!  KeyBinding::new("cmd-k left", pane::SplitLeft, Some("Pane"))
 
+use crate::collections::FxHashMap;
 use crate::{
     Action, ActionRegistry, App, DispatchPhase, EntityId, FocusId, KeyBinding, KeyContext, Keymap,
     Keystroke, ModifiersChangedEvent, Window,
 };
-use collections::FxHashMap;
 use smallvec::SmallVec;
 use std::{
     any::{Any, TypeId},
@@ -625,8 +625,9 @@ mod tests {
         InspectorElementId, Keystroke, LayoutId, Style,
     };
     use core::panic;
+    use gpui_macros::perf;
     use smallvec::SmallVec;
-    use std::{cell::RefCell, ops::Range, rc::Rc};
+    use std::{any::TypeId, cell::RefCell, hint::black_box, ops::Range, rc::Rc};
 
     use crate::{
         ActionRegistry, App, Bounds, Context, DispatchTree, FocusHandle, InputHandler, IntoElement,
@@ -643,6 +644,37 @@ mod tests {
             Rc::new(RefCell::new(Keymap::new(bindings))),
             Rc::new(registry),
         )
+    }
+
+    #[perf(important)]
+    fn perf_available_actions_deep_dispatch_tree() {
+        const DEPTH: usize = 128;
+        const LISTENERS_PER_NODE: usize = 32;
+
+        let mut tree = test_dispatch_tree(Vec::new());
+        let mut target = None;
+        for depth in 0..DEPTH {
+            let node_id = tree.push_node();
+            if depth % 4 == 0 {
+                tree.set_key_context(KeyContext::parse("Workspace").unwrap());
+            }
+
+            for listener_ix in 0..LISTENERS_PER_NODE {
+                let action_type = if listener_ix % 5 == 0 {
+                    TypeId::of::<SecondaryTestAction>()
+                } else {
+                    TypeId::of::<TestAction>()
+                };
+                tree.on_action(action_type, Rc::new(|_, _, _, _| {}));
+            }
+
+            target = Some(node_id);
+        }
+
+        let actions = tree.available_actions(target.unwrap());
+
+        assert_eq!(actions.len(), 2);
+        black_box(actions.len());
     }
 
     #[test]

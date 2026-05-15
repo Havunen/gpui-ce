@@ -22,8 +22,9 @@ use itertools::Itertools;
 use parking_lot::RwLock;
 use slotmap::SlotMap;
 
+use crate::collections::{FxHashMap, FxHashSet, HashMap, VecDeque};
+use crate::util::{ResultExt, debug_panic};
 pub use async_context::*;
-use collections::{FxHashMap, FxHashSet, HashMap, VecDeque};
 pub use context::*;
 pub use entity_map::*;
 #[cfg(any(test, feature = "test-support"))]
@@ -34,7 +35,6 @@ use smallvec::SmallVec;
 pub use test_app::*;
 #[cfg(any(test, feature = "test-support"))]
 pub use test_context::*;
-use util::{ResultExt, debug_panic};
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 pub use visual_test_context::*;
 
@@ -49,7 +49,8 @@ use crate::{
     PlatformKeyboardMapper, Point, Priority, PromptBuilder, PromptButton, PromptHandle,
     PromptLevel, Render, RenderImage, RenderablePromptHandle, Reservation, ScreenCaptureSource,
     SharedString, SubscriberSet, Subscription, SvgRenderer, Task, TextRenderingMode, TextSystem,
-    ThermalState, Window, WindowAppearance, WindowHandle, WindowId, WindowInvalidator,
+    ThermalState, Window, WindowAppearance, WindowButtonLayout, WindowHandle, WindowId,
+    WindowInvalidator,
     colors::{Colors, GlobalColors},
     hash, init_app_menus,
 };
@@ -1180,6 +1181,11 @@ impl App {
     /// Returns the appearance of the application's windows.
     pub fn window_appearance(&self) -> WindowAppearance {
         self.platform.window_appearance()
+    }
+
+    /// Returns the window button layout configuration when supported.
+    pub fn button_layout(&self) -> Option<WindowButtonLayout> {
+        self.platform.button_layout()
     }
 
     /// Reads data from the platform clipboard.
@@ -2578,10 +2584,6 @@ pub struct KeystrokeEvent {
 struct NullHttpClient;
 
 impl HttpClient for NullHttpClient {
-    fn type_name(&self) -> &'static str {
-        "NullHttpClient"
-    }
-
     fn send(
         &self,
         _req: http_client::Request<http_client::AsyncBody>,

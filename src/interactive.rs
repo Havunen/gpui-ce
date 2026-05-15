@@ -724,6 +724,7 @@ mod test {
         self as gpui, AppContext as _, Context, FocusHandle, InteractiveElement, IntoElement,
         KeyBinding, Keystroke, ParentElement, Render, TestAppContext, Window, div,
     };
+    use gpui_macros::perf;
 
     struct TestView {
         saw_key_down: bool,
@@ -786,6 +787,67 @@ mod test {
                 assert!(test_view.saw_key_down || test_view.saw_action);
                 assert!(test_view.saw_key_down);
                 assert!(test_view.saw_action);
+            })
+            .unwrap();
+    }
+
+    struct PerfActionView {
+        action_count: usize,
+        focus_handle: FocusHandle,
+    }
+
+    impl Render for PerfActionView {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            const LISTENER_COUNT: usize = 256;
+
+            let mut element = div()
+                .id("perf-action-view")
+                .key_context("PerfAction")
+                .track_focus(&self.focus_handle);
+            for _ in 0..LISTENER_COUNT {
+                element = element.capture_action(cx.listener(
+                    |this: &mut PerfActionView, _: &TestAction, _, _| {
+                        this.action_count += 1;
+                    },
+                ));
+            }
+            element
+        }
+    }
+
+    #[perf(iterations = 1, important)]
+    #[gpui::test]
+    fn perf_action_dispatch_many_capture_listeners(cx: &mut TestAppContext) {
+        const LISTENER_COUNT: usize = 256;
+        const DISPATCH_COUNT: usize = 64;
+
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| {
+                cx.new(|cx| PerfActionView {
+                    action_count: 0,
+                    focus_handle: cx.focus_handle(),
+                })
+            })
+            .unwrap()
+        });
+
+        cx.update(|cx| {
+            cx.bind_keys([KeyBinding::new("ctrl-g", TestAction, Some("PerfAction"))]);
+        });
+
+        window
+            .update(cx, |view, window, cx| {
+                window.focus(&view.focus_handle, cx);
+            })
+            .unwrap();
+
+        for _ in 0..DISPATCH_COUNT {
+            cx.dispatch_keystroke(*window, Keystroke::parse("ctrl-g").unwrap());
+        }
+
+        window
+            .update(cx, |view, _, _| {
+                assert_eq!(view.action_count, LISTENER_COUNT * DISPATCH_COUNT);
             })
             .unwrap();
     }

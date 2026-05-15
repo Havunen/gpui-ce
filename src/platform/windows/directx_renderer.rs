@@ -3,8 +3,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use ::util::ResultExt;
-use anyhow::{Context, Result};
+use crate::util::ResultExt;
 use ::windows::{
     Win32::{
         Foundation::HWND,
@@ -18,6 +17,7 @@ use ::windows::{
     },
     core::Interface,
 };
+use anyhow::{Context, Result};
 
 use self::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
 use super::{DirectXAtlas, DirectXDevices, try_to_recover_from_device_lost};
@@ -633,7 +633,7 @@ impl DirectXRenderer {
         }
         let devices = self.devices.as_ref().context("devices missing")?;
         let resources = self.resources.as_ref().context("resources missing")?;
-        let texture_view = self.atlas.get_texture_view(texture_id);
+        let texture_view = self.atlas.get_texture_view(texture_id)?;
         self.pipelines.mono_sprites.draw_range_with_texture(
             &devices.device,
             &devices.device_context,
@@ -657,7 +657,7 @@ impl DirectXRenderer {
         }
         let devices = self.devices.as_ref().context("devices missing")?;
         let resources = self.resources.as_ref().context("resources missing")?;
-        let texture_view = self.atlas.get_texture_view(texture_id);
+        let texture_view = self.atlas.get_texture_view(texture_id)?;
         self.pipelines.subpixel_sprites.draw_range_with_texture(
             &devices.device,
             &devices.device_context,
@@ -681,7 +681,7 @@ impl DirectXRenderer {
         }
         let devices = self.devices.as_ref().context("devices missing")?;
         let resources = self.resources.as_ref().context("resources missing")?;
-        let texture_view = self.atlas.get_texture_view(texture_id);
+        let texture_view = self.atlas.get_texture_view(texture_id)?;
         self.pipelines.poly_sprites.draw_range_with_texture(
             &devices.device,
             &devices.device_context,
@@ -715,9 +715,9 @@ impl DirectXRenderer {
             id => format!("Unknown Vendor (ID: {:#X})", id),
         };
         let driver_version = dxgi::get_driver_version(&devices.adapter)
-        .context("Failed to get gpu driver info")
-        .log_err()
-        .unwrap_or("Unknown Driver".to_string());
+            .context("Failed to get gpu driver info")
+            .log_err()
+            .unwrap_or("Unknown Driver".to_string());
         Ok(GpuSpecs {
             is_software_emulated,
             device_name,
@@ -1574,7 +1574,7 @@ pub(crate) mod shader_resources {
     use anyhow::Result;
 
     #[cfg(debug_assertions)]
-    use windows::{
+    use ::windows::{
         Win32::Graphics::Direct3D::{
             Fxc::{D3DCOMPILE_DEBUG, D3DCOMPILE_SKIP_OPTIMIZATION, D3DCompileFromFile},
             ID3DBlob,
@@ -1678,7 +1678,7 @@ pub(crate) mod shader_resources {
     #[cfg(debug_assertions)]
     pub(super) fn build_shader_blob(entry: ShaderModule, target: ShaderTarget) -> Result<ID3DBlob> {
         unsafe {
-            use windows::Win32::Graphics::{
+            use ::windows::Win32::Graphics::{
                 Direct3D::ID3DInclude, Hlsl::D3D_COMPILE_STANDARD_FILE_INCLUDE,
             };
 
@@ -1764,7 +1764,7 @@ pub(crate) mod shader_resources {
 }
 
 mod dxgi {
-    use windows::{
+    use ::windows::{
         Win32::Graphics::Dxgi::{IDXGIAdapter1, IDXGIDevice},
         core::Interface,
     };

@@ -1,6 +1,10 @@
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::Inspector;
+use crate::collections::{FxHashMap, FxHashSet, VecDeque};
+use crate::refineable::Refineable;
 use crate::scheduler::Instant;
+use crate::util::post_inc;
+use crate::util::{ResultExt, measure};
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
@@ -21,7 +25,6 @@ use crate::{
     point, prelude::*, px, rems, size, transparent_black,
 };
 use anyhow::{Context as _, Result, anyhow};
-use collections::{FxHashMap, FxHashSet};
 #[cfg(target_os = "macos")]
 use core_video::pixel_buffer::CVPixelBuffer;
 use derive_more::{Deref, DerefMut};
@@ -31,7 +34,6 @@ use itertools::FoldWhile::{Continue, Done};
 use itertools::Itertools;
 use parking_lot::RwLock;
 use raw_window_handle::{HandleError, HasDisplayHandle, HasWindowHandle};
-use refineable::Refineable;
 use slotmap::SlotMap;
 use smallvec::SmallVec;
 use std::{
@@ -51,8 +53,6 @@ use std::{
     },
     time::Duration,
 };
-use util::post_inc;
-use util::{ResultExt, measure};
 use uuid::Uuid;
 
 mod prompts;
@@ -745,6 +745,7 @@ pub(crate) struct DeferredDraw {
 }
 
 pub(crate) struct Frame {
+    pub(crate) atlas_generation: u64,
     pub(crate) focus: Option<FocusId>,
     pub(crate) window_active: bool,
     pub(crate) element_states: FxHashMap<(GlobalElementId, TypeId), ElementStateBox>,
@@ -791,6 +792,7 @@ pub(crate) struct PaintIndex {
 impl Frame {
     pub(crate) fn new(dispatch_tree: DispatchTree) -> Self {
         Frame {
+            atlas_generation: 0,
             focus: None,
             window_active: false,
             element_states: FxHashMap::default(),
@@ -831,6 +833,7 @@ impl Frame {
         self.deferred_draws.clear();
         self.tab_stops.clear();
         self.focus = None;
+        self.atlas_generation = 0;
 
         #[cfg(any(test, feature = "test-support"))]
         {
@@ -984,7 +987,7 @@ struct ModifierState {
 /// Used for selective VRR (Variable Refresh Rate) optimization.
 #[derive(Clone, Debug)]
 pub(crate) struct InputRateTracker {
-    timestamps: Vec<Instant>,
+    timestamps: VecDeque<Instant>,
     window: Duration,
     inputs_per_second: u32,
     sustain_until: Instant,
@@ -994,7 +997,7 @@ pub(crate) struct InputRateTracker {
 impl Default for InputRateTracker {
     fn default() -> Self {
         Self {
-            timestamps: Vec::new(),
+            timestamps: VecDeque::new(),
             window: Duration::from_millis(100),
             inputs_per_second: 60,
             sustain_until: Instant::now(),
@@ -1006,7 +1009,11 @@ impl Default for InputRateTracker {
 impl InputRateTracker {
     pub fn record_input(&mut self) {
         let now = Instant::now();
-        self.timestamps.push(now);
+        self.record_input_at(now);
+    }
+
+    fn record_input_at(&mut self, now: Instant) {
+        self.timestamps.push_back(now);
         self.prune_old_timestamps(now);
 
         let min_events = self.inputs_per_second as u128 * self.window.as_millis() / 1000;
@@ -1020,8 +1027,13 @@ impl InputRateTracker {
     }
 
     fn prune_old_timestamps(&mut self, now: Instant) {
-        self.timestamps
-            .retain(|&t| now.duration_since(t) <= self.window);
+        while self
+            .timestamps
+            .front()
+            .is_some_and(|&timestamp| now.duration_since(timestamp) > self.window)
+        {
+            self.timestamps.pop_front();
+        }
     }
 }
 
@@ -1245,6 +1257,9 @@ impl Window {
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {
+                                if request_frame_options.force_render {
+                                    window.refresh();
+                                }
                                 let arena_clear_needed = window.draw(cx);
                                 window.present();
                                 arena_clear_needed.clear();
@@ -1934,8 +1949,30 @@ impl Window {
     /// to capture what would be rendered without displaying it or requiring the window to be visible.
     #[cfg(any(test, feature = "test-support"))]
     pub fn render_to_image(&self) -> anyhow::Result<image::RgbaImage> {
+        if self.rendered_frame_atlas_is_stale() {
+            anyhow::bail!(
+                "rendered frame uses stale atlas textures: frame generation {}, atlas generation {}",
+                self.rendered_frame.atlas_generation,
+                self.sprite_atlas.generation(),
+            );
+        }
         self.platform_window
             .render_to_image(&self.rendered_frame.scene)
+    }
+
+    fn rendered_frame_atlas_is_stale(&self) -> bool {
+        self.rendered_frame.atlas_generation != self.sprite_atlas.generation()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn redraw_if_rendered_frame_atlas_is_stale(
+        &mut self,
+        cx: &mut App,
+    ) -> Option<ArenaClearNeeded> {
+        self.rendered_frame_atlas_is_stale().then(|| {
+            self.refreshing = true;
+            self.draw(cx)
+        })
     }
 
     /// Set the content size of the window.
@@ -2215,6 +2252,10 @@ impl Window {
         // Set up the per-App arena for element allocation during this draw.
         // This ensures that multiple test Apps have isolated arenas.
         let _arena_scope = ElementArenaScope::enter(&cx.element_arena);
+        let current_atlas_generation = self.sprite_atlas.generation();
+        if self.rendered_frame.atlas_generation != current_atlas_generation {
+            self.refreshing = true;
+        }
 
         self.invalidate_entities();
         cx.entities.clear_accessed();
@@ -2240,6 +2281,7 @@ impl Window {
 
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
+        self.next_frame.atlas_generation = current_atlas_generation;
         self.next_frame.finish(&mut self.rendered_frame);
 
         self.invalidator.set_phase(DrawPhase::Focus);
@@ -2310,6 +2352,12 @@ impl Window {
 
     #[profiling::function]
     fn present(&self) {
+        if self.rendered_frame_atlas_is_stale() {
+            self.invalidator.set_dirty(true);
+            self.needs_present.set(true);
+            profiling::finish_frame!();
+            return;
+        }
         self.platform_window.draw(&self.rendered_frame.scene);
         self.needs_present.set(false);
         profiling::finish_frame!();
@@ -5690,5 +5738,118 @@ pub fn outline(
         border_widths: (1.).into(),
         border_color: border_color.into(),
         border_style,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_macros::perf;
+    use std::hint::black_box;
+
+    #[test]
+    fn input_rate_tracker_prunes_old_timestamps() {
+        let mut tracker = InputRateTracker::default();
+        let start = Instant::now();
+
+        tracker.record_input_at(start);
+        tracker.record_input_at(start + Duration::from_millis(50));
+        tracker.record_input_at(start + Duration::from_millis(101));
+
+        assert_eq!(tracker.timestamps.len(), 2);
+        assert_eq!(
+            tracker.timestamps.front().copied(),
+            Some(start + Duration::from_millis(50))
+        );
+    }
+
+    #[test]
+    fn input_rate_tracker_retains_exact_window_boundary() {
+        let mut tracker = InputRateTracker::default();
+        let start = Instant::now();
+
+        tracker.record_input_at(start);
+        tracker.record_input_at(start + tracker.window);
+
+        assert_eq!(tracker.timestamps.len(), 2);
+        assert_eq!(tracker.timestamps.front().copied(), Some(start));
+
+        tracker.record_input_at(start + tracker.window + Duration::from_millis(1));
+
+        assert_eq!(tracker.timestamps.len(), 2);
+        assert_eq!(
+            tracker.timestamps.front().copied(),
+            Some(start + tracker.window)
+        );
+    }
+
+    #[test]
+    fn input_rate_tracker_only_sets_sustain_after_threshold() {
+        let mut tracker = InputRateTracker::default();
+        let initial_sustain_until = tracker.sustain_until;
+        let start = Instant::now();
+
+        for ix in 0..5 {
+            tracker.record_input_at(start + Duration::from_millis(ix));
+        }
+        assert_eq!(tracker.sustain_until, initial_sustain_until);
+
+        tracker.record_input_at(start + Duration::from_millis(5));
+        assert_eq!(
+            tracker.sustain_until,
+            start + Duration::from_millis(5) + tracker.sustain_duration
+        );
+    }
+
+    #[test]
+    fn input_rate_tracker_monotonic_slow_inputs_do_not_become_high_rate() {
+        let mut tracker = InputRateTracker::default();
+        let initial_sustain_until = tracker.sustain_until;
+        let start = Instant::now();
+
+        for ix in 0..10 {
+            tracker.record_input_at(start + Duration::from_millis(ix * 200));
+        }
+
+        assert_eq!(tracker.timestamps.len(), 1);
+        assert_eq!(tracker.sustain_until, initial_sustain_until);
+    }
+
+    #[test]
+    fn input_rate_tracker_prunes_before_threshold_check() {
+        let mut tracker = InputRateTracker::default();
+        tracker.inputs_per_second = 20;
+        let initial_sustain_until = tracker.sustain_until;
+        let start = Instant::now();
+
+        tracker.record_input_at(start);
+        tracker.record_input_at(start + tracker.window + Duration::from_millis(1));
+
+        assert_eq!(tracker.timestamps.len(), 1);
+        assert_eq!(tracker.sustain_until, initial_sustain_until);
+
+        tracker.record_input_at(start + tracker.window + Duration::from_millis(2));
+
+        assert_eq!(tracker.timestamps.len(), 2);
+        assert_eq!(
+            tracker.sustain_until,
+            start + tracker.window + Duration::from_millis(2) + tracker.sustain_duration
+        );
+    }
+
+    #[perf(important)]
+    fn perf_input_rate_tracker_high_frequency_pruning() {
+        const INPUT_COUNT: usize = 10_000;
+
+        let mut tracker = InputRateTracker::default();
+        let start = Instant::now();
+
+        for ix in 0..INPUT_COUNT {
+            tracker.record_input_at(start + Duration::from_millis(ix as u64));
+        }
+
+        assert!(tracker.timestamps.len() <= 101);
+        black_box(tracker.timestamps.len());
+        black_box(tracker.sustain_until);
     }
 }

@@ -11,7 +11,7 @@ use lyon::tessellation::{
 pub use lyon::math::Transform;
 pub use lyon::tessellation::{FillOptions, FillRule, StrokeOptions};
 
-use crate::{Path, Pixels, Point, point, px};
+use crate::{Bounds, Path, PathVertex, Pixels, Point, point, px};
 
 /// Style of the PathBuilder
 pub enum PathStyle {
@@ -325,23 +325,153 @@ impl PathBuilder {
         }
 
         let first_point = buf.vertices[0];
+        let mut min_x = first_point.x;
+        let mut min_y = first_point.y;
+        let mut max_x = first_point.x;
+        let mut max_y = first_point.y;
 
         let mut path = Path::new(first_point.into());
-        for i in 0..buf.indices.len() / 3 {
-            let i0 = buf.indices[i * 3] as usize;
-            let i1 = buf.indices[i * 3 + 1] as usize;
-            let i2 = buf.indices[i * 3 + 2] as usize;
+        path.vertices.reserve(buf.indices.len());
+        for triangle in buf.indices.chunks_exact(3) {
+            let i0 = triangle[0] as usize;
+            let i1 = triangle[1] as usize;
+            let i2 = triangle[2] as usize;
 
             let v0 = buf.vertices[i0];
             let v1 = buf.vertices[i1];
             let v2 = buf.vertices[i2];
 
-            path.push_triangle(
-                (v0.into(), v1.into(), v2.into()),
-                (point(0., 1.), point(0., 1.), point(0., 1.)),
-            );
+            min_x = min_x.min(v0.x).min(v1.x).min(v2.x);
+            min_y = min_y.min(v0.y).min(v1.y).min(v2.y);
+            max_x = max_x.max(v0.x).max(v1.x).max(v2.x);
+            max_y = max_y.max(v0.y).max(v1.y).max(v2.y);
+
+            let st = point(0., 1.);
+            path.vertices.push(PathVertex {
+                xy_position: v0.into(),
+                st_position: st,
+                content_mask: Default::default(),
+            });
+            path.vertices.push(PathVertex {
+                xy_position: v1.into(),
+                st_position: st,
+                content_mask: Default::default(),
+            });
+            path.vertices.push(PathVertex {
+                xy_position: v2.into(),
+                st_position: st,
+                content_mask: Default::default(),
+            });
         }
 
+        path.bounds =
+            Bounds::from_corners(point(px(min_x), px(min_y)), point(px(max_x), px(max_y)));
+
         path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_macros::perf;
+    use std::hint::black_box;
+
+    #[test]
+    fn build_path_handles_empty_buffers() {
+        let path = PathBuilder::build_path(VertexBuffers::new());
+
+        assert!(path.vertices.is_empty());
+        assert_eq!(
+            path.bounds,
+            Bounds::new(Point::default(), Default::default())
+        );
+    }
+
+    #[test]
+    fn build_path_handles_vertices_without_indices() {
+        let mut buf: VertexBuffers<lyon::math::Point, u16> = VertexBuffers::new();
+        buf.vertices.push(lyon::math::point(-2.0, 3.0));
+        buf.vertices.push(lyon::math::point(8.0, 9.0));
+
+        let path = PathBuilder::build_path(buf);
+
+        assert!(path.vertices.is_empty());
+        assert_eq!(
+            path.bounds,
+            Bounds::from_corners(point(px(-2.0), px(3.0)), point(px(-2.0), px(3.0)))
+        );
+    }
+
+    #[test]
+    fn build_path_computes_bounds_and_vertex_metadata() {
+        let mut buf: VertexBuffers<lyon::math::Point, u16> = VertexBuffers::new();
+        buf.vertices.extend_from_slice(&[
+            lyon::math::point(-2.0, 3.0),
+            lyon::math::point(4.0, -1.0),
+            lyon::math::point(1.0, 5.0),
+            lyon::math::point(6.0, 7.0),
+        ]);
+        buf.indices.extend_from_slice(&[0, 1, 2, 1, 2, 3]);
+
+        let path = PathBuilder::build_path(buf);
+
+        assert_eq!(path.vertices.len(), 6);
+        assert_eq!(
+            path.bounds,
+            Bounds::from_corners(point(px(-2.0), px(-1.0)), point(px(6.0), px(7.0)))
+        );
+        for vertex in &path.vertices {
+            assert_eq!(vertex.st_position, point(0., 1.));
+            assert_eq!(vertex.content_mask.bounds, Bounds::default());
+        }
+        assert_eq!(path.vertices[0].xy_position, point(px(-2.0), px(3.0)));
+        assert_eq!(path.vertices[5].xy_position, point(px(6.0), px(7.0)));
+    }
+
+    #[test]
+    fn build_path_ignores_trailing_incomplete_index_group() {
+        let mut buf: VertexBuffers<lyon::math::Point, u16> = VertexBuffers::new();
+        buf.vertices.extend_from_slice(&[
+            lyon::math::point(0.0, 0.0),
+            lyon::math::point(1.0, 0.0),
+            lyon::math::point(0.0, 1.0),
+            lyon::math::point(100.0, 100.0),
+        ]);
+        buf.indices.extend_from_slice(&[0, 1, 2, 3]);
+
+        let path = PathBuilder::build_path(buf);
+
+        assert_eq!(path.vertices.len(), 3);
+        assert_eq!(
+            path.bounds,
+            Bounds::from_corners(point(px(0.0), px(0.0)), point(px(1.0), px(1.0)))
+        );
+    }
+
+    #[perf(important)]
+    fn perf_build_path_many_triangles() {
+        const TRIANGLES: usize = 4_096;
+
+        let mut buf: VertexBuffers<lyon::math::Point, u16> = VertexBuffers::new();
+        buf.vertices.reserve(TRIANGLES * 3);
+        buf.indices.reserve(TRIANGLES * 3);
+
+        for ix in 0..TRIANGLES {
+            let base = (ix * 3) as u16;
+            let x = (ix % 128) as f32;
+            let y = (ix / 128) as f32;
+
+            buf.vertices.push(lyon::math::point(x, y));
+            buf.vertices.push(lyon::math::point(x + 1.0, y));
+            buf.vertices.push(lyon::math::point(x, y + 1.0));
+            buf.indices.extend_from_slice(&[base, base + 1, base + 2]);
+        }
+
+        let path = PathBuilder::build_path(buf);
+
+        assert_eq!(path.vertices.len(), TRIANGLES * 3);
+        black_box(path.bounds);
+        black_box(path.vertices.len());
     }
 }

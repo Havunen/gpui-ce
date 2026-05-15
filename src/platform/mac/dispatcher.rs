@@ -1,3 +1,4 @@
+use crate::util::ResultExt;
 use dispatch2::{DispatchQueue, DispatchQueueGlobalPriority, DispatchTime, GlobalQueueIdentifier};
 use gpui::{
     GLOBAL_THREAD_TIMINGS, PlatformDispatcher, Priority, RunnableMeta, RunnableVariant,
@@ -13,7 +14,6 @@ use mach2::{
         thread_precedence_policy_data_t, thread_time_constraint_policy_data_t,
     },
 };
-use util::ResultExt;
 
 use async_task::Runnable;
 use objc::{

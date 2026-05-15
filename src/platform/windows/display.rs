@@ -1,9 +1,9 @@
+use crate::util::ResultExt;
 use itertools::Itertools;
 use smallvec::SmallVec;
 use std::rc::Rc;
-use util::ResultExt;
 use uuid::Uuid;
-use ::windows::{
+use windows::{
     Win32::{
         Foundation::*,
         Graphics::Gdi::*,

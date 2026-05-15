@@ -71,7 +71,6 @@ fn publish_dependencies(new_version: &str, dry_run: bool, skip_to: Option<&str>)
         ),
         ("refineable", "gpui_refineable", "crates"),
         ("semantic_version", "gpui_semantic_version", "crates"),
-        ("sum_tree", "gpui_sum_tree", "crates"),
         ("media", "gpui_media", "crates"),
     ];
 

@@ -14,10 +14,10 @@ use std::{
 };
 
 use crate::command::{new_command, new_std_command};
+use crate::util::ResultExt as _;
 use anyhow::{Context as _, anyhow};
 use calloop::LoopSignal;
 use futures::channel::oneshot;
-use util::ResultExt as _;
 #[cfg(any(feature = "wayland", feature = "x11"))]
 use xkbcommon::xkb::{self, Keycode, Keysym, State};
 

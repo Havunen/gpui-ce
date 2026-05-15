@@ -18,10 +18,10 @@
 // https://tronche.com/gui/x/icccm/sec-2.html#s-2.6
 // https://freedesktop.org/wiki/ClipboardManager/
 
+use crate::collections::{HashMap, hash_map::Entry};
 use std::{
     borrow::Cow,
     cell::RefCell,
-    collections::{HashMap, hash_map::Entry},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -843,7 +843,7 @@ fn serve_requests(context: Arc<Inner>) -> Result<(), Box<dyn std::error::Error>>
 
     log::trace!("Started serve requests thread.");
 
-    let _guard = util::defer(|| {
+    let _guard = crate::util::defer(|| {
         context.serve_stopped.store(true, Ordering::Relaxed);
     });
 

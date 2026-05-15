@@ -1,9 +1,10 @@
+use crate::util::ResultExt;
 use crate::{
     ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
     HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextOverflow,
     TextRun, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window, WrappedLine,
-    WrappedLineLayout, register_tooltip_mouse_handlers, set_tooltip_on_window,
+    WrappedLineLayout, point, px, register_tooltip_mouse_handlers, set_tooltip_on_window,
 };
 use anyhow::Context as _;
 use itertools::Itertools;
@@ -16,7 +17,6 @@ use std::{
     rc::Rc,
     sync::Arc,
 };
-use util::ResultExt;
 
 impl Element for &'static str {
     type RequestLayoutState = TextLayout;
@@ -220,12 +220,16 @@ impl StyledText {
         default_style: &TextStyle,
         highlights: impl IntoIterator<Item = (Range<usize>, HighlightStyle)>,
     ) -> Vec<TextRun> {
-        let mut runs = Vec::new();
+        let highlights = highlights.into_iter();
+        let mut runs = Vec::with_capacity(highlights.size_hint().0 * 2 + 1);
+        let default_run = default_style.to_run(0);
         let mut ix = 0;
         for (range, highlight) in highlights {
             if ix < range.start {
                 debug_assert!(text.is_char_boundary(range.start));
-                runs.push(default_style.clone().to_run(range.start - ix));
+                let mut run = default_run.clone();
+                run.len = range.start - ix;
+                runs.push(run);
             }
             debug_assert!(text.is_char_boundary(range.end));
             runs.push(
@@ -237,7 +241,9 @@ impl StyledText {
             ix = range.end;
         }
         if ix < text.len() {
-            runs.push(default_style.to_run(text.len() - ix));
+            let mut run = default_run;
+            run.len = text.len() - ix;
+            runs.push(run);
         }
         runs
     }
@@ -329,10 +335,19 @@ pub struct TextLayout(Rc<RefCell<Option<TextLayoutInner>>>);
 struct TextLayoutInner {
     len: usize,
     lines: SmallVec<[WrappedLine; 1]>,
+    line_metrics: SmallVec<[TextLayoutLineMetric; 1]>,
     line_height: Pixels,
     wrap_width: Option<Pixels>,
     size: Option<Size<Pixels>>,
     bounds: Option<Bounds<Pixels>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TextLayoutLineMetric {
+    start_ix: usize,
+    end_ix: usize,
+    origin_y: Pixels,
+    height: Pixels,
 }
 
 impl TextLayout {
@@ -425,6 +440,7 @@ impl TextLayout {
                 else {
                     element_state.0.borrow_mut().replace(TextLayoutInner {
                         lines: Default::default(),
+                        line_metrics: Default::default(),
                         len: 0,
                         line_height,
                         wrap_width,
@@ -435,14 +451,27 @@ impl TextLayout {
                 };
 
                 let mut size: Size<Pixels> = Size::default();
+                let mut line_metrics = SmallVec::new();
+                let mut line_start_ix = 0;
+                let mut line_origin_y = px(0.);
                 for line in &lines {
                     let line_size = line.size(line_height);
+                    let line_end_ix = line_start_ix + line.len();
+                    line_metrics.push(TextLayoutLineMetric {
+                        start_ix: line_start_ix,
+                        end_ix: line_end_ix,
+                        origin_y: line_origin_y,
+                        height: line_size.height,
+                    });
                     size.height += line_size.height;
                     size.width = size.width.max(line_size.width).ceil();
+                    line_start_ix = line_end_ix + 1;
+                    line_origin_y += line_size.height;
                 }
 
                 element_state.0.borrow_mut().replace(TextLayoutInner {
                     lines,
+                    line_metrics,
                     len,
                     line_height,
                     wrap_width,
@@ -502,7 +531,7 @@ impl TextLayout {
     }
 
     /// Get the byte index into the input of the pixel position.
-    pub fn index_for_position(&self, mut position: Point<Pixels>) -> Result<usize, usize> {
+    pub fn index_for_position(&self, position: Point<Pixels>) -> Result<usize, usize> {
         let element_state = self.0.borrow();
         let element_state = element_state
             .as_ref()
@@ -516,23 +545,23 @@ impl TextLayout {
         }
 
         let line_height = element_state.line_height;
-        let mut line_origin = bounds.origin;
-        let mut line_start_ix = 0;
-        for line in &element_state.lines {
-            let line_bottom = line_origin.y + line.size(line_height).height;
-            if position.y > line_bottom {
-                line_origin.y = line_bottom;
-                line_start_ix += line.len() + 1;
-            } else {
-                let position_within_line = position - line_origin;
-                match line.index_for_position(position_within_line, line_height) {
-                    Ok(index_within_line) => return Ok(line_start_ix + index_within_line),
-                    Err(index_within_line) => return Err(line_start_ix + index_within_line),
-                }
-            }
-        }
+        let y = position.y - bounds.origin.y;
+        let line_ix = element_state
+            .line_metrics
+            .partition_point(|metric| y > metric.origin_y + metric.height);
+        let Some(metric) = element_state.line_metrics.get(line_ix) else {
+            return Err(element_state
+                .line_metrics
+                .last()
+                .map_or(0, |metric| metric.end_ix));
+        };
 
-        Err(line_start_ix.saturating_sub(1))
+        let line_origin = point(bounds.origin.x, bounds.origin.y + metric.origin_y);
+        let position_within_line = position - line_origin;
+        match element_state.lines[line_ix].index_for_position(position_within_line, line_height) {
+            Ok(index_within_line) => Ok(metric.start_ix + index_within_line),
+            Err(index_within_line) => Err(metric.start_ix + index_within_line),
+        }
     }
 
     /// Get the pixel position for the given byte index.
@@ -544,26 +573,21 @@ impl TextLayout {
         let bounds = element_state
             .bounds
             .expect("prepaint has not been performed");
-        let line_height = element_state.line_height;
-
-        let mut line_origin = bounds.origin;
-        let mut line_start_ix = 0;
-
-        for line in &element_state.lines {
-            let line_end_ix = line_start_ix + line.len();
-            if index < line_start_ix {
-                break;
-            } else if index > line_end_ix {
-                line_origin.y += line.size(line_height).height;
-                line_start_ix = line_end_ix + 1;
-                continue;
-            } else {
-                let ix_within_line = index - line_start_ix;
-                return Some(line_origin + line.position_for_index(ix_within_line, line_height)?);
-            }
+        let line_ix = element_state
+            .line_metrics
+            .partition_point(|metric| index > metric.end_ix);
+        let metric = element_state.line_metrics.get(line_ix)?;
+        if index < metric.start_ix {
+            return None;
         }
 
-        None
+        let line_origin = point(bounds.origin.x, bounds.origin.y + metric.origin_y);
+        let ix_within_line = index - metric.start_ix;
+        Some(
+            line_origin
+                + element_state.lines[line_ix]
+                    .position_for_index(ix_within_line, element_state.line_height)?,
+        )
     }
 
     /// Retrieve the layout for the line containing the given byte index.
@@ -572,28 +596,18 @@ impl TextLayout {
         let element_state = element_state
             .as_ref()
             .expect("measurement has not been performed");
-        let bounds = element_state
+        let _ = element_state
             .bounds
             .expect("prepaint has not been performed");
-        let line_height = element_state.line_height;
-
-        let mut line_origin = bounds.origin;
-        let mut line_start_ix = 0;
-
-        for line in &element_state.lines {
-            let line_end_ix = line_start_ix + line.len();
-            if index < line_start_ix {
-                break;
-            } else if index > line_end_ix {
-                line_origin.y += line.size(line_height).height;
-                line_start_ix = line_end_ix + 1;
-                continue;
-            } else {
-                return Some(line.layout.clone());
-            }
+        let line_ix = element_state
+            .line_metrics
+            .partition_point(|metric| index > metric.end_ix);
+        let metric = element_state.line_metrics.get(line_ix)?;
+        if index < metric.start_ix {
+            return None;
         }
 
-        None
+        Some(element_state.lines[line_ix].layout.clone())
     }
 
     /// The bounds of this layout.
@@ -940,6 +954,39 @@ impl IntoElement for InteractiveText {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::{
+        FontId, FontWeight, GlyphId, HighlightStyle, LineLayout, ShapedGlyph, ShapedRun,
+        SharedString, TextStyle, WrapBoundary, WrappedLine, WrappedLineLayout, point, px,
+    };
+    use gpui_macros::perf;
+    use smallvec::SmallVec;
+    use std::{hint::black_box, sync::Arc};
+
+    fn text_layout_line_metrics(
+        lines: &SmallVec<[WrappedLine; 1]>,
+        line_height: Pixels,
+    ) -> SmallVec<[TextLayoutLineMetric; 1]> {
+        let mut metrics = SmallVec::new();
+        let mut start_ix = 0;
+        let mut origin_y = px(0.);
+
+        for line in lines {
+            let height = line.size(line_height).height;
+            let end_ix = start_ix + line.len();
+            metrics.push(TextLayoutLineMetric {
+                start_ix,
+                end_ix,
+                origin_y,
+                height,
+            });
+            start_ix = end_ix + 1;
+            origin_y += height;
+        }
+
+        metrics
+    }
+
     #[test]
     fn test_into_element_for() {
         use crate::{ParentElement as _, SharedString, div};
@@ -949,5 +996,344 @@ mod tests {
         let _ = div().child("String".to_string());
         let _ = div().child(Cow::Borrowed("Cow"));
         let _ = div().child(SharedString::from("SharedString"));
+    }
+
+    #[perf(important)]
+    fn perf_compute_runs_many_highlights() {
+        const HIGHLIGHTS: usize = 4_096;
+
+        let mut text = String::with_capacity(HIGHLIGHTS * 2);
+        for _ in 0..HIGHLIGHTS {
+            text.push_str("ab");
+        }
+
+        let highlights = (0..HIGHLIGHTS)
+            .map(|ix| {
+                let start = ix * 2;
+                let style: HighlightStyle = if ix % 2 == 0 {
+                    FontWeight::BOLD.into()
+                } else {
+                    HighlightStyle {
+                        color: Some(crate::red()),
+                        ..Default::default()
+                    }
+                };
+                (start..start + 1, style)
+            })
+            .collect::<Vec<_>>();
+
+        let runs = StyledText::compute_runs(&text, &TextStyle::default(), highlights);
+
+        assert_eq!(runs.iter().map(|run| run.len).sum::<usize>(), text.len());
+        black_box(runs.len());
+    }
+
+    #[perf(important)]
+    fn perf_wrapped_text_many_soft_wraps() {
+        const LINE_COUNT: usize = 256;
+        const LINE_LEN: usize = 128;
+        const WRAP_STEP: usize = 8;
+
+        let layout = TextLayout::default();
+        let mut lines = SmallVec::<[WrappedLine; 1]>::new();
+
+        for line_ix in 0..LINE_COUNT {
+            let text = SharedString::from("x".repeat(LINE_LEN));
+            let glyphs = (0..LINE_LEN)
+                .map(|ix| ShapedGlyph {
+                    id: GlyphId((line_ix + ix) as u32),
+                    position: point(px(ix as f32), px(0.0)),
+                    index: ix,
+                    is_emoji: false,
+                })
+                .collect::<Vec<_>>();
+            let wrap_boundaries = (WRAP_STEP..LINE_LEN)
+                .step_by(WRAP_STEP)
+                .map(|glyph_ix| WrapBoundary {
+                    run_ix: 0,
+                    glyph_ix,
+                })
+                .collect::<SmallVec<[_; 1]>>();
+
+            lines.push(WrappedLine {
+                layout: Arc::new(WrappedLineLayout {
+                    unwrapped_layout: Arc::new(LineLayout {
+                        font_size: px(16.0),
+                        width: px(LINE_LEN as f32),
+                        ascent: px(12.0),
+                        descent: px(4.0),
+                        runs: vec![ShapedRun {
+                            font_id: FontId(0),
+                            glyphs,
+                        }],
+                        len: LINE_LEN,
+                    }),
+                    wrap_boundaries,
+                    wrap_width: Some(px(WRAP_STEP as f32)),
+                }),
+                text,
+                decoration_runs: Vec::new(),
+            });
+        }
+
+        let line_metrics = text_layout_line_metrics(&lines, px(16.0));
+        *layout.0.borrow_mut() = Some(TextLayoutInner {
+            len: LINE_COUNT * LINE_LEN + LINE_COUNT - 1,
+            lines,
+            line_metrics,
+            line_height: px(16.0),
+            wrap_width: Some(px(WRAP_STEP as f32)),
+            size: None,
+            bounds: None,
+        });
+
+        let wrapped_text = layout.wrapped_text();
+
+        assert!(wrapped_text.len() > LINE_COUNT * LINE_LEN);
+        black_box(wrapped_text.len());
+    }
+
+    fn build_many_line_text_layout(line_count: usize, line_len: usize) -> TextLayout {
+        let layout = TextLayout::default();
+        let mut lines = SmallVec::<[WrappedLine; 1]>::new();
+        let glyphs = (0..line_len)
+            .map(|ix| ShapedGlyph {
+                id: GlyphId(ix as u32),
+                position: point(px(ix as f32), px(0.0)),
+                index: ix,
+                is_emoji: false,
+            })
+            .collect::<Vec<_>>();
+        let line_layout = Arc::new(WrappedLineLayout {
+            unwrapped_layout: Arc::new(LineLayout {
+                font_size: px(16.0),
+                width: px(line_len as f32),
+                ascent: px(12.0),
+                descent: px(4.0),
+                runs: vec![ShapedRun {
+                    font_id: FontId(0),
+                    glyphs,
+                }],
+                len: line_len,
+            }),
+            wrap_boundaries: SmallVec::new(),
+            wrap_width: None,
+        });
+
+        for ix in 0..line_count {
+            lines.push(WrappedLine {
+                layout: line_layout.clone(),
+                text: SharedString::from(format!("{ix:04}-{}", "x".repeat(line_len - 5))),
+                decoration_runs: Vec::new(),
+            });
+        }
+
+        let line_height = px(16.0);
+        let line_metrics = text_layout_line_metrics(&lines, line_height);
+        *layout.0.borrow_mut() = Some(TextLayoutInner {
+            len: line_count * line_len + line_count.saturating_sub(1),
+            lines,
+            line_metrics,
+            line_height,
+            wrap_width: None,
+            size: None,
+            bounds: Some(Bounds::new(
+                point(px(0.0), px(0.0)),
+                Size {
+                    width: px(line_len as f32),
+                    height: line_height * line_count,
+                },
+            )),
+        });
+
+        layout
+    }
+
+    fn build_text_layout_with_line_lengths(
+        line_lengths: &[usize],
+        line_height: Pixels,
+    ) -> (TextLayout, Vec<Arc<WrappedLineLayout>>) {
+        let layout = TextLayout::default();
+        let mut lines = SmallVec::<[WrappedLine; 1]>::new();
+        let mut line_layouts = Vec::new();
+
+        for (line_ix, &line_len) in line_lengths.iter().enumerate() {
+            let glyphs = (0..line_len)
+                .map(|ix| ShapedGlyph {
+                    id: GlyphId((line_ix * 100 + ix) as u32),
+                    position: point(px(ix as f32), px(0.0)),
+                    index: ix,
+                    is_emoji: false,
+                })
+                .collect::<Vec<_>>();
+            let line_layout = Arc::new(WrappedLineLayout {
+                unwrapped_layout: Arc::new(LineLayout {
+                    font_size: px(16.0),
+                    width: px(line_len as f32),
+                    ascent: px(12.0),
+                    descent: px(4.0),
+                    runs: vec![ShapedRun {
+                        font_id: FontId(line_ix),
+                        glyphs,
+                    }],
+                    len: line_len,
+                }),
+                wrap_boundaries: SmallVec::new(),
+                wrap_width: None,
+            });
+            line_layouts.push(line_layout.clone());
+            lines.push(WrappedLine {
+                layout: line_layout,
+                text: SharedString::from("x".repeat(line_len)),
+                decoration_runs: Vec::new(),
+            });
+        }
+
+        let line_metrics = text_layout_line_metrics(&lines, line_height);
+        let len = line_lengths.iter().sum::<usize>() + line_lengths.len().saturating_sub(1);
+        *layout.0.borrow_mut() = Some(TextLayoutInner {
+            len,
+            lines,
+            line_metrics,
+            line_height,
+            wrap_width: None,
+            size: None,
+            bounds: Some(Bounds::new(
+                point(px(0.0), px(0.0)),
+                Size {
+                    width: px(line_lengths.iter().copied().max().unwrap_or_default() as f32),
+                    height: line_height * line_lengths.len(),
+                },
+            )),
+        });
+
+        (layout, line_layouts)
+    }
+
+    #[test]
+    fn text_layout_lookup_methods_handle_line_boundaries() {
+        let line_height = px(10.0);
+        let (layout, line_layouts) = build_text_layout_with_line_lengths(&[4, 3, 2], line_height);
+
+        assert_eq!(layout.len(), 11);
+        assert_eq!(layout.index_for_position(point(px(1.0), px(-0.1))), Err(0));
+        assert_eq!(layout.index_for_position(point(px(2.0), px(9.9))), Ok(2));
+        assert_eq!(layout.index_for_position(point(px(2.0), px(10.0))), Err(0));
+        assert_eq!(layout.index_for_position(point(px(2.0), px(10.1))), Ok(7));
+        assert_eq!(layout.index_for_position(point(px(1.0), px(31.0))), Err(11));
+
+        assert_eq!(layout.position_for_index(0), Some(point(px(0.0), px(0.0))));
+        assert_eq!(layout.position_for_index(4), Some(point(px(4.0), px(0.0))));
+        assert_eq!(layout.position_for_index(5), Some(point(px(0.0), px(10.0))));
+        assert_eq!(layout.position_for_index(8), Some(point(px(3.0), px(10.0))));
+        assert_eq!(layout.position_for_index(9), Some(point(px(0.0), px(20.0))));
+        assert_eq!(
+            layout.position_for_index(11),
+            Some(point(px(2.0), px(20.0)))
+        );
+        assert_eq!(layout.position_for_index(12), None);
+
+        assert!(Arc::ptr_eq(
+            &layout.line_layout_for_index(4).unwrap(),
+            &line_layouts[0]
+        ));
+        assert!(Arc::ptr_eq(
+            &layout.line_layout_for_index(5).unwrap(),
+            &line_layouts[1]
+        ));
+        assert!(Arc::ptr_eq(
+            &layout.line_layout_for_index(9).unwrap(),
+            &line_layouts[2]
+        ));
+        assert!(layout.line_layout_for_index(12).is_none());
+    }
+
+    #[test]
+    fn text_layout_lookup_methods_handle_empty_middle_line() {
+        let line_height = px(10.0);
+        let (layout, line_layouts) = build_text_layout_with_line_lengths(&[2, 0, 2], line_height);
+
+        assert_eq!(layout.len(), 6);
+        assert_eq!(layout.index_for_position(point(px(0.0), px(10.1))), Err(3));
+        assert_eq!(layout.position_for_index(2), Some(point(px(2.0), px(0.0))));
+        assert_eq!(layout.position_for_index(3), Some(point(px(0.0), px(10.0))));
+        assert_eq!(layout.position_for_index(4), Some(point(px(0.0), px(20.0))));
+        assert_eq!(layout.position_for_index(6), Some(point(px(2.0), px(20.0))));
+        assert_eq!(layout.position_for_index(7), None);
+
+        assert!(Arc::ptr_eq(
+            &layout.line_layout_for_index(3).unwrap(),
+            &line_layouts[1]
+        ));
+        assert!(Arc::ptr_eq(
+            &layout.line_layout_for_index(4).unwrap(),
+            &line_layouts[2]
+        ));
+    }
+
+    #[test]
+    fn compute_runs_preserves_default_gaps_and_adjacent_highlights() {
+        let text = "abcdef";
+        let default_style = TextStyle::default();
+        let bold: HighlightStyle = FontWeight::BOLD.into();
+        let red = HighlightStyle {
+            color: Some(crate::red()),
+            ..Default::default()
+        };
+
+        let runs = StyledText::compute_runs(
+            text,
+            &default_style,
+            vec![(1..3, bold), (3..4, red.clone())],
+        );
+
+        assert_eq!(runs.len(), 4);
+        assert_eq!(runs[0], default_style.to_run(1));
+        assert_eq!(runs[1], default_style.clone().highlight(bold).to_run(2));
+        assert_eq!(runs[2], default_style.clone().highlight(red).to_run(1));
+        assert_eq!(runs[3], default_style.to_run(2));
+        assert_eq!(runs.iter().map(|run| run.len).sum::<usize>(), text.len());
+
+        let empty_runs = StyledText::compute_runs("", &default_style, Vec::new());
+        assert!(empty_runs.is_empty());
+
+        let default_only = StyledText::compute_runs("abc", &default_style, Vec::new());
+        assert_eq!(default_only, vec![default_style.to_run(3)]);
+
+        let all_highlighted =
+            StyledText::compute_runs("abc", &default_style, vec![(0..3, FontWeight::BOLD.into())]);
+        assert_eq!(all_highlighted.len(), 1);
+        assert_eq!(
+            all_highlighted[0],
+            default_style.highlight(FontWeight::BOLD).to_run(3)
+        );
+    }
+
+    #[perf(important)]
+    fn perf_text_layout_position_lookups_many_lines() {
+        const LINE_COUNT: usize = 4_096;
+        const LINE_LEN: usize = 64;
+
+        let layout = build_many_line_text_layout(LINE_COUNT, LINE_LEN);
+        let mut checksum = 0usize;
+        let mut total_x = px(0.0);
+
+        for line_ix in (0..LINE_COUNT).step_by(7) {
+            let y = px(line_ix as f32 * 16.0 + 4.0);
+            checksum ^= layout
+                .index_for_position(point(px(10.25), y))
+                .unwrap_or_else(|index| index);
+
+            let index = line_ix * (LINE_LEN + 1) + LINE_LEN / 2;
+            if let Some(position) = layout.position_for_index(index) {
+                total_x += position.x;
+            }
+            if let Some(line) = layout.line_layout_for_index(index) {
+                checksum ^= line.len();
+            }
+        }
+
+        black_box(checksum);
+        black_box(total_x);
     }
 }

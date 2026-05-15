@@ -4,10 +4,8 @@ use std::{
     mem::ManuallyDrop,
 };
 
-use ::util::{ResultExt, maybe};
-use anyhow::{Context, Result};
-use collections::HashMap;
-use parking_lot::{RwLock, RwLockUpgradableReadGuard};
+use crate::collections::HashMap;
+use crate::util::{ResultExt, maybe};
 use ::windows::{
     Win32::{
         Foundation::*,
@@ -21,10 +19,12 @@ use ::windows::{
     },
     core::*,
 };
+use anyhow::{Context, Result};
+use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use windows_numerics::Vector2;
 
-use super::{DirectXDevices, DirectXRenderer, try_to_recover_from_device_lost};
 use super::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
+use super::{DirectXDevices, DirectXRenderer, try_to_recover_from_device_lost};
 use gpui::*;
 
 #[derive(Debug)]

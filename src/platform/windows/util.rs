@@ -1,14 +1,12 @@
 use std::sync::OnceLock;
 
-use ::util::ResultExt;
+use crate::util::ResultExt;
 use ::windows::{
     UI::{
         Color,
         ViewManagement::{UIColorType, UISettings},
     },
-    Win32::{
-        Foundation::*, Graphics::Dwm::*, UI::WindowsAndMessaging::*,
-    },
+    Win32::{Foundation::*, Graphics::Dwm::*, UI::WindowsAndMessaging::*},
     core::BOOL,
 };
 
