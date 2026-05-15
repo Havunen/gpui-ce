@@ -4,8 +4,7 @@ use std::{
 };
 
 use crate::util::ResultExt;
-use anyhow::{Context, Result};
-use windows::{
+use ::windows::{
     Win32::{
         Foundation::HWND,
         Graphics::{
@@ -18,6 +17,7 @@ use windows::{
     },
     core::Interface,
 };
+use anyhow::{Context, Result};
 
 use self::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
 use super::{DirectXAtlas, DirectXDevices, try_to_recover_from_device_lost};
@@ -1574,7 +1574,7 @@ pub(crate) mod shader_resources {
     use anyhow::Result;
 
     #[cfg(debug_assertions)]
-    use windows::{
+    use ::windows::{
         Win32::Graphics::Direct3D::{
             Fxc::{D3DCOMPILE_DEBUG, D3DCOMPILE_SKIP_OPTIMIZATION, D3DCompileFromFile},
             ID3DBlob,
@@ -1678,7 +1678,7 @@ pub(crate) mod shader_resources {
     #[cfg(debug_assertions)]
     pub(super) fn build_shader_blob(entry: ShaderModule, target: ShaderTarget) -> Result<ID3DBlob> {
         unsafe {
-            use windows::Win32::Graphics::{
+            use ::windows::Win32::Graphics::{
                 Direct3D::ID3DInclude, Hlsl::D3D_COMPILE_STANDARD_FILE_INCLUDE,
             };
 
@@ -1764,7 +1764,7 @@ pub(crate) mod shader_resources {
 }
 
 mod dxgi {
-    use windows::{
+    use ::windows::{
         Win32::Graphics::Dxgi::{IDXGIAdapter1, IDXGIDevice},
         core::Interface,
     };

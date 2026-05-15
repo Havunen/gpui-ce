@@ -6,9 +6,7 @@ use std::{
 
 use crate::collections::HashMap;
 use crate::util::{ResultExt, maybe};
-use anyhow::{Context, Result};
-use parking_lot::{RwLock, RwLockUpgradableReadGuard};
-use windows::{
+use ::windows::{
     Win32::{
         Foundation::*,
         Globalization::GetUserDefaultLocaleName,
@@ -21,6 +19,8 @@ use windows::{
     },
     core::*,
 };
+use anyhow::{Context, Result};
+use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use windows_numerics::Vector2;
 
 use super::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};

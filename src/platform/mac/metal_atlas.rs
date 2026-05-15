@@ -68,7 +68,7 @@ impl PlatformAtlas for MetalAtlas {
         };
         let id = tile.texture_id;
 
-        let mut freed_texture = false;
+        let mut deallocated_tile = false;
         {
             let textures = match id.kind {
                 AtlasTextureKind::Monochrome => &mut lock.monochrome_textures,
@@ -86,18 +86,18 @@ impl PlatformAtlas for MetalAtlas {
 
             if let Some(mut texture) = texture_slot.take() {
                 texture.allocator.deallocate(tile.tile_id.into());
+                deallocated_tile = true;
                 texture.decrement_ref_count();
 
                 if texture.is_unreferenced() {
                     textures.free_list.push(id.index as usize);
-                    freed_texture = true;
                 } else {
                     *texture_slot = Some(texture);
                 }
             }
         }
 
-        if freed_texture {
+        if deallocated_tile {
             lock.generation = lock.generation.wrapping_add(1);
         }
     }
@@ -343,6 +343,44 @@ mod tests {
 
         let tile_a2 = insert_tile(&atlas, &key_a, small);
         let _texture = atlas.metal_texture(tile_a2.texture_id);
+    }
+
+    #[test]
+    fn test_remove_bumps_generation_for_tile_in_live_texture() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+
+        let large = Size {
+            width: DevicePixels(1024),
+            height: DevicePixels(512),
+        };
+        let small = Size {
+            width: DevicePixels(1),
+            height: DevicePixels(1),
+        };
+
+        let key_a = make_image_key(1, 0);
+        let key_b = make_image_key(2, 0);
+        let key_c = make_image_key(3, 0);
+
+        let tile_a = insert_tile(&atlas, &key_a, large);
+        let tile_b = insert_tile(&atlas, &key_b, small);
+        assert_eq!(tile_a.texture_id, tile_b.texture_id);
+
+        let generation_before_remove = atlas.generation();
+        atlas.remove(&key_a);
+        assert_eq!(
+            atlas.generation(),
+            generation_before_remove.wrapping_add(1),
+            "removing a tile from a live texture should invalidate cached atlas generations"
+        );
+
+        let tile_c = insert_tile(&atlas, &key_c, large);
+        assert_eq!(
+            tile_c.texture_id, tile_a.texture_id,
+            "removed tile space should be reused before allocating another texture"
+        );
     }
 
     #[test]

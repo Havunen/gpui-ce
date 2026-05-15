@@ -1,8 +1,7 @@
 use std::rc::Rc;
 
 use crate::util::ResultExt;
-use anyhow::Context as _;
-use windows::{
+use ::windows::{
     Win32::{
         Foundation::*,
         Graphics::Gdi::*,
@@ -16,6 +15,7 @@ use windows::{
     },
     core::PCWSTR,
 };
+use anyhow::Context as _;
 
 use super::{
     DirectXDevices, HiLoWord, WindowsDispatcher, WindowsDisplay, WindowsWindowInner,

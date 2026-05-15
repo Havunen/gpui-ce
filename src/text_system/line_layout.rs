@@ -748,18 +748,23 @@ fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
     let mut glyph_pos: usize = 0;
     let mut last_base_shaped_x = px(f32::NEG_INFINITY);
     let mut last_base_actual_x = px(0.);
+    let mut last_base_index = None;
 
     for run in layout.runs.iter_mut() {
         for glyph in run.glyphs.iter_mut() {
             let shaped_x = glyph.position.x;
+            let shaped_x_advanced = shaped_x > last_base_shaped_x;
+            let starts_new_cluster = last_base_index != Some(glyph.index);
+            let advanced_far_enough = shaped_x > last_base_shaped_x + force_width * 0.5;
 
-            if shaped_x > last_base_shaped_x + force_width * 0.5 {
+            if shaped_x_advanced && (starts_new_cluster || advanced_far_enough) {
                 let forced_x = glyph_pos * force_width;
                 if (shaped_x - forced_x).abs() > px(1.) {
                     glyph.position.x = forced_x;
                 }
                 last_base_shaped_x = shaped_x;
                 last_base_actual_x = glyph.position.x;
+                last_base_index = Some(glyph.index);
                 glyph_pos += 1;
             } else {
                 glyph.position.x = last_base_actual_x + (shaped_x - last_base_shaped_x);
@@ -1259,6 +1264,26 @@ mod tests {
         apply_force_width_to_layout(&mut layout, cell_width);
 
         assert_eq!(glyph_x_positions(&layout), vec![0., 8., 16.]);
+    }
+
+    #[test]
+    fn test_force_width_advances_narrow_base_glyphs() {
+        let cell_width = px(8.);
+        let mut layout = make_layout(vec![glyph_at(0., 0), glyph_at(3., 1), glyph_at(6., 2)]);
+
+        apply_force_width_to_layout(&mut layout, cell_width);
+
+        assert_eq!(glyph_x_positions(&layout), vec![0., 8., 16.]);
+    }
+
+    #[test]
+    fn test_force_width_same_cluster_glyph_offsets_not_advanced() {
+        let cell_width = px(8.);
+        let mut layout = make_layout(vec![glyph_at(0., 0), glyph_at(3., 0), glyph_at(8., 3)]);
+
+        apply_force_width_to_layout(&mut layout, cell_width);
+
+        assert_eq!(glyph_x_positions(&layout), vec![0., 3., 8.]);
     }
 
     #[test]
