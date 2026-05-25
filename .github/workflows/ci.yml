@@ -73,7 +73,7 @@ jobs:
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: v1-rust
+          prefix-key: v2-rust-${{ matrix.runner }}-${{ matrix.target }}
           cache-bin: false
 
       - name: Install Linux system dependencies
@@ -162,7 +162,7 @@ jobs:
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: v1-rust
+          prefix-key: v2-rust-container-ubuntu-${{ matrix.ubuntu_version }}-x86_64-unknown-linux-gnu
           cache-bin: false
 
       - name: Build workspace
@@ -224,7 +224,7 @@ jobs:
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: v1-rust
+          prefix-key: v2-rust-${{ matrix.runner }}-${{ matrix.target }}
           cache-bin: false
 
       - name: Install Linux system dependencies
