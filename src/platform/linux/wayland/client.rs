@@ -1,7 +1,7 @@
 use std::{
     cell::{RefCell, RefMut},
     hash::Hash,
-    os::fd::{AsRawFd, BorrowedFd},
+    os::fd::{AsRawFd, BorrowedFd, OwnedFd},
     path::PathBuf,
     rc::{Rc, Weak},
     time::{Duration, Instant},
@@ -107,6 +107,59 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::{
 const MIN_KEYCODE: u32 = 8;
 
 const UNKNOWN_KEYBOARD_LAYOUT_NAME: SharedString = SharedString::new_static("unknown");
+
+#[derive(Debug)]
+enum WaylandKeymapError {
+    Map(std::io::Error),
+    Compile,
+}
+
+fn load_wayland_keymap(
+    xkb_context: &xkb::Context,
+    fd: OwnedFd,
+    size: usize,
+) -> Result<xkb::Keymap, WaylandKeymapError> {
+    let keymap = unsafe {
+        xkb::Keymap::new_from_fd(
+            xkb_context,
+            fd,
+            size,
+            XKB_KEYMAP_FORMAT_TEXT_V1,
+            KEYMAP_COMPILE_NO_FLAGS,
+        )
+    }
+    .map_err(WaylandKeymapError::Map)?;
+
+    keymap.ok_or(WaylandKeymapError::Compile)
+}
+
+fn log_wayland_keymap_error(error: WaylandKeymapError, size: usize) {
+    match error {
+        WaylandKeymapError::Map(error) => {
+            log::error!("Failed to map Wayland XKB keymap (size {size} bytes): {error}");
+        }
+        WaylandKeymapError::Compile => {
+            log::error!("Failed to compile Wayland XKB keymap (size {size} bytes)");
+        }
+    }
+}
+
+fn reset_wayland_keyboard_keymap_state(
+    state: &mut WaylandClientState,
+) -> Option<WaylandWindowStatePtr> {
+    state.keymap_state = None;
+    state.compose_state = None;
+    state.repeat.current_id += 1;
+    state.repeat.current_keycode = None;
+    state.modifiers = Modifiers::default();
+    state.capslock = Capslock::default();
+
+    if state.pre_edit_text.take().is_some() {
+        state.keyboard_focused_window.clone()
+    } else {
+        None
+    }
+}
 
 #[derive(Clone)]
 pub struct Globals {
@@ -1369,20 +1422,26 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
             } => {
                 if format != wl_keyboard::KeymapFormat::XkbV1 {
                     log::error!("Received keymap format {:?}, expected XkbV1", format);
+                    let clear_marked_text_window = reset_wayland_keyboard_keymap_state(&mut state);
+                    drop(state);
+                    if let Some(window) = clear_marked_text_window {
+                        window.handle_ime(ImeInput::DeleteText);
+                    }
                     return;
                 }
                 let xkb_context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-                let keymap = unsafe {
-                    xkb::Keymap::new_from_fd(
-                        &xkb_context,
-                        fd,
-                        size as usize,
-                        XKB_KEYMAP_FORMAT_TEXT_V1,
-                        KEYMAP_COMPILE_NO_FLAGS,
-                    )
-                    .log_err()
-                    .flatten()
-                    .expect("Failed to create keymap")
+                let keymap = match load_wayland_keymap(&xkb_context, fd, size as usize) {
+                    Ok(keymap) => keymap,
+                    Err(error) => {
+                        log_wayland_keymap_error(error, size as usize);
+                        let clear_marked_text_window =
+                            reset_wayland_keyboard_keymap_state(&mut state);
+                        drop(state);
+                        if let Some(window) = clear_marked_text_window {
+                            window.handle_ime(ImeInput::DeleteText);
+                        }
+                        return;
+                    }
                 };
                 state.keymap_state = Some(xkb::State::new(&keymap));
                 state.compose_state = get_xkb_compose_state(&xkb_context);
@@ -1425,13 +1484,17 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
             } => {
                 let focused_window = state.keyboard_focused_window.clone();
 
-                let keymap_state = state.keymap_state.as_mut().unwrap();
+                let Some(keymap_state) = state.keymap_state.as_mut() else {
+                    log::debug!("Ignoring Wayland keyboard modifiers event without a keymap");
+                    return;
+                };
                 let old_layout =
                     keymap_state.serialize_layout(xkbcommon::xkb::STATE_LAYOUT_EFFECTIVE);
                 keymap_state.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
-                state.modifiers = modifiers_from_xkb(keymap_state);
-                let keymap_state = state.keymap_state.as_mut().unwrap();
-                state.capslock = capslock_from_xkb(keymap_state);
+                let modifiers = modifiers_from_xkb(keymap_state);
+                let capslock = capslock_from_xkb(keymap_state);
+                state.modifiers = modifiers;
+                state.capslock = capslock;
 
                 let input = PlatformInput::ModifiersChanged(ModifiersChangedEvent {
                     modifiers: state.modifiers,
@@ -1460,7 +1523,10 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                     return;
                 };
 
-                let keymap_state = state.keymap_state.as_ref().unwrap();
+                let Some(keymap_state) = state.keymap_state.as_ref() else {
+                    log::debug!("Ignoring Wayland keyboard key event without a keymap");
+                    return;
+                };
                 let keycode = Keycode::from(key + MIN_KEYCODE);
                 let keysym = keymap_state.key_get_one_sym(keycode);
 
@@ -2457,5 +2523,98 @@ impl Dispatch<XdgDialogV1, ()> for WaylandClientStatePtr {
         _conn: &Connection,
         _qhandle: &QueueHandle<Self>,
     ) {
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        fs::{self, OpenOptions},
+        io::Write as _,
+        os::fd::OwnedFd,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn keymap_fd(contents: &[u8]) -> OwnedFd {
+        let path = temp_keymap_path();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("failed to create temporary keymap file");
+        file.write_all(contents)
+            .expect("failed to write temporary keymap file");
+        file.flush().expect("failed to flush temporary keymap file");
+        fs::remove_file(path).expect("failed to unlink temporary keymap file");
+        file.into()
+    }
+
+    fn temp_keymap_path() -> PathBuf {
+        let id = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "gpui-wayland-keymap-test-{}-{id}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn invalid_wayland_keymap_returns_compile_error() {
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let contents = b"not a valid xkb keymap";
+        let result = load_wayland_keymap(&context, keymap_fd(contents), contents.len());
+
+        match result {
+            Err(WaylandKeymapError::Compile) => {}
+            Err(error) => panic!("expected compile error, got {error:?}"),
+            Ok(_) => panic!("expected invalid keymap to fail"),
+        }
+    }
+
+    #[test]
+    fn zero_sized_wayland_keymap_returns_compile_error() {
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let result = load_wayland_keymap(&context, keymap_fd(b"ignored"), 0);
+
+        match result {
+            Err(WaylandKeymapError::Compile) => {}
+            Err(error) => panic!("expected compile error, got {error:?}"),
+            Ok(_) => panic!("expected zero-sized keymap to fail"),
+        }
+    }
+
+    #[test]
+    fn valid_wayland_keymap_loads_from_fd() {
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let keymap = xkb::Keymap::new_from_names(
+            &context,
+            "",
+            "pc105",
+            "us",
+            "",
+            None,
+            KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .expect("failed to create test keymap");
+        let keymap_text = keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
+
+        let loaded_keymap = match load_wayland_keymap(
+            &context,
+            keymap_fd(keymap_text.as_bytes()),
+            keymap_text.len(),
+        ) {
+            Ok(keymap) => keymap,
+            Err(error) => panic!("expected valid keymap to load, got {error:?}"),
+        };
+        let state = xkb::State::new(&loaded_keymap);
+        let keycode = loaded_keymap
+            .key_by_name("AE01")
+            .expect("expected AE01 in test keymap");
+
+        assert_eq!(state.key_get_utf8(keycode), "1");
     }
 }
