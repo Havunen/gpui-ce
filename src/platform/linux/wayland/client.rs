@@ -2576,13 +2576,13 @@ mod tests {
     }
 
     #[test]
-    fn zero_sized_wayland_keymap_returns_map_error() {
+    fn zero_sized_wayland_keymap_returns_compile_error() {
         let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
         let result = load_wayland_keymap(&context, keymap_fd(b"ignored"), 0);
 
         match result {
-            Err(WaylandKeymapError::Map(_)) => {}
-            Err(error) => panic!("expected map error, got {error:?}"),
+            Err(WaylandKeymapError::Compile) => {}
+            Err(error) => panic!("expected compile error, got {error:?}"),
             Ok(_) => panic!("expected zero-sized keymap to fail"),
         }
     }
