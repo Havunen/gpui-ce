@@ -89,7 +89,7 @@ futures = "0.3"
 futures-concurrency = "7"
 gpui-ce-macros = { path = "./tooling/macros", features = ["inspector"] }
 heapless = "0.9"
-http_client = { package = "http-client-gpui-unofficial", version = "1.2.3" }
+http_client = { package = "http-client-gpui-unofficial", version = "1.2.7" }
 image = "0.25"
 indexmap = "2.14"
 inventory = "0.3"
@@ -122,7 +122,7 @@ serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 slotmap = "1"
 smallvec = { version = "1", features = ["union"] }
 smol = "2"
-spin = "0.10"
+spin = "0.12"
 stacksafe = "1"
 strum = { version = "0.28", features = ["derive"] }
 taffy = "0.10"
@@ -166,7 +166,7 @@ oo7 = { version = "0.6", default-features = false, features = [
     "async-std",
     "native_crypto",
 ] }
-wgpu = "29"
+wgpu = { git = "https://github.com/zed-industries/wgpu.git", rev = "357a0c56e0070480ad9daea5d2eaa83150b79e88" }
 cosmic-text = "0.19"
 swash = "0.2"
 bytemuck = "1"
@@ -279,7 +279,7 @@ windows-registry = "0.6"
 [dev-dependencies]
 backtrace = "0.3"
 env_logger = "0.11"
-http_client = { package = "http-client-gpui-unofficial", version = "1.2.3", features = ["test-support"] }
+http_client = { package = "http-client-gpui-unofficial", version = "1.2.7", features = ["test-support"] }
 lyon = { version = "1", features = ["extra"] }
 proptest = "1"
 rand = "0.10"
