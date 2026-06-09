@@ -3,12 +3,12 @@
 //! Common helpers for GPUI examples. Import with:
 //!
 //! ```ignore
-//! #[path = "../prelude.rs"]
+//! #[path = "../example_prelude.rs"]
 //! mod example_prelude;
 //! use example_prelude::init_example;
 //! ```
 
-use gpui::{actions, App, KeyBinding, Menu, MenuItem, SharedString};
+use gpui::{App, KeyBinding, Menu, MenuItem, SharedString, actions};
 
 actions!(example, [Quit, CloseWindow]);
 

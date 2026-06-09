@@ -9,13 +9,16 @@
 
 use gpui::colors::Colors;
 use gpui::{
-    canvas, div, fill, point, prelude::*, px, rgb, size, App, Application, Bounds, Context, Hsla,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Path, PathBuilder, Pixels, Point,
-    Render, Rgba, Window, WindowBounds, WindowOptions,
+    App, Application, Bounds, Context, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Path, PathBuilder, Pixels, Point, Render, Rgba, Window, WindowBounds,
+    WindowOptions, canvas, div, fill, point, prelude::*, px, rgb, size,
 };
+use gpui_platform;
 
-#[path = "../prelude.rs"]
-mod example_prelude;
+#[path = "../common/mod.rs"]
+mod common;
+
+use common::init_example;
 
 // Example 1: Basic Canvas Drawing
 //
@@ -475,6 +478,6 @@ fn main() {
         )
         .expect("Failed to open window");
 
-        example_prelude::init_example(cx, "Custom Drawing");
+        init_example(cx, "Custom Drawing");
     });
 }

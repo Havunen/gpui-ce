@@ -7,17 +7,20 @@
 //! 3. Transformations - rotate, scale, translate
 //! 4. Repeating and duration controls
 
-#[path = "../prelude.rs"]
-mod example_prelude;
+#[path = "../common/mod.rs"]
+mod common;
 
+use common::init_example;
+
+use gpui_platform;
 use std::time::Duration;
 
 use anyhow::Result;
 use gpui::colors::Colors;
 use gpui::{
-    bounce, div, ease_in_out, linear, percentage, prelude::*, px, rgb, size as gpui_size, svg,
     Animation, AnimationExt as _, App, Application, AssetSource, Bounds, Context, Hsla,
-    SharedString, Transformation, Window, WindowBounds, WindowOptions,
+    SharedString, Transformation, Window, WindowBounds, WindowOptions, bounce, div, ease_in_out,
+    linear, percentage, prelude::*, px, rgb, size as gpui_size, svg,
 };
 
 struct Assets {}
@@ -274,6 +277,6 @@ fn main() {
             )
             .expect("Failed to open window");
 
-            example_prelude::init_example(cx, "Animation");
+            init_example(cx, "Animation");
         });
 }

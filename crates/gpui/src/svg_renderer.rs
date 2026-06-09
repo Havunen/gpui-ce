@@ -267,34 +267,16 @@ fn load_bundled_fonts(asset_source: &dyn AssetSource, db: &mut usvg::fontdb::Dat
 // fontdb defaults generic families to Microsoft fonts ("Arial", "Times New Roman")
 // which aren't installed on most Linux systems. fontconfig normally overrides these,
 // but when it fails the defaults remain and all generic family queries return None.
+// We always set the generic families to our bundled fonts to ensure consistent
+// rendering across platforms.
 fn fix_generic_font_families(db: &mut usvg::fontdb::Database) {
-    use usvg::fontdb::{Family, Query};
-
-    let families_and_fallbacks: &[(Family<'_>, &str)] = &[
-        (Family::SansSerif, "IBM Plex Sans"),
-        // No serif font bundled; use sans-serif as best available fallback.
-        (Family::Serif, "IBM Plex Sans"),
-        (Family::Monospace, "Lilex"),
-        (Family::Cursive, "IBM Plex Sans"),
-        (Family::Fantasy, "IBM Plex Sans"),
-    ];
-
-    for (family, fallback_name) in families_and_fallbacks {
-        let query = Query {
-            families: &[*family],
-            ..Default::default()
-        };
-        if db.query(&query).is_none() {
-            match family {
-                Family::SansSerif => db.set_sans_serif_family(*fallback_name),
-                Family::Serif => db.set_serif_family(*fallback_name),
-                Family::Monospace => db.set_monospace_family(*fallback_name),
-                Family::Cursive => db.set_cursive_family(*fallback_name),
-                Family::Fantasy => db.set_fantasy_family(*fallback_name),
-                _ => {}
-            }
-        }
-    }
+    // Always use our bundled fonts for generic families, overriding any system defaults
+    db.set_sans_serif_family("IBM Plex Sans");
+    // No serif font bundled; use sans-serif as best available fallback.
+    db.set_serif_family("IBM Plex Sans");
+    db.set_monospace_family("Lilex");
+    db.set_cursive_family("IBM Plex Sans");
+    db.set_fantasy_family("IBM Plex Sans");
 }
 
 #[cfg(all(test, feature = "font-kit"))]
@@ -303,8 +285,8 @@ mod tests {
     use usvg::fontdb::{Database, Family, Query};
 
     const IBM_PLEX_REGULAR: &[u8] =
-        include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
-    const LILEX_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf");
+        include_bytes!("../tests/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
+    const LILEX_REGULAR: &[u8] = include_bytes!("../tests/fonts/lilex/Lilex-Regular.ttf");
 
     fn db_with_bundled_fonts() -> Database {
         let mut db = Database::new();

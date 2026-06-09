@@ -7,15 +7,16 @@
 //! 2. `RenderOnce` - Stateless component that receives state from parent
 //! 3. `Render` - Entity-backed view with persistent internal state
 
-#[path = "../prelude.rs"]
-mod example_prelude;
+#[path = "../common/mod.rs"]
+mod common;
 
-use example_prelude::init_example;
+use common::init_example;
 use gpui::colors::Colors;
 use gpui::{
-    div, prelude::*, px, rgb, size, App, Application, Bounds, Context, Entity, IntoElement, Render,
-    RenderOnce, Window, WindowBounds, WindowOptions,
+    App, Application, Bounds, Context, Entity, IntoElement, Render, RenderOnce, Window,
+    WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
 };
+use gpui_platform;
 
 // ============================================================================
 // Approach 1: use_state

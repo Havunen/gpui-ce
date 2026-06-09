@@ -7,15 +7,18 @@
 //! 3. Task management - Storing, canceling, and detaching tasks
 //! 4. Progress updates - Communicating from background to UI
 
-#[path = "../prelude.rs"]
-mod example_prelude;
+#[path = "../common/mod.rs"]
+mod common;
 
+use common::init_example;
+
+use gpui_platform;
 use std::time::Duration;
 
 use gpui::colors::Colors;
 use gpui::{
-    div, prelude::*, px, rgb, size, App, Application, Bounds, Context, Entity, Render, Task,
-    Window, WindowBounds, WindowOptions,
+    App, Application, Bounds, Context, Entity, Render, Task, Window, WindowBounds, WindowOptions,
+    div, prelude::*, px, rgb, size,
 };
 
 // Example 1: Simple Foreground Task
@@ -138,22 +141,24 @@ impl CancellableTaskDemo {
             self.counting_task = None;
             cx.notify();
         } else {
-            self.counting_task = Some(cx.spawn(async move |this, cx| loop {
-                cx.background_spawn(async {
-                    std::thread::sleep(Duration::from_millis(100));
-                })
-                .await;
-
-                let should_continue = this
-                    .update(cx, |this, cx| {
-                        this.counter += 1;
-                        cx.notify();
-                        true
+            self.counting_task = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_spawn(async {
+                        std::thread::sleep(Duration::from_millis(100));
                     })
-                    .unwrap_or(false);
+                    .await;
 
-                if !should_continue {
-                    break;
+                    let should_continue = this
+                        .update(cx, |this, cx| {
+                            this.counter += 1;
+                            cx.notify();
+                            true
+                        })
+                        .unwrap_or(false);
+
+                    if !should_continue {
+                        break;
+                    }
                 }
             }));
             cx.notify();
@@ -555,6 +560,6 @@ fn main() {
         )
         .expect("Failed to open window");
 
-        example_prelude::init_example(cx, "Async Tasks");
+        init_example(cx, "Async Tasks");
     });
 }

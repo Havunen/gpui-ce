@@ -27,9 +27,9 @@ use crate::util::debug_panic;
 pub use async_context::*;
 pub use context::*;
 pub use entity_map::*;
+use gpui_util::ResultExt;
 #[cfg(any(test, feature = "test-support"))]
 pub use headless_app_context::*;
-use gpui_util::ResultExt;
 use http_client::{HttpClient, Url};
 use smallvec::SmallVec;
 #[cfg(any(test, feature = "test-support"))]

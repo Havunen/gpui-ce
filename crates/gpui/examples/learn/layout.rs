@@ -6,15 +6,16 @@
 //! 2. Grid - Two-dimensional layouts with spans
 //! 3. Common patterns - Sidebar, header/footer, centering
 
-#[path = "../prelude.rs"]
-mod example_prelude;
+#[path = "../common/mod.rs"]
+mod common;
 
-use example_prelude::init_example;
+use common::init_example;
 use gpui::colors::Colors;
 use gpui::{
-    div, prelude::*, px, size, App, Application, Bounds, Context, Div, Hsla, Render, Rgba, Window,
-    WindowBounds, WindowOptions,
+    App, Application, Bounds, Context, Div, Hsla, Render, Rgba, Window, WindowBounds,
+    WindowOptions, div, prelude::*, px, size,
 };
+use gpui_platform;
 
 // Helper: Colored block for visualization
 
@@ -484,7 +485,7 @@ fn section(colors: &Colors, title: &'static str, content: impl IntoElement) -> i
 }
 
 fn main() {
-    gpui_platform::application().run(|cx| {
+    gpui_platform::application().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(650.), px(700.)), cx);
         cx.open_window(
             WindowOptions {

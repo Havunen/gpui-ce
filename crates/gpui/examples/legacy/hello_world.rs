@@ -1,7 +1,8 @@
 use gpui::{
-    div, prelude::*, px, rgb, size, App, Application, Bounds, Context, SharedString, Window,
-    WindowBounds, WindowOptions,
+    App, Bounds, Context, SharedString, Window, WindowBounds, WindowOptions, div, prelude::*, px,
+    rgb, size,
 };
+use gpui_platform;
 
 struct HelloWorld {
     text: SharedString,

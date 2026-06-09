@@ -1,9 +1,10 @@
+use gpui_platform;
 use std::{fs, path::PathBuf};
 
 use anyhow::Result;
 use gpui::{
-    div, hsla, img, point, prelude::*, px, rgb, size, svg, App, Application, AssetSource, Bounds,
-    BoxShadow, ClickEvent, Context, SharedString, Task, Window, WindowBounds, WindowOptions,
+    App, Application, AssetSource, Bounds, BoxShadow, ClickEvent, Context, SharedString, Task,
+    Window, WindowBounds, WindowOptions, div, hsla, img, point, prelude::*, px, rgb, size, svg,
 };
 
 struct Assets {
@@ -115,6 +116,7 @@ impl Render for HelloWorld {
                                 color: hsla(0.0, 0.0, 0.0, 0.5),
                                 blur_radius: px(1.0),
                                 spread_radius: px(5.0),
+                                inset: false,
                                 offset: point(px(10.0), px(10.0)),
                             }])
                             .child(img("image/app-icon.png").size_8())

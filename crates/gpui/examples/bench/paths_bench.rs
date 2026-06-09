@@ -1,8 +1,9 @@
 use gpui::{
-    canvas, div, linear_color_stop, linear_gradient, point, prelude::*, px, rgb, size, Application,
     Background, Bounds, ColorSpace, Context, Path, PathBuilder, Pixels, Render, TitlebarOptions,
-    Window, WindowBounds, WindowOptions,
+    Window, WindowBounds, WindowOptions, canvas, div, linear_color_stop, linear_gradient, point,
+    prelude::*, px, rgb, size,
 };
+use gpui_platform;
 
 const DEFAULT_WINDOW_WIDTH: Pixels = px(1024.0);
 const DEFAULT_WINDOW_HEIGHT: Pixels = px(768.0);

@@ -18,7 +18,6 @@ mod vsync;
 mod window;
 mod wrapper;
 
-pub(crate) use gpui::collections;
 pub(crate) use self::util::*;
 pub(crate) use clipboard::*;
 pub(crate) use destination_list::*;
@@ -29,6 +28,7 @@ pub(crate) use directx_renderer::*;
 pub(crate) use dispatcher::*;
 pub(crate) use display::*;
 pub(crate) use events::*;
+pub(crate) use gpui::collections;
 pub(crate) use keyboard::*;
 pub(crate) use platform::*;
 pub(crate) use system_settings::*;

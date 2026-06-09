@@ -1,3 +1,4 @@
+use gpui_platform;
 use std::ops::Range;
 
 use gpui::{

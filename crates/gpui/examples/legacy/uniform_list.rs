@@ -1,7 +1,8 @@
 use gpui::{
-    div, prelude::*, px, rgb, size, uniform_list, App, Application, Bounds, Context, Window,
-    WindowBounds, WindowOptions,
+    App, Bounds, Context, Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
+    uniform_list,
 };
+use gpui_platform;
 
 struct UniformListExample {}
 
