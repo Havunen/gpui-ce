@@ -47,14 +47,14 @@ doctest = false
 [dependencies]
 accesskit.workspace = true
 anyhow.workspace = true
-async-task = "4.7"
+async-task.workspace = true
 backtrace = { workspace = true, optional = true }
 bitflags = { workspace = true, optional = true }
 
 collections.workspace = true
 ctor.workspace = true
 derive_more.workspace = true
-etagere = "0.3"
+etagere.workspace = true
 futures.workspace = true
 futures-concurrency.workspace = true
 gpui_macros.workspace = true
@@ -64,29 +64,28 @@ image.workspace = true
 inventory.workspace = true
 itertools.workspace = true
 log.workspace = true
-num_cpus = "1.17"
-parking = "2.2.1"
+num_cpus.workspace = true
+parking.workspace = true
 parking_lot.workspace = true
 postage.workspace = true
 proptest = { workspace = true, optional = true }
 chrono.workspace = true
 profiling.workspace = true
 rand.workspace = true
-raw-window-handle = "0.6"
+raw-window-handle.workspace = true
 regex.workspace = true
 refineable.workspace = true
 scheduler.workspace = true
-resvg = { version = "0.47.0", default-features = false, features = [
+resvg = { workspace = true, default-features = false, features = [
     "text",
     "system-fonts",
     "memmap-fonts",
     "raster-images"
 ] }
-usvg = { version = "0.47.0", default-features = false }
-ttf-parser = "0.25"
-util_macros.workspace = true
+usvg = { workspace = true, default-features = false }
+ttf-parser.workspace = true
 schemars.workspace = true
-seahash = "4.1"
+seahash.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 slotmap.workspace = true
@@ -95,46 +94,46 @@ async-channel.workspace = true
 stacksafe.workspace = true
 strum.workspace = true
 sum_tree.workspace = true
-taffy = "=0.10.1"
+taffy.workspace = true
 thiserror.workspace = true
 gpui_util.workspace = true
 hdrhistogram = { workspace = true, optional = true }
-waker-fn = "1.2.0"
-lyon = "1.0"
-pin-project = "1.1.13"
-spin = "0.12.0"
+waker-fn.workspace = true
+lyon.workspace = true
+pin-project.workspace = true
+spin.workspace = true
 pollster.workspace = true
 url.workspace = true
 uuid.workspace = true
 web-time.workspace = true
 
 [target.'cfg(target_family = "wasm")'.dependencies]
-getrandom = { version = "0.4.2", features = ["wasm_js"] }
+getrandom = { workspace = true, features = ["wasm_js"] }
 uuid = { workspace = true, features = ["js"] }
 
 
 [target.'cfg(target_os = "macos")'.dependencies]
-block = "0.1"
+block.workspace = true
 cocoa.workspace = true
 cocoa-foundation.workspace = true
 core-foundation.workspace = true
 core-foundation-sys.workspace = true
-core-graphics = "0.25"
+core-graphics.workspace = true
 core-video.workspace = true
-core-text = "22"
-font-kit = { git = "https://github.com/Havunen/font-kit", rev = "cc6f86949e40ef3a5e9b2063f8127cdcb72d7ac4", package = "font-kit", version = "0.14.3-1", optional = true, features = ["freetype-bundled"] }
-foreign-types = "0.5"
+core-text.workspace = true
+font-kit = { workspace = true, optional = true, features = ["freetype-bundled"] }
+foreign-types.workspace = true
 log.workspace = true
 media.workspace = true
 objc.workspace = true
-objc2 = { version = "0.6", optional = true }
-objc2-metal = { version = "0.3", optional = true }
+objc2 = { workspace = true, optional = true }
+objc2-metal = { workspace = true, optional = true }
 mach2.workspace = true
 #TODO: replace with "objc2"
 metal.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))'.dependencies]
-pathfinder_geometry = "0.5"
+pathfinder_geometry.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))'.dependencies]
 scap = { workspace = true, optional = true }
@@ -151,7 +150,7 @@ collections = { workspace = true, features = ["test-support"] }
 env_logger.workspace = true
 gpui_platform.workspace = true
 gpui_util = { workspace = true }
-lyon = { version = "1.0", features = ["extra"] }
+lyon = { workspace = true, features = ["extra"] }
 proptest = { workspace = true }
 rand.workspace = true
 scheduler = { workspace = true, features = ["test-support"] }
@@ -159,18 +158,17 @@ unicode-segmentation = { workspace = true }
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 http_client = { workspace = true, features = ["test-support"] }
-reqwest_client = { workspace = true, features = ["test-support"] }
 
 [target.'cfg(target_family = "wasm")'.dev-dependencies]
 wasm-bindgen = { workspace = true }
 gpui_web.workspace = true
 
 [build-dependencies]
-embed-resource = { version = "3.0", optional = true }
+embed-resource = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.build-dependencies]
-bindgen = "0.72"
-cbindgen = { version = "0.29.3", default-features = false }
+bindgen.workspace = true
+cbindgen = { workspace = true, default-features = false }
 
 
 # ============================================================================

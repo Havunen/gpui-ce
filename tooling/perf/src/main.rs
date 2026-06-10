@@ -1,5 +1,5 @@
 //! Perf profiler for Zed tests. Outputs timings of tests marked with the `#[perf]`
-//! attribute to stdout in Markdown. See the documentation of `gpui_ce_macros::perf`
+//! attribute to stdout in Markdown. See the documentation of `gpui_macros::perf`
 //! for usage details on the actual attribute.
 //!
 //! # Setup

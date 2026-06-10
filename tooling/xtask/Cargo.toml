@@ -9,7 +9,7 @@ license = "GPL-3.0-or-later"
 workspace = true
 
 [dependencies]
-annotate-snippets = "0.12.1"
+annotate-snippets.workspace = true
 anyhow.workspace = true
 backtrace.workspace = true
 cargo_metadata.workspace = true
@@ -22,7 +22,7 @@ itertools.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml = "0.9.34"
+serde_yaml.workspace = true
 strum.workspace = true
 toml_edit.workspace = true
 gh-workflow.workspace = true

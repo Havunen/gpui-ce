@@ -2,13 +2,11 @@
 #![allow(unexpected_cfgs)]
 #![cfg_attr(not(target_os = "windows"), allow(unused))]
 
-include!("../../../src/util/util_macros.rs");
+include!("util_macros.rs");
 
 mod derive_action;
 mod derive_app_context;
 mod derive_into_element;
-#[path = "../../../src/refineable/derive_refineable.rs"]
-mod derive_refineable;
 mod derive_render;
 mod derive_visual_context;
 mod property_test;
@@ -84,12 +82,6 @@ pub fn derive_into_element(input: TokenStream) -> TokenStream {
 #[doc(hidden)]
 pub fn derive_render(input: TokenStream) -> TokenStream {
     derive_render::derive_render(input)
-}
-
-/// `Refineable` derive macro - see the trait documentation for details.
-#[proc_macro_derive(Refineable, attributes(refineable))]
-pub fn derive_refineable(input: TokenStream) -> TokenStream {
-    derive_refineable::derive_refineable(input)
 }
 
 /// #[derive(AppContext)] is used to create a context out of anything that holds a `&mut App`

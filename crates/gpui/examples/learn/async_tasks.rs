@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use gpui::colors::Colors;
 use gpui::{
-    App, Application, Bounds, Context, Entity, Render, Task, Window, WindowBounds, WindowOptions,
-    div, prelude::*, px, rgb, size,
+    App, Bounds, Context, Entity, Render, Task, Window, WindowBounds, WindowOptions, div,
+    prelude::*, px, rgb, size,
 };
 
 // Example 1: Simple Foreground Task

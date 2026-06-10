@@ -1,0 +1,16 @@
+[package]
+name = "xim-ctext"
+description = "compound text en/decoder"
+version = "0.3.0"
+authors = ["Riey <creeper844@gmail.com>"]
+repository = "https://github.com/Riey/xim-rs"
+edition.workspace = true
+publish = false
+license.workspace = true
+
+[dependencies]
+encoding_rs.workspace = true
+
+[features]
+default = ["std"]
+std = []

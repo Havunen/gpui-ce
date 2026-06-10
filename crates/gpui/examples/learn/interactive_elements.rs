@@ -13,9 +13,8 @@ mod common;
 use common::init_example;
 use gpui::colors::Colors;
 use gpui::{
-    App, Application, Bounds, ClickEvent, Context, Entity, Half, Hsla, IntoElement, MouseButton,
-    MouseMoveEvent, Pixels, Point, Render, Window, WindowBounds, WindowOptions, div, prelude::*,
-    px, rgb, size,
+    App, Bounds, ClickEvent, Context, Entity, Half, Hsla, IntoElement, MouseButton, MouseMoveEvent,
+    Pixels, Point, Render, Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
 };
 use gpui_platform;
 

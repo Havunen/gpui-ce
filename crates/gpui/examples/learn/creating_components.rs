@@ -13,8 +13,8 @@ mod common;
 use common::init_example;
 use gpui::colors::Colors;
 use gpui::{
-    App, Application, Bounds, Context, Entity, IntoElement, Render, RenderOnce, Window,
-    WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
+    App, Bounds, Context, Entity, IntoElement, Render, RenderOnce, Window, WindowBounds,
+    WindowOptions, div, prelude::*, px, rgb, size,
 };
 use gpui_platform;
 
