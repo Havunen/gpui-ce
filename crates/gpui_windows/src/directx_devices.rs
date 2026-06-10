@@ -1,4 +1,4 @@
-use crate::util::ResultExt;
+use ::util::ResultExt;
 use anyhow::{Context, Result};
 use itertools::Itertools;
 use windows::Win32::{

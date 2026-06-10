@@ -1,4 +1,4 @@
-use crate::util::ResultExt;
+use ::util::ResultExt;
 use itertools::Itertools;
 use smallvec::SmallVec;
 use std::rc::Rc;

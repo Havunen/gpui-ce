@@ -9,7 +9,7 @@ use std::{
     },
 };
 
-use crate::util::{ResultExt, paths::SanitizedPath};
+use ::util::{ResultExt, paths::SanitizedPath};
 use ::windows::{
     UI::ViewManagement::UISettings,
     Win32::{

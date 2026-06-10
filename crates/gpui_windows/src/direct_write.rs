@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::collections::HashMap;
-use crate::util::{ResultExt, maybe};
+use ::util::{ResultExt, maybe};
 use ::windows::{
     Win32::{
         Foundation::*,

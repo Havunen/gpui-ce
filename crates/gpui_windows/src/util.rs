@@ -1,6 +1,6 @@
 use std::sync::OnceLock;
 
-use crate::util::ResultExt;
+use ::util::ResultExt;
 use ::windows::{
     UI::{
         Color,

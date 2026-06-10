@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::util::ResultExt;
+use ::util::ResultExt;
 use anyhow::Context;
 use windows::{
     System::Threading::{

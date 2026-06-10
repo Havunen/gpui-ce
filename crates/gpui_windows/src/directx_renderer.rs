@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use crate::util::ResultExt;
+use ::util::ResultExt;
 use ::windows::{
     Win32::{
         Foundation::HWND,

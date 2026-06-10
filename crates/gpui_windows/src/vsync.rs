@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::util::ResultExt;
+use ::util::ResultExt;
 use anyhow::{Context, Result};
 use windows::Win32::{
     Foundation::HWND,
