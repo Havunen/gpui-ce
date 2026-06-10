@@ -7,18 +7,18 @@ use crate::{
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    KeystrokeEvent, LayoutId, Lerp, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
+    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
-    transparent_black,
+    TextStyleRefinement, ThermalState, TransformationMatrix, Transition, TransitionState,
+    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point,
+    prelude::*, px, rems, size, transparent_black,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -3526,6 +3526,40 @@ impl Window {
         }
     }
 
+    /// Creates a new transition with automatic state management.
+    ///
+    /// The state for this transition is managed internally and will be recreated
+    /// on each render. For persistent state across renders, use [`use_keyed_transition`](Self::use_keyed_transition).
+    pub fn use_transition<T: Lerp + Clone + PartialEq + 'static>(
+        &mut self,
+        cx: &mut App,
+        duration: Duration,
+        init: impl Fn(&mut Window, &mut Context<TransitionState<T>>) -> T,
+    ) -> Transition<T> {
+        let state = self.use_state(cx, |window, cx| TransitionState::new(init(window, cx)));
+
+        Transition::new(state, duration)
+    }
+
+    /// Creates a new keyed transition with persistent state.
+    ///
+    /// The state for this transition is associated with the provided key and will
+    /// persist across renders as long as the key remains the same. This is the
+    /// recommended method for most use cases where you want smooth, continuous
+    /// animations.
+    pub fn use_keyed_transition<T: Lerp + Clone + PartialEq + 'static>(
+        &mut self,
+        key: impl Into<ElementId>,
+        cx: &mut App,
+        duration: Duration,
+        init: impl Fn(&mut Window, &mut Context<TransitionState<T>>) -> T,
+    ) -> Transition<T> {
+        let state =
+            self.use_keyed_state(key, cx, |window, cx| TransitionState::new(init(window, cx)));
+
+        Transition::new(state, duration)
+    }
+
     /// Executes the given closure within the context of a tab group.
     #[inline]
     pub fn with_tab_group<R>(&mut self, index: Option<isize>, f: impl FnOnce(&mut Self) -> R) -> R {
@@ -4085,6 +4119,32 @@ impl Window {
             bounds,
             content_mask,
             image_buffer,
+        });
+    }
+
+    /// Paint a surface into the scene for the next frame at the current z-index.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub fn paint_surface(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        texture: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+        texture_size: Size<DevicePixels>,
+    ) {
+        use crate::PaintSurface;
+
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let bounds = bounds.scale(scale_factor);
+        let content_mask = self.content_mask().scale(scale_factor);
+        self.next_frame.scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask,
+            texture,
+            texture_size,
         });
     }
 
@@ -5386,6 +5446,13 @@ impl Window {
     /// Currently returns None on Mac and Windows.
     pub fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.platform_window.gpu_specs()
+    }
+
+    /// Returns the GPU context (device + queue) if available.
+    /// The returned `Box` contains `(Arc<wgpu::Device>, Arc<wgpu::Queue>)`.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub fn gpu_context(&self) -> Option<Box<dyn std::any::Any>> {
+        self.platform_window.gpu_context()
     }
 
     /// Perform titlebar double-click action.

@@ -118,6 +118,7 @@ impl Render for HelloWorld {
                                 spread_radius: px(5.0),
                                 inset: false,
                                 offset: point(px(10.0), px(10.0)),
+                                inset: false,
                             }])
                             .child(img("image/app-icon.png").size_8())
                             .child("Opacity Panel (Click to test)")

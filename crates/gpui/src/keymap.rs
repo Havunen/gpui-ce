@@ -1,7 +1,9 @@
 mod binding;
+mod collection;
 mod context;
 
 pub use binding::*;
+pub use collection::*;
 pub use context::*;
 
 use crate::collections::{HashMap, HashSet};

@@ -2554,6 +2554,7 @@ dependencies = [
  "serde_json",
  "slotmap",
  "smallvec",
+ "smol",
  "spin 0.12.0",
  "stacksafe",
  "strum",
@@ -2580,6 +2581,13 @@ checksum = "176aec8d175046257e111733aab663ba9ec7eb05559fe4ddcc3731b77368f9a5"
 dependencies = [
  "anyhow",
  "log",
+]
+
+[[package]]
+name = "gpui_elements"
+version = "0.1.0"
+dependencies = [
+ "gpui",
 ]
 
 [[package]]

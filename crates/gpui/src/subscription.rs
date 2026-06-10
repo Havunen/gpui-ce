@@ -296,6 +296,7 @@ mod tests {
     }
 
     #[test]
+    #[test]
     fn test_inactive_subscriber_dropped_during_retain_is_removed() {
         let subscribers = SubscriberSet::<(), Box<dyn FnMut()>>::new();
 

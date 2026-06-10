@@ -146,9 +146,10 @@ windows = { version = "0.62", features = ["Win32_Foundation"] }
 
 [dev-dependencies]
 backtrace.workspace = true
+smol.workspace = true
 collections = { workspace = true, features = ["test-support"] }
 env_logger.workspace = true
-gpui_platform.workspace = true
+gpui_platform = { workspace = true, features = ["font-kit", "wayland", "x11"] }
 gpui_util = { workspace = true }
 lyon = { workspace = true, features = ["extra"] }
 proptest = { workspace = true }
@@ -206,6 +207,11 @@ path = "examples/learn/animation.rs"
 [[example]]
 name = "text"
 path = "examples/learn/text.rs"
+
+[[example]]
+name = "transition"
+path = "examples/learn/transition.rs"
+
 
 # ============================================================================
 # Bench Examples - Performance benchmarks

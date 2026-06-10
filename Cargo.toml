@@ -22,6 +22,7 @@ members = [
     "./crates/xim_ctext/",
     "./crates/util/",
     "./crates/media/",
+    "./crates/gpui_elements/",
     "./tooling/perf/",
 ]
 default-members = [
