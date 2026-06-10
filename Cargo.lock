@@ -2731,6 +2731,7 @@ name = "gpui_util"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dunce",
  "log",
 ]
 
@@ -6403,6 +6404,7 @@ name = "util"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures-lite 2.6.1",
  "gpui_util",
  "libc",
  "log",

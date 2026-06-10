@@ -61,8 +61,10 @@ derive_more = { version = "2.1.1", features = [
     "mul_assign",
     "not",
 ] }
+dunce = "1.0"
 futures = "0.3.32"
 futures-concurrency = "7.7.1"
+futures-lite = "2.6"
 http_client = { package = "http-client-gpui-unofficial", version = "1.2.7" }
 image = "0.25.10"
 inventory = "0.3.24"

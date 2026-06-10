@@ -14,6 +14,7 @@ path = "src/util.rs"
 
 [dependencies]
 anyhow.workspace = true
+futures-lite.workspace = true
 gpui_util = { path = "../gpui_util" }
 log.workspace = true
 

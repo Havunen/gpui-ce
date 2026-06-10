@@ -1,7 +1,6 @@
-#[cfg(not(any(feature = "wayland", feature = "x11")))]
-compile_error!("'wayland' or 'x11' feature must be enabled.");
-
-use std::{env, sync::mpsc};
+#[cfg(any(feature = "wayland", feature = "x11"))]
+use std::env;
+use std::sync::mpsc;
 
 use anyhow::{Result, anyhow};
 
@@ -59,6 +58,9 @@ impl LinuxCapturer {
         let error_msg = "Unsupported platform. Could not detect X11 display. Enable the 'wayland' feature for Wayland support.";
         #[cfg(all(feature = "wayland", not(feature = "x11")))]
         let error_msg = "Unsupported platform. Could not detect wayland display. Enable the 'x11' feature for X11 support.";
+        #[cfg(not(any(feature = "wayland", feature = "x11")))]
+        let error_msg =
+            "Linux screen capture is not enabled. Enable the 'x11' or 'wayland' feature.";
 
         Err(anyhow!(error_msg))
     }

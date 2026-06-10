@@ -1,6 +1,3 @@
-#[cfg(not(any(feature = "wayland", feature = "x11")))]
-compile_error!("'wayland' or 'x11' feature must be enabled.");
-
 #[cfg(feature = "x11")]
 use std::ffi::{CStr, CString, NulError, c_char};
 
@@ -205,6 +202,8 @@ pub fn get_all_targets() -> anyhow::Result<Vec<Target>> {
     let error_msg = "Unsupported platform. Could not detect X11 display. Enable the 'wayland' feature for Wayland support.";
     #[cfg(all(feature = "wayland", not(feature = "x11")))]
     let error_msg = "Unsupported platform. Could not detect Wayland display. Enable the 'x11' feature for X11 support.";
+    #[cfg(not(any(feature = "wayland", feature = "x11")))]
+    let error_msg = "Linux target detection is not enabled. Enable the 'x11' or 'wayland' feature.";
 
     Err(anyhow!(error_msg))
 }
@@ -263,6 +262,9 @@ pub fn get_main_display() -> anyhow::Result<Display> {
     let error_msg = "Unsupported platform. Could not detect X11 display. Enable the 'wayland' feature for Wayland support.";
     #[cfg(all(feature = "wayland", not(feature = "x11")))]
     let error_msg = "Unsupported platform. Could not detect Wayland display. Enable the 'x11' feature for X11 support.";
+    #[cfg(not(any(feature = "wayland", feature = "x11")))]
+    let error_msg =
+        "Linux display detection is not enabled. Enable the 'x11' or 'wayland' feature.";
 
     Err(anyhow!(error_msg))
 }
