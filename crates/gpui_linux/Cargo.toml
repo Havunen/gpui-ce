@@ -42,11 +42,6 @@ x11 = [
     "x11-clipboard",
     "filedescriptor",
     "open",
-    "scap?/x11",
-]
-screen-capture = [
-    "gpui/screen-capture",
-    "scap",
 ]
 
 
@@ -91,10 +86,7 @@ filedescriptor = { workspace = true, optional = true }
 open = { workspace = true, optional = true }
 xkbcommon = { workspace = true, features = ["wayland", "x11"], optional = true }
 
-# Screen capture
-scap = { workspace = true, optional = true }
-
-# Wayland
+# X11
 calloop-wayland-source = { workspace = true, optional = true }
 wayland-backend = { workspace = true, features = [
     "client_system",

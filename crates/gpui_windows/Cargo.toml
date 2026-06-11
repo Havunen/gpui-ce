@@ -14,7 +14,6 @@ path = "src/gpui_windows.rs"
 [features]
 default = ["gpui/default"]
 test-support = ["gpui/test-support"]
-screen-capture = ["gpui/screen-capture", "scap"]
 
 [dependencies]
 gpui.workspace = true
@@ -40,10 +39,6 @@ windows.workspace = true
 windows-core.workspace = true
 windows-numerics.workspace = true
 windows-registry.workspace = true
-
-[target.'cfg(target_os = "windows")'.dependencies.scap]
-workspace = true
-optional = true
 
 [target.'cfg(target_os = "windows")'.build-dependencies]
 windows-registry.workspace = true

@@ -93,6 +93,7 @@ jobs:
             libvulkan-dev \
             libwayland-dev \
             libx11-dev \
+            libx11-xcb-dev \
             libxcb1-dev \
             libxkbcommon-dev \
             libxkbcommon-x11-dev \
@@ -139,6 +140,7 @@ jobs:
             libvulkan-dev \
             libwayland-dev \
             libx11-dev \
+            libx11-xcb-dev \
             libxcb1-dev \
             libxkbcommon-dev \
             libxkbcommon-x11-dev \
@@ -244,6 +246,7 @@ jobs:
             libvulkan-dev \
             libwayland-dev \
             libx11-dev \
+            libx11-xcb-dev \
             libxcb1-dev \
             libxkbcommon-dev \
             libxkbcommon-x11-dev \

@@ -31,12 +31,7 @@ leak-detection = ["backtrace"]
 wayland = [
     "bitflags",
 ]
-x11 = [
-    "scap?/x11",
-]
-screen-capture = [
-    "scap",
-]
+x11 = []
 windows-manifest = ["dep:embed-resource"]
 input-latency-histogram = ["dep:hdrhistogram"]
 
@@ -134,11 +129,6 @@ metal.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))'.dependencies]
 pathfinder_geometry.workspace = true
-
-[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))'.dependencies]
-scap = { workspace = true, optional = true }
-
-
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62", features = ["Win32_Foundation"] }

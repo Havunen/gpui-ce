@@ -89,7 +89,7 @@ impl VisualTestAppContext {
     /// Opens a window positioned off-screen for invisible rendering.
     ///
     /// The window is positioned at (-10000, -10000) so it's not visible on any display,
-    /// but it's still fully rendered by the compositor and can be captured via ScreenCaptureKit.
+    /// but it's still fully rendered by the compositor and can be captured via a screenshot API.
     ///
     /// # Arguments
     /// * `size` - The size of the window to create
@@ -125,11 +125,6 @@ impl VisualTestAppContext {
     ) -> Result<WindowHandle<V>> {
         use crate::{px, size};
         self.open_offscreen_window(size(px(1280.0), px(800.0)), build_root)
-    }
-
-    /// Returns whether screen capture is supported on this platform.
-    pub fn is_screen_capture_supported(&self) -> bool {
-        self.platform.is_screen_capture_supported()
     }
 
     /// Returns the text system used by this context.
