@@ -41,7 +41,7 @@ fn code_text() -> String {
 }
 
 fn bench_layout_line(c: &mut Criterion) {
-    let system = CosmicTextSystem::new_without_system_fonts("Lilex");
+    let system = CosmicTextSystem::new("Lilex");
     system
         .add_fonts(vec![Cow::Borrowed(LILEX), Cow::Borrowed(IBM_PLEX)])
         .unwrap();

@@ -706,7 +706,7 @@ impl Platform for WindowsPlatform {
         }
 
         for handle in self.raw_window_handles.read().iter() {
-            let Some(window) = window_from_hwnd(handle.as_raw()) else {
+            let Some(window) = self.window_from_hwnd(handle.as_raw()) else {
                 continue;
             };
             if window.state.hovered.get() {
