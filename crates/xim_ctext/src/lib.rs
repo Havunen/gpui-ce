@@ -250,6 +250,14 @@ pub fn compound_text_to_utf8(bytes: &[u8]) -> Result<String, DecodeError> {
                 let (out, _) = encoding_rs::ISO_8859_16.decode_without_bom_handling(left);
                 result.push_str(&out);
             }
+            // G0/G1/G2/G3 single-byte designation sequences
+            // ESC ( F, ESC ) F, ESC * F, ESC + F
+            (Some(0x28 | 0x29 | 0x2a | 0x2b), _) => {}
+            // 96N multibyte designation sequences
+            // ESC $ ) F, ESC $ * F, ESC $ + F
+            (Some(0x24), Some(0x29 | 0x2a | 0x2b)) => {
+                let _ = iter.next();
+            }
             // defaults to ISO-8859-1
             _ => {
                 let out = encoding_rs::mem::decode_latin1(chunk);

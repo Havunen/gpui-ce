@@ -450,7 +450,10 @@ mod tests {
 
     #[test]
     fn before_frame_skips_uploads_for_removed_texture() -> anyhow::Result<()> {
-        let (device, queue) = test_device_and_queue()?;
+        let Ok((device, queue)) = test_device_and_queue() else {
+            eprintln!("skipping test: no GPU adapter available");
+            return Ok(());
+        };
 
         let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
         let key = AtlasKey::Image(RenderImageParams {

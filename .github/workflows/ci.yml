@@ -205,7 +205,7 @@ jobs:
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             check_targets: --lib
-            target_cc: musl-gcc
+            target_cc: gcc
             target_linker: musl-gcc
             cargo_args: --no-default-features
           - name: Windows Server 2022 i686 MSVC headless
@@ -258,4 +258,5 @@ jobs:
         env:
           CC_x86_64_unknown_linux_musl: ${{ matrix.target_cc || '' }}
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.target_linker || '' }}
+          PKG_CONFIG_ALLOW_CROSS: "1"
         run: cargo check --workspace ${{ matrix.check_targets }} --target ${{ matrix.target }} ${{ matrix.cargo_args }}

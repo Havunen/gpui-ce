@@ -1327,7 +1327,16 @@ impl WgpuRenderer {
                                 &mut pass,
                             ),
                         PrimitiveBatch::Surfaces(range) => {
-                            self.draw_surfaces(&scene.surfaces[range], &mut pass)
+                            #[cfg(not(target_os = "macos"))]
+                            {
+                                self.draw_surfaces(&scene.surfaces[range], &mut pass)
+                            }
+                            #[cfg(target_os = "macos")]
+                            {
+                                let _ = range;
+                                let _ = &pass;
+                                true
+                            }
                         }
                     };
                     if !ok {
@@ -1451,6 +1460,7 @@ impl WgpuRenderer {
         )
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn draw_surfaces(&self, surfaces: &[PaintSurface], pass: &mut wgpu::RenderPass<'_>) -> bool {
         let resources = self.resources();
         for surface in surfaces {
