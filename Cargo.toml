@@ -68,7 +68,7 @@ http_client = { package = "http-client-gpui-unofficial", version = "1.2.7" }
 image = "0.25.10"
 inventory = "0.3.24"
 itertools = "0.14.0"
-log = { version = "0.4.32", features = ["kv_unstable_serde", "serde"] }
+log = { version = "0.4.32", features = ["serde"] }
 parking_lot = "0.12.5"
 postage = { version = "0.5", features = ["futures-traits"] }
 proptest = { git = "https://github.com/proptest-rs/proptest", rev = "3dca198a8fef1b32e3a66f1e1897c955b4dc5b5b", features = ["attr-macro"] }
@@ -80,7 +80,7 @@ refineable = { path = "./crates/refineable/" }
 scheduler = { path = "./crates/scheduler/" }
 schemars = { version = "1.2.1", features = ["indexmap2"] }
 serde = { version = "1.0.228", features = ["derive", "rc"] }
-serde_json = { version = "1.0.150", features = ["preserve_order", "raw_value"] }
+serde_json = { version = "1.0.150", features = ["raw_value"] }
 slotmap = "1.1.1"
 smallvec = { version = "1.15", features = ["union", "const_new"] }
 async-channel = "2.5.0"
@@ -91,7 +91,7 @@ thiserror = "2.0.18"
 hdrhistogram = "7"
 pollster = "0.4.0"
 url = "2.5"
-uuid = { version = "1.23.3", features = ["v4", "v5", "v7", "serde"] }
+uuid = { version = "1.23.3", features = ["v4", "v5", "serde"] }
 web-time = "1.1.0"
 cocoa = "=0.26.1"
 cocoa-foundation = "=0.2.1"
@@ -179,7 +179,7 @@ serde_yaml = "0.9.34"
 smol_str = "0.3.6"
 spin = "0.12.0"
 swash = "0.2.8"
-taffy = "=0.10.1"
+taffy = { version = "=0.10.1", default-features = false, features = ["std", "taffy_tree", "flexbox", "grid", "block_layout", "calc", "content_size", "detailed_layout_info"] }
 toml = "1.1.2"
 toml_edit = "0.25.12"
 ttf-parser = "0.25"
