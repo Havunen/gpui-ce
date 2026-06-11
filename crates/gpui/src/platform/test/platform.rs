@@ -1,10 +1,9 @@
 use crate::collections::VecDeque;
 use crate::{
-    AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DevicePixels,
-    DummyKeyboardMapper, ForegroundExecutor, Keymap, NoopTextSystem, PathPromptOptions, Platform,
-    PlatformDisplay, PlatformHeadlessRenderer, PlatformKeyboardLayout, PlatformKeyboardMapper,
-    PlatformTextSystem, PromptButton, Task, TestDisplay, TestWindow, ThermalState,
-    WindowAppearance, WindowParams, size,
+    AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DummyKeyboardMapper,
+    ForegroundExecutor, Keymap, NoopTextSystem, PathPromptOptions, Platform, PlatformDisplay,
+    PlatformHeadlessRenderer, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
+    PromptButton, Task, TestDisplay, TestWindow, ThermalState, WindowAppearance, WindowParams,
 };
 use anyhow::Result;
 use futures::channel::oneshot;
