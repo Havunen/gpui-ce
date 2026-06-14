@@ -7,24 +7,55 @@ A community fork of [GPUI](https://gpui.rs), Zed's GPU-accelerated UI framework.
 ```toml
 [dependencies]
 gpui = { package = "gpui-ce", version = "0.3" }
+gpui_platform = { git = "https://github.com/gpui-ce/gpui-ce" }
 
 # for test support...
 [dev-dependencies]
 gpui = { package = "gpui-ce", version = "0.3", features = ["test-support"] }
 ```
 
+or for using the git version
+
+```toml
+gpui = { package = "gpui", git = "https://github.com/gpui-ce/gpui-ce" }
+```
+
 Then use `gpui::{import}` as normal.
 
----
+## FAQ
+#### How does the project compare to other forks in the ecosystem?
+Other efforts (namely WGPUI) are actively maintained, but have diverged quite a bit from mainline usage. They typically serve the interests of the projects that they're used within, leading to a diverse yet fragmented ecosystem. GPUI-CE strives to focus on the general use-case first, and over time, grow in the facilities to support the same outside adaptations through a single consistent API.
 
-todo: rewrite below...
+#### What is the long-term goal of GPUI-CE?
+We'd like to be a premiere Rust GUI library! For the time being, we're working incrementally, in an effort to better understand the codebase and where is the right direction to take it, so we're okay being limited by mainline Zed. We will not stay this way forever! The spirit of the project is independence, so "limited" is loose, and we have and will continue to add features that mainline will never have. We will make your contribution work :)
+
+If you'd like to join discussions and help us forge an path forward, please join the discord.
+
+#### Can I use GPUI-CE with gpui-component?
+100% Because we're a drop-in for GPUI, any component library or surrounding project should work 1:1 through the use of a [patch block](https://doc.rust-lang.org/cargo/reference/overriding-dependencies.html). DO NOTE: We track the latest upstream -- if there's breaking changes and the library you're pulling in hasn't updated yet, gpui-ce cannot help you. Otherwise, we treat any mismatches as bugs.
+
+Example:
+```toml
+# If they're using the crates release
+[patch.crates-io]
+gpui = { git = "https://github.com/gpui-ce/gpui-ce", package = "gpui-ce" }
+
+# If they're using the git remote
+[patch."https://github.com/zed-industries/zed.git"]
+gpui = { git = "https://github.com/gpui-ce/gpui-ce }
+```
+
+#### Is there a community I could... join?
+For sure! Join the [discord](https://discord.gg/WYEmCKuv)
+
+<!-- todo: rewrite below... -->
 
 # Welcome to GPUI!
 
 GPUI is a hybrid immediate and retained mode, GPU accelerated, UI framework
 for Rust, designed to support a wide variety of applications.
 
-Everything in GPUI starts with an `Application`. You can create one with `Application::new()`, and kick off your application by passing a callback to `Application::run()`. Inside this callback, you can create a new window with `App::open_window()`, and register your first root view. See [gpui.rs](https://www.gpui.rs/) for a complete example.
+Everything in GPUI starts with an `Application`. You can create one with `gpui_platform::application()`, and kick off your application by passing a callback to `Application::run()`. Inside this callback, you can create a new window with `App::open_window()`, and register your first root view. See [gpui.rs](https://www.gpui.rs/) for a complete example.
 
 ### Dependencies
 
@@ -75,4 +106,3 @@ In addition to the systems above, GPUI provides a range of smaller services that
 - The `[gpui::test]` macro provides a convenient way to write tests for your GPUI applications. Tests also have their own kind of context, a `TestAppContext` which provides ways of simulating common platform input. See `app::test_context` and `test` modules for more details.
 
 Currently, the best way to learn about these APIs is to read the Zed source code or drop a question in the [Zed Discord](https://zed.dev/community-links). We're working on improving the documentation, creating more examples, and will be publishing more guides to GPUI on our [blog](https://zed.dev/blog).
-

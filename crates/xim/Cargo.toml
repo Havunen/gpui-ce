@@ -1,0 +1,33 @@
+[package]
+name = "zed-xim"
+description = "XIM protocol parser, handler"
+version = "0.4.0-zed"
+authors = ["Riey <creeper844@gmail.com>"]
+repository = "https://github.com/Riey/xim-rs"
+documentation = "https://docs.rs/xim"
+categories = ["no-std", "parser-implementations"]
+readme = "README.md"
+keywords = ["x11", "xim", "x11rb", "no-std"]
+edition.workspace = true
+publish = false
+license.workspace = true
+
+[features]
+default = ["std"]
+bootstrap-parser = ["xim-parser/bootstrap"]
+std = ["xim-parser/std", "xim-ctext/std", "ahash/std"]
+x11rb-client = ["client", "x11rb", "std"]
+xlib-client = ["client", "x11-dl", "std"]
+x11rb-server = ["server", "x11rb", "std"]
+x11rb-xcb = ["x11rb/allow-unsafe-code", "std"]
+client = []
+server = []
+
+[dependencies]
+xim-parser = { path = "../xim_parser", version = "0.2.0", default-features = false }
+xim-ctext = { path = "../xim_ctext", version = "0.3.0", default-features = false }
+log.workspace = true
+ahash = { workspace = true, default-features = false, features = ["compile-time-rng"] }
+x11rb = { version = "0.13", optional = true }
+x11-dl = { workspace = true, optional = true }
+hashbrown = { workspace = true, default-features = false }

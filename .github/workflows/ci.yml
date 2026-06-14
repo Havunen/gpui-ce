@@ -76,6 +76,15 @@ jobs:
           prefix-key: v2-rust-${{ matrix.runner }}-${{ matrix.target }}
           cache-bin: false
 
+      - name: Free disk space on Linux
+        if: runner.os == 'Linux'
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup
+          sudo apt-get autoremove --purge -y
+          sudo apt-get clean
+          df -h /
+
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
@@ -93,6 +102,7 @@ jobs:
             libvulkan-dev \
             libwayland-dev \
             libx11-dev \
+            libx11-xcb-dev \
             libxcb1-dev \
             libxkbcommon-dev \
             libxkbcommon-x11-dev \
@@ -100,7 +110,7 @@ jobs:
             zlib1g-dev
 
       - name: Build workspace
-        run: cargo build --workspace --all-targets --target ${{ matrix.target }}
+        run: cargo build --workspace --lib --bins --examples --target ${{ matrix.target }}
 
       - name: Run tests
         run: cargo test --workspace --lib --tests --target ${{ matrix.target }}
@@ -139,6 +149,7 @@ jobs:
             libvulkan-dev \
             libwayland-dev \
             libx11-dev \
+            libx11-xcb-dev \
             libxcb1-dev \
             libxkbcommon-dev \
             libxkbcommon-x11-dev \
@@ -166,7 +177,7 @@ jobs:
           cache-bin: false
 
       - name: Build workspace
-        run: cargo build --workspace --all-targets --target x86_64-unknown-linux-gnu
+        run: cargo build --workspace --lib --bins --examples --target x86_64-unknown-linux-gnu
 
       - name: Run tests
         run: cargo test --workspace --lib --tests --target x86_64-unknown-linux-gnu
@@ -203,7 +214,7 @@ jobs:
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             check_targets: --lib
-            target_cc: musl-gcc
+            target_cc: gcc
             target_linker: musl-gcc
             cargo_args: --no-default-features
           - name: Windows Server 2022 i686 MSVC headless
@@ -227,6 +238,15 @@ jobs:
           prefix-key: v2-rust-${{ matrix.runner }}-${{ matrix.target }}
           cache-bin: false
 
+      - name: Free disk space on Linux
+        if: runner.os == 'Linux'
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup
+          sudo apt-get autoremove --purge -y
+          sudo apt-get clean
+          df -h /
+
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
@@ -244,6 +264,7 @@ jobs:
             libvulkan-dev \
             libwayland-dev \
             libx11-dev \
+            libx11-xcb-dev \
             libxcb1-dev \
             libxkbcommon-dev \
             libxkbcommon-x11-dev \
@@ -255,4 +276,5 @@ jobs:
         env:
           CC_x86_64_unknown_linux_musl: ${{ matrix.target_cc || '' }}
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.target_linker || '' }}
+          PKG_CONFIG_ALLOW_CROSS: "1"
         run: cargo check --workspace ${{ matrix.check_targets }} --target ${{ matrix.target }} ${{ matrix.cargo_args }}
