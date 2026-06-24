@@ -252,10 +252,10 @@ pub fn compound_text_to_utf8(bytes: &[u8]) -> Result<String, DecodeError> {
             }
             // G0/G1/G2/G3 single-byte designation sequences
             // ESC ( F, ESC ) F, ESC * F, ESC + F
-            (Some(0x28 | 0x29 | 0x2a | 0x2b), _) => {}
+            (Some(0x28..=0x2b), _) => {}
             // 96N multibyte designation sequences
             // ESC $ ) F, ESC $ * F, ESC $ + F
-            (Some(0x24), Some(0x29 | 0x2a | 0x2b)) => {
+            (Some(0x24), Some(0x29..=0x2b)) => {
                 let _ = iter.next();
             }
             // defaults to ISO-8859-1
