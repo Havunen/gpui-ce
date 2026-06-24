@@ -1861,7 +1861,7 @@ impl WgpuRenderer {
         )
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn draw_surfaces(&self, surfaces: &[PaintSurface], pass: &mut wgpu::RenderPass<'_>) -> bool {
         let resources = self.resources();
         for surface in surfaces {

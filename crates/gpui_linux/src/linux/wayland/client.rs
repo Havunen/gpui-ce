@@ -17,6 +17,7 @@ use calloop::{
 use calloop_wayland_source::WaylandSource;
 use filedescriptor::Pipe;
 use smallvec::SmallVec;
+use url::Url;
 use wayland_backend::client::ObjectId;
 use wayland_backend::protocol::WEnum;
 use wayland_client::event_created_child;
