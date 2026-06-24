@@ -480,10 +480,7 @@ impl MacTextSystemState {
                 cx.set_should_smooth_fonts(true);
                 cx.set_gray_fill_color(luminance, 1.0);
             } else {
-                // In a kCGImageAlphaOnly context, gray=1.0 means "opaque white" which
-                // causes CoreGraphics to write alpha=1.0 for each glyph pixel. gray=0.0
-                // would write alpha=0.0 (transparent), making glyphs invisible.
-                cx.set_gray_fill_color(1.0, 1.0);
+                cx.set_gray_fill_color(0.0, 1.0);
             }
             self.fonts[params.font_id.0]
                 .native_font()
