@@ -15,25 +15,25 @@ path = "src/gpui_linux.rs"
 default = ["wayland", "x11"]
 test-support = ["gpui/test-support"]
 wayland = [
-    "bitflags",
-    "gpui_wgpu",
-    "ashpd/wayland",
+  "bitflags",
+  "gpui_wgpu",
+  "ashpd/wayland",
 
-    "calloop-wayland-source",
-    "wayland-backend",
-    "wayland-client",
-    "wayland-cursor",
-    "wayland-protocols",
-    "wayland-protocols-plasma",
-    "wayland-protocols-wlr",
-    "filedescriptor",
-    "xkbcommon",
-    "open",
-    "gpui/wayland",
+  "calloop-wayland-source",
+  "wayland-backend",
+  "wayland-client",
+  "wayland-cursor",
+  "wayland-protocols",
+  "wayland-protocols-plasma",
+  "wayland-protocols-wlr",
+  "filedescriptor",
+  "xkbcommon",
+  "open",
+  "gpui/wayland",
 ]
 x11 = [
-    "gpui_wgpu",
-    "ashpd",
+  "gpui_wgpu",
+  "ashpd",
 
     "as-raw-xcb-connection",
     "x11rb",
@@ -43,6 +43,7 @@ x11 = [
     "filedescriptor",
     "open",
 ]
+screen-capture = ["gpui/screen-capture", "scap"]
 
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
@@ -55,7 +56,6 @@ image.workspace = true
 futures.workspace = true
 gpui.workspace = true
 gpui_wgpu = { workspace = true, optional = true, features = ["font-kit"] }
-http_client.workspace = true
 itertools.workspace = true
 libc.workspace = true
 log.workspace = true
@@ -86,7 +86,7 @@ filedescriptor = { workspace = true, optional = true }
 open = { workspace = true, optional = true }
 xkbcommon = { workspace = true, features = ["wayland", "x11"], optional = true }
 
-# X11
+# Wayland
 calloop-wayland-source = { workspace = true, optional = true }
 wayland-backend = { workspace = true, features = [
     "client_system",

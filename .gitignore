@@ -33,3 +33,4 @@ xcuserdata/
 **/*.db
 .build
 
+/build

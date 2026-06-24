@@ -12,8 +12,8 @@ mod common;
 use common::init_example;
 use gpui::colors::Colors;
 use gpui::{
-    App, Bounds, Context, Div, Hsla, Render, Rgba, Window, WindowBounds, WindowOptions, div,
-    prelude::*, px, size,
+    Bounds, Context, Div, Hsla, Render, Rgba, Window, WindowBounds, WindowOptions, div, prelude::*,
+    px, size,
 };
 use gpui_platform;
 

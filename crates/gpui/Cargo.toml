@@ -19,12 +19,11 @@ workspace = true
 [features]
 default = ["font-kit", "wayland", "x11", "windows-manifest"]
 test-support = [
-    "leak-detection",
-    "collections/test-support",
-    "http_client/test-support",
-    "wayland",
-    "x11",
-    "proptest",
+  "leak-detection",
+  "collections/test-support",
+  "wayland",
+  "x11",
+  "proptest",
 ]
 inspector = ["gpui_macros/inspector"]
 leak-detection = ["backtrace"]
@@ -54,7 +53,7 @@ futures.workspace = true
 futures-concurrency.workspace = true
 gpui_macros.workspace = true
 gpui_shared_string.workspace = true
-http_client.workspace = true
+http.workspace = true
 image.workspace = true
 inventory.workspace = true
 itertools.workspace = true
@@ -202,6 +201,13 @@ path = "examples/learn/text.rs"
 name = "transition"
 path = "examples/learn/transition.rs"
 
+[[example]]
+name = "blur"
+path = "examples/learn/blur.rs"
+
+[[example]]
+name = "keyring"
+path = "examples/learn/keyring.rs"
 
 # ============================================================================
 # Bench Examples - Performance benchmarks

@@ -43,7 +43,7 @@ use crate::{App, Entity, EntityId, Window, lerp::Lerp, linear};
 /// ```
 #[derive(Clone)]
 pub struct Transition<T: Lerp + Clone + PartialEq + 'static> {
-    /// The amount of time for which this transtion should run.
+    /// The amount of time for which this transition should run.
     duration_secs: f32,
 
     /// A function that takes a delta between 0 and 1 and returns a new delta
@@ -702,7 +702,7 @@ mod tests {
     #[test]
     fn test_state_with_point() {
         let initial: Point<f32> = Point { x: 10.0, y: 20.0 };
-        let state = TransitionState::new(initial.clone());
+        let state = TransitionState::new(initial);
 
         assert_eq!(state.initial_goal.x, 10.0);
         assert_eq!(state.initial_goal.y, 20.0);

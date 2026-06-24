@@ -24,9 +24,7 @@ members = [
     "./crates/gpui_elements/",
     "./tooling/perf/",
 ]
-default-members = [
-    "./crates/gpui/",
-]
+default-members = ["./crates/gpui/"]
 resolver = "3"
 
 [workspace.package]
@@ -50,15 +48,15 @@ bitflags = { version = "2.13.0", default-features = false }
 collections = { path = "./crates/collections/" }
 ctor = "1.0.7"
 derive_more = { version = "2.1.1", features = [
-    "add",
-    "add_assign",
-    "deref",
-    "deref_mut",
-    "display",
-    "from_str",
-    "mul",
-    "mul_assign",
-    "not",
+  "add",
+  "add_assign",
+  "deref",
+  "deref_mut",
+  "display",
+  "from_str",
+  "mul",
+  "mul_assign",
+  "not",
 ] }
 dunce = "1.0"
 futures = "0.3.32"
@@ -71,7 +69,9 @@ itertools = "0.14.0"
 log = { version = "0.4.32", features = ["serde"] }
 parking_lot = "0.12.5"
 postage = { version = "0.5", features = ["futures-traits"] }
-proptest = { git = "https://github.com/proptest-rs/proptest", rev = "3dca198a8fef1b32e3a66f1e1897c955b4dc5b5b", features = ["attr-macro"] }
+proptest = { git = "https://github.com/proptest-rs/proptest", rev = "3dca198a8fef1b32e3a66f1e1897c955b4dc5b5b", features = [
+  "attr-macro",
+] }
 chrono = { version = "0.4", features = ["serde"] }
 profiling = "1"
 rand = "0.10.1"
@@ -218,59 +218,59 @@ gpui_tokio = { path = "./crates/gpui_tokio/" }
 [workspace.dependencies.windows]
 version = "0.62.2"
 features = [
-    "Foundation_Numerics",
-    "Globalization_DateTimeFormatting",
-    "Storage_Search",
-    "Storage_Streams",
-    "System_Threading",
-    "UI_ViewManagement",
-    "Wdk_System_SystemServices",
-    "Win32_Foundation",
-    "Win32_Globalization",
-    "Win32_Graphics_Direct3D",
-    "Win32_Graphics_Direct3D11",
-    "Win32_Graphics_Direct3D_Fxc",
-    "Win32_Graphics_DirectComposition",
-    "Win32_Graphics_DirectWrite",
-    "Win32_Graphics_DirectManipulation",
-    "Win32_Graphics_Dwm",
-    "Win32_Graphics_Dxgi",
-    "Win32_Graphics_Dxgi_Common",
-    "Win32_Graphics_Gdi",
-    "Win32_Graphics_Imaging",
-    "Win32_Graphics_Hlsl",
-    "Win32_Networking_WinSock",
-    "Win32_Security",
-    "Win32_Security_Credentials",
-    "Win32_Security_Cryptography",
-    "Win32_Storage_FileSystem",
-    "Win32_System_Com",
-    "Win32_System_Com_StructuredStorage",
-    "Win32_System_Console",
-    "Win32_System_Diagnostics_Debug",
-    "Win32_System_DataExchange",
-    "Win32_System_IO",
-    "Win32_System_LibraryLoader",
-    "Win32_System_Memory",
-    "Win32_System_Ole",
-    "Win32_System_Performance",
-    "Win32_System_Pipes",
-    "Win32_System_RestartManager",
-    "Win32_System_SystemInformation",
-    "Win32_System_SystemServices",
-    "Win32_System_Threading",
-    "Win32_System_Variant",
-    "Win32_System_WinRT",
-    "Win32_UI_Controls",
-    "Win32_UI_HiDpi",
-    "Win32_UI_Input_Ime",
-    "Win32_UI_Input_KeyboardAndMouse",
-    "Win32_UI_Input_Pointer",
-    "Win32_UI_Shell",
-    "Win32_UI_Shell_Common",
-    "Win32_UI_Shell_PropertiesSystem",
-    "Win32_UI_WindowsAndMessaging",
-    "Win32_Media",
+  "Foundation_Numerics",
+  "Globalization_DateTimeFormatting",
+  "Storage_Search",
+  "Storage_Streams",
+  "System_Threading",
+  "UI_ViewManagement",
+  "Wdk_System_SystemServices",
+  "Win32_Foundation",
+  "Win32_Globalization",
+  "Win32_Graphics_Direct3D",
+  "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Direct3D_Fxc",
+  "Win32_Graphics_DirectComposition",
+  "Win32_Graphics_DirectWrite",
+  "Win32_Graphics_DirectManipulation",
+  "Win32_Graphics_Dwm",
+  "Win32_Graphics_Dxgi",
+  "Win32_Graphics_Dxgi_Common",
+  "Win32_Graphics_Gdi",
+  "Win32_Graphics_Imaging",
+  "Win32_Graphics_Hlsl",
+  "Win32_Networking_WinSock",
+  "Win32_Security",
+  "Win32_Security_Credentials",
+  "Win32_Security_Cryptography",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Console",
+  "Win32_System_Diagnostics_Debug",
+  "Win32_System_DataExchange",
+  "Win32_System_IO",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Memory",
+  "Win32_System_Ole",
+  "Win32_System_Performance",
+  "Win32_System_Pipes",
+  "Win32_System_RestartManager",
+  "Win32_System_SystemInformation",
+  "Win32_System_SystemServices",
+  "Win32_System_Threading",
+  "Win32_System_Variant",
+  "Win32_System_WinRT",
+  "Win32_UI_Controls",
+  "Win32_UI_HiDpi",
+  "Win32_UI_Input_Ime",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_Input_Pointer",
+  "Win32_UI_Shell",
+  "Win32_UI_Shell_Common",
+  "Win32_UI_Shell_PropertiesSystem",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_Media",
 ]
 
 [workspace.lints.rust]

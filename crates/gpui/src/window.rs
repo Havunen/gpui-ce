@@ -2,23 +2,23 @@
 use crate::Inspector;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
-    Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
+    AsyncWindowContext, AvailableSpace, BackdropFilter, Background, BorderStyle, Bounds, BoxShadow,
+    Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutId, Lerp, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
+    EntityId, EventEmitter, FileDropEvent, Filter, FilterBoundary, FontId, Global, GlobalElementId,
+    GlyphId, GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
+    Keystroke, KeystrokeEvent, LayoutId, Lerp, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
     MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
     RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Transition, TransitionState,
-    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point,
-    prelude::*, px, rems, size, transparent_black,
+    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledFilter, ScaledPixels, Scene, Shadow,
+    SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
+    SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
+    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
+    Transition, TransitionState, Underline, UnderlineStyle, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
+    WindowParams, WindowTextSystem, point, prelude::*, px, rems, size, transparent_black,
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
@@ -1948,6 +1948,21 @@ impl Window {
         self.platform_window.request_decorations(decorations);
     }
 
+    /// Set the window's input region to the union of `rects`. Pointer events
+    /// outside the region pass through to whatever is below the window.
+    /// An empty slice resets the input region, so the window will receive all
+    /// pointer events again. (wayland only)
+    pub fn set_input_region(&self, rects: &[Bounds<Pixels>]) {
+        self.platform_window.set_input_region(rects);
+    }
+
+    /// Controls how a surface interacts with surrounding screen space.
+    /// Positive values reserve space, 0 avoids reserved space, and -1 ignores
+    /// reserved space and may extend underneath other surfaces. (wayland only)
+    pub fn set_exclusive_zone(&self, zone: Pixels) {
+        self.platform_window.set_exclusive_zone(zone);
+    }
+
     /// Start a window resize operation (Wayland)
     pub fn start_window_resize(&self, edge: ResizeEdge) {
         self.platform_window.start_window_resize(edge);
@@ -2974,6 +2989,11 @@ impl Window {
             return;
         }
 
+        // Deferred draws are overlays (tooltips, popovers, drag images) and must sort above the
+        // whole main scene. Raise the order floor so they do — this also keeps a deferred
+        // backdrop's order from falling inside a content-filter order range left by the main scene.
+        self.next_frame.scene.raise_order_floor();
+
         let traversal_order = self.deferred_draw_traversal_order();
         let mut deferred_draws = mem::take(&mut self.next_frame.deferred_draws);
         for deferred_draw_ix in traversal_order {
@@ -3711,6 +3731,98 @@ impl Window {
                 pad: 0,
             });
         }
+    }
+
+    /// Paint a backdrop filter into the scene for the next frame at the current z-index. The
+    /// renderer blurs the content already painted behind `bounds` and composites the result
+    /// into the rounded rectangle described by `bounds` and `corner_radii` — the CSS
+    /// `backdrop-filter` effect (frosted glass). Typically the element then paints a translucent
+    /// background quad on top so its color tints the blurred backdrop.
+    ///
+    /// Does nothing when `filters` produce no visible blur.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_backdrop_filter(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        filters: &[Filter],
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let filters: SmallVec<[ScaledFilter; 4]> = filters
+            .iter()
+            .filter(|filter| !filter.is_identity())
+            .map(|filter| filter.scale(scale_factor))
+            .collect();
+        if filters.is_empty() {
+            return;
+        }
+
+        self.next_frame.scene.insert_primitive(BackdropFilter {
+            order: 0,
+            bounds: self.snap_bounds(bounds),
+            content_mask: self.snapped_content_mask(),
+            corner_radii: corner_radii.scale(scale_factor),
+            filters,
+            opacity: self.element_opacity(),
+        });
+    }
+
+    /// Isolate the painting performed by `f` into a content-filter group: the renderer renders
+    /// everything `f` paints into an offscreen target, blurs it as a single layer, and
+    /// composites the result back into the rounded rectangle described by `bounds` and
+    /// `corner_radii` — the CSS `filter` effect (e.g. blurring an element and its children).
+    ///
+    /// When `filters` produce no visible blur this simply runs `f` with no offscreen
+    /// indirection.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn with_filter_layer<R>(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        filters: &[Filter],
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let filters: SmallVec<[ScaledFilter; 4]> = filters
+            .iter()
+            .filter(|filter| !filter.is_identity())
+            .map(|filter| filter.scale(scale_factor))
+            .collect();
+        if filters.is_empty() {
+            return f(self);
+        }
+
+        // Snapshot the (scaled) group parameters once so the start and end markers agree.
+        //
+        // `opacity` is 1.0 — NOT `element_opacity()`. The group's children/bg/border are painted
+        // through the normal paint methods while `element_opacity` is still in effect, so they
+        // already carry the element's opacity (consistent with gpui's per-primitive opacity for
+        // non-filtered elements). Re-applying it at composite time would double it (e.g.
+        // `.blur(r).opacity(0.5)` would render at 0.25 instead of 0.5).
+        let boundary = FilterBoundary {
+            order: 0,
+            bounds: self.snap_bounds(bounds),
+            content_mask: self.snapped_content_mask(),
+            corner_radii: corner_radii.scale(scale_factor),
+            filters,
+            opacity: 1.0,
+            is_start: true,
+        };
+
+        self.next_frame.scene.insert_primitive(boundary.clone());
+        let result = f(self);
+        self.next_frame.scene.insert_primitive(FilterBoundary {
+            is_start: false,
+            ..boundary
+        });
+
+        result
     }
 
     /// Paint one or more quads into the scene for the next frame at the current stacking context.
@@ -5453,6 +5565,16 @@ impl Window {
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     pub fn gpu_context(&self) -> Option<Box<dyn std::any::Any>> {
         self.platform_window.gpu_context()
+    }
+
+    /// Whether the GPU device backing this window has been lost (recovery
+    /// happens on a subsequent platform draw). `None` when the backend
+    /// cannot know. Embedders that captured the device from
+    /// [`Self::gpu_context`] should stop submitting while this is
+    /// `Some(true)` and re-acquire the device once it reads `Some(false)`.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub fn gpu_device_lost(&self) -> Option<bool> {
+        self.platform_window.gpu_device_lost()
     }
 
     /// Perform titlebar double-click action.
