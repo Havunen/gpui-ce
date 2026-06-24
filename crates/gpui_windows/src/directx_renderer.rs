@@ -1769,6 +1769,27 @@ pub(crate) mod shader_resources {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[cfg(debug_assertions)]
+    fn shader_paths_exist() {
+        // In debug builds, shaders are compiled from source via build_shader_blob().
+        // This test guards against regressions where the path points to a non-existent
+        // directory (e.g. src/platform/windows/) and causes DirectWrite init to fail
+        // with OS error 3 at startup.
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        for name in ["shaders.hlsl", "color_text_raster.hlsl"] {
+            let path = manifest_dir.join("src").join(name);
+            assert!(
+                path.exists(),
+                "shader file not found at {}: debug builds will fail to start",
+                path.display()
+            );
+        }
+    }
+}
+
 mod dxgi {
     use ::windows::{
         Win32::Graphics::Dxgi::{IDXGIAdapter1, IDXGIDevice},
