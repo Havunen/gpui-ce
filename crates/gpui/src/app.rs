@@ -51,7 +51,9 @@ use crate::{
     SubscriberSet, Subscription, SvgRenderer, Task, TextRenderingMode, TextSystem, ThermalState,
     Window, WindowAppearance, WindowButtonLayout, WindowHandle, WindowId, WindowInvalidator,
     colors::{Colors, GlobalColors},
-    hash, init_app_menus,
+    hash,
+    http_client::{HttpClient, NullHttpClient},
+    init_app_menus,
 };
 
 mod async_context;

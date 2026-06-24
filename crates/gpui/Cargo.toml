@@ -146,8 +146,6 @@ rand.workspace = true
 scheduler = { workspace = true, features = ["test-support"] }
 unicode-segmentation = { workspace = true }
 
-[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
-http_client = { workspace = true, features = ["test-support"] }
 
 [target.'cfg(target_family = "wasm")'.dev-dependencies]
 wasm-bindgen = { workspace = true }

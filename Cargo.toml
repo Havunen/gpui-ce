@@ -38,10 +38,10 @@ readme = "README.md"
 rust-version = "1.96"
 
 [workspace.dependencies]
-accesskit = "0.24.0"
-accesskit_macos = "0.26.1"
+accesskit = "0.24.1"
+accesskit_macos = "0.26.2"
 accesskit_unix = "0.21.1"
-accesskit_windows = "0.33.0"
+accesskit_windows = "0.33.1"
 anyhow = "1.0.102"
 backtrace = "0.3"
 bitflags = { version = "2.13.0", default-features = false }
@@ -62,11 +62,11 @@ dunce = "1.0"
 futures = "0.3.32"
 futures-concurrency = "7.7.1"
 futures-lite = "2.6"
-http_client = { package = "http-client-gpui-unofficial", version = "1.2.7" }
+http = "1"
 image = "0.25.10"
 inventory = "0.3.24"
 itertools = "0.14.0"
-log = { version = "0.4.32", features = ["serde"] }
+log = { version = "0.4.33", features = ["serde"] }
 parking_lot = "0.12.5"
 postage = { version = "0.5", features = ["futures-traits"] }
 proptest = { git = "https://github.com/proptest-rs/proptest", rev = "3dca198a8fef1b32e3a66f1e1897c955b4dc5b5b", features = [
@@ -104,11 +104,11 @@ mach2 = "0.6"
 metal = "0.33.0"
 env_logger = "0.11.10"
 unicode-segmentation = "1.13.3"
-wasm-bindgen = "0.2.123"
+wasm-bindgen = "0.2.125"
 heck = "0.5"
 proc-macro2 = "1.0.106"
-syn = { version = "2.0.117", features = ["full", "extra-traits", "visit-mut"] }
-quote = "1.0.45"
+syn = { version = "2.0.118", features = ["full", "extra-traits", "visit-mut"] }
+quote = "1.0.46"
 ashpd = { version = "0.13.11", default-features = false, features = [
     "async-io",
     "notification",
@@ -154,7 +154,7 @@ filedescriptor = "0.8.3"
 flume = "0.12"
 font-kit = { git = "https://github.com/Havunen/font-kit", rev = "cc6f86949e40ef3a5e9b2063f8127cdcb72d7ac4", package = "font-kit", version = "0.14.3-1" }
 foreign-types = "0.5"
-getrandom = "0.4.2"
+getrandom = "0.4.3"
 gh-workflow = "0.8.1"
 hashbrown = { version = "0.17.1", default-features = false }
 heapless = "0.9.3"
@@ -177,8 +177,8 @@ rustc-hash = "2.1.2"
 seahash = "4.1"
 serde_yaml = "0.9.34"
 smol_str = "0.3.6"
-spin = "0.12.0"
-swash = "0.2.8"
+spin = "0.12.1"
+swash = "0.2.9"
 taffy = { version = "=0.10.1", default-features = false, features = ["std", "taffy_tree", "flexbox", "grid", "block_layout", "calc", "content_size", "detailed_layout_info"] }
 toml = "1.1.2"
 toml_edit = "0.25.12"
@@ -190,7 +190,7 @@ wasm_thread = "0.3"
 wayland-backend = "0.3.15"
 wayland-client = "0.31.14"
 wayland-cursor = "0.31.14"
-wayland-protocols = "0.32.12"
+wayland-protocols = "0.32.13"
 wayland-protocols-plasma = "0.3.12"
 wayland-protocols-wlr = "0.3.12"
 web-sys = "0.3"

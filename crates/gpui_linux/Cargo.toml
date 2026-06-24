@@ -43,8 +43,6 @@ x11 = [
     "filedescriptor",
     "open",
 ]
-screen-capture = ["gpui/screen-capture", "scap"]
-
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 accesskit.workspace = true
