@@ -147,7 +147,9 @@ impl MetalAtlasState {
         let usage;
         match kind {
             AtlasTextureKind::Monochrome => {
-                pixel_format = metal::MTLPixelFormat::A8Unorm;
+                // Match the other backends' single-channel glyph atlases and avoid relying on
+                // legacy alpha-only texture channel behavior on newer macOS/Metal stacks.
+                pixel_format = metal::MTLPixelFormat::R8Unorm;
                 usage = metal::MTLTextureUsage::ShaderRead;
             }
             AtlasTextureKind::Polychrome => {
