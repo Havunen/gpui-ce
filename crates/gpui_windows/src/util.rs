@@ -10,10 +10,7 @@ use ::windows::{
     core::BOOL,
 };
 #[cfg(not(feature = "wgpu"))]
-use ::windows::{
-    Win32::System::LibraryLoader::{FreeLibrary, LoadLibraryA},
-    core::PCSTR,
-};
+use ::windows::{Win32::System::LibraryLoader::LoadLibraryA, core::PCSTR};
 #[cfg(not(feature = "wgpu"))]
 use anyhow::Context;
 
