@@ -28,6 +28,6 @@ xim-parser = { path = "../xim_parser", version = "0.2.0", default-features = fal
 xim-ctext = { path = "../xim_ctext", version = "0.3.0", default-features = false }
 log.workspace = true
 ahash = { workspace = true, default-features = false, features = ["compile-time-rng"] }
-x11rb = { version = "0.13", optional = true }
+x11rb = { version = "0.14", optional = true }
 x11-dl = { workspace = true, optional = true }
 hashbrown = { workspace = true, default-features = false }
