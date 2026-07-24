@@ -1452,7 +1452,7 @@ mod tests {
         );
     }
 
-    #[perf]
+    #[test]
     fn test_combine_highlights() {
         assert_eq!(
             combine_highlights(

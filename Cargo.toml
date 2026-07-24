@@ -22,6 +22,14 @@ members = [
     "./crates/util/",
     "./crates/media/",
     "./crates/gpui_elements/",
+    "./crates/gpui_collections/",
+    "./crates/gpui_refineable/",
+    "./crates/gpui_derive_refineable/",
+    "./crates/gpui_scheduler/",
+    "./crates/gpui_sum_tree/",
+    "./crates/gpui_media/",
+    "./crates/gpui_zed_util/",
+    "./crates/gpui_ce_util/",
     "./tooling/perf/",
 ]
 default-members = ["./crates/gpui/"]
@@ -69,9 +77,7 @@ itertools = "0.15.0"
 log = { version = "0.4.33", features = ["serde"] }
 parking_lot = "0.12.5"
 postage = { version = "0.5", features = ["futures-traits"] }
-proptest = { git = "https://github.com/proptest-rs/proptest", rev = "3dca198a8fef1b32e3a66f1e1897c955b4dc5b5b", features = [
-  "attr-macro",
-] }
+proptest = { version = "1.10", features = ["attr-macro"] }
 chrono = { version = "0.4", features = ["serde"] }
 profiling = "1"
 rand = "0.10.2"
@@ -105,6 +111,7 @@ metal = "0.33.0"
 env_logger = "0.11.11"
 unicode-segmentation = "1.13.3"
 wasm-bindgen = "0.2.126"
+scap = { version = "0.0.8-zed", package = "zed-scap", default-features = false }
 heck = "0.5"
 proc-macro2 = "1.0.106"
 syn = { version = "2.0.118", features = ["full", "extra-traits", "visit-mut"] }
@@ -202,18 +209,18 @@ x11-dl = "2.21.0"
 x11rb = "0.13.2"
 xkbcommon = "0.9.0"
 
-gpui = { path = "./crates/gpui/" }
-gpui_platform = { path = "./crates/gpui_platform/" }
-gpui_linux = { path = "./crates/gpui_linux/" }
-gpui_macos = { path = "./crates/gpui_macos/" }
-gpui_windows = { path = "./crates/gpui_windows/" }
-gpui_web = { path = "./crates/gpui_web/" }
+gpui = { path = "./crates/gpui/", version = "0.2.2" }
+gpui_platform = { path = "./crates/gpui_platform/", version = "0.1.0" }
+gpui_linux = { path = "./crates/gpui_linux/", version = "0.1.0" }
+gpui_macos = { path = "./crates/gpui_macos/", version = "0.1.0" }
+gpui_windows = { path = "./crates/gpui_windows/", version = "0.1.0" }
+gpui_web = { path = "./crates/gpui_web/", version = "0.1.0" }
 
-gpui_wgpu = { path = "./crates/gpui_wgpu/" }
+gpui_wgpu = { path = "./crates/gpui_wgpu/", version = "0.1.0" }
 
-gpui_macros = { path = "./crates/gpui_macros/" }
-gpui_shared_string = { path = "./crates/gpui_shared_string/" }
-gpui_tokio = { path = "./crates/gpui_tokio/" }
+gpui_macros = { path = "./crates/gpui_macros/", version = "0.1.0" }
+gpui_shared_string = { path = "./crates/gpui_shared_string/", version = "0.1.0" }
+gpui_tokio = { path = "./crates/gpui_tokio/", version = "0.1.0" }
 
 [workspace.dependencies.windows]
 version = "0.62.2"
