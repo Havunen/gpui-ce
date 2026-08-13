@@ -9,8 +9,10 @@ mod dispatcher;
 mod display;
 mod display_link;
 mod events;
+mod haptic_feedback;
 mod keyboard;
 mod pasteboard;
+mod system_notifications;
 
 mod metal_atlas;
 pub mod metal_renderer;

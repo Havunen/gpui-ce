@@ -18,3 +18,4 @@ log.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 dunce.workspace = true
+which = "6.0.0"
