@@ -201,14 +201,14 @@ parking = "2"
 pathfinder_geometry = "0.5"
 pin-project = "1"
 raw-window-handle = "0.6"
-resvg = { version = "0.47", default-features = false }
+resvg = { version = "0.48", default-features = false }
 seahash = "4"
 smol_str = "0.3"
 spin = "0.12"
 swash = "0.2"
 taffy = { version = "=0.12.2", default-features = false, features = ["std", "taffy_tree", "flexbox", "grid", "block_layout", "calc", "content_size", "detailed_layout_info"] }
 ttf-parser = "0.25"
-usvg = { version = "0.47", default-features = false }
+usvg = { version = "0.48", default-features = false }
 waker-fn = "1.2"
 wasm-bindgen-futures = "0.4"
 # Vendored: upstream is unmaintained and its published worker bootstrap still
