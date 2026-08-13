@@ -2635,6 +2635,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpui_wasm_thread"
+version = "0.3.3"
+dependencies = [
+ "futures",
+ "js-sys",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
 name = "gpui_web"
 version = "0.1.0"
 dependencies = [
@@ -2642,6 +2652,7 @@ dependencies = [
  "console_error_panic_hook",
  "futures",
  "gpui",
+ "gpui_wasm_thread",
  "gpui_wgpu",
  "http",
  "js-sys",
@@ -2651,7 +2662,6 @@ dependencies = [
  "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm_thread",
  "web-sys",
  "web-time",
 ]
@@ -6395,17 +6405,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc1b4cb0cc549fcf58d7dfc081778139b3d283a081644e833e84682ad71cea24"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "wasm_thread"
-version = "0.3.3"
-source = "git+https://github.com/zed-industries/wasm_thread?rev=0cf96c7708dfb97ccf3da50347e25edcf75d6937#0cf96c7708dfb97ccf3da50347e25edcf75d6937"
-dependencies = [
- "futures",
- "js-sys",
- "wasm-bindgen",
- "web-sys",
 ]
 
 [[package]]
