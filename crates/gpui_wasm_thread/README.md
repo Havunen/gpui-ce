@@ -28,6 +28,21 @@ the shape of the fix is identical.)
 Keep this list current if the crate is patched further, so a future upgrade to a
 maintained release can be checked off against it.
 
+## Requires nightly on wasm32
+
+`src/lib.rs` opens with upstream's own
+`#![cfg_attr(target_arch = "wasm32", feature(stdarch_wasm_atomic_wait))]`, so
+anything enabling `gpui_web/multithreaded` for `wasm32-unknown-unknown` has to
+build on nightly:
+
+```
+cargo +nightly check --target wasm32-unknown-unknown -p gpui_web --features multithreaded
+```
+
+On stable it fails with `E0554`. This is inherent rather than a consequence of
+vendoring — wasm atomics are nightly-only anyway, which is why `just
+check-wasm-atomics` also runs under `+nightly`.
+
 ## Upgrading
 
 The vendored tree is rustfmt-normalized by this workspace's `cargo fmt --all`,
