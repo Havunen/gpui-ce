@@ -150,7 +150,7 @@ ashpd = { version = "0.13.13", default-features = false, features = [
 ] }
 libc = "0.2"
 smol = "2.0.2"
-wgpu = { git = "https://github.com/zed-industries/wgpu.git", rev = "357a0c56e0070480ad9daea5d2eaa83150b79e88" }
+wgpu = "29.0.4"
 criterion = { version = "0.8.2", features = ["html_reports"] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSButton",
