@@ -2659,7 +2659,6 @@ name = "gpui_util"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "dunce",
  "log",
  "which 6.0.3",
 ]

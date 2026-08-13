@@ -144,45 +144,6 @@ pub fn get_windows_system_shell() -> String {
     (*SYSTEM_SHELL).clone()
 }
 
-pub mod paths {
-    use std::{
-        fmt::{self, Display, Formatter},
-        mem,
-        path::Path,
-    };
-
-    #[derive(Eq, PartialEq, Hash, Ord, PartialOrd)]
-    #[repr(transparent)]
-    pub struct SanitizedPath(Path);
-
-    impl SanitizedPath {
-        pub fn new<T: AsRef<Path> + ?Sized>(path: &T) -> &Self {
-            #[cfg(not(target_os = "windows"))]
-            return Self::unchecked_new(path.as_ref());
-
-            #[cfg(target_os = "windows")]
-            return Self::unchecked_new(dunce::simplified(path.as_ref()));
-        }
-
-        pub fn unchecked_new<T: AsRef<Path> + ?Sized>(path: &T) -> &Self {
-            // SAFETY: SanitizedPath is a transparent wrapper over Path and has no Drop implementation.
-            unsafe { mem::transmute::<&Path, &Self>(path.as_ref()) }
-        }
-    }
-
-    impl fmt::Debug for SanitizedPath {
-        fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-            fmt::Debug::fmt(&self.0, formatter)
-        }
-    }
-
-    impl Display for SanitizedPath {
-        fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-            write!(formatter, "{}", self.0.display())
-        }
-    }
-}
-
 pub fn post_inc<T: From<u8> + AddAssign<T> + Copy>(value: &mut T) -> T {
     let prev = *value;
     *value += T::from(1);
