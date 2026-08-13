@@ -10,6 +10,9 @@ members = [
     "./crates/gpui_windows/",
     "./crates/gpui_platform/",
     "./crates/gpui_shared_string/",
+    "./crates/xim/",
+    "./crates/xim_parser/",
+    "./crates/xim_ctext/",
     "./crates/gpui_elements/",
     "./crates/gpui_collections/",
     "./crates/gpui_refineable/",
@@ -161,8 +164,9 @@ semver = { version = "1.0", features = ["serde"] }
 windows-core = "0.62.2"
 tokio = { version = "1" }
 gpui_util = { path = "./crates/gpui_ce_util/", version = "0.2.2", package = "gpui_ce_util" }
-xim = { version = "0.4.0-zed", package = "zed-xim" }
+xim = { path = "./crates/xim/", package = "gpui_xim" }
 
+ahash = { version = "0.8", default-features = false }
 as-raw-xcb-connection = "1"
 async-task = "4.7"
 bindgen = "0.72"
@@ -177,11 +181,13 @@ core-text = "22"
 cosmic-text = "0.19.0"
 dispatch2 = "0.3.1"
 embed-resource = "3"
+encoding_rs = "0.8.35"
 etagere = "0.3"
 filedescriptor = "0.8.3"
 font-kit = { git = "https://github.com/Havunen/font-kit", rev = "cc6f86949e40ef3a5e9b2063f8127cdcb72d7ac4", package = "font-kit", version = "0.14.3-1" }
 foreign-types = "0.5"
 getrandom = "0.4.3"
+hashbrown = { version = "0.17.1", default-features = false }
 heapless = "0.9.3"
 js-sys = "0.3"
 lyon = "1"
@@ -218,10 +224,8 @@ windows-numerics = "0.3.1"
 windows-registry = "0.6.1"
 x11 = "2.21.0"
 x11-clipboard = "0.9.3"
-# Held at 0.13 to match `zed-xim`, which pins x11rb 0.13 and hands gpui_linux an
-# `XCBConnection`. Bumping this to 0.14 splits x11rb across two versions and the
-# x11 client stops compiling; upstream gpui-ce pins 0.13.1 for the same reason.
-x11rb = "0.13.1"
+x11-dl = "2.21.0"
+x11rb = "0.14.0"
 xkbcommon = "0.9.0"
 
 gpui = { path = "./crates/gpui/", version = "0.2.2" }
