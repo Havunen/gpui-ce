@@ -15,9 +15,9 @@ path = "src/path.rs"
 test-support = []
 
 [dependencies]
-anyhow = "1.0.86"
+anyhow = "1"
 dunce = "1.0"
-serde = { version = "1.0.221", features = ["derive", "rc"], optional = true }
+serde = { version = "1", features = ["derive", "rc"], optional = true }
 
 [dev-dependencies]
-tempfile = "3.20.0"
+tempfile = "3.27"
