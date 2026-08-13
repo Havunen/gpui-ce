@@ -281,6 +281,7 @@ features = [
   "Win32_System_Memory",
   "Win32_System_Ole",
   "Win32_System_Performance",
+  "Win32_System_Power",
   "Win32_System_Pipes",
   "Win32_System_RestartManager",
   "Win32_System_SystemInformation",
