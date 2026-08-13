@@ -2726,7 +2726,7 @@ dependencies = [
 
 [[package]]
 name = "gpui_xim"
-version = "0.4.0-zed"
+version = "0.4.0-gpui"
 dependencies = [
  "ahash",
  "hashbrown 0.17.1",
