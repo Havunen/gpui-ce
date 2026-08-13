@@ -3,7 +3,6 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use ::util::ResultExt;
 use ::windows::{
     Win32::{
         Foundation::HWND,
@@ -18,6 +17,7 @@ use ::windows::{
     core::{HSTRING, Interface},
 };
 use anyhow::{Context, Result};
+use gpui_util::ResultExt;
 
 use self::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
 use super::{DirectXAtlas, DirectXDevices, try_to_recover_from_device_lost};

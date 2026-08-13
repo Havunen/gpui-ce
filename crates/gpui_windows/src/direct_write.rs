@@ -5,7 +5,6 @@ use std::{
 };
 
 use crate::collections::HashMap;
-use ::util::{ResultExt, maybe};
 use ::windows::{
     Win32::{
         Foundation::*,
@@ -20,6 +19,7 @@ use ::windows::{
     core::*,
 };
 use anyhow::{Context, Result};
+use gpui_util::{ResultExt, maybe};
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use windows_numerics::Vector2;
 

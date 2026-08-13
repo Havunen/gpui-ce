@@ -1069,15 +1069,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "collections"
-version = "0.1.0"
-dependencies = [
- "gpui_util",
- "indexmap",
- "rustc-hash 2.1.3",
-]
-
-[[package]]
 name = "color_quant"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1514,15 +1505,6 @@ dependencies = [
  "rustc_version",
  "syn 2.0.119",
  "unicode-xid",
-]
-
-[[package]]
-name = "derive_refineable"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 3.0.3",
 ]
 
 [[package]]
@@ -2341,7 +2323,6 @@ dependencies = [
  "chrono",
  "cocoa",
  "cocoa-foundation",
- "collections",
  "core-foundation",
  "core-foundation-sys",
  "core-graphics 0.25.0",
@@ -2358,10 +2339,15 @@ dependencies = [
  "futures",
  "futures-concurrency",
  "getrandom 0.4.3",
+ "gpui_ce_util",
+ "gpui_collections",
  "gpui_macros",
+ "gpui_media",
  "gpui_platform",
+ "gpui_refineable",
+ "gpui_scheduler",
  "gpui_shared_string",
- "gpui_util",
+ "gpui_sum_tree",
  "gpui_web",
  "hdrhistogram",
  "heapless",
@@ -2372,7 +2358,6 @@ dependencies = [
  "log",
  "lyon",
  "mach2",
- "media",
  "metal",
  "num_cpus",
  "objc",
@@ -2389,10 +2374,8 @@ dependencies = [
  "proptest",
  "rand 0.10.2",
  "raw-window-handle",
- "refineable",
  "regex",
  "resvg",
- "scheduler",
  "schemars",
  "seahash",
  "serde",
@@ -2403,7 +2386,6 @@ dependencies = [
  "spin 0.12.2",
  "stacksafe",
  "strum",
- "sum_tree",
  "taffy",
  "thiserror 2.0.19",
  "ttf-parser",
@@ -2468,11 +2450,11 @@ dependencies = [
  "bytemuck",
  "calloop",
  "calloop-wayland-source",
- "collections",
  "filedescriptor",
  "futures",
  "gpui",
- "gpui_util",
+ "gpui_ce_util",
+ "gpui_collections",
  "gpui_wgpu",
  "image",
  "itertools 0.15.0",
@@ -2491,7 +2473,6 @@ dependencies = [
  "strum",
  "swash",
  "url",
- "util",
  "uuid",
  "wayland-backend",
  "wayland-client",
@@ -2517,7 +2498,6 @@ dependencies = [
  "block2 0.6.2",
  "cbindgen",
  "cocoa",
- "collections",
  "core-foundation",
  "core-foundation-sys",
  "core-graphics 0.25.0",
@@ -2531,13 +2511,14 @@ dependencies = [
  "foreign-types",
  "futures",
  "gpui",
- "gpui_util",
+ "gpui_ce_util",
+ "gpui_collections",
+ "gpui_media",
  "image",
  "itertools 0.15.0",
  "libc",
  "log",
  "mach2",
- "media",
  "metal",
  "objc",
  "objc2 0.6.4",
@@ -2551,7 +2532,6 @@ dependencies = [
  "semver",
  "smallvec",
  "strum",
- "util",
  "uuid",
 ]
 
@@ -2650,17 +2630,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "gpui",
- "gpui_util",
+ "gpui_ce_util",
  "tokio",
-]
-
-[[package]]
-name = "gpui_util"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "log",
- "which 6.0.3",
 ]
 
 [[package]]
@@ -2691,13 +2662,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytemuck",
- "collections",
  "cosmic-text",
  "criterion",
  "etagere",
  "font-kit",
  "gpui",
- "gpui_util",
+ "gpui_ce_util",
+ "gpui_collections",
  "itertools 0.15.0",
  "js-sys",
  "log",
@@ -2722,12 +2693,12 @@ dependencies = [
  "accesskit",
  "accesskit_windows",
  "anyhow",
- "collections",
  "dunce",
  "etagere",
  "futures",
  "gpui",
- "gpui_util",
+ "gpui_ce_util",
+ "gpui_collections",
  "gpui_wgpu",
  "image",
  "itertools 0.15.0",
@@ -2736,7 +2707,6 @@ dependencies = [
  "rand 0.10.2",
  "raw-window-handle",
  "smallvec",
- "util",
  "uuid",
  "windows 0.62.2",
  "windows-core 0.62.2",
@@ -3584,20 +3554,6 @@ checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
 dependencies = [
  "cfg-if",
  "digest 0.10.7",
-]
-
-[[package]]
-name = "media"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bindgen",
- "core-foundation",
- "core-video",
- "ctor",
- "foreign-types",
- "metal",
- "objc",
 ]
 
 [[package]]
@@ -4984,13 +4940,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "refineable"
-version = "0.1.0"
-dependencies = [
- "derive_refineable",
-]
-
-[[package]]
 name = "regex"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5204,21 +5153,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
-]
-
-[[package]]
-name = "scheduler"
-version = "0.1.0"
-dependencies = [
- "async-task",
- "backtrace",
- "chrono",
- "flume",
- "futures",
- "log",
- "parking_lot",
- "rand 0.10.2",
- "web-time",
 ]
 
 [[package]]
@@ -5644,20 +5578,6 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
-
-[[package]]
-name = "sum_tree"
-version = "0.1.0"
-dependencies = [
- "ctor",
- "env_logger",
- "heapless",
- "log",
- "profiling",
- "proptest",
- "rand 0.10.2",
- "rayon",
-]
 
 [[package]]
 name = "sval"
@@ -6281,19 +6201,6 @@ name = "utf8parse"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
-
-[[package]]
-name = "util"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "futures-lite",
- "gpui_util",
- "libc",
- "log",
- "mach2",
- "smol",
-]
 
 [[package]]
 name = "uuid"

@@ -10,14 +10,6 @@ members = [
     "./crates/gpui_windows/",
     "./crates/gpui_platform/",
     "./crates/gpui_shared_string/",
-    "./crates/collections/",
-    "./crates/scheduler/",
-    "./crates/sum_tree/",
-    "./crates/gpui_util/",
-    "./crates/refineable/",
-    "./crates/derive_refineable/",
-    "./crates/util/",
-    "./crates/media/",
     "./crates/gpui_elements/",
     "./crates/gpui_collections/",
     "./crates/gpui_refineable/",
@@ -51,7 +43,7 @@ accesskit_windows = "0.34.0"
 anyhow = "1.0.104"
 backtrace = "0.3"
 bitflags = { version = "2.13.1", default-features = false }
-collections = { path = "./crates/collections/" }
+collections = { path = "./crates/gpui_collections/", version = "0.2.2", package = "gpui_collections" }
 ctor = "1.0.12"
 unicode-bidi = { version = "0.3.18", default-features = false, features = [
     "hardcoded-data",
@@ -84,8 +76,8 @@ chrono = { version = "0.4", features = ["serde"] }
 profiling = "1"
 rand = "0.10.2"
 regex = "1.13"
-refineable = { path = "./crates/refineable/" }
-scheduler = { path = "./crates/scheduler/" }
+refineable = { path = "./crates/gpui_refineable/", version = "0.2.2", package = "gpui_refineable" }
+scheduler = { path = "./crates/gpui_scheduler/", version = "0.2.2", package = "gpui_scheduler" }
 schemars = { version = "1.2.2", features = ["indexmap2"] }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = { version = "1.0.151", features = ["raw_value"] }
@@ -94,7 +86,7 @@ smallvec = { version = "1.15", features = ["union", "const_new"] }
 async-channel = "2.5.0"
 stacksafe = "1.0.3"
 strum = { version = "0.28.0", features = ["derive"] }
-sum_tree = { path = "./crates/sum_tree/" }
+sum_tree = { path = "./crates/gpui_sum_tree/", version = "0.2.2", package = "gpui_sum_tree" }
 thiserror = "2.0.19"
 hdrhistogram = "7"
 pollster = "1"
@@ -106,7 +98,7 @@ cocoa-foundation = "=0.2.1"
 core-foundation = "0.10"
 core-foundation-sys = "0.8.7"
 core-video = { version = "0.6.1", features = ["metal"] }
-media = { path = "./crates/media/" }
+media = { path = "./crates/gpui_media/", version = "0.2.2", package = "gpui_media" }
 objc = "0.2"
 block2 = "0.6"
 objc2-foundation = { version = "=0.3.2", default-features = false, features = [
@@ -156,7 +148,6 @@ ashpd = { version = "0.13.13", default-features = false, features = [
 ] }
 libc = "0.2"
 smol = "2.0.2"
-util = { path = "./crates/util/" }
 wgpu = { git = "https://github.com/zed-industries/wgpu.git", rev = "357a0c56e0070480ad9daea5d2eaa83150b79e88" }
 criterion = { version = "0.8.2", features = ["html_reports"] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
@@ -170,7 +161,7 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
 semver = { version = "1.0", features = ["serde"] }
 windows-core = "0.62.2"
 tokio = { version = "1" }
-gpui_util = { path = "./crates/gpui_util/" }
+gpui_util = { path = "./crates/gpui_ce_util/", version = "0.2.2", package = "gpui_ce_util" }
 xim = { version = "0.4.0-zed", package = "zed-xim" }
 
 as-raw-xcb-connection = "1"
