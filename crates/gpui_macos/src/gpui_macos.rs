@@ -30,7 +30,6 @@ mod window;
 mod window_appearance;
 
 pub(crate) use gpui::collections;
-pub(crate) use gpui_util as util;
 
 use cocoa::{
     base::{id, nil},

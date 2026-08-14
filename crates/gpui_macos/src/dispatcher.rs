@@ -1,4 +1,3 @@
-use crate::util::ResultExt;
 use dispatch2::{DispatchQueue, DispatchQueueGlobalPriority, DispatchTime, GlobalQueueIdentifier};
 use gpui::{PlatformDispatcher, Priority, RunnableMeta, RunnableVariant};
 use gpui_util::ResultExt;
