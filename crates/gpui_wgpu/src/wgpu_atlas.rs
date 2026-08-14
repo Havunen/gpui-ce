@@ -477,7 +477,10 @@ mod tests {
 
     #[test]
     fn remove_deallocates_tile_space_for_reuse() -> anyhow::Result<()> {
-        let (device, queue) = test_device_and_queue()?;
+        let Ok((device, queue)) = test_device_and_queue() else {
+            eprintln!("skipping test: no GPU adapter available");
+            return Ok(());
+        };
         let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
 
         let small = Size {

@@ -341,7 +341,6 @@ mod tests {
     use std::sync::Mutex;
 
     use gpui::{ClipboardEntry, ClipboardItem, ClipboardString, ImageFormat};
-    use objc::rc::autoreleasepool;
 
     use super::*;
 
