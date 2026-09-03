@@ -316,7 +316,13 @@ jobs:
             --config 'patch.crates-io.gpui_ce_web.path="../gpui_web"'
             --config 'patch.crates-io.gpui_ce_macros.path="../gpui_macros"'
           )
-          (cd crates/gpui_ce_components && cargo "${component_patch_args[@]}" build --workspace --all-targets)
+          (
+            cd crates/gpui_ce_components
+            # Its lockfile describes crates.io gpui-ce, whose exact macOS
+            # dependencies can differ from the locally patched manifest.
+            cargo "${component_patch_args[@]}" update -p gpui-ce
+            cargo "${component_patch_args[@]}" build --workspace --all-targets --locked
+          )
       - name: Test components workspace
         run: |
           component_patch_args=(
