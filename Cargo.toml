@@ -166,7 +166,10 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
 ] }
 objc2-quartz-core = { version = "0.3", default-features = false, features = ["CALayer"] }
 semver = { version = "1", features = ["serde"] }
-windows-core = "0.100"
+# These types cross `windows` API boundaries and must remain on the versions
+# used by `windows` 0.62.x. `windows-registry` is versioned independently.
+# https://github.com/microsoft/windows-rs/issues/4884
+windows-core = "0.62"
 tokio = { version = "1" }
 gpui_util = { path = "./crates/gpui_ce_util/", version = "0.2.6", package = "gpui_ce_util" }
 xim = { path = "./crates/xim/", package = "gpui_xim" }
@@ -223,8 +226,8 @@ wayland-protocols = "0.32"
 wayland-protocols-plasma = "0.3"
 wayland-protocols-wlr = "0.3"
 web-sys = "0.3"
-windows-numerics = "0.100"
-windows-registry = "0.100"
+windows-numerics = "0.3"
+windows-registry = "0.6"
 x11 = "2.21"
 x11-clipboard = "0.9"
 x11-dl = "2.21"
