@@ -210,7 +210,7 @@ seahash = "4"
 smol_str = "0.3"
 spin = "0.12"
 swash = "0.2"
-taffy = { version = "=0.13.0", default-features = false, features = ["std", "taffy_tree", "flexbox", "grid", "block_layout", "calc", "content_size", "detailed_layout_info"] }
+taffy = { version = "=0.14.0", default-features = false, features = ["std", "taffy_tree", "flexbox", "grid", "block_layout", "calc", "content_size", "detailed_layout_info"] }
 skrifa = "0.46"
 usvg = { version = "0.48", default-features = false }
 waker-fn = "1.2"
