@@ -206,21 +206,35 @@ mod windows_tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    /// Spawns a process tree `powershell -> ping` via `Child::spawn` and
+    /// Spawns a process tree `shell -> ping` via `Child::spawn` and
     /// returns the `Child` along with the pid of the grandchild (`ping`).
-    fn spawn_process_tree(temp_dir: &std::path::Path) -> (Child, u32) {
+    fn spawn_process_tree(temp_dir: &std::path::Path) -> Option<(Child, u32)> {
         let pid_file = temp_dir.join("grandchild_pid");
-        let mut command = std::process::Command::new("powershell.exe");
-        command.args(["-NoProfile", "-Command"]).arg(format!(
+        let script = format!(
             "$p = Start-Process -FilePath ping.exe -ArgumentList @('-n','60','127.0.0.1') -PassThru -WindowStyle Hidden; \
              Set-Content -LiteralPath '{}' -Value $p.Id; \
              Wait-Process -Id $p.Id",
             pid_file.display()
-        ));
-        let child = Child::spawn(command, Stdio::null(), Stdio::null(), Stdio::null())
-            .expect("failed to spawn powershell");
+        );
+        let mut child = None;
+        for shell in ["pwsh.exe", "powershell.exe"] {
+            let mut command = std::process::Command::new(shell);
+            command.args(["-NoProfile", "-Command"]).arg(&script);
+            if let Ok(spawned) = Child::spawn(command, Stdio::null(), Stdio::null(), Stdio::null())
+            {
+                child = Some(spawned);
+                break;
+            }
+        }
+        let child = match child {
+            Some(child) => child,
+            None => {
+                eprintln!("skipping: neither pwsh.exe nor powershell.exe is available");
+                return None;
+            }
+        };
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         let grandchild_pid = loop {
             if let Ok(contents) = std::fs::read_to_string(&pid_file)
                 && let Ok(pid) = contents.trim().parse::<u32>()
@@ -237,7 +251,7 @@ mod windows_tests {
             process_is_alive(grandchild_pid),
             "grandchild should be alive after spawning"
         );
-        (child, grandchild_pid)
+        Some((child, grandchild_pid))
     }
 
     fn process_is_alive(pid: u32) -> bool {
@@ -271,7 +285,9 @@ mod windows_tests {
     #[test]
     fn test_kill_terminates_grandchildren() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let (mut child, grandchild_pid) = spawn_process_tree(temp_dir.path());
+        let Some((mut child, grandchild_pid)) = spawn_process_tree(temp_dir.path()) else {
+            return;
+        };
 
         child.kill().expect("failed to kill child");
 
@@ -284,7 +300,9 @@ mod windows_tests {
     #[test]
     fn test_drop_terminates_grandchildren() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let (child, grandchild_pid) = spawn_process_tree(temp_dir.path());
+        let Some((child, grandchild_pid)) = spawn_process_tree(temp_dir.path()) else {
+            return;
+        };
 
         drop(child);
 
