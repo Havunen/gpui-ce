@@ -40,10 +40,10 @@ readme = "README.md"
 rust-version = "1.97"
 
 [workspace.dependencies]
-accesskit = { version = "0.24", features = ["enumn"] }
-accesskit_macos = "0.26"
-accesskit_unix = "0.22"
-accesskit_windows = "0.34"
+accesskit = { version = "0.25", features = ["enumn"] }
+accesskit_macos = "0.27"
+accesskit_unix = "0.23"
+accesskit_windows = "0.35"
 anyhow = "1"
 backtrace = "0.3"
 bitflags = { version = "2", default-features = false }
@@ -98,8 +98,6 @@ pollster = "1"
 url = "2"
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 web-time = "1.1"
-cocoa = "=0.26.1"
-cocoa-foundation = "=0.2.1"
 core-foundation = "0.10"
 core-foundation-sys = "0.8"
 core-video = { version = "0.6", features = ["metal"] }
@@ -133,7 +131,7 @@ objc2-foundation = { version = "=0.3.2", default-features = false, features = [
     "std",
 ] }
 objc2-user-notifications = "0.3"
-mach2 = "0.6"
+mach2 = "0.7"
 metal = "0.33"
 env_logger = "0.11"
 unicode-segmentation = "1.13"
@@ -166,7 +164,11 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSWindow",
     "block2",
 ] }
+objc2-quartz-core = { version = "0.3", default-features = false, features = ["CALayer"] }
 semver = { version = "1", features = ["serde"] }
+# These types cross `windows` API boundaries and must remain on the versions
+# used by `windows` 0.62.x. `windows-registry` is versioned independently.
+# https://github.com/microsoft/windows-rs/issues/4884
 windows-core = "0.62"
 tokio = { version = "1" }
 gpui_util = { path = "./crates/gpui_ce_util/", version = "0.2.6", package = "gpui_ce_util" }
@@ -211,7 +213,7 @@ seahash = "4"
 smol_str = "0.3"
 spin = "0.12"
 swash = "0.2"
-taffy = { version = "=0.13.0", default-features = false, features = ["std", "taffy_tree", "flexbox", "grid", "block_layout", "calc", "content_size", "detailed_layout_info"] }
+taffy = { version = "=0.14.0", default-features = false, features = ["std", "taffy_tree", "flexbox", "grid", "block_layout", "calc", "content_size", "detailed_layout_info"] }
 skrifa = "0.46"
 usvg = { version = "0.48", default-features = false }
 waker-fn = "1.2"
