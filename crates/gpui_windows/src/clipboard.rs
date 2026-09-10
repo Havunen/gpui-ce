@@ -1,4 +1,4 @@
-use std::{sync::LazyLock, time::Duration};
+use std::{ffi::OsString, os::windows::ffi::OsStringExt, sync::LazyLock, time::Duration};
 
 use crate::collections::FxHashMap;
 use anyhow::Result;
@@ -34,6 +34,11 @@ static CLIPBOARD_GIF_FORMAT: LazyLock<u32> =
     LazyLock::new(|| register_clipboard_format(windows::core::w!("GIF")));
 static CLIPBOARD_PNG_FORMAT: LazyLock<u32> =
     LazyLock::new(|| register_clipboard_format(windows::core::w!("PNG")));
+static FILE_TRANSFER_FORMAT: LazyLock<u32> = LazyLock::new(|| {
+    register_clipboard_format(windows::core::w!("application/x-gpui-file-transfer"))
+});
+static PREFERRED_DROP_EFFECT: LazyLock<u32> =
+    LazyLock::new(|| register_clipboard_format(windows::core::w!("Preferred DropEffect")));
 static CLIPBOARD_JPG_FORMAT: LazyLock<u32> =
     LazyLock::new(|| register_clipboard_format(windows::core::w!("JFIF")));
 
@@ -68,6 +73,12 @@ fn get_clipboard_data(format: u32) -> Option<LockedGlobal> {
 }
 
 pub(crate) fn write_to_clipboard(item: ClipboardItem) {
+    if let Some(files) = item.file_transfer() {
+        if let Err(error) = crate::file_transfer::write_files(files) {
+            log::error!("Could not write native files to clipboard: {error}");
+        }
+        return;
+    }
     let Some(_clip) = ClipboardGuard::open() else {
         return;
     };
@@ -78,7 +89,12 @@ pub(crate) fn write_to_clipboard(item: ClipboardItem) {
             match entry {
                 ClipboardEntry::String(string) => write_string(string)?,
                 ClipboardEntry::Image(image) => write_image(image)?,
-                ClipboardEntry::ExternalPaths(_) => {}
+                ClipboardEntry::ExternalPaths(paths) => write_files(&gpui::FileTransfer {
+                    paths: paths.clone(),
+                    operation: gpui::FileTransferOperation::Copy,
+                    ownership: 0,
+                })?,
+                ClipboardEntry::Files(files) => write_files(files)?,
             }
         }
         Ok(())
@@ -91,6 +107,36 @@ pub(crate) fn write_to_clipboard(item: ClipboardItem) {
 
 pub(crate) fn read_from_clipboard() -> Option<ClipboardItem> {
     let _clip = ClipboardGuard::open()?;
+    // CF_HDROP preserves native UTF-16 names, including names that cannot be
+    // encoded as a Unicode URL. Private metadata carries only operation/token.
+    if let Some(ClipboardEntry::ExternalPaths(paths)) = read_files() {
+        let operation = if get_clipboard_data(*PREFERRED_DROP_EFFECT).is_some_and(|data| {
+            data.as_bytes()
+                .get(..4)
+                .is_some_and(|bytes| bytes == 2u32.to_le_bytes())
+        }) {
+            gpui::FileTransferOperation::Move
+        } else {
+            gpui::FileTransferOperation::Copy
+        };
+        let ownership = get_clipboard_data(*FILE_TRANSFER_FORMAT)
+            .and_then(|data| {
+                std::str::from_utf8(data.as_bytes())
+                    .ok()?
+                    .lines()
+                    .nth(1)?
+                    .parse()
+                    .ok()
+            })
+            .unwrap_or(0);
+        return Some(ClipboardItem {
+            entries: vec![ClipboardEntry::Files(gpui::FileTransfer {
+                paths,
+                operation,
+                ownership,
+            })],
+        });
+    }
 
     let mut entries = Vec::new();
     let mut have_text = false;
@@ -129,7 +175,7 @@ pub(crate) fn read_from_clipboard() -> Option<ClipboardItem> {
 
 pub(crate) fn with_file_names<F>(hdrop: HDROP, mut f: F)
 where
-    F: FnMut(String),
+    F: FnMut(OsString),
 {
     let file_count = unsafe { DragQueryFileW(hdrop, DRAGDROP_GET_FILES_COUNT, None) };
     for file_index in 0..file_count {
@@ -140,10 +186,7 @@ where
             log::error!("unable to read file name of dragged file");
             continue;
         }
-        match String::from_utf16(&buffer[0..filename_length]) {
-            Ok(file_name) => f(file_name),
-            Err(e) => log::error!("dragged file name is not UTF-16: {}", e),
-        }
+        f(OsString::from_wide(&buffer[..filename_length]));
     }
 }
 
@@ -188,6 +231,34 @@ fn write_string(item: &ClipboardString) -> Result<()> {
         let wide: Vec<u16> = metadata.encode_utf16().chain(Some(0)).collect_vec();
         set_clipboard_bytes(&wide, *CLIPBOARD_METADATA_FORMAT)?;
     }
+    Ok(())
+}
+
+fn write_files(files: &gpui::FileTransfer) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    // DROPFILES: pFiles, POINT, fNC, fWide. The file list is UTF-16 and
+    // double-NUL terminated; native names must not pass through UTF-8.
+    let mut bytes = Vec::new();
+    for value in [20u32, 0, 0, 0, 1] {
+        bytes.extend(value.to_le_bytes());
+    }
+    for path in files.paths.paths() {
+        for value in path.as_os_str().encode_wide().chain(Some(0)) {
+            bytes.extend(value.to_le_bytes());
+        }
+    }
+    bytes.extend(0u16.to_le_bytes());
+    set_clipboard_bytes(&bytes, CF_HDROP.0 as u32)?;
+    let effect = if files.operation == gpui::FileTransferOperation::Move {
+        2u32
+    } else {
+        1u32
+    };
+    set_clipboard_bytes(&effect.to_le_bytes(), *PREFERRED_DROP_EFFECT)?;
+    set_clipboard_bytes(
+        &files.encode(gpui::FILE_TRANSFER_MIME).unwrap(),
+        *FILE_TRANSFER_FORMAT,
+    )?;
     Ok(())
 }
 

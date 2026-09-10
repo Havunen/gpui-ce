@@ -153,6 +153,8 @@ pub use lerp::*;
 pub use motion::*;
 pub use path_builder::*;
 pub use platform::*;
+mod file_transfer;
+pub use file_transfer::*;
 pub use profiler::*;
 #[cfg(any(target_os = "windows", target_os = "linux", target_family = "wasm"))]
 pub use queue::{PriorityQueueReceiver, PriorityQueueSender};

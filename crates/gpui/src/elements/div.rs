@@ -669,7 +669,30 @@ impl Interactivity {
             "calling external_drag_payload more than once on the same element is not supported"
         );
         drag_listener.external_payload = Some(Box::new(move |value, window, cx| {
-            resolver(value.downcast_ref::<T>()?, window, cx)
+            crate::ExternalDragPayloadResolution::Ready(
+                value
+                    .downcast_ref::<T>()
+                    .and_then(|value| resolver(value, window, cx)),
+            )
+        }));
+    }
+
+    /// Prepare a native payload asynchronously after a drag leaves the viewport.
+    pub fn external_drag_payload_async<T: 'static>(
+        &mut self,
+        resolver: impl Fn(&T, &mut Window, &mut App) -> crate::Task<Option<ExternalDragPayload>>
+        + 'static,
+    ) {
+        let Some(listener) = self.drag_listener.as_mut() else {
+            return;
+        };
+        listener.external_payload = Some(Box::new(move |value, window, cx| {
+            match value.downcast_ref::<T>() {
+                Some(value) => {
+                    crate::ExternalDragPayloadResolution::Pending(resolver(value, window, cx))
+                }
+                None => crate::ExternalDragPayloadResolution::Ready(None),
+            }
         }));
     }
 
@@ -1672,6 +1695,19 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Prepare metadata on a background worker before starting native dragging.
+    fn external_drag_payload_async<T: 'static>(
+        mut self,
+        resolver: impl Fn(&T, &mut Window, &mut App) -> crate::Task<Option<ExternalDragPayload>>
+        + 'static,
+    ) -> Self
+    where
+        Self: Sized,
+    {
+        self.interactivity().external_drag_payload_async(resolver);
+        self
+    }
+
     /// Bind the given callback on the hover start and end events of this element. Note that the boolean
     /// passed to the callback is true when the hover starts and false when it ends.
     /// Transitions caused by layout changes under a stationary mouse also invoke the callback.
@@ -1774,7 +1810,7 @@ pub(crate) struct DragListener {
 }
 
 type ExternalDragPayloadResolver =
-    Box<dyn Fn(&dyn Any, &mut Window, &mut App) -> Option<ExternalDragPayload> + 'static>;
+    Box<dyn Fn(&dyn Any, &mut Window, &mut App) -> crate::ExternalDragPayloadResolution + 'static>;
 
 type DropListener = Box<dyn Fn(&dyn Any, &mut Window, &mut App) + 'static>;
 

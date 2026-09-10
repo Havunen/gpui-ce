@@ -1032,6 +1032,7 @@ struct MacWindowState {
     appearance_changed_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
     last_key_equivalent: Option<KeyDownEvent>,
+    outbound_files: Option<gpui::FileTransfer>,
     last_left_mouse_down_event: Option<Retained<Objc2Object>>,
     synthetic_drag_counter: usize,
     traffic_light_position: Option<Point<Pixels>>,
@@ -1470,6 +1471,7 @@ impl MacWindow {
                 input_handler: None,
                 last_key_equivalent: None,
                 last_left_mouse_down_event: None,
+                outbound_files: None,
                 synthetic_drag_counter: 0,
                 traffic_light_position: titlebar
                     .as_ref()
@@ -2548,6 +2550,7 @@ impl PlatformWindow for MacWindow {
                 return false;
             }
 
+            self.0.lock().outbound_files = Some(paths.transfer());
             let session: id = msg_send![
                 native_view,
                 beginDraggingSessionWithItems: dragging_items
@@ -3746,13 +3749,25 @@ extern "C" fn conclude_drag_operation(this: &Object, _: Sel, _: id) {
 }
 
 extern "C" fn dragging_session_source_operation_mask(
-    _: &Object,
+    this: &Object,
     _: Sel,
     _: id,
     context: NSInteger,
 ) -> NSDragOperation {
     let operation = match context {
-        NSDRAGGING_CONTEXT_OUTSIDE_APPLICATION => NSDragOperationCopy,
+        NSDRAGGING_CONTEXT_OUTSIDE_APPLICATION => {
+            let state = unsafe { get_window_state(this) };
+            if state
+                .lock()
+                .outbound_files
+                .as_ref()
+                .is_some_and(|f| f.operation == gpui::FileTransferOperation::Move)
+            {
+                NSDragOperationCopy | NSDragOperationMove
+            } else {
+                NSDragOperationCopy
+            }
+        }
         NSDRAGGING_CONTEXT_WITHIN_APPLICATION => NSDragOperationCopy | NSDragOperationMove,
         _ => NSDragOperationCopy | NSDragOperationMove,
     };
@@ -3780,7 +3795,26 @@ extern "C" fn dragging_session_ended(
         lock.synthetic_drag_counter += 1;
         lock.last_left_mouse_down_event = None;
     }
-    send_file_drop_event(window_state, FileDropEvent::Ended);
+    let files = window_state.lock().outbound_files.take();
+    if let Some(files) = files {
+        let operation = if operation & NSDragOperationMove != 0 {
+            Some(gpui::FileTransferOperation::Move)
+        } else if operation & NSDragOperationCopy != 0 {
+            Some(gpui::FileTransferOperation::Copy)
+        } else {
+            None
+        };
+        send_file_drop_event(
+            window_state,
+            FileDropEvent::Completed(gpui::FileTransferCompletion {
+                files,
+                operation,
+                source_removed: false,
+            }),
+        );
+    } else {
+        send_file_drop_event(window_state, FileDropEvent::Ended);
+    }
 }
 
 async fn synthetic_drag(
@@ -3814,7 +3848,7 @@ fn send_file_drop_event(
 ) -> bool {
     let external_files_dragged = match file_drop_event {
         FileDropEvent::Entered { .. } => Some(true),
-        FileDropEvent::Exited | FileDropEvent::Ended => Some(false),
+        FileDropEvent::Exited | FileDropEvent::Ended | FileDropEvent::Completed(_) => Some(false),
         _ => None,
     };
 

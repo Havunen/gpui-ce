@@ -49,6 +49,45 @@ impl Pasteboard {
 
     pub fn read(&self) -> Option<ClipboardItem> {
         unsafe {
+            let data: Id = msg_send![*self.inner, dataForType: ns_string(gpui::FILE_TRANSFER_MIME)];
+            if !data.is_null() {
+                let length: usize = msg_send![data, length];
+                let bytes: *const u8 = msg_send![data, bytes];
+                if length > 0
+                    && !bytes.is_null()
+                    && let Some(files) = gpui::FileTransfer::decode(
+                        slice::from_raw_parts(bytes, length),
+                        gpui::FILE_TRANSFER_MIME,
+                    )
+                {
+                    return Some(ClipboardItem {
+                        entries: vec![ClipboardEntry::Files(files)],
+                    });
+                }
+            }
+            let classes: Id = msg_send![class!(NSArray), arrayWithObject: class!(NSURL)];
+            let only_files: Id = msg_send![class!(NSNumber), numberWithBool: true];
+            let options: Id = msg_send![class!(NSDictionary), dictionaryWithObject: only_files forKey: ns_string("NSPasteboardURLReadingFileURLsOnlyKey")];
+            let urls: Id = msg_send![*self.inner, readObjectsForClasses: classes options: options];
+            if !urls.is_null() {
+                let count: usize = msg_send![urls, count];
+                let mut paths = SmallVec::new();
+                for i in 0..count {
+                    let url: Id = msg_send![urls, objectAtIndex: i];
+                    let path: *const std::ffi::c_char = msg_send![url, fileSystemRepresentation];
+                    if !path.is_null() {
+                        use std::os::unix::ffi::OsStrExt;
+                        paths.push(PathBuf::from(std::ffi::OsStr::from_bytes(
+                            CStr::from_ptr(path).to_bytes(),
+                        )));
+                    }
+                }
+                if !paths.is_empty() {
+                    return Some(ClipboardItem {
+                        entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths(paths))],
+                    });
+                }
+            }
             // Check for file paths first
             let filenames: Id = msg_send![*self.inner, propertyListForType: NSFilenamesPboardType];
             if !filenames.is_null() {
@@ -160,6 +199,28 @@ impl Pasteboard {
     }
 
     pub fn write(&self, item: ClipboardItem) {
+        if let Some(files) = item.file_transfer() {
+            unsafe {
+                let urls: Id = msg_send![class!(NSMutableArray), array];
+                for url in String::from_utf8(files.uri_list())
+                    .unwrap_or_default()
+                    .lines()
+                {
+                    {
+                        let native: Id = msg_send![class!(NSURL), URLWithString: ns_string(url)];
+                        if !native.is_null() {
+                            let _: () = msg_send![urls, addObject: native];
+                        }
+                    }
+                }
+                let _: usize = msg_send![*self.inner, clearContents];
+                let _: bool = msg_send![*self.inner, writeObjects: urls];
+                let bytes = files.encode(gpui::FILE_TRANSFER_MIME).unwrap();
+                let data: Id = msg_send![class!(NSData), dataWithBytes: bytes.as_ptr() as *const c_void length: bytes.len()];
+                let _: bool = msg_send![*self.inner, setData: data forType: ns_string(gpui::FILE_TRANSFER_MIME)];
+            }
+            return;
+        }
         unsafe {
             match item.entries.as_slice() {
                 [] => {

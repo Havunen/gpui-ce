@@ -78,7 +78,10 @@ x11rb::atom_manager! {
         TEXT_MIME_UNKNOWN: b"text/plain",
 
         // HTML: b"text/html",
-        // URI_LIST: b"text/uri-list",
+        URI_LIST: b"text/uri-list",
+        COPIED_FILES: b"x-special/gnome-copied-files",
+        FILE_TRANSFER: b"application/x-gpui-file-transfer",
+        KDE_CUT: b"application/x-kde-cutselection",
 
         PNG__MIME: ImageFormat::mime_type(ImageFormat::Png ).as_bytes(),
         JPEG_MIME: ImageFormat::mime_type(ImageFormat::Jpeg).as_bytes(),
@@ -990,6 +993,28 @@ impl Clipboard {
         self.inner.write(data, selection, wait)
     }
 
+    pub(crate) fn set_files(
+        &self,
+        files: &gpui::FileTransfer,
+        selection: ClipboardKind,
+        wait: WaitConfig,
+    ) -> Result<()> {
+        let formats = [
+            (self.inner.atoms.FILE_TRANSFER, gpui::FILE_TRANSFER_MIME),
+            (self.inner.atoms.COPIED_FILES, gpui::COPIED_FILES_MIME),
+            (self.inner.atoms.URI_LIST, gpui::URI_LIST_MIME),
+            (self.inner.atoms.KDE_CUT, gpui::KDE_CUT_MIME),
+        ];
+        let data = formats
+            .into_iter()
+            .map(|(format, mime)| ClipboardData {
+                format,
+                bytes: files.encode(mime).unwrap(),
+            })
+            .collect();
+        self.inner.write(data, selection, wait)
+    }
+
     fn image_format_atom(&self, format: ImageFormat) -> Atom {
         match format {
             ImageFormat::Png => self.inner.atoms.PNG__MIME,
@@ -1036,10 +1061,36 @@ impl Clipboard {
         // image formats first, as they are more specific, and read will return the first
         // format that the contents can be converted to
         let mut format_atoms = Vec::with_capacity(image_entries.len() + text_format_atoms.len());
+        format_atoms.extend([
+            self.inner.atoms.FILE_TRANSFER,
+            self.inner.atoms.COPIED_FILES,
+            self.inner.atoms.URI_LIST,
+        ]);
         format_atoms.extend(image_entries.iter().map(|(atom, _)| *atom));
         format_atoms.extend_from_slice(text_format_atoms);
 
         let result = self.inner.read(&format_atoms, selection)?;
+        for (format, mime) in [
+            (self.inner.atoms.FILE_TRANSFER, gpui::FILE_TRANSFER_MIME),
+            (self.inner.atoms.COPIED_FILES, gpui::COPIED_FILES_MIME),
+            (self.inner.atoms.URI_LIST, gpui::URI_LIST_MIME),
+        ] {
+            if result.format == format {
+                let mut files = gpui::FileTransfer::decode(&result.bytes, mime)
+                    .ok_or(Error::ConversionFailure)?;
+                if mime == gpui::URI_LIST_MIME
+                    && self
+                        .inner
+                        .read(&[self.inner.atoms.KDE_CUT], selection)
+                        .is_ok_and(|data| data.bytes == b"1")
+                {
+                    files.operation = gpui::FileTransferOperation::Move;
+                }
+                return Ok(ClipboardItem {
+                    entries: vec![gpui::ClipboardEntry::Files(files)],
+                });
+            }
+        }
 
         log::trace!(
             "read clipboard as format {:?}",
