@@ -83,9 +83,11 @@ impl Pasteboard {
                     }
                 }
                 if !paths.is_empty() {
-                    return Some(ClipboardItem {
-                        entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths(paths))],
-                    });
+                    let mut entries = vec![ClipboardEntry::ExternalPaths(ExternalPaths(paths))];
+                    if let Some(text) = self.read_string_from_pasteboard() {
+                        entries.push(text);
+                    }
+                    return Some(ClipboardItem { entries });
                 }
             }
             // Check for file paths first
@@ -457,6 +459,34 @@ mod tests {
             assert_eq!(text_hash_type.to_bytes(), b"zed-text-hash");
             assert_eq!(metadata_type.to_bytes(), b"zed-metadata");
         }
+    }
+
+    #[test]
+    fn native_file_urls_and_owned_move_payload_roundtrip() {
+        run_pasteboard_test(|| {
+            let pasteboard = Pasteboard::unique();
+            let files = gpui::FileTransfer {
+                paths: ExternalPaths(
+                    [PathBuf::from("/tmp/a b.txt"), PathBuf::from("/tmp/folder")].into(),
+                ),
+                operation: gpui::FileTransferOperation::Move,
+                ownership: 23,
+            };
+            pasteboard.write(ClipboardItem {
+                entries: vec![ClipboardEntry::Files(files.clone())],
+            });
+            assert_eq!(
+                pasteboard.read().and_then(|item| item.file_transfer()),
+                Some(files)
+            );
+            unsafe {
+                let classes: Id = msg_send![class!(NSArray), arrayWithObject: class!(NSURL)];
+                let urls: Id =
+                    msg_send![*pasteboard.inner, readObjectsForClasses: classes options: NIL];
+                let count: usize = msg_send![urls, count];
+                assert_eq!(count, 2, "Finder must receive a native URL for every file");
+            }
+        });
     }
 
     #[test]

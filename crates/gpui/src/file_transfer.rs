@@ -150,16 +150,27 @@ mod tests {
 
     #[test]
     fn nautilus_payload_has_lf_separators_and_no_empty_lines() {
+        let root = if cfg!(windows) { "C:/tmp" } else { "/tmp" };
+        let urls = if cfg!(windows) {
+            ["file:///C:/tmp/a", "file:///C:/tmp/b"]
+        } else {
+            ["file:///tmp/a", "file:///tmp/b"]
+        };
         let files = FileTransfer {
-            paths: ExternalPaths([PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")].into()),
+            paths: ExternalPaths(
+                [PathBuf::from(root).join("a"), PathBuf::from(root).join("b")].into(),
+            ),
             operation: FileTransferOperation::Copy,
             ownership: 7,
         };
         assert_eq!(
             files.encode(COPIED_FILES_MIME).unwrap(),
-            b"copy\nfile:///tmp/a\nfile:///tmp/b"
+            format!("copy\n{}\n{}", urls[0], urls[1]).as_bytes()
         );
-        assert_eq!(files.uri_list(), b"file:///tmp/a\r\nfile:///tmp/b\r\n");
+        assert_eq!(
+            files.uri_list(),
+            format!("{}\r\n{}\r\n", urls[0], urls[1]).as_bytes()
+        );
     }
 
     #[test]
@@ -180,7 +191,15 @@ mod tests {
     #[test]
     fn native_names_roundtrip_without_treating_text_as_files() {
         let files = FileTransfer {
-            paths: ExternalPaths([PathBuf::from("/tmp/a b\n#%.txt")].into_iter().collect()),
+            paths: ExternalPaths(
+                [PathBuf::from(if cfg!(windows) {
+                    "C:/tmp/a b#%.txt"
+                } else {
+                    "/tmp/a b\n#%.txt"
+                })]
+                .into_iter()
+                .collect(),
+            ),
             operation: FileTransferOperation::Move,
             ownership: 19,
         };
