@@ -341,8 +341,9 @@ impl Drop for FilePasteState {
 pub struct FileDropTransfer {
     /// The operation agreed with the source application.
     pub operation: FileTransferOperation,
-    /// Wayland/Xdnd sources perform their own removal after successful Move.
-    /// Such receivers copy the items, then acknowledge the entire transfer.
+    /// Whether this particular source guarantees removal after successful Move.
+    /// Local file URL transfers normally delegate the move to the receiver;
+    /// a protocol completion alone does not imply source-side deletion.
     pub source_owns_move: bool,
     /// A completion tied to the original offer or data object.
     pub completion: FilePaste,

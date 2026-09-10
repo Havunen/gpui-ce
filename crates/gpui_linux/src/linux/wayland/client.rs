@@ -2956,7 +2956,9 @@ fn finish_native_file_drop(client: &Rc<RefCell<WaylandClientState>>) {
         position,
         transfer: gpui::FileDropTransfer {
             operation: action.unwrap_or(gpui::FileTransferOperation::Copy),
-            source_owns_move: true,
+            // The receiver moves local URI-list files. wl_data_offer.finish
+            // acknowledges the transfer; Nautilus does not remove the originals.
+            source_owns_move: false,
             completion: gpui::FilePaste::new(move |completed| {
                 if completed.is_some() && completed == action {
                     offer.finish();

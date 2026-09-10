@@ -839,7 +839,9 @@ impl X11Client {
             position,
             transfer: gpui::FileDropTransfer {
                 operation,
-                source_owns_move: true,
+                // URI-list file managers delegate the filesystem move to the
+                // target. XdndFinished acknowledges it; it does not delete files.
+                source_owns_move: false,
                 completion: gpui::FilePaste::new(move |completed| {
                     xdnd_send_finished(
                         &connection,
