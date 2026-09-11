@@ -17,10 +17,10 @@
 
 use crate::{
     Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, AppContext, Bounds, ClickEvent,
-    DispatchPhase, Display, Element, ElementId, Entity, EntityId, ExternalDragPayload,
-    ExternalDragPayloadSource, FocusHandle, Global, GlobalElementId, Hitbox, HitboxBehavior,
-    HitboxId, InspectorElementId, IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent,
-    KeyboardButton, KeyboardClickEvent, LayoutId, ModifiersChangedEvent, MouseButton,
+    DispatchPhase, Display, DragMoveRefresh, Element, ElementId, Entity, EntityId,
+    ExternalDragPayload, ExternalDragPayloadSource, FocusHandle, Global, GlobalElementId, Hitbox,
+    HitboxBehavior, HitboxId, InspectorElementId, IntoElement, IsZero, KeyContext, KeyDownEvent,
+    KeyUpEvent, KeyboardButton, KeyboardClickEvent, LayoutId, ModifiersChangedEvent, MouseButton,
     MouseClickEvent, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent,
     MouseUpEvent, OngoingScroll, Overflow, ParentElement, PinchEvent, Pixels, Point, Render,
     ScrollWheelEvent, SharedString, Size, Style, StyleRefinement, StyleTransitionContext,
@@ -642,7 +642,18 @@ impl Interactivity {
                 constructor(value.downcast_ref().unwrap(), offset, window, cx).into()
             }),
             external_payload: None,
+            move_refresh: DragMoveRefresh::default(),
         });
+    }
+
+    /// Choose how pointer movement invalidates the UI. Call after `on_drag`.
+    /// With `Preview`, handlers must notify any other views that change.
+    pub fn drag_move_refresh(&mut self, refresh: DragMoveRefresh) {
+        let listener = self
+            .drag_listener
+            .as_mut()
+            .expect("drag_move_refresh must follow on_drag");
+        listener.move_refresh = refresh;
     }
 
     /// Registers a callback resolving a payload to offer the platform if a drag started by this
@@ -1678,6 +1689,13 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Choose how pointer movement invalidates the UI. Call after `on_drag`.
+    /// With `Preview`, handlers must notify any other views that change.
+    fn drag_move_refresh(mut self, refresh: DragMoveRefresh) -> Self {
+        self.interactivity().drag_move_refresh(refresh);
+        self
+    }
+
     /// Registers a callback resolving a payload to offer the platform if a drag started by this
     /// element leaves the window. It is invoked at most once per drag gesture, when the pointer
     /// exits the viewport. Must be called after [`Self::on_drag`], with the same dragged value
@@ -1807,6 +1825,7 @@ pub(crate) struct DragListener {
     value: Arc<dyn Any>,
     render: Box<dyn Fn(&dyn Any, Point<Pixels>, &mut Window, &mut App) -> AnyView + 'static>,
     external_payload: Option<ExternalDragPayloadResolver>,
+    move_refresh: DragMoveRefresh,
 }
 
 type ExternalDragPayloadResolver =
@@ -3087,6 +3106,7 @@ impl Interactivity {
                                 view: drag,
                                 value: listener.value,
                                 cursor_offset,
+                                move_refresh: listener.move_refresh,
                                 cursor_style: drag_cursor_style,
                                 external_payload_source,
                             });

@@ -3049,6 +3049,17 @@ impl<G: Global> DerefMut for GlobalLease<G> {
     }
 }
 
+/// How pointer movement invalidates the UI during a drag.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DragMoveRefresh {
+    /// Refresh the whole window, including cached views (the default).
+    #[default]
+    Window,
+    /// Invalidate only the preview. Drag handlers must notify views whose
+    /// appearance changes, including custom drop targets and drag-over styles.
+    Preview,
+}
+
 /// Contains state associated with an active drag operation, started by dragging an element
 /// within the window or by dragging into the app from the underlying platform.
 pub struct AnyDrag {
@@ -3061,6 +3072,9 @@ pub struct AnyDrag {
     /// This is used to render the dragged item in the same place
     /// on the original element that the drag was initiated
     pub cursor_offset: Point<Pixels>,
+
+    /// Which views to invalidate when the pointer moves.
+    pub move_refresh: DragMoveRefresh,
 
     /// The cursor style to use while dragging
     pub cursor_style: Option<CursorStyle>,

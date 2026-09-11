@@ -5348,6 +5348,11 @@ impl Window {
             PlatformInput::ModifiersChanged(modifiers_changed) => {
                 self.modifiers = modifiers_changed.modifiers;
                 self.capslock = modifiers_changed.capslock;
+                if let Some(drag) = &cx.active_drag
+                    && drag.move_refresh == crate::DragMoveRefresh::Preview
+                {
+                    self.invalidator.invalidate_view(drag.view.entity_id(), cx);
+                }
                 PlatformInput::ModifiersChanged(modifiers_changed)
             }
             PlatformInput::ScrollWheel(scroll_wheel) => {
@@ -5372,6 +5377,7 @@ impl Window {
                             value: Arc::new(paths.clone()),
                             view: cx.new(|_| paths).into(),
                             cursor_offset: position,
+                            move_refresh: crate::DragMoveRefresh::default(),
                             cursor_style: None,
                             external_payload_source: None,
                         });
@@ -5755,7 +5761,13 @@ impl Window {
             if event.is::<MouseMoveEvent>() {
                 // If this was a mouse move event, redraw the window so that the
                 // active drag can follow the mouse cursor.
-                self.refresh();
+                let drag = cx.active_drag.as_ref().unwrap();
+                match drag.move_refresh {
+                    crate::DragMoveRefresh::Window => self.refresh(),
+                    crate::DragMoveRefresh::Preview => {
+                        self.invalidator.invalidate_view(drag.view.entity_id(), cx);
+                    }
+                }
             } else if event.is::<MouseUpEvent>() {
                 // If this was a mouse up event, cancel the active drag and redraw
                 // the window.
@@ -7815,6 +7827,145 @@ mod tests {
         assert_eq!(child_bounds.get().size, size(px(300.), px(200.)));
     }
 
+    struct DragRenderCounter(Rc<Cell<usize>>);
+
+    impl Render for DragRenderCounter {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.0.set(self.0.get() + 1);
+            div().size_full()
+        }
+    }
+
+    struct DragRefreshRoot {
+        content: crate::Entity<DragRenderCounter>,
+        preview_renders: Rc<Cell<usize>>,
+        refresh: crate::DragMoveRefresh,
+    }
+
+    impl Render for DragRefreshRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let preview_renders = self.preview_renders.clone();
+            div()
+                .id("drag-refresh-root")
+                .size_full()
+                .child(
+                    crate::AnyView::from(self.content.clone())
+                        .cached(crate::StyleRefinement::default().size_full()),
+                )
+                .on_drag((), move |_, _, _, cx| {
+                    cx.new(|_| DragRenderCounter(preview_renders.clone()))
+                })
+                .drag_move_refresh(self.refresh)
+        }
+    }
+
+    #[gpui::test]
+    fn drag_move_refresh_preserves_caches_only_when_opted_in(cx: &mut TestAppContext) {
+        for refresh in [
+            crate::DragMoveRefresh::Window,
+            crate::DragMoveRefresh::Preview,
+        ] {
+            let content_renders = Rc::new(Cell::new(0));
+            let preview_renders = Rc::new(Cell::new(0));
+            let window: AnyWindowHandle = cx
+                .add_window({
+                    let content_renders = content_renders.clone();
+                    let preview_renders = preview_renders.clone();
+                    move |_, cx| DragRefreshRoot {
+                        content: cx.new(|_| DragRenderCounter(content_renders)),
+                        preview_renders,
+                        refresh,
+                    }
+                })
+                .into();
+            cx.update_window(window, |root, window, cx| {
+                window.draw(cx).clear(cx);
+                window.dispatch_event(
+                    MouseDownEvent {
+                        position: point(px(10.), px(10.)),
+                        button: MouseButton::Left,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                let move_pointer = |x, window: &mut Window, cx: &mut crate::App| {
+                    window.dispatch_event(
+                        MouseMoveEvent {
+                            position: point(px(x), px(20.)),
+                            pressed_button: Some(MouseButton::Left),
+                            modifiers: Default::default(),
+                        }
+                        .to_platform_input(),
+                        cx,
+                    );
+                };
+                move_pointer(20., window, cx);
+                assert_eq!(cx.active_drag.as_ref().unwrap().move_refresh, refresh);
+                window.draw(cx).clear(cx);
+                let before = content_renders.get();
+                let previews_before = preview_renders.get();
+                for x in [30., 40., 50., 60.] {
+                    move_pointer(x, window, cx);
+                    assert!(window.invalidator.is_dirty());
+                    window.draw(cx).clear(cx);
+                }
+                assert_eq!(preview_renders.get(), previews_before + 4);
+                assert_eq!(
+                    content_renders.get(),
+                    before
+                        + if refresh == crate::DragMoveRefresh::Window {
+                            4
+                        } else {
+                            0
+                        }
+                );
+
+                // Explicit view changes and previously requested full refreshes
+                // must still reach the screen during a preview-only drag.
+                let content = root
+                    .downcast::<DragRefreshRoot>()
+                    .unwrap()
+                    .read(cx)
+                    .content
+                    .clone();
+                window.invalidator.invalidate_view(content.entity_id(), cx);
+                let before = content_renders.get();
+                move_pointer(70., window, cx);
+                window.draw(cx).clear(cx);
+                assert_eq!(content_renders.get(), before + 1);
+                window.refresh();
+                move_pointer(80., window, cx);
+                window.draw(cx).clear(cx);
+                assert_eq!(content_renders.get(), before + 2);
+                if refresh == crate::DragMoveRefresh::Preview {
+                    let before = preview_renders.get();
+                    window.dispatch_event(
+                        crate::ModifiersChangedEvent {
+                            modifiers: crate::Modifiers {
+                                control: true,
+                                ..Default::default()
+                            },
+                            capslock: Default::default(),
+                        }
+                        .to_platform_input(),
+                        cx,
+                    );
+                    assert!(
+                        preview_renders.get() > before,
+                        "stationary modifiers must repaint the preview"
+                    );
+                }
+                assert!(cx.stop_active_drag(window));
+                window.draw(cx).clear(cx);
+                assert!(!cx.has_active_drag());
+            })
+            .unwrap();
+        }
+    }
+
     struct FileDragView {
         path: PathBuf,
         observed_drag_moves: Rc<RefCell<Vec<Point<Pixels>>>>,
@@ -7827,6 +7978,7 @@ mod tests {
                 .id("file-drag")
                 .size_full()
                 .on_drag(self.path.clone(), |_, _, _, cx| cx.new(|_| Empty))
+                .drag_move_refresh(crate::DragMoveRefresh::Preview)
                 .external_drag_payload(|path: &PathBuf, _, _| {
                     Some(ExternalDragPayload::Files(FileDragPaths::new([(
                         path.clone(),
