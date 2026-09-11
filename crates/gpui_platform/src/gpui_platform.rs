@@ -205,3 +205,6 @@ mod tests {
         assert!(*task_ran.borrow());
     }
 }
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub use gpui_linux::{read_files_from_x11_clipboard, write_files_to_x11_clipboard};

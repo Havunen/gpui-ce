@@ -1180,6 +1180,7 @@ pub struct Window {
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
     focus_lost_path: SmallVec<[FocusId; 8]>,
     default_prevented: bool,
+    incoming_file_drop: Option<crate::FileDropTransfer>,
     mouse_position: Point<Pixels>,
     mouse_hit_test: HitTest,
     modifiers: Modifiers,
@@ -1877,6 +1878,7 @@ impl Window {
             focus_lost_listeners: SubscriberSet::new(),
             focus_lost_path: SmallVec::new(),
             default_prevented: true,
+            incoming_file_drop: None,
             mouse_position,
             mouse_hit_test: HitTest::default(),
             modifiers,
@@ -5308,6 +5310,16 @@ impl Window {
         // Handlers may set this to true by calling `prevent_default`.
         self.default_prevented = false;
 
+        let event = if let PlatformInput::FileDrop(FileDropEvent::SubmitWithTransfer {
+            position,
+            transfer,
+        }) = event
+        {
+            self.incoming_file_drop = Some(transfer);
+            PlatformInput::FileDrop(FileDropEvent::Submit { position })
+        } else {
+            event
+        };
         let event = match event {
             // Track the mouse position with our own state, since accessing the platform
             // API for the mouse position can only occur on the main thread.
@@ -5351,6 +5363,7 @@ impl Window {
             // Translate dragging and dropping of external files from the operating system
             // to internal drag and drop events.
             PlatformInput::FileDrop(file_drop) => match file_drop {
+                FileDropEvent::SubmitWithTransfer { .. } => unreachable!("normalized above"),
                 FileDropEvent::Entered { position, paths } => {
                     self.mouse_position = position;
                     let source_window = self.handle.window_id();
@@ -5366,7 +5379,7 @@ impl Window {
                     PlatformInput::MouseMove(MouseMoveEvent {
                         position,
                         pressed_button: Some(MouseButton::Left),
-                        modifiers: Modifiers::default(),
+                        modifiers: self.platform_window.modifiers(),
                     })
                 }
                 FileDropEvent::Pending { position } => {
@@ -5374,16 +5387,17 @@ impl Window {
                     PlatformInput::MouseMove(MouseMoveEvent {
                         position,
                         pressed_button: Some(MouseButton::Left),
-                        modifiers: Modifiers::default(),
+                        modifiers: self.platform_window.modifiers(),
                     })
                 }
                 FileDropEvent::Submit { position } => {
                     cx.activate(true);
                     self.mouse_position = position;
+                    self.modifiers = self.platform_window.modifiers();
                     PlatformInput::MouseUp(MouseUpEvent {
                         button: MouseButton::Left,
                         position,
-                        modifiers: Modifiers::default(),
+                        modifiers: self.modifiers,
                         click_count: 1,
                     })
                 }
@@ -5393,6 +5407,12 @@ impl Window {
                     }
                     self.refresh();
                     PlatformInput::FileDrop(FileDropEvent::Exited)
+                }
+                FileDropEvent::Completed(completion) => {
+                    completion.report();
+                    cx.end_platform_drag(self.handle.window_id());
+                    self.refresh();
+                    PlatformInput::FileDrop(FileDropEvent::Ended)
                 }
                 FileDropEvent::Ended => {
                     cx.end_platform_drag(self.handle.window_id());
@@ -5449,10 +5469,25 @@ impl Window {
         #[cfg(feature = "profiler")]
         self.window_profiler.end_input(caused_invalidation);
 
+        // Unclaimed native drops are rejected; a handler can take the lease
+        // during on_drop and complete it from asynchronous filesystem work.
+        self.incoming_file_drop.take();
         DispatchEventResult {
             propagate: cx.propagate_event,
             default_prevented: self.default_prevented,
         }
+    }
+
+    /// Claim the native completion lease during a file-drop handler.
+    pub fn take_file_drop(&mut self) -> Option<crate::FileDropTransfer> {
+        self.incoming_file_drop.take()
+    }
+
+    /// Cancel the current in-application drag, including pending preparation.
+    pub fn cancel_drag(&mut self, cx: &mut App) {
+        cx.active_drag.take();
+        self.incoming_file_drop.take();
+        self.refresh();
     }
 
     fn promote_external_drag_to_platform(&mut self, event: &PlatformInput, cx: &mut App) {
@@ -5475,12 +5510,67 @@ impl Window {
         else {
             return;
         };
-        let Some(payload) = payload_source(self, cx) else {
-            return;
-        };
+        let value = cx.active_drag.as_ref().map(|drag| drag.value.clone());
+        match payload_source(self, cx) {
+            crate::ExternalDragPayloadResolution::Ready(Some(payload)) => {
+                self.start_prepared_external_drag(payload, cx)
+            }
+            crate::ExternalDragPayloadResolution::Ready(None) => {}
+            crate::ExternalDragPayloadResolution::Pending(task) => {
+                let handle = self.handle;
+                cx.spawn(async move |cx| {
+                    if let Some(payload) = task.await {
+                        let cancelled = payload.clone();
+                        if handle
+                            .update(cx, |_, window, cx| {
+                                if cx
+                                    .active_drag
+                                    .as_ref()
+                                    .zip(value.as_ref())
+                                    .is_some_and(|(drag, value)| Arc::ptr_eq(&drag.value, value))
+                                {
+                                    window.start_prepared_external_drag(payload, cx);
+                                } else {
+                                    let crate::ExternalDragPayload::Files(files) = payload;
+                                    crate::FileTransferCompletion {
+                                        files: files.transfer(),
+                                        operation: None,
+                                        source_removed: false,
+                                    }
+                                    .report();
+                                    window.refresh();
+                                }
+                            })
+                            .is_err()
+                        {
+                            let crate::ExternalDragPayload::Files(files) = cancelled;
+                            crate::FileTransferCompletion {
+                                files: files.transfer(),
+                                operation: None,
+                                source_removed: false,
+                            }
+                            .report();
+                        }
+                    }
+                })
+                .detach();
+            }
+        }
+    }
+
+    fn start_prepared_external_drag(&mut self, payload: crate::ExternalDragPayload, cx: &mut App) {
         if self.platform_window.start_external_drag(&payload)
             && cx.hand_active_drag_to_platform(self.handle.window_id())
         {
+            self.refresh();
+        } else {
+            let crate::ExternalDragPayload::Files(files) = payload;
+            crate::FileTransferCompletion {
+                files: files.transfer(),
+                operation: None,
+                source_removed: false,
+            }
+            .report();
             self.refresh();
         }
     }

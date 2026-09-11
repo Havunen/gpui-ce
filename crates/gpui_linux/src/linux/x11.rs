@@ -1,7 +1,8 @@
 mod client;
-mod clipboard;
+pub(crate) mod clipboard;
 mod display;
 mod event;
+mod outbound_drag;
 mod window;
 mod xim_handler;
 

@@ -47,6 +47,8 @@ x11rb::atom_manager! {
         XdndFinished,
         XdndTypeList,
         XdndActionCopy,
+        XdndActionMove,
+        XdndActionList,
         TextUriList: b"text/uri-list",
         UTF8_STRING,
         TEXT,
@@ -54,6 +56,7 @@ x11rb::atom_manager! {
         TEXT_PLAIN_UTF8: b"text/plain;charset=utf-8",
         TEXT_PLAIN: b"text/plain",
         XDND_DATA,
+        INCR,
         WM_PROTOCOLS,
         WM_DELETE_WINDOW,
         WM_CHANGE_STATE,
@@ -1371,6 +1374,32 @@ impl X11WindowStatePtr {
 }
 
 impl PlatformWindow for X11Window {
+    fn can_start_external_drag(&self) -> bool {
+        true
+    }
+    fn start_external_drag(&self, payload: &gpui::ExternalDragPayload) -> bool {
+        let gpui::ExternalDragPayload::Files(paths) = payload;
+        if paths.entries().is_empty() {
+            return false;
+        }
+        let _ = self.0.xcb.ungrab_pointer(x11rb::CURRENT_TIME);
+        let _ = self.0.xcb.flush();
+        let window = self.0.clone();
+        let files = paths.transfer();
+        self.0
+            .state
+            .borrow()
+            .executor
+            .spawn(async move {
+                let completion = smol::unblock(move || super::outbound_drag::run(files)).await;
+                window.handle_input(PlatformInput::FileDrop(gpui::FileDropEvent::Completed(
+                    completion,
+                )));
+            })
+            .detach();
+        true
+    }
+
     fn bounds(&self) -> Bounds<Pixels> {
         self.0.state.borrow().bounds
     }

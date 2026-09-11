@@ -846,6 +846,10 @@ impl Platform for WindowsPlatform {
         write_to_clipboard(item);
     }
 
+    fn capture_file_paste(&self, files: &gpui::FileTransfer) -> Option<gpui::FilePaste> {
+        crate::file_transfer::capture_paste(files)
+    }
+
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
         read_from_clipboard()
     }

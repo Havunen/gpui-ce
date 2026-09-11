@@ -78,7 +78,10 @@ x11rb::atom_manager! {
         TEXT_MIME_UNKNOWN: b"text/plain",
 
         // HTML: b"text/html",
-        // URI_LIST: b"text/uri-list",
+        URI_LIST: b"text/uri-list",
+        COPIED_FILES: b"x-special/gnome-copied-files",
+        FILE_TRANSFER: b"application/x-gpui-file-transfer",
+        KDE_CUT: b"application/x-kde-cutselection",
 
         PNG__MIME: ImageFormat::mime_type(ImageFormat::Png ).as_bytes(),
         JPEG_MIME: ImageFormat::mime_type(ImageFormat::Jpeg).as_bytes(),
@@ -990,6 +993,28 @@ impl Clipboard {
         self.inner.write(data, selection, wait)
     }
 
+    pub(crate) fn set_files(
+        &self,
+        files: &gpui::FileTransfer,
+        selection: ClipboardKind,
+        wait: WaitConfig,
+    ) -> Result<()> {
+        let formats = [
+            (self.inner.atoms.FILE_TRANSFER, gpui::FILE_TRANSFER_MIME),
+            (self.inner.atoms.COPIED_FILES, gpui::COPIED_FILES_MIME),
+            (self.inner.atoms.URI_LIST, gpui::URI_LIST_MIME),
+            (self.inner.atoms.KDE_CUT, gpui::KDE_CUT_MIME),
+        ];
+        let data = formats
+            .into_iter()
+            .map(|(format, mime)| ClipboardData {
+                format,
+                bytes: files.encode(mime).unwrap(),
+            })
+            .collect();
+        self.inner.write(data, selection, wait)
+    }
+
     fn image_format_atom(&self, format: ImageFormat) -> Atom {
         match format {
             ImageFormat::Png => self.inner.atoms.PNG__MIME,
@@ -1033,13 +1058,44 @@ impl Clipboard {
             self.inner.atoms.TEXT_MIME_UNKNOWN,
         ];
 
-        // image formats first, as they are more specific, and read will return the first
-        // format that the contents can be converted to
-        let mut format_atoms = Vec::with_capacity(image_entries.len() + text_format_atoms.len());
+        let file_formats = [
+            (self.inner.atoms.FILE_TRANSFER, gpui::FILE_TRANSFER_MIME),
+            (self.inner.atoms.COPIED_FILES, gpui::COPIED_FILES_MIME),
+            (self.inner.atoms.URI_LIST, gpui::URI_LIST_MIME),
+        ];
+
+        // file formats first, then image formats, as they are more specific, and
+        // read will return the first format that the contents can be converted to
+        let mut format_atoms =
+            Vec::with_capacity(file_formats.len() + image_entries.len() + text_format_atoms.len());
+        format_atoms.extend(file_formats.iter().map(|(atom, _)| *atom));
         format_atoms.extend(image_entries.iter().map(|(atom, _)| *atom));
         format_atoms.extend_from_slice(text_format_atoms);
 
-        let result = self.inner.read(&format_atoms, selection)?;
+        let mut result = self.inner.read(&format_atoms, selection)?;
+
+        if let Some((_, mime)) = file_formats
+            .iter()
+            .find(|(format, _)| *format == result.format)
+        {
+            let kde_cut = *mime == gpui::URI_LIST_MIME
+                && self
+                    .inner
+                    .read(&[self.inner.atoms.KDE_CUT], selection)
+                    .is_ok_and(|data| data.bytes == b"1");
+            if let Some(files) = decode_file_clipboard(&result.bytes, mime, kde_cut) {
+                return Ok(ClipboardItem {
+                    entries: vec![gpui::ClipboardEntry::Files(files)],
+                });
+            }
+            // An owner advertising `text/uri-list` has not necessarily put
+            // *files* on the clipboard - browsers use it for ordinary links.
+            // That is not a clipboard failure, so read the selection again
+            // ignoring the file formats rather than failing the whole paste.
+            result = self
+                .inner
+                .read(&format_atoms[file_formats.len()..], selection)?;
+        }
 
         log::trace!(
             "read clipboard as format {:?}",
@@ -1251,5 +1307,56 @@ impl Error {
         Error::Unknown {
             description: message.into(),
         }
+    }
+}
+
+/// Decode a selection payload as local files.
+///
+/// Returns `None` when the payload is a perfectly valid document of that MIME
+/// type that simply does not describe local files - a browser advertises
+/// `text/uri-list` for ordinary links. That is not a clipboard failure, so
+/// callers fall back to reading the selection as text or an image.
+fn decode_file_clipboard(bytes: &[u8], mime: &str, kde_cut: bool) -> Option<gpui::FileTransfer> {
+    let mut files = gpui::FileTransfer::decode(bytes, mime)?;
+    if mime == gpui::URI_LIST_MIME && kde_cut {
+        files.operation = gpui::FileTransferOperation::Move;
+    }
+    Some(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_file_clipboard;
+    use gpui::FileTransferOperation;
+
+    #[test]
+    fn link_uri_lists_are_not_files() {
+        // A browser owning the selection offers text/uri-list for a link. The
+        // X11 backend must fall through to text rather than failing the read.
+        for payload in [
+            b"https://example.com/page".as_slice(),
+            b"file:///tmp/ok\r\nhttps://example.com/mixed".as_slice(),
+        ] {
+            assert!(
+                decode_file_clipboard(payload, gpui::URI_LIST_MIME, false).is_none(),
+                "{:?} should not decode as files",
+                std::str::from_utf8(payload),
+            );
+        }
+    }
+
+    #[test]
+    fn kde_cut_selection_upgrades_a_uri_list_to_a_move() {
+        let copied = decode_file_clipboard(b"file:///tmp/a", gpui::URI_LIST_MIME, false).unwrap();
+        assert_eq!(copied.operation, FileTransferOperation::Copy);
+
+        let cut = decode_file_clipboard(b"file:///tmp/a", gpui::URI_LIST_MIME, true).unwrap();
+        assert_eq!(cut.operation, FileTransferOperation::Move);
+
+        // The KDE hint only qualifies a bare uri-list; gnome-copied-files and
+        // our own format carry the operation in the payload itself.
+        let gnome =
+            decode_file_clipboard(b"copy\nfile:///tmp/a", gpui::COPIED_FILES_MIME, true).unwrap();
+        assert_eq!(gnome.operation, FileTransferOperation::Copy);
     }
 }
