@@ -220,6 +220,24 @@ impl Pasteboard {
                 let bytes = files.encode(gpui::FILE_TRANSFER_MIME).unwrap();
                 let data: Id = msg_send![class!(NSData), dataWithBytes: bytes.as_ptr() as *const c_void length: bytes.len()];
                 let _: bool = msg_send![*self.inner, setData: data forType: ns_string(gpui::FILE_TRANSFER_MIME)];
+
+                // An item can carry text alongside its paths. `file_transfer`
+                // also matches plain `ExternalPaths`, so returning here without
+                // writing the text would silently drop it for items that used
+                // to be written as text. The pasteboard holds both types.
+                let text = item
+                    .entries()
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        ClipboardEntry::String(string) => Some(string.text().as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>();
+                if !text.is_empty() {
+                    let text_bytes: Id = msg_send![class!(NSData), dataWithBytes: text.as_ptr() as *const c_void length: text.len()];
+                    let _: bool =
+                        msg_send![*self.inner, setData: text_bytes forType: NSPasteboardTypeString];
+                }
             }
             return;
         }

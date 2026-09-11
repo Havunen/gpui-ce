@@ -1302,10 +1302,10 @@ impl LinuxClient for WaylandClient {
                 return;
             };
             let data_source = primary_selection_manager.create_source(&state.globals.qh, ());
-            if state.clipboard.file_mime_types().is_empty() {
-                for mime_type in TEXT_MIME_TYPES {
-                    data_source.offer(mime_type.to_string());
-                }
+            // The primary selection carries text only - `send_primary` never
+            // encodes a file format - so it always advertises the text types.
+            for mime_type in TEXT_MIME_TYPES {
+                data_source.offer(mime_type.to_string());
             }
             data_source.offer(state.clipboard.self_mime());
             primary_selection.set_selection(Some(&data_source), serial.as_raw());

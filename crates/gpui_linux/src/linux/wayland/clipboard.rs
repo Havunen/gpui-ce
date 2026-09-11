@@ -296,6 +296,9 @@ impl Clipboard {
             .unwrap();
     }
 
+    /// File formats the *clipboard* data source should advertise, on top of the
+    /// text types it always offers. Describes `contents` only; the primary
+    /// selection carries text and must not consult this.
     pub fn file_mime_types(&self) -> &'static [&'static str] {
         if self
             .contents

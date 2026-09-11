@@ -144,82 +144,6 @@ impl ClipboardItem {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn nautilus_payload_has_lf_separators_and_no_empty_lines() {
-        let root = if cfg!(windows) { "C:/tmp" } else { "/tmp" };
-        let urls = if cfg!(windows) {
-            ["file:///C:/tmp/a", "file:///C:/tmp/b"]
-        } else {
-            ["file:///tmp/a", "file:///tmp/b"]
-        };
-        let files = FileTransfer {
-            paths: ExternalPaths(
-                [PathBuf::from(root).join("a"), PathBuf::from(root).join("b")].into(),
-            ),
-            operation: FileTransferOperation::Copy,
-            ownership: 7,
-        };
-        assert_eq!(
-            files.encode(COPIED_FILES_MIME).unwrap(),
-            format!("copy\n{}\n{}", urls[0], urls[1]).as_bytes()
-        );
-        assert_eq!(
-            files.uri_list(),
-            format!("{}\r\n{}\r\n", urls[0], urls[1]).as_bytes()
-        );
-    }
-
-    #[test]
-    fn paste_receipt_reports_completion_once_and_drop_reports_cancellation() {
-        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let observed = events.clone();
-        let receipt = FilePaste::new(move |operation| observed.borrow_mut().push(operation));
-        let retained = receipt.clone();
-        drop(receipt);
-        assert!(events.borrow().is_empty());
-        retained.complete(Some(FileTransferOperation::Move));
-        let observed = events.clone();
-        drop(FilePaste::new(move |operation| {
-            observed.borrow_mut().push(operation)
-        }));
-        assert_eq!(*events.borrow(), [Some(FileTransferOperation::Move), None]);
-    }
-    #[test]
-    fn native_names_roundtrip_without_treating_text_as_files() {
-        let files = FileTransfer {
-            paths: ExternalPaths(
-                [PathBuf::from(if cfg!(windows) {
-                    "C:/tmp/a b#%.txt"
-                } else {
-                    "/tmp/a b\n#%.txt"
-                })]
-                .into_iter()
-                .collect(),
-            ),
-            operation: FileTransferOperation::Move,
-            ownership: 19,
-        };
-        assert_eq!(
-            FileTransfer::decode(
-                &files.encode(FILE_TRANSFER_MIME).unwrap(),
-                FILE_TRANSFER_MIME
-            ),
-            Some(files)
-        );
-        assert!(FileTransfer::decode(b"/tmp/file", URI_LIST_MIME).is_none());
-        assert!(FileTransfer::decode(b"file://host/remote", URI_LIST_MIME).is_none());
-        assert!(
-            ClipboardItem::new_string("/tmp/file".into())
-                .file_transfer()
-                .is_none()
-        );
-    }
-}
-
 /// A completed native transfer. `None` means cancellation or rejection.
 #[derive(Clone, Debug)]
 pub struct FileTransferCompletion {
@@ -256,13 +180,18 @@ impl FileTransferCompletion {
             .push(self);
     }
 }
+/// Whether a transfer with this ownership token is still in flight.
+pub(crate) fn transfer_is_active(ownership: u64) -> bool {
+    ACTIVE_TRANSFERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&ownership)
+}
+
 impl crate::App {
     /// Whether a native receiver is still extracting this clipboard payload.
     pub fn file_transfer_is_active(&self, ownership: u64) -> bool {
-        ACTIVE_TRANSFERS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(&ownership)
+        transfer_is_active(ownership)
     }
 
     /// Includes completed transfers whose source cleanup has not been consumed.
@@ -347,4 +276,150 @@ pub struct FileDropTransfer {
     pub source_owns_move: bool,
     /// A completion tied to the original offer or data object.
     pub completion: FilePaste,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nautilus_payload_has_lf_separators_and_no_empty_lines() {
+        let root = if cfg!(windows) { "C:/tmp" } else { "/tmp" };
+        let urls = if cfg!(windows) {
+            ["file:///C:/tmp/a", "file:///C:/tmp/b"]
+        } else {
+            ["file:///tmp/a", "file:///tmp/b"]
+        };
+        let files = FileTransfer {
+            paths: ExternalPaths(
+                [PathBuf::from(root).join("a"), PathBuf::from(root).join("b")].into(),
+            ),
+            operation: FileTransferOperation::Copy,
+            ownership: 7,
+        };
+        assert_eq!(
+            files.encode(COPIED_FILES_MIME).unwrap(),
+            format!("copy\n{}\n{}", urls[0], urls[1]).as_bytes()
+        );
+        assert_eq!(
+            files.uri_list(),
+            format!("{}\r\n{}\r\n", urls[0], urls[1]).as_bytes()
+        );
+    }
+
+    #[test]
+    fn paste_receipt_reports_completion_once_and_drop_reports_cancellation() {
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let observed = events.clone();
+        let receipt = FilePaste::new(move |operation| observed.borrow_mut().push(operation));
+        let retained = receipt.clone();
+        drop(receipt);
+        assert!(events.borrow().is_empty());
+        retained.complete(Some(FileTransferOperation::Move));
+        let observed = events.clone();
+        drop(FilePaste::new(move |operation| {
+            observed.borrow_mut().push(operation)
+        }));
+        assert_eq!(*events.borrow(), [Some(FileTransferOperation::Move), None]);
+    }
+    #[test]
+    fn native_names_roundtrip_without_treating_text_as_files() {
+        let files = FileTransfer {
+            paths: ExternalPaths(
+                [PathBuf::from(if cfg!(windows) {
+                    "C:/tmp/a b#%.txt"
+                } else {
+                    "/tmp/a b\n#%.txt"
+                })]
+                .into_iter()
+                .collect(),
+            ),
+            operation: FileTransferOperation::Move,
+            ownership: 19,
+        };
+        assert_eq!(
+            FileTransfer::decode(
+                &files.encode(FILE_TRANSFER_MIME).unwrap(),
+                FILE_TRANSFER_MIME
+            ),
+            Some(files)
+        );
+        assert!(FileTransfer::decode(b"/tmp/file", URI_LIST_MIME).is_none());
+        assert!(FileTransfer::decode(b"file://host/remote", URI_LIST_MIME).is_none());
+        assert!(
+            ClipboardItem::new_string("/tmp/file".into())
+                .file_transfer()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn copied_files_still_paste_as_text() {
+        // Regression: platforms now read file clipboards as `ClipboardEntry::Files`
+        // instead of `ExternalPaths`. `ClipboardItem::text()` is what every
+        // text consumer uses (including Wayland's `text/plain` send path), so
+        // both entry kinds must render identically.
+        let root = if cfg!(windows) { "C:/tmp" } else { "/tmp" };
+        let paths = ExternalPaths([PathBuf::from(root).join("a")].into_iter().collect());
+        let as_external = ClipboardItem {
+            entries: vec![ClipboardEntry::ExternalPaths(paths.clone())],
+        };
+        let as_files = ClipboardItem {
+            entries: vec![ClipboardEntry::Files(FileTransfer {
+                paths,
+                operation: FileTransferOperation::Move,
+                ownership: 3,
+            })],
+        };
+        assert_eq!(
+            as_external.text(),
+            Some(PathBuf::from(root).join("a").display().to_string())
+        );
+        assert_eq!(as_files.text(), as_external.text());
+    }
+
+    #[test]
+    fn transfer_is_active_until_its_completion_is_reported() {
+        let files = FileTransfer {
+            paths: ExternalPaths(
+                [PathBuf::from(if cfg!(windows) {
+                    "C:/tmp/a"
+                } else {
+                    "/tmp/a"
+                })]
+                .into_iter()
+                .collect(),
+            ),
+            operation: FileTransferOperation::Move,
+            ownership: 0x5f1a_2b3c_4d5e_6f70,
+        };
+        files.set_active(true);
+        assert!(transfer_is_active(files.ownership));
+        FileTransferCompletion {
+            files: files.clone(),
+            operation: Some(FileTransferOperation::Move),
+            source_removed: false,
+        }
+        .report();
+        assert!(!transfer_is_active(files.ownership));
+    }
+
+    #[test]
+    fn non_file_uri_lists_decode_to_none_so_callers_can_fall_back() {
+        // Browsers advertise `text/uri-list` for ordinary links. Clipboard
+        // backends must be able to tell "not a file payload" apart from
+        // "clipboard is broken", so decode returns None rather than erroring.
+        for payload in [
+            b"https://example.com/page".as_slice(),
+            b"mailto:someone@example.com".as_slice(),
+            b"file:///tmp/ok\r\nhttps://example.com/mixed".as_slice(),
+        ] {
+            assert!(
+                FileTransfer::decode(payload, URI_LIST_MIME).is_none(),
+                "expected {:?} to be rejected as a file payload",
+                std::str::from_utf8(payload),
+            );
+        }
+        assert!(FileTransfer::decode(b"file:///tmp/ok", URI_LIST_MIME).is_some());
+    }
 }

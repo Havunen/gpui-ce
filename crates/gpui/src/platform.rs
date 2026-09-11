@@ -2552,11 +2552,17 @@ impl ClipboardItem {
 
         if answer.is_empty() {
             for entry in self.entries.iter() {
-                if let ClipboardEntry::ExternalPaths(paths) = entry {
-                    for path in &paths.0 {
-                        use std::fmt::Write as _;
-                        _ = write!(answer, "{}", path.display());
-                    }
+                // `Files` and `ExternalPaths` both describe pathnames, and text
+                // consumers must not be able to tell them apart: platforms pick
+                // between the two based on what the source application offered.
+                let paths = match entry {
+                    ClipboardEntry::ExternalPaths(paths) => &paths.0,
+                    ClipboardEntry::Files(files) => &files.paths.0,
+                    _ => continue,
+                };
+                for path in paths {
+                    use std::fmt::Write as _;
+                    _ = write!(answer, "{}", path.display());
                 }
             }
         }
