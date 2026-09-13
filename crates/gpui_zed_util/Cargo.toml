@@ -38,7 +38,7 @@ serde_json_lenient = { version = "0.2", features = [
   "raw_value",
 ] }
 shlex = "2.0"
-take-until = "0.2"
+take-until = "0.3"
 tempfile = "3.27"
 unicase = "2.9"
 url = "2"
@@ -53,7 +53,7 @@ smol = "2"
 which = "8.0"
 async-fs = "2.2"
 walkdir = "2.5"
-dirs = "6.0"
+dirs = "7.0"
 
 [target.'cfg(unix)'.dependencies]
 command-fds = "0.3"

@@ -177,7 +177,7 @@ xim = { path = "./crates/xim/", package = "gpui_xim" }
 ahash = { version = "0.8", default-features = false }
 as-raw-xcb-connection = "1"
 async-task = "4.7"
-bindgen = "0.72"
+bindgen = "0.73"
 block = "0.1"
 bytemuck = "1"
 calloop = "0.14"
@@ -214,7 +214,7 @@ smol_str = "0.3"
 spin = "0.12"
 swash = "0.2"
 taffy = { version = "=0.14.0", default-features = false, features = ["std", "taffy_tree", "flexbox", "grid", "block_layout", "calc", "content_size", "detailed_layout_info"] }
-skrifa = "0.46"
+skrifa = "0.47"
 usvg = { version = "0.48", default-features = false }
 waker-fn = "1.2"
 wasm-bindgen-futures = "0.4"
