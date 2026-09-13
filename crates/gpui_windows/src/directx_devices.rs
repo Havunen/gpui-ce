@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use gpui_util::ResultExt;
 use itertools::Itertools;
-use windows::Win32::{
+use crate::bindings::Windows::Win32::{
     Foundation::HMODULE,
     Graphics::{
         Direct3D::{
@@ -19,7 +19,7 @@ use windows::Win32::{
         },
     },
 };
-use windows::core::Interface;
+use windows_core::Interface;
 
 pub(crate) fn try_to_recover_from_device_lost<T>(mut f: impl FnMut() -> Result<T>) -> Result<T> {
     (0..5)
@@ -76,7 +76,7 @@ impl DirectXDevices {
 fn check_debug_layer_available() -> bool {
     #[cfg(debug_assertions)]
     {
-        use windows::Win32::Graphics::Dxgi::{DXGIGetDebugInterface1, IDXGIInfoQueue};
+        use crate::bindings::Windows::Win32::Graphics::Dxgi::{DXGIGetDebugInterface1, IDXGIInfoQueue};
 
         unsafe { DXGIGetDebugInterface1::<IDXGIInfoQueue>(0) }
             .log_err()

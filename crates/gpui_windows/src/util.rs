@@ -1,13 +1,13 @@
 use std::sync::OnceLock;
 
-use ::windows::{
+use crate::bindings::Windows::{
     UI::{
         Color,
         ViewManagement::{UIColorType, UISettings},
     },
     Win32::{Foundation::*, Graphics::Dwm::*, UI::WindowsAndMessaging::*},
-    core::BOOL,
 };
+use windows_core::BOOL;
 use gpui_util::ResultExt;
 
 use super::SafeCursor;

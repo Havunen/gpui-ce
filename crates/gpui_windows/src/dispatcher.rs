@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::Context;
 use gpui_util::ResultExt;
-use windows::Win32::{
+use crate::bindings::Windows::Win32::{
     Foundation::{FILETIME, LPARAM, WPARAM},
     Media::{timeBeginPeriod, timeEndPeriod},
     System::Threading::{

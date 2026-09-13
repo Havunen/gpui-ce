@@ -10,12 +10,12 @@ use futures::channel::mpsc;
 use gpui::{
     ForegroundExecutor, SharedString, SystemNotification, SystemNotificationResponse, Task,
 };
-use windows::Data::Xml::Dom::XmlDocument;
-use windows::Foundation::TypedEventHandler;
-use windows::UI::Notifications::{
+use crate::bindings::Windows::Data::Xml::Dom::XmlDocument;
+use crate::bindings::Windows::Foundation::TypedEventHandler;
+use crate::bindings::Windows::UI::Notifications::{
     ToastActivatedEventArgs, ToastNotification, ToastNotificationManager, ToastNotifier,
 };
-use windows::core::{IInspectable, Interface as _, h};
+use windows_core::{IInspectable, Interface as _, h};
 
 type ResponseCallback = Rc<RefCell<Option<Box<dyn FnMut(SystemNotificationResponse)>>>>;
 
@@ -46,7 +46,7 @@ impl SystemNotificationState {
         has_package_identity: bool,
         app_identity: Option<(&str, &str)>,
         notification: SystemNotification,
-    ) -> windows::core::Result<()> {
+    ) -> windows_core::Result<()> {
         let Some(notifier) = self.notifier(has_package_identity, app_identity)? else {
             return Ok(());
         };
@@ -130,7 +130,7 @@ impl SystemNotificationState {
         &mut self,
         has_package_identity: bool,
         app_identity: Option<(&str, &str)>,
-    ) -> windows::core::Result<Option<ToastNotifier>> {
+    ) -> windows_core::Result<Option<ToastNotifier>> {
         if let Some(notifier) = &self.notifier {
             return Ok(Some(notifier.clone()));
         }
@@ -154,7 +154,7 @@ impl SystemNotificationState {
     }
 }
 
-fn toast_document(notification: &SystemNotification) -> windows::core::Result<XmlDocument> {
+fn toast_document(notification: &SystemNotification) -> windows_core::Result<XmlDocument> {
     let document = XmlDocument::new()?;
     let toast = document.CreateElement(h!("toast"))?;
     document.AppendChild(&toast)?;

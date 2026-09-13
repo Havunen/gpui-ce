@@ -4,7 +4,7 @@ use std::{cell::Cell, rc::Rc, sync::atomic::Ordering};
 
 use anyhow::Context as _;
 use gpui_util::ResultExt;
-use windows::{
+use crate::bindings::Windows::{
     Win32::{
         Foundation::*,
         Graphics::Gdi::*,
@@ -16,8 +16,8 @@ use windows::{
             WindowsAndMessaging::*,
         },
     },
-    core::PCWSTR,
 };
+use windows_core::PCWSTR;
 
 use crate::*;
 use gpui::*;

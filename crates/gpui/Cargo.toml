@@ -126,10 +126,6 @@ log.workspace = true
 objc2 = { workspace = true, optional = true }
 objc2-metal = { workspace = true, optional = true }
 
-[target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.62", features = ["Win32_Foundation"] }
-
-
 [dev-dependencies]
 backtrace.workspace = true
 smol.workspace = true

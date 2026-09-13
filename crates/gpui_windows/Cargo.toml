@@ -38,10 +38,11 @@ rand.workspace = true
 raw-window-handle.workspace = true
 smallvec.workspace = true
 uuid.workspace = true
-windows.workspace = true
+windows-collections.workspace = true
 windows-core.workspace = true
 windows-numerics.workspace = true
 windows-registry.workspace = true
+windows-version.workspace = true
 
 [target.'cfg(target_os = "windows")'.build-dependencies]
 windows-registry.workspace = true

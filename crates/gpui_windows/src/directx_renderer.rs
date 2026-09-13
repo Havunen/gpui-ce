@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use ::windows::{
+use crate::bindings::Windows::{
     Win32::{
         Foundation::HWND,
         Graphics::{
@@ -14,8 +14,8 @@ use ::windows::{
             Dxgi::{Common::*, *},
         },
     },
-    core::{HSTRING, Interface},
 };
+use windows_core::{HSTRING, Interface};
 use anyhow::{Context, Result};
 use gpui_util::ResultExt;
 
@@ -1832,7 +1832,7 @@ fn create_swap_chain(
     width: u32,
     height: u32,
 ) -> Result<IDXGISwapChain1> {
-    use ::windows::Win32::Graphics::Dxgi::DXGI_MWA_NO_ALT_ENTER;
+    use crate::bindings::Windows::Win32::Graphics::Dxgi::DXGI_MWA_NO_ALT_ENTER;
 
     let desc = DXGI_SWAP_CHAIN_DESC1 {
         Width: width,
@@ -2265,13 +2265,13 @@ pub(crate) mod shader_resources {
     use anyhow::Result;
 
     #[cfg(debug_assertions)]
-    use ::windows::{
+    use crate::bindings::Windows::{
         Win32::Graphics::Direct3D::{
             Fxc::{D3DCOMPILE_DEBUG, D3DCOMPILE_SKIP_OPTIMIZATION, D3DCompileFromFile},
             ID3DBlob,
         },
-        core::{HSTRING, PCSTR},
     };
+use windows_core::{HSTRING, PCSTR};
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
     pub(crate) enum ShaderModule {
@@ -2384,7 +2384,7 @@ pub(crate) mod shader_resources {
     #[cfg(debug_assertions)]
     pub(super) fn build_shader_blob(entry: ShaderModule, target: ShaderTarget) -> Result<ID3DBlob> {
         unsafe {
-            use ::windows::Win32::Graphics::{
+            use crate::bindings::Windows::Win32::Graphics::{
                 Direct3D::ID3DInclude, Hlsl::D3D_COMPILE_STANDARD_FILE_INCLUDE,
             };
 
@@ -2494,10 +2494,10 @@ mod tests {
 }
 
 mod dxgi {
-    use ::windows::{
+    use crate::bindings::Windows::{
         Win32::Graphics::Dxgi::{IDXGIAdapter1, IDXGIDevice},
-        core::Interface,
     };
+use windows_core::Interface;
 
     pub(super) fn get_driver_version(adapter: &IDXGIAdapter1) -> anyhow::Result<String> {
         let number = unsafe { adapter.CheckInterfaceSupport(&IDXGIDevice::IID as _) }?;

@@ -11,8 +11,8 @@ use std::{
 };
 
 #[cfg(not(feature = "wgpu"))]
-use ::windows::Win32::Graphics::Direct3D11::ID3D11Device;
-use ::windows::{
+use crate::bindings::Windows::Win32::Graphics::Direct3D11::ID3D11Device;
+use crate::bindings::Windows::{
     UI::ViewManagement::UISettings,
     Win32::{
         Foundation::*,
@@ -21,8 +21,8 @@ use ::windows::{
         System::{Com::*, LibraryLoader::*, Ole::*, Power::*, SystemInformation::*},
         UI::{Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
     },
-    core::*,
 };
+use windows_core::*;
 use anyhow::{Context as _, Result, anyhow};
 use futures::channel::oneshot::{self, Receiver};
 use gpui_util::{ResultExt, get_powershell, new_std_command};
@@ -717,11 +717,11 @@ impl Platform for WindowsPlatform {
             return;
         }
 
-        let identifier_utf16 = windows::core::HSTRING::from(identifier);
+        let identifier_utf16 = windows_core::HSTRING::from(identifier);
         // SAFETY: `identifier_utf16` outlives the call and is null-terminated.
         if let Err(error) = unsafe {
-            windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(
-                windows::core::PCWSTR(identifier_utf16.as_ptr()),
+            crate::bindings::Windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID(
+                windows_core::PCWSTR(identifier_utf16.as_ptr()),
             )
         } {
             log::warn!("failed to set the process AppUserModelID: {error}");
@@ -1250,7 +1250,7 @@ struct PlatformWindowCreateContext {
 fn has_package_identity() -> bool {
     let mut package_full_name_length = 0;
     let result = unsafe {
-        windows::Win32::Storage::Packaging::Appx::GetCurrentPackageFullName(
+        crate::bindings::Windows::Win32::Storage::Packaging::Appx::GetCurrentPackageFullName(
             &mut package_full_name_length,
             None,
         )
@@ -1270,7 +1270,7 @@ fn open_target(target: impl AsRef<OsStr>) -> Result<()> {
     let ret = unsafe {
         ShellExecuteW(
             None,
-            ::windows::core::w!("open"),
+            windows_core::w!("open"),
             &HSTRING::from(target),
             None,
             None,
@@ -1408,8 +1408,8 @@ fn file_save_dialog(
 
     unsafe {
         dialog.SetFileTypes(&[Common::COMDLG_FILTERSPEC {
-            pszName: ::windows::core::w!("All files"),
-            pszSpec: ::windows::core::w!("*.*"),
+            pszName: windows_core::w!("All files"),
+            pszSpec: windows_core::w!("*.*"),
         }])?;
         if dialog.Show(window).is_err() {
             // User cancelled
@@ -1431,7 +1431,7 @@ fn load_icon() -> Result<HICON> {
     let handle = unsafe {
         LoadImageW(
             Some(module.into()),
-            ::windows::core::PCWSTR(1 as _),
+            windows_core::PCWSTR(1 as _),
             IMAGE_ICON,
             0,
             0,

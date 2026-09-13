@@ -3,7 +3,7 @@ use std::{sync::LazyLock, time::Duration};
 use crate::collections::FxHashMap;
 use anyhow::Result;
 use itertools::Itertools;
-use windows::Win32::{
+use crate::bindings::Windows::Win32::{
     Foundation::{HANDLE, HGLOBAL},
     System::{
         DataExchange::{
@@ -16,7 +16,7 @@ use windows::Win32::{
     },
     UI::Shell::{DragQueryFileW, HDROP},
 };
-use windows::core::{Owned, PCWSTR};
+use windows_core::{Owned, PCWSTR};
 
 use gpui::{
     ClipboardEntry, ClipboardItem, ClipboardString, ExternalPaths, Image, ImageFormat, hash,
@@ -25,17 +25,17 @@ use gpui::{
 const DRAGDROP_GET_FILES_COUNT: u32 = 0xFFFFFFFF;
 
 static CLIPBOARD_HASH_FORMAT: LazyLock<u32> =
-    LazyLock::new(|| register_clipboard_format(windows::core::w!("GPUI internal text hash")));
+    LazyLock::new(|| register_clipboard_format(windows_core::w!("GPUI internal text hash")));
 static CLIPBOARD_METADATA_FORMAT: LazyLock<u32> =
-    LazyLock::new(|| register_clipboard_format(windows::core::w!("GPUI internal metadata")));
+    LazyLock::new(|| register_clipboard_format(windows_core::w!("GPUI internal metadata")));
 static CLIPBOARD_SVG_FORMAT: LazyLock<u32> =
-    LazyLock::new(|| register_clipboard_format(windows::core::w!("image/svg+xml")));
+    LazyLock::new(|| register_clipboard_format(windows_core::w!("image/svg+xml")));
 static CLIPBOARD_GIF_FORMAT: LazyLock<u32> =
-    LazyLock::new(|| register_clipboard_format(windows::core::w!("GIF")));
+    LazyLock::new(|| register_clipboard_format(windows_core::w!("GIF")));
 static CLIPBOARD_PNG_FORMAT: LazyLock<u32> =
-    LazyLock::new(|| register_clipboard_format(windows::core::w!("PNG")));
+    LazyLock::new(|| register_clipboard_format(windows_core::w!("PNG")));
 static CLIPBOARD_JPG_FORMAT: LazyLock<u32> =
-    LazyLock::new(|| register_clipboard_format(windows::core::w!("JFIF")));
+    LazyLock::new(|| register_clipboard_format(windows_core::w!("JFIF")));
 
 static IMAGE_FORMATS_MAP: LazyLock<FxHashMap<u32, ImageFormat>> = LazyLock::new(|| {
     let mut map = FxHashMap::default();

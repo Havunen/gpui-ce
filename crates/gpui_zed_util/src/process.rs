@@ -133,18 +133,20 @@ impl Child {
 
 #[cfg(windows)]
 mod windows_job {
-    use crate::ResultExt as _;
+    use std::{
+        io,
+        os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+        ptr,
+    };
+
     use anyhow::{Context as _, Result};
-    use windows::Win32::{
-        Foundation::{CloseHandle, HANDLE},
-        System::{
-            JobObjects::{
-                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-                SetInformationJobObject, TerminateJobObject,
-            },
-            Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE},
+    use crate::windows_bindings::Windows::Win32::System::{
+        JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, TerminateJobObject,
         },
+        Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE},
     };
 
     /// A Win32 job object configured with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`:
@@ -152,25 +154,25 @@ mod windows_job {
     /// when the last handle to the job is closed, which happens when this struct
     /// is dropped, or when the OS closes the owning process's handles after it
     /// exits for any reason.
-    pub(crate) struct JobObject(HANDLE);
-
-    // SAFETY: Job object handles can be used from any thread.
-    unsafe impl Send for JobObject {}
-    unsafe impl Sync for JobObject {}
+    pub(crate) struct JobObject(OwnedHandle);
 
     impl JobObject {
         pub(crate) fn new() -> Result<Self> {
             unsafe {
-                let job =
-                    Self(CreateJobObjectW(None, None).context("failed to create job object")?);
+                let handle = CreateJobObjectW(ptr::null(), ptr::null());
+                if handle.is_null() {
+                    return Err(io::Error::last_os_error()).context("failed to create job object");
+                }
+                // SAFETY: CreateJobObjectW returned a valid, newly owned handle.
+                let job = Self(OwnedHandle::from_raw_handle(handle));
                 let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
                 info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-                SetInformationJobObject(
-                    job.0,
+                check_bool(SetInformationJobObject(
+                    job.0.as_raw_handle(),
                     JobObjectExtendedLimitInformation,
                     &info as *const _ as *const _,
                     size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                )
+                ))
                 .context("failed to set job object limits")?;
                 Ok(job)
             }
@@ -178,25 +180,28 @@ mod windows_job {
 
         pub(crate) fn assign_process(&self, pid: u32) -> Result<()> {
             unsafe {
-                let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid)
-                    .context("failed to open process")?;
-                let result = AssignProcessToJobObject(self.0, process)
-                    .context("failed to assign process to job object");
-                CloseHandle(process).log_err();
-                result
+                let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+                if process.is_null() {
+                    return Err(io::Error::last_os_error()).context("failed to open process");
+                }
+                // SAFETY: OpenProcess returned a valid, newly owned handle.
+                let process = OwnedHandle::from_raw_handle(process);
+                check_bool(AssignProcessToJobObject(self.0.as_raw_handle(), process.as_raw_handle()))
+                    .context("failed to assign process to job object")
             }
         }
 
         pub(crate) fn terminate(&self) -> Result<()> {
-            unsafe { TerminateJobObject(self.0, 1).context("failed to terminate job object") }
+            unsafe { check_bool(TerminateJobObject(self.0.as_raw_handle(), 1)) }
+                .context("failed to terminate job object")
         }
     }
 
-    impl Drop for JobObject {
-        fn drop(&mut self) {
-            unsafe {
-                CloseHandle(self.0).log_err();
-            }
+    fn check_bool(success: i32) -> io::Result<()> {
+        if success == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
         }
     }
 }
@@ -255,22 +260,24 @@ mod windows_tests {
     }
 
     fn process_is_alive(pid: u32) -> bool {
-        use windows::Win32::{
-            Foundation::{CloseHandle, STILL_ACTIVE},
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use crate::windows_bindings::Windows::Win32::{
+            Foundation::STILL_ACTIVE,
             System::Threading::{
                 GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
             },
         };
 
         unsafe {
-            let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
                 return false;
-            };
+            }
+            // SAFETY: OpenProcess returned a valid, newly owned handle.
+            let handle = OwnedHandle::from_raw_handle(handle);
             let mut exit_code = 0u32;
-            let alive = GetExitCodeProcess(handle, &mut exit_code).is_ok()
-                && exit_code == STILL_ACTIVE.0 as u32;
-            CloseHandle(handle).expect("failed to close process handle");
-            alive
+            GetExitCodeProcess(handle.as_raw_handle(), &mut exit_code) != 0
+                && exit_code == STILL_ACTIVE as u32
         }
     }
 

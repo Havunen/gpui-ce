@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::collections::HashMap;
-use ::windows::{
+use crate::bindings::Windows::{
     Win32::{
         Foundation::*,
         Globalization::GetUserDefaultLocaleName,
@@ -16,8 +16,8 @@ use ::windows::{
         System::SystemServices::LOCALE_NAME_MAX_LENGTH,
         UI::WindowsAndMessaging::*,
     },
-    core::*,
 };
+use windows_core::*;
 use anyhow::{Context, Result};
 use gpui_util::{ResultExt, maybe};
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
@@ -1460,7 +1460,7 @@ impl IDWritePixelSnapping_Impl for TextRenderer_Impl {
     fn IsPixelSnappingDisabled(
         &self,
         _clientdrawingcontext: *const ::core::ffi::c_void,
-    ) -> ::windows::core::Result<BOOL> {
+    ) -> windows_core::Result<BOOL> {
         Ok(BOOL(0))
     }
 
@@ -1468,7 +1468,7 @@ impl IDWritePixelSnapping_Impl for TextRenderer_Impl {
         &self,
         _clientdrawingcontext: *const ::core::ffi::c_void,
         transform: *mut DWRITE_MATRIX,
-    ) -> ::windows::core::Result<()> {
+    ) -> windows_core::Result<()> {
         unsafe {
             *transform = DWRITE_MATRIX {
                 m11: 1.0,
@@ -1485,7 +1485,7 @@ impl IDWritePixelSnapping_Impl for TextRenderer_Impl {
     fn GetPixelsPerDip(
         &self,
         _clientdrawingcontext: *const ::core::ffi::c_void,
-    ) -> ::windows::core::Result<f32> {
+    ) -> windows_core::Result<f32> {
         Ok(1.0)
     }
 }
@@ -1500,8 +1500,8 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
         _measuringmode: DWRITE_MEASURING_MODE,
         glyphrun: *const DWRITE_GLYPH_RUN,
         glyphrundescription: *const DWRITE_GLYPH_RUN_DESCRIPTION,
-        _clientdrawingeffect: ::windows::core::Ref<::windows::core::IUnknown>,
-    ) -> ::windows::core::Result<()> {
+        _clientdrawingeffect: windows_core::Ref<windows_core::IUnknown>,
+    ) -> windows_core::Result<()> {
         let glyphrun = unsafe { &*glyphrun };
         let glyph_count = glyphrun.glyphCount as usize;
         if glyph_count == 0 {
@@ -1544,7 +1544,7 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
                         .text_system
                         .font_info_cache
                         .insert(font_face_key, font_id);
-                    ::windows::core::Result::Ok(font_id)
+                    windows_core::Result::Ok(font_id)
                 },
                 Ok,
             )?;
@@ -1619,9 +1619,9 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
         _baselineoriginx: f32,
         _baselineoriginy: f32,
         _underline: *const DWRITE_UNDERLINE,
-        _clientdrawingeffect: ::windows::core::Ref<::windows::core::IUnknown>,
-    ) -> ::windows::core::Result<()> {
-        Err(::windows::core::Error::new(
+        _clientdrawingeffect: windows_core::Ref<windows_core::IUnknown>,
+    ) -> windows_core::Result<()> {
+        Err(windows_core::Error::new(
             E_NOTIMPL,
             "DrawUnderline unimplemented",
         ))
@@ -1633,9 +1633,9 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
         _baselineoriginx: f32,
         _baselineoriginy: f32,
         _strikethrough: *const DWRITE_STRIKETHROUGH,
-        _clientdrawingeffect: ::windows::core::Ref<::windows::core::IUnknown>,
-    ) -> ::windows::core::Result<()> {
-        Err(::windows::core::Error::new(
+        _clientdrawingeffect: windows_core::Ref<windows_core::IUnknown>,
+    ) -> windows_core::Result<()> {
+        Err(windows_core::Error::new(
             E_NOTIMPL,
             "DrawStrikethrough unimplemented",
         ))
@@ -1646,12 +1646,12 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
         _clientdrawingcontext: *const ::core::ffi::c_void,
         _originx: f32,
         _originy: f32,
-        _inlineobject: ::windows::core::Ref<IDWriteInlineObject>,
+        _inlineobject: windows_core::Ref<IDWriteInlineObject>,
         _issideways: BOOL,
         _isrighttoleft: BOOL,
-        _clientdrawingeffect: ::windows::core::Ref<::windows::core::IUnknown>,
-    ) -> ::windows::core::Result<()> {
-        Err(::windows::core::Error::new(
+        _clientdrawingeffect: windows_core::Ref<windows_core::IUnknown>,
+    ) -> windows_core::Result<()> {
+        Err(windows_core::Error::new(
             E_NOTIMPL,
             "DrawInlineObject unimplemented",
         ))
@@ -1670,7 +1670,7 @@ unsafe fn slice_from_nullable<'a, T>(
     ptr: *const T,
     len: usize,
     null_error_message: &str,
-) -> windows::core::Result<&'a [T]> {
+) -> windows_core::Result<&'a [T]> {
     if ptr.is_null() {
         if len != 0 {
             return Err(Error::new(E_INVALIDARG, null_error_message));
@@ -1951,7 +1951,7 @@ fn is_color_glyph(
     .is_ok()
 }
 
-const DEFAULT_LOCALE_NAME: PCWSTR = ::windows::core::w!("en-US");
+const DEFAULT_LOCALE_NAME: PCWSTR = windows_core::w!("en-US");
 
 #[cfg(test)]
 mod tests {
@@ -1963,12 +1963,12 @@ mod tests {
         DevicePixels, Font, PlatformTextSystem, RenderGlyphParams, Rgba, bounds, point, px, size,
     };
     use std::ffi::c_void;
-    use windows::Win32::Graphics::Direct3D11::{
+    use crate::bindings::Windows::Win32::Graphics::Direct3D11::{
         D3D11_BIND_RENDER_TARGET, D3D11_RENDER_TARGET_VIEW_DESC, D3D11_RENDER_TARGET_VIEW_DESC_0,
         D3D11_RTV_DIMENSION_TEXTURE2D, D3D11_SUBRESOURCE_DATA, D3D11_TEX2D_RTV,
         D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
     };
-    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+    use crate::bindings::Windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 
     #[test]
     fn test_cluster_map() {

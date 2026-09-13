@@ -15,7 +15,7 @@ use futures::channel::oneshot::{self, Receiver};
 use gpui_util::ResultExt;
 use raw_window_handle as rwh;
 use smallvec::SmallVec;
-use windows::{
+use crate::bindings::Windows::{
     Win32::{
         Foundation::*,
         Graphics::Dwm::*,
@@ -25,8 +25,8 @@ use windows::{
         },
         UI::{Controls::*, HiDpi::*, Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
     },
-    core::*,
 };
+use windows_core::*;
 
 use crate::direct_manipulation::DirectManipulationHandler;
 use crate::*;
@@ -36,6 +36,12 @@ use gpui::*;
 use gpui_wgpu::{WgpuRenderer, WgpuSurfaceConfig, wgpu};
 
 pub(crate) struct WindowsWindow(pub Rc<WindowsWindowInner>);
+
+impl WindowsWindow {
+    pub(crate) fn get_raw_handle(&self) -> HWND {
+        self.0.hwnd
+    }
+}
 
 impl std::ops::Deref for WindowsWindow {
     type Target = WindowsWindowInner;
@@ -779,15 +785,15 @@ impl PlatformWindow for WindowsWindow {
                     let main_icon;
                     match level {
                         PromptLevel::Info => {
-                            title = windows::core::w!("Info");
+                            title = windows_core::w!("Info");
                             main_icon = TD_INFORMATION_ICON;
                         }
                         PromptLevel::Warning => {
-                            title = windows::core::w!("Warning");
+                            title = windows_core::w!("Warning");
                             main_icon = TD_WARNING_ICON;
                         }
                         PromptLevel::Critical => {
-                            title = windows::core::w!("Critical");
+                            title = windows_core::w!("Critical");
                             main_icon = TD_ERROR_ICON;
                         }
                     };
@@ -1147,10 +1153,6 @@ impl PlatformWindow for WindowsWindow {
         self.state.renderer.borrow().sprite_atlas().clone()
     }
 
-    fn get_raw_handle(&self) -> HWND {
-        self.0.hwnd
-    }
-
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         #[cfg(feature = "wgpu")]
         return Some(self.state.renderer.borrow().gpu_specs());
@@ -1254,11 +1256,11 @@ impl WindowsDragDropHandler {
 impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
     fn DragEnter(
         &self,
-        pdataobj: windows::core::Ref<IDataObject>,
+        pdataobj: windows_core::Ref<IDataObject>,
         _grfkeystate: MODIFIERKEYS_FLAGS,
         pt: &POINTL,
         pdweffect: *mut DROPEFFECT,
-    ) -> windows::core::Result<()> {
+    ) -> windows_core::Result<()> {
         unsafe {
             let idata_obj = pdataobj.ok()?;
             let config = FORMATETC {
@@ -1315,7 +1317,7 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
         _grfkeystate: MODIFIERKEYS_FLAGS,
         pt: &POINTL,
         pdweffect: *mut DROPEFFECT,
-    ) -> windows::core::Result<()> {
+    ) -> windows_core::Result<()> {
         let mut cursor_position = POINT { x: pt.x, y: pt.y };
         unsafe {
             *pdweffect = DROPEFFECT_COPY;
@@ -1340,7 +1342,7 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
         Ok(())
     }
 
-    fn DragLeave(&self) -> windows::core::Result<()> {
+    fn DragLeave(&self) -> windows_core::Result<()> {
         unsafe {
             self.0.drop_target_helper.DragLeave().log_err();
         }
@@ -1352,11 +1354,11 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
 
     fn Drop(
         &self,
-        pdataobj: windows::core::Ref<IDataObject>,
+        pdataobj: windows_core::Ref<IDataObject>,
         _grfkeystate: MODIFIERKEYS_FLAGS,
         pt: &POINTL,
         pdweffect: *mut DROPEFFECT,
-    ) -> windows::core::Result<()> {
+    ) -> windows_core::Result<()> {
         let idata_obj = pdataobj.ok()?;
         let mut cursor_position = POINT { x: pt.x, y: pt.y };
         unsafe {
@@ -1598,7 +1600,7 @@ fn get_module_handle() -> HMODULE {
         let mut h_module = std::mem::zeroed();
         GetModuleHandleExW(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            windows::core::w!("ZedModule"),
+            windows_core::w!("ZedModule"),
             &mut h_module,
         )
         .expect("Unable to get module handle"); // this should never fail
@@ -1696,12 +1698,9 @@ fn retrieve_window_placement(
 }
 
 fn dwm_set_window_composition_attribute(hwnd: HWND, backdrop_type: u32) {
-    let mut version = unsafe { std::mem::zeroed() };
-    let status = unsafe { windows::Wdk::System::SystemServices::RtlGetVersion(&mut version) };
-
     // DWMWA_SYSTEMBACKDROP_TYPE is available only on version 22621 or later
     // using SetWindowCompositionAttributeType as a fallback
-    if !status.is_ok() || version.dwBuildNumber < 22621 {
+    if windows_version::OsVersion::current().build < 22621 {
         return;
     }
 
@@ -1720,10 +1719,7 @@ fn dwm_set_window_composition_attribute(hwnd: HWND, backdrop_type: u32) {
 }
 
 fn set_window_composition_attribute(hwnd: HWND, color: Option<Color>, state: u32) {
-    let mut version = unsafe { std::mem::zeroed() };
-    let status = unsafe { windows::Wdk::System::SystemServices::RtlGetVersion(&mut version) };
-
-    if !status.is_ok() || version.dwBuildNumber < 17763 {
+    if windows_version::OsVersion::current().build < 17763 {
         return;
     }
 

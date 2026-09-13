@@ -2,7 +2,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use itertools::Itertools;
 use smallvec::SmallVec;
-use windows::{
+use crate::bindings::Windows::{
     Win32::{
         Foundation::PROPERTYKEY,
         Globalization::u_strlen,
@@ -17,8 +17,8 @@ use windows::{
             },
         },
     },
-    core::{GUID, HSTRING, Interface},
 };
+use windows_core::{GUID, HSTRING, Interface};
 
 use gpui::{Action, MenuItem, SharedString};
 

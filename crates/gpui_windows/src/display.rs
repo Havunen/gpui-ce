@@ -3,7 +3,7 @@ use itertools::Itertools;
 use smallvec::SmallVec;
 use std::rc::Rc;
 use uuid::Uuid;
-use windows::{
+use crate::bindings::Windows::{
     Win32::{
         Foundation::*,
         Graphics::Gdi::*,
@@ -12,8 +12,8 @@ use windows::{
             WindowsAndMessaging::USER_DEFAULT_SCREEN_DPI,
         },
     },
-    core::*,
 };
+use windows_core::*;
 
 use super::logical_point;
 use gpui::{Bounds, DevicePixels, DisplayId, Pixels, PlatformDisplay, point, size};

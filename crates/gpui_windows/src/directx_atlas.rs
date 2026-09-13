@@ -1,7 +1,7 @@
 use collections::FxHashMap;
 use etagere::BucketedAtlasAllocator;
 use parking_lot::Mutex;
-use windows::Win32::Graphics::{
+use crate::bindings::Windows::Win32::Graphics::{
     Direct3D11::{
         D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
         ID3D11Device, ID3D11DeviceContext, ID3D11ShaderResourceView, ID3D11Texture2D,
@@ -358,7 +358,7 @@ mod tests {
     use super::*;
     use gpui::{ImageId, RenderImageParams};
     use std::borrow::Cow;
-    use windows::Win32::{
+    use crate::bindings::Windows::Win32::{
         Foundation::HMODULE,
         Graphics::{
             Direct3D::D3D_DRIVER_TYPE_WARP,
