@@ -123,6 +123,9 @@ fn generate_test_function(
     inner_fn_name: Ident,
     outer_fn_name: Ident,
 ) -> Result<TokenStream, TokenStream> {
+    // Teardown must call TestAppContext::quit outside an App borrow: it releases
+    // retained visual contexts and shuts down windows. App::quit only notifies
+    // the platform, whose test implementation does nothing.
     let seeds = &args.seeds;
     let max_retries = args.max_retries;
     let num_iterations = args.max_iterations;
@@ -169,7 +172,8 @@ fn generate_test_function(
                         ));
                         cx_teardowns.extend(quote!(
                             #cx_varname.run_until_parked();
-                            #cx_varname.update(|cx| { cx.background_executor().forbid_parking(); cx.quit(); });
+                            #cx_varname.executor().forbid_parking();
+                            #cx_varname.quit();
                             #cx_varname.run_until_parked();
                             drop(#cx_varname);
                         ));
@@ -241,12 +245,13 @@ fn generate_test_function(
                             ));
                             inner_fn_args.extend(quote!(&mut #cx_varname_lock,));
                             cx_teardowns.extend(quote!(
-                                    drop(#cx_varname_lock);
-                                    #cx_varname.run_until_parked();
-                                    #cx_varname.update(|cx| { cx.background_executor().forbid_parking(); cx.quit(); });
-                                    #cx_varname.run_until_parked();
-                                    drop(#cx_varname);
-                                ));
+                                drop(#cx_varname_lock);
+                                #cx_varname.run_until_parked();
+                                #cx_varname.executor().forbid_parking();
+                                #cx_varname.quit();
+                                #cx_varname.run_until_parked();
+                                drop(#cx_varname);
+                            ));
                             continue;
                         }
                         Some("TestAppContext") => {
@@ -260,7 +265,8 @@ fn generate_test_function(
                             ));
                             cx_teardowns.extend(quote!(
                                 #cx_varname.run_until_parked();
-                                #cx_varname.update(|cx| { cx.background_executor().forbid_parking(); cx.quit(); });
+                                #cx_varname.executor().forbid_parking();
+                                #cx_varname.quit();
                                 #cx_varname.run_until_parked();
                                 drop(#cx_varname);
                             ));
