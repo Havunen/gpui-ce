@@ -44,8 +44,8 @@ use objc2_app_kit::{
     NSWindow as Objc2NSWindow, NSWindowButton as Objc2NSWindowButton,
 };
 use objc2_foundation::{
-    NSOperatingSystemVersion, NSPoint as Objc2NSPoint, NSProcessInfo as Objc2NSProcessInfo,
-    NSRect as Objc2NSRect, NSString as Objc2NSString,
+    NSNotFound, NSOperatingSystemVersion, NSPoint as Objc2NSPoint,
+    NSProcessInfo as Objc2NSProcessInfo, NSRect as Objc2NSRect, NSString as Objc2NSString,
 };
 use parking_lot::Mutex;
 use raw_window_handle as rwh;
@@ -72,7 +72,6 @@ type id = *mut Object;
 const nil: id = ptr::null_mut();
 type NSInteger = isize;
 type NSUInteger = usize;
-const NSNotFound: NSUInteger = NSUInteger::MAX;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -4024,5 +4023,12 @@ mod tests {
     #[test]
     fn display_id_for_screen_returns_none_for_null_screen() {
         assert_eq!(display_id_for_screen(nil), None);
+    }
+
+    /// `characterIndexForPoint:` reports a miss with this value, and AppKit
+    /// only recognises Foundation's `NSNotFound` (`NSIntegerMax`).
+    #[test]
+    fn not_found_index_is_foundation_not_found() {
+        assert_eq!(NSNotFound as u64, isize::MAX as u64);
     }
 }

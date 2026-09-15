@@ -40,6 +40,7 @@ use objc::{
     runtime::{BOOL, NO, Object, YES},
     sel, sel_impl,
 };
+use objc2_foundation::NSNotFound;
 use std::{
     ffi::{CStr, c_char},
     ops::Range,
@@ -47,7 +48,6 @@ use std::{
 
 pub(crate) type Id = *mut Object;
 pub(crate) type NSUInteger = usize;
-pub(crate) const NS_NOT_FOUND: NSUInteger = NSUInteger::MAX;
 
 pub(crate) use dispatcher::*;
 pub(crate) use display::*;
@@ -96,15 +96,17 @@ struct NSRange {
 }
 
 impl NSRange {
+    // AppKit's "no range" is Foundation's `NSNotFound` (`NSIntegerMax`), not
+    // `NSUIntegerMax`.
     fn invalid() -> Self {
         Self {
-            location: NS_NOT_FOUND,
+            location: NSNotFound as NSUInteger,
             length: 0,
         }
     }
 
     fn is_valid(&self) -> bool {
-        self.location != NS_NOT_FOUND
+        self.location != NSNotFound as NSUInteger
     }
 
     fn to_range(self) -> Option<Range<usize>> {
@@ -146,5 +148,38 @@ unsafe fn ns_string(string: &str) -> Id {
         let value: Id =
             msg_send![value, initWithBytes: string.as_ptr() length: string.len() encoding: 4usize];
         msg_send![value, autorelease]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use objc::rc::autoreleasepool;
+
+    /// AppKit reports "no range" as Foundation's `NSNotFound`, which is
+    /// `NSIntegerMax` rather than `NSUIntegerMax`. Plain typing arrives through
+    /// `insertText:replacementRange:` with exactly this range, and mistaking it
+    /// for a real range inserts the text at the end of the document.
+    #[test]
+    fn foundation_not_found_range_decodes_to_none() {
+        let range: NSRange = autoreleasepool(|| unsafe {
+            msg_send![ns_string("gpui"), rangeOfString: ns_string("zed")]
+        });
+        assert_eq!(range.location, isize::MAX as NSUInteger);
+        assert_eq!(range.to_range(), None);
+    }
+
+    #[test]
+    fn invalid_range_uses_foundation_not_found() {
+        let invalid = NSRange::invalid();
+        assert_eq!(invalid.location, objc2_foundation::NSNotFound as NSUInteger);
+        assert_eq!(invalid.location, isize::MAX as NSUInteger);
+        assert!(!invalid.is_valid());
+    }
+
+    #[test]
+    fn real_ranges_round_trip() {
+        assert_eq!(NSRange::from(0..0).to_range(), Some(0..0));
+        assert_eq!(NSRange::from(3..7).to_range(), Some(3..7));
     }
 }
