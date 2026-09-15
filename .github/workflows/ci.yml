@@ -107,6 +107,7 @@ jobs:
             libxkbcommon-dev \
             libxkbcommon-x11-dev \
             lld \
+            mesa-vulkan-drivers \
             zlib1g-dev
 
       - name: Build workspace
@@ -154,6 +155,7 @@ jobs:
             libxkbcommon-dev \
             libxkbcommon-x11-dev \
             lld \
+            mesa-vulkan-drivers \
             pkg-config \
             zlib1g-dev \
             zstd

@@ -1135,7 +1135,7 @@ impl DirectXRenderer {
         texture_id: AtlasTextureId,
         instances: InstanceRange,
     ) -> Result<()> {
-        let texture_view = self.atlas.get_texture_view(texture_id);
+        let texture_view = self.atlas.get_texture_view(texture_id)?;
         self.pipelines.mono_sprites.draw_instances(
             &self.frame_bindings()?,
             Some(&texture_view),
@@ -1148,7 +1148,7 @@ impl DirectXRenderer {
         texture_id: AtlasTextureId,
         instances: InstanceRange,
     ) -> Result<()> {
-        let texture_view = self.atlas.get_texture_view(texture_id);
+        let texture_view = self.atlas.get_texture_view(texture_id)?;
         self.pipelines.subpixel_sprites.draw_instances(
             &self.frame_bindings()?,
             Some(&texture_view),
@@ -1162,7 +1162,7 @@ impl DirectXRenderer {
         instances: InstanceRange,
         smoothed: bool,
     ) -> Result<()> {
-        let texture_view = self.atlas.get_texture_view(texture_id);
+        let texture_view = self.atlas.get_texture_view(texture_id)?;
         self.pipelines.poly_sprites.draw_instances_variant(
             &self.frame_bindings()?,
             Some(&texture_view),
