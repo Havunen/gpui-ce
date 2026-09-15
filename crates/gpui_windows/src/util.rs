@@ -1,6 +1,7 @@
 use std::sync::OnceLock;
 
-use ::windows::{
+use gpui_util::ResultExt;
+use windows::{
     UI::{
         Color,
         ViewManagement::{UIColorType, UISettings},
@@ -8,9 +9,8 @@ use ::windows::{
     Win32::{Foundation::*, Graphics::Dwm::*, UI::WindowsAndMessaging::*},
     core::BOOL,
 };
-use gpui_util::ResultExt;
 
-use super::SafeCursor;
+use crate::*;
 use gpui::*;
 
 pub(crate) trait HiLoWord {
