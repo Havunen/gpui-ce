@@ -1,24 +1,13 @@
 use std::{path::PathBuf, sync::Arc};
 
+use crate::bindings::Windows::Win32::{
+    CLSCTX_INPROC_SERVER, CoCreateInstance, DestinationList, EnumerableObjectCollection,
+    ICustomDestinationList, INFOTIPSIZE, IObjectArray, IObjectCollection, IPropertyStore,
+    IShellLinkW, PROPERTYKEY, PROPVARIANT, ShellLink,
+};
 use itertools::Itertools;
 use smallvec::SmallVec;
-use crate::bindings::Windows::{
-    Win32::{
-        Foundation::PROPERTYKEY,
-        Globalization::u_strlen,
-        System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, StructuredStorage::PROPVARIANT},
-        UI::{
-            Controls::INFOTIPSIZE,
-            Shell::{
-                Common::{IObjectArray, IObjectCollection},
-                DestinationList, EnumerableObjectCollection, ICustomDestinationList, IShellLinkW,
-                PropertiesSystem::IPropertyStore,
-                ShellLink,
-            },
-        },
-    },
-};
-use windows_core::{GUID, HSTRING, Interface};
+use windows_core::{GUID, HSTRING, Interface, PWSTR};
 
 use gpui::{Action, MenuItem, SharedString};
 
@@ -68,7 +57,7 @@ pub(crate) fn update_jump_list(
     let (list, removed) = create_destination_list()?;
     add_recent_folders(&list, recent_workspaces, removed.as_ref())?;
     add_dock_menu(&list, dock_menus)?;
-    unsafe { list.CommitList() }?;
+    unsafe { list.CommitList().ok() }?;
     Ok(removed)
 }
 
@@ -99,8 +88,12 @@ fn create_destination_list() -> anyhow::Result<(ICustomDestinationList, Vec<Smal
             // INFOTIPSIZE is the maximum size of the buffer
             // see https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-ishelllinkw-getdescription
             let mut buffer = [0u16; INFOTIPSIZE as usize];
-            unsafe { shell_link.GetDescription(&mut buffer)? };
-            let len = unsafe { u_strlen(buffer.as_ptr()) };
+            unsafe {
+                shell_link
+                    .GetDescription(PWSTR(buffer.as_mut_ptr()), buffer.len() as i32)
+                    .ok()?
+            };
+            let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
             String::from_utf16_lossy(&buffer[..len as usize])
         };
         let args = description.split('\n').map(PathBuf::from).collect();
@@ -123,9 +116,9 @@ fn add_dock_menu(
             let description = HSTRING::from(description.as_str());
             let display = name.as_str();
             let task = create_shell_link(argument, description, None, display)?;
-            tasks.AddObject(&task)?;
+            tasks.AddObject(&task).ok()?;
         }
-        list.AddUserTasks(&tasks)?;
+        list.AddUserTasks(&tasks).ok()?;
         Ok(())
     }
 }
@@ -167,16 +160,19 @@ fn add_recent_folders(
                 })
                 .join(", ");
 
-            tasks.AddObject(&create_shell_link(
-                argument,
-                description,
-                Some(icon),
-                &display,
-            )?)?;
+            tasks
+                .AddObject(&create_shell_link(
+                    argument,
+                    description,
+                    Some(icon),
+                    &display,
+                )?)
+                .ok()?;
         }
 
         if tasks.GetCount().unwrap_or(0) > 0 {
-            list.AppendCategory(&HSTRING::from("Recent Folders"), &tasks)?;
+            list.AppendCategory(&HSTRING::from("Recent Folders"), &tasks)
+                .ok()?;
         }
         Ok(())
     }
@@ -191,16 +187,22 @@ fn create_shell_link(
     unsafe {
         let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
         let exe_path = HSTRING::from(std::env::current_exe()?.as_os_str());
-        link.SetPath(&exe_path)?;
-        link.SetArguments(&argument)?;
-        link.SetDescription(&description)?;
+        link.SetPath(&exe_path).ok()?;
+        link.SetArguments(&argument).ok()?;
+        link.SetDescription(&description).ok()?;
         if let Some(icon) = icon {
-            link.SetIconLocation(&icon, 0)?;
+            link.SetIconLocation(&icon, 0).ok()?;
         }
         let store: IPropertyStore = link.cast()?;
-        let title = PROPVARIANT::from(display);
-        store.SetValue(&PKEY_TITLE, &title)?;
-        store.Commit()?;
+        // SetValue copies the string before this borrowed buffer is dropped.
+        let mut title_text: Vec<u16> = display.encode_utf16().chain(Some(0)).collect();
+        let mut title = PROPVARIANT::default();
+        (*title.Anonymous.Anonymous).vt = crate::bindings::Windows::Win32::VARTYPE(
+            crate::bindings::Windows::Win32::VT_LPWSTR as u16,
+        );
+        (*title.Anonymous.Anonymous).Anonymous.pwszVal = PWSTR(title_text.as_mut_ptr());
+        store.SetValue(&PKEY_TITLE, &title).ok()?;
+        store.Commit().ok()?;
 
         Ok(link)
     }

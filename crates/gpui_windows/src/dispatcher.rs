@@ -6,19 +6,15 @@ use std::{
     time::Duration,
 };
 
+use crate::bindings::Windows::Win32::{
+    CloseThreadpoolTimer, CreateThreadpoolTimer, FILETIME, GetCurrentThread, LPARAM,
+    PTP_CALLBACK_INSTANCE, PTP_TIMER, PostMessageW, SetThreadPriority, SetThreadpoolTimer,
+    THREAD_PRIORITY_TIME_CRITICAL, TP_CALLBACK_ENVIRON_V3, TP_CALLBACK_PRIORITY,
+    TP_CALLBACK_PRIORITY_HIGH, TP_CALLBACK_PRIORITY_LOW, TP_CALLBACK_PRIORITY_NORMAL,
+    TrySubmitThreadpoolCallback, WPARAM, timeBeginPeriod, timeEndPeriod,
+};
 use anyhow::Context;
 use gpui_util::ResultExt;
-use crate::bindings::Windows::Win32::{
-    Foundation::{FILETIME, LPARAM, WPARAM},
-    Media::{timeBeginPeriod, timeEndPeriod},
-    System::Threading::{
-        CloseThreadpoolTimer, CreateThreadpoolTimer, GetCurrentThread, PTP_CALLBACK_INSTANCE,
-        PTP_TIMER, SetThreadPriority, SetThreadpoolTimer, THREAD_PRIORITY_TIME_CRITICAL,
-        TP_CALLBACK_ENVIRON_V3, TP_CALLBACK_PRIORITY, TP_CALLBACK_PRIORITY_HIGH,
-        TP_CALLBACK_PRIORITY_LOW, TP_CALLBACK_PRIORITY_NORMAL, TrySubmitThreadpoolCallback,
-    },
-    UI::WindowsAndMessaging::PostMessageW,
-};
 
 use crate::{HWND, SafeHwnd, WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD};
 use gpui::{
@@ -53,7 +49,7 @@ impl WindowsDispatcher {
 
     fn dispatch_on_threadpool(&self, priority: TP_CALLBACK_PRIORITY, runnable: RunnableVariant) {
         let environ = TP_CALLBACK_ENVIRON_V3 {
-            Version: 3,
+            Version: crate::bindings::Windows::Win32::TP_VERSION(3),
             CallbackPriority: priority,
             Size: size_of::<TP_CALLBACK_ENVIRON_V3>() as u32,
             ..Default::default()
@@ -66,6 +62,7 @@ impl WindowsDispatcher {
 
         unsafe {
             TrySubmitThreadpoolCallback(Some(run_work_callback), Some(context), Some(&environ))
+                .ok()
                 .log_err();
         }
     }
@@ -74,8 +71,8 @@ impl WindowsDispatcher {
         let context = runnable.into_raw().as_ptr() as *mut c_void;
 
         unsafe {
-            if let Ok(timer) = CreateThreadpoolTimer(Some(run_timer_callback), Some(context), None)
-            {
+            let timer = CreateThreadpoolTimer(Some(run_timer_callback), Some(context), None);
+            if !timer.is_null() {
                 // Negative FILETIME expresses a relative delay in 100ns ticks
                 let ticks = (duration.as_nanos() / 100).min(i64::MAX as u128) as i64;
                 let due = (-ticks) as u64;
@@ -122,10 +119,11 @@ impl PlatformDispatcher for WindowsDispatcher {
                     unsafe {
                         PostMessageW(
                             Some(self.platform_window_handle.as_raw()),
-                            WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD,
+                            WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD as u32,
                             WPARAM(self.validation_number),
                             LPARAM(0),
                         )
+                        .ok()
                         .log_err();
                     }
                 }
@@ -154,7 +152,7 @@ impl PlatformDispatcher for WindowsDispatcher {
             let thread_handle = unsafe { GetCurrentThread() };
 
             // SAFETY: thread_handle is a valid handle to the current thread
-            unsafe { SetThreadPriority(thread_handle, THREAD_PRIORITY_TIME_CRITICAL) }
+            unsafe { SetThreadPriority(thread_handle, THREAD_PRIORITY_TIME_CRITICAL).ok() }
                 .context("thread priority")
                 .log_err();
 

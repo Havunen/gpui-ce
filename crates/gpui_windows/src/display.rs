@@ -1,18 +1,11 @@
+use crate::bindings::Windows::Win32::{
+    GetDpiForMonitor, MDT_EFFECTIVE_DPI, USER_DEFAULT_SCREEN_DPI, *,
+};
 use gpui_util::ResultExt;
 use itertools::Itertools;
 use smallvec::SmallVec;
 use std::rc::Rc;
 use uuid::Uuid;
-use crate::bindings::Windows::{
-    Win32::{
-        Foundation::*,
-        Graphics::Gdi::*,
-        UI::{
-            HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
-            WindowsAndMessaging::USER_DEFAULT_SCREEN_DPI,
-        },
-    },
-};
 use windows_core::*;
 
 use super::logical_point;
@@ -37,8 +30,8 @@ impl WindowsDisplay {
     pub(crate) fn new(display_id: DisplayId) -> Option<Self> {
         let handle = HMONITOR(u64::from(display_id) as _);
         let info = get_monitor_info(handle).log_err()?;
-        let monitor_size = info.monitorInfo.rcMonitor;
-        let work_area = info.monitorInfo.rcWork;
+        let monitor_size = info.Base.rcMonitor;
+        let work_area = info.Base.rcWork;
         let uuid = generate_uuid(&info.szDevice);
         let scale_factor = get_scale_factor_for_monitor(handle).log_err()?;
         let physical_size = size(
@@ -81,7 +74,7 @@ impl WindowsDisplay {
     pub fn primary_monitor() -> Option<Self> {
         // https://devblogs.microsoft.com/oldnewthing/20070809-00/?p=25643
         const POINT_ZERO: POINT = POINT { x: 0, y: 0 };
-        let monitor = unsafe { MonitorFromPoint(POINT_ZERO, MONITOR_DEFAULTTOPRIMARY) };
+        let monitor = unsafe { MonitorFromPoint(POINT_ZERO, MONITOR_DEFAULTTOPRIMARY as u32) };
         if monitor.is_invalid() {
             log::error!(
                 "can not find the primary monitor: {}",
@@ -105,7 +98,7 @@ impl WindowsDisplay {
             x: (center.x.as_f32() * self.scale_factor) as i32,
             y: (center.y.as_f32() * self.scale_factor) as i32,
         };
-        let monitor = unsafe { MonitorFromPoint(center, MONITOR_DEFAULTTONULL) };
+        let monitor = unsafe { MonitorFromPoint(center, MONITOR_DEFAULTTONULL as u32) };
         if monitor.is_invalid() {
             false
         } else {
@@ -179,7 +172,7 @@ unsafe extern "system" fn monitor_enum_proc(
 
 fn get_monitor_info(hmonitor: HMONITOR) -> anyhow::Result<MONITORINFOEXW> {
     let mut monitor_info: MONITORINFOEXW = unsafe { std::mem::zeroed() };
-    monitor_info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+    monitor_info.Base.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
     let status = unsafe {
         GetMonitorInfoW(
             hmonitor,
@@ -204,7 +197,7 @@ fn generate_uuid(device_name: &[u16]) -> Uuid {
 fn get_scale_factor_for_monitor(monitor: HMONITOR) -> Result<f32> {
     let mut dpi_x = 0;
     let mut dpi_y = 0;
-    unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }?;
+    unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y).ok() }?;
     assert_eq!(dpi_x, dpi_y);
     Ok(dpi_x as f32 / USER_DEFAULT_SCREEN_DPI as f32)
 }

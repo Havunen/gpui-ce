@@ -1,24 +1,14 @@
+use crate::bindings::Windows::Win32::{
+    CreateDXGIFactory2, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_10_1,
+    D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_CREATE_DEVICE_DEBUG, D3D11_FEATURE_D3D10_X_HARDWARE_OPTIONS,
+    D3D11_FEATURE_DATA_D3D10_X_HARDWARE_OPTIONS, D3D11_SDK_VERSION, D3D11CreateDevice,
+    DXGI_CREATE_FACTORY_DEBUG, HMODULE, ID3D11Device, ID3D11DeviceContext, IDXGIAdapter1,
+    IDXGIFactory6,
+};
 use anyhow::{Context, Result};
 use gpui_util::ResultExt;
 use itertools::Itertools;
-use crate::bindings::Windows::Win32::{
-    Foundation::HMODULE,
-    Graphics::{
-        Direct3D::{
-            D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_10_1,
-            D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
-        },
-        Direct3D11::{
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_DEBUG,
-            D3D11_FEATURE_D3D10_X_HARDWARE_OPTIONS, D3D11_FEATURE_DATA_D3D10_X_HARDWARE_OPTIONS,
-            D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
-        },
-        Dxgi::{
-            CreateDXGIFactory2, DXGI_CREATE_FACTORY_DEBUG, DXGI_CREATE_FACTORY_FLAGS,
-            IDXGIAdapter1, IDXGIFactory6,
-        },
-    },
-};
 use windows_core::Interface;
 
 pub(crate) fn try_to_recover_from_device_lost<T>(mut f: impl FnMut() -> Result<T>) -> Result<T> {
@@ -42,6 +32,10 @@ pub(crate) struct DirectXDevices {
     pub(crate) device: ID3D11Device,
     pub(crate) device_context: ID3D11DeviceContext,
 }
+
+// D3D/DXGI interfaces can move between threads. Callers still serialize access
+// to the immediate device context when rendering.
+unsafe impl Send for DirectXDevices {}
 
 impl DirectXDevices {
     pub(crate) fn new() -> Result<Self> {
@@ -76,7 +70,7 @@ impl DirectXDevices {
 fn check_debug_layer_available() -> bool {
     #[cfg(debug_assertions)]
     {
-        use crate::bindings::Windows::Win32::Graphics::Dxgi::{DXGIGetDebugInterface1, IDXGIInfoQueue};
+        use crate::bindings::Windows::Win32::{DXGIGetDebugInterface1, IDXGIInfoQueue};
 
         unsafe { DXGIGetDebugInterface1::<IDXGIInfoQueue>(0) }
             .log_err()
@@ -97,9 +91,9 @@ fn get_dxgi_factory(debug_layer_available: bool) -> Result<IDXGIFactory6> {
         log::warn!(
             "Failed to get DXGI debug interface. DirectX debugging features will be disabled."
         );
-        DXGI_CREATE_FACTORY_FLAGS::default()
+        0
     };
-    unsafe { Ok(CreateDXGIFactory2(factory_flag)?) }
+    unsafe { Ok(CreateDXGIFactory2(factory_flag as u32)?) }
 }
 
 #[inline]
@@ -114,7 +108,8 @@ fn get_adapter(
 )> {
     for adapter_index in 0.. {
         let adapter: IDXGIAdapter1 = unsafe { dxgi_factory.EnumAdapters(adapter_index)?.cast()? };
-        if let Ok(desc) = unsafe { adapter.GetDesc1() } {
+        let mut desc = crate::bindings::Windows::Win32::DXGI_ADAPTER_DESC1::default();
+        if unsafe { adapter.GetDesc1(&mut desc).is_ok() } {
             let gpu_name = String::from_utf16_lossy(&desc.Description)
                 .trim_matches(char::from(0))
                 .to_string();
@@ -157,18 +152,19 @@ fn get_device(
             adapter,
             D3D_DRIVER_TYPE_UNKNOWN,
             HMODULE::default(),
-            device_flags,
+            device_flags as u32,
             // 4x MSAA is required for Direct3D Feature Level 10.1 or better
             Some(&[
                 D3D_FEATURE_LEVEL_11_1,
                 D3D_FEATURE_LEVEL_11_0,
                 D3D_FEATURE_LEVEL_10_1,
             ]),
-            D3D11_SDK_VERSION,
+            D3D11_SDK_VERSION as u32,
             Some(&mut device),
             feature_level,
             context,
-        )?;
+        )
+        .ok()?;
     }
     let device = device.unwrap();
     let mut data = D3D11_FEATURE_DATA_D3D10_X_HARDWARE_OPTIONS::default();
@@ -179,6 +175,7 @@ fn get_device(
                 &mut data as *mut _ as _,
                 std::mem::size_of::<D3D11_FEATURE_DATA_D3D10_X_HARDWARE_OPTIONS>() as u32,
             )
+            .ok()
             .context("Checking GPU device feature support")?;
     }
     if data

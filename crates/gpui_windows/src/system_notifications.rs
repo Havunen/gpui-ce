@@ -5,23 +5,22 @@ use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash as _, Hasher as _};
 use std::rc::Rc;
 
+use crate::bindings::Windows::Data::Xml::Dom::XmlDocument;
+use crate::bindings::Windows::UI::Notifications::{
+    ToastActivatedEventArgs, ToastNotification, ToastNotificationManager, ToastNotifier,
+};
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gpui::{
     ForegroundExecutor, SharedString, SystemNotification, SystemNotificationResponse, Task,
 };
-use crate::bindings::Windows::Data::Xml::Dom::XmlDocument;
-use crate::bindings::Windows::Foundation::TypedEventHandler;
-use crate::bindings::Windows::UI::Notifications::{
-    ToastActivatedEventArgs, ToastNotification, ToastNotificationManager, ToastNotifier,
-};
-use windows_core::{IInspectable, Interface as _, h};
+use windows_core::{EventRevoker, Interface as _, h};
 
 type ResponseCallback = Rc<RefCell<Option<Box<dyn FnMut(SystemNotificationResponse)>>>>;
 
 pub(crate) struct SystemNotificationState {
     notifier: Option<ToastNotifier>,
-    active_toasts: HashMap<SharedString, ToastNotification>,
+    active_toasts: HashMap<SharedString, (ToastNotification, EventRevoker)>,
     response_sender: mpsc::UnboundedSender<SystemNotificationResponse>,
     response_receiver: Option<mpsc::UnboundedReceiver<SystemNotificationResponse>>,
     callback: ResponseCallback,
@@ -64,34 +63,32 @@ impl SystemNotificationState {
 
         let sender = self.response_sender.clone();
         let response_tag = notification.tag.clone();
-        toast.Activated(&TypedEventHandler::<ToastNotification, IInspectable>::new(
-            move |_sender, arguments| {
-                let action_id = arguments
-                    .as_ref()
-                    .and_then(|arguments| arguments.cast::<ToastActivatedEventArgs>().ok())
-                    .and_then(|arguments| arguments.Arguments().ok())
-                    .filter(|arguments| !arguments.is_empty())
-                    .map(|arguments| SharedString::from(arguments.to_string()));
-                sender
-                    .unbounded_send(SystemNotificationResponse {
-                        tag: response_tag.clone(),
-                        action_id,
-                    })
-                    .ok();
-                Ok(())
-            },
-        ))?;
+        let activation = toast.Activated(move |_sender, arguments| {
+            let action_id = arguments
+                .as_ref()
+                .and_then(|arguments| arguments.cast::<ToastActivatedEventArgs>().ok())
+                .and_then(|arguments| arguments.Arguments().ok())
+                .filter(|arguments| !arguments.is_empty())
+                .map(|arguments| SharedString::from(arguments.to_string_lossy()));
+            sender
+                .unbounded_send(SystemNotificationResponse {
+                    tag: response_tag.clone(),
+                    action_id,
+                })
+                .ok();
+        })?;
 
-        if let Some(previous) = self.active_toasts.remove(&notification.tag) {
+        if let Some((previous, _activation)) = self.active_toasts.remove(&notification.tag) {
             notifier.Hide(&previous)?;
         }
         notifier.Show(&toast)?;
-        self.active_toasts.insert(notification.tag, toast);
+        self.active_toasts
+            .insert(notification.tag, (toast, activation));
         Ok(())
     }
 
     pub(crate) fn dismiss(&mut self, tag: &str) {
-        let Some(toast) = self.active_toasts.remove(tag) else {
+        let Some((toast, _activation)) = self.active_toasts.remove(tag) else {
             return;
         };
         let Some(notifier) = &self.notifier else {

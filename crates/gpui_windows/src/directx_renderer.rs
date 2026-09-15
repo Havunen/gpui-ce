@@ -3,21 +3,10 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use crate::bindings::Windows::{
-    Win32::{
-        Foundation::HWND,
-        Graphics::{
-            Direct3D::*,
-            Direct3D11::*,
-            DirectComposition::*,
-            DirectWrite::*,
-            Dxgi::{Common::*, *},
-        },
-    },
-};
-use windows_core::{HSTRING, Interface};
+use crate::bindings::Windows::Win32::{HWND, *};
 use anyhow::{Context, Result};
 use gpui_util::ResultExt;
+use windows_core::{HSTRING, Interface};
 
 use self::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
 use super::{DirectXAtlas, DirectXDevices, try_to_recover_from_device_lost};
@@ -347,7 +336,7 @@ impl DirectXRenderer {
                 .as_ref()
                 .expect("resources missing")
                 .swap_chain
-                .Present(0, DXGI_PRESENT(0))
+                .Present(0, 0)
         };
         result.ok().context("Presenting swap chain failed")
     }
@@ -666,7 +655,7 @@ impl DirectXRenderer {
         let staging_desc = D3D11_TEXTURE2D_DESC {
             Usage: D3D11_USAGE_STAGING,
             BindFlags: 0,
-            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ as u32,
             MiscFlags: 0,
             MipLevels: 1,
             ArraySize: 1,
@@ -677,12 +666,20 @@ impl DirectXRenderer {
             ..desc
         };
         let mut staging: Option<ID3D11Texture2D> = None;
-        unsafe { device.CreateTexture2D(&staging_desc, None, Some(&mut staging))? };
+        unsafe {
+            device
+                .CreateTexture2D(&staging_desc, None, Some(&mut staging))
+                .ok()?
+        };
         let staging = staging.context("creating staging texture")?;
         unsafe { context.CopyResource(&staging, render_target) };
 
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe { context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))? };
+        unsafe {
+            context
+                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .ok()?
+        };
         let row_bytes = (width as usize) * 4;
         let mut pixels = vec![0u8; row_bytes * height as usize];
         // SAFETY: `Map` succeeded, so `pData` points at `RowPitch * height`
@@ -730,13 +727,8 @@ impl DirectXRenderer {
         unsafe {
             resources
                 .swap_chain
-                .ResizeBuffers(
-                    BUFFER_COUNT as u32,
-                    width,
-                    height,
-                    RENDER_TARGET_FORMAT,
-                    DXGI_SWAP_CHAIN_FLAG(0),
-                )
+                .ResizeBuffers(BUFFER_COUNT as u32, width, height, RENDER_TARGET_FORMAT, 0)
+                .ok()
                 .context("Failed to resize swap chain")?;
         }
 
@@ -1077,7 +1069,9 @@ impl DirectXRenderer {
             }
             ctx.OMSetRenderTargets(Some(slice::from_ref(target_rtv)), None);
             ctx.RSSetViewports(Some(slice::from_ref(viewport)));
-            ctx.IASetPrimitiveTopology(topology);
+            ctx.IASetPrimitiveTopology(crate::bindings::Windows::Win32::D3D11_PRIMITIVE_TOPOLOGY(
+                topology as _,
+            ));
             ctx.VSSetShader(vertex, None);
             ctx.PSSetShader(fragment, None);
             ctx.VSSetConstantBuffers(0, Some(slice::from_ref(&self.globals.global_params_buffer)));
@@ -1249,8 +1243,9 @@ impl DirectXRenderer {
 
     pub(crate) fn gpu_specs(&self) -> Result<GpuSpecs> {
         let devices = self.devices.as_ref().context("devices missing")?;
-        let desc = unsafe { devices.adapter.GetDesc1() }?;
-        let is_software_emulated = (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0;
+        let mut desc = DXGI_ADAPTER_DESC1::default();
+        unsafe { devices.adapter.GetDesc1(&mut desc).ok()? };
+        let is_software_emulated = (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE as u32) != 0;
         let device_name = String::from_utf16_lossy(&desc.Description)
             .trim_matches(char::from(0))
             .to_string();
@@ -1490,9 +1485,9 @@ impl DirectComposition {
 
     pub fn set_swap_chain(&self, swap_chain: &IDXGISwapChain1) -> Result<()> {
         unsafe {
-            self.comp_visual.SetContent(swap_chain)?;
-            self.comp_target.SetRoot(&self.comp_visual)?;
-            self.comp_device.Commit()?;
+            self.comp_visual.SetContent(swap_chain).ok()?;
+            self.comp_target.SetRoot(&self.comp_visual).ok()?;
+            self.comp_device.Commit().ok()?;
         }
         Ok(())
     }
@@ -1517,7 +1512,7 @@ impl DirectXGlobalElements {
                 MaxLOD: D3D11_FLOAT32_MAX,
             };
             let mut output = None;
-            device.CreateSamplerState(&desc, Some(&mut output))?;
+            device.CreateSamplerState(&desc, Some(&mut output)).ok()?;
             output
         };
 
@@ -1814,7 +1809,9 @@ fn create_swap_chain_for_composition(
             Count: 1,
             Quality: 0,
         },
-        BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+        BufferUsage: crate::bindings::Windows::Win32::DXGI_USAGE(
+            DXGI_USAGE_RENDER_TARGET_OUTPUT as _,
+        ),
         BufferCount: BUFFER_COUNT as u32,
         // Composition SwapChains only support the DXGI_SCALING_STRETCH Scaling.
         Scaling: DXGI_SCALING_STRETCH,
@@ -1832,7 +1829,7 @@ fn create_swap_chain(
     width: u32,
     height: u32,
 ) -> Result<IDXGISwapChain1> {
-    use crate::bindings::Windows::Win32::Graphics::Dxgi::DXGI_MWA_NO_ALT_ENTER;
+    use crate::bindings::Windows::Win32::DXGI_MWA_NO_ALT_ENTER;
 
     let desc = DXGI_SWAP_CHAIN_DESC1 {
         Width: width,
@@ -1843,7 +1840,9 @@ fn create_swap_chain(
             Count: 1,
             Quality: 0,
         },
-        BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+        BufferUsage: crate::bindings::Windows::Win32::DXGI_USAGE(
+            DXGI_USAGE_RENDER_TARGET_OUTPUT as _,
+        ),
         BufferCount: BUFFER_COUNT as u32,
         Scaling: DXGI_SCALING_NONE,
         SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
@@ -1852,7 +1851,11 @@ fn create_swap_chain(
     };
     let swap_chain =
         unsafe { dxgi_factory.CreateSwapChainForHwnd(device, hwnd, &desc, None, None) }?;
-    unsafe { dxgi_factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER) }?;
+    unsafe {
+        dxgi_factory
+            .MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER as u32)
+            .ok()
+    }?;
     Ok(swap_chain)
 }
 
@@ -1913,7 +1916,11 @@ fn create_render_target_and_its_view(
 ) -> Result<(ID3D11Texture2D, Option<ID3D11RenderTargetView>)> {
     let render_target: ID3D11Texture2D = unsafe { swap_chain.GetBuffer(0) }?;
     let mut render_target_view = None;
-    unsafe { device.CreateRenderTargetView(&render_target, None, Some(&mut render_target_view))? };
+    unsafe {
+        device
+            .CreateRenderTargetView(&render_target, None, Some(&mut render_target_view))
+            .ok()?
+    };
     Ok((render_target, render_target_view))
 }
 
@@ -1936,16 +1943,22 @@ fn create_path_intermediate_texture(
                 Quality: 0,
             },
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            BindFlags: (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE) as u32,
             CPUAccessFlags: 0,
             MiscFlags: 0,
         };
-        device.CreateTexture2D(&desc, None, Some(&mut output))?;
+        device
+            .CreateTexture2D(&desc, None, Some(&mut output))
+            .ok()?;
         output.unwrap()
     };
 
     let mut shader_resource_view = None;
-    unsafe { device.CreateShaderResourceView(&texture, None, Some(&mut shader_resource_view))? };
+    unsafe {
+        device
+            .CreateShaderResourceView(&texture, None, Some(&mut shader_resource_view))
+            .ok()?
+    };
 
     Ok((texture, Some(shader_resource_view.unwrap())))
 }
@@ -1975,17 +1988,27 @@ fn create_color_target(
                 Quality: 0,
             },
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+            BindFlags: (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE) as u32,
             CPUAccessFlags: 0,
             MiscFlags: 0,
         };
-        device.CreateTexture2D(&desc, None, Some(&mut output))?;
+        device
+            .CreateTexture2D(&desc, None, Some(&mut output))
+            .ok()?;
         output.unwrap()
     };
     let mut rtv = None;
-    unsafe { device.CreateRenderTargetView(&texture, None, Some(&mut rtv))? };
+    unsafe {
+        device
+            .CreateRenderTargetView(&texture, None, Some(&mut rtv))
+            .ok()?
+    };
     let mut srv = None;
-    unsafe { device.CreateShaderResourceView(&texture, None, Some(&mut srv))? };
+    unsafe {
+        device
+            .CreateShaderResourceView(&texture, None, Some(&mut srv))
+            .ok()?
+    };
     Ok((texture, rtv, srv))
 }
 
@@ -2005,18 +2028,24 @@ fn create_path_intermediate_msaa_texture_and_view(
             Format: RENDER_TARGET_FORMAT,
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: PATH_MULTISAMPLE_COUNT,
-                Quality: D3D11_STANDARD_MULTISAMPLE_PATTERN.0 as u32,
+                Quality: D3D11_STANDARD_MULTISAMPLE_PATTERN as u32,
             },
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+            BindFlags: D3D11_BIND_RENDER_TARGET as u32,
             CPUAccessFlags: 0,
             MiscFlags: 0,
         };
-        device.CreateTexture2D(&desc, None, Some(&mut output))?;
+        device
+            .CreateTexture2D(&desc, None, Some(&mut output))
+            .ok()?;
         output.unwrap()
     };
     let mut msaa_view = None;
-    unsafe { device.CreateRenderTargetView(&msaa_texture, None, Some(&mut msaa_view))? };
+    unsafe {
+        device
+            .CreateRenderTargetView(&msaa_texture, None, Some(&mut msaa_view))
+            .ok()?
+    };
     Ok((msaa_texture, Some(msaa_view.unwrap())))
 }
 
@@ -2036,7 +2065,7 @@ fn set_rasterizer_state(device: &ID3D11Device, device_context: &ID3D11DeviceCont
     };
     let rasterizer_state = unsafe {
         let mut state = None;
-        device.CreateRasterizerState(&desc, Some(&mut state))?;
+        device.CreateRasterizerState(&desc, Some(&mut state)).ok()?;
         state.unwrap()
     };
     unsafe { device_context.RSSetState(&rasterizer_state) };
@@ -2054,10 +2083,10 @@ fn create_blend_state(device: &ID3D11Device) -> Result<ID3D11BlendState> {
     desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
     desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
     desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
-    desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
+    desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL as u8;
     unsafe {
         let mut state = None;
-        device.CreateBlendState(&desc, Some(&mut state))?;
+        device.CreateBlendState(&desc, Some(&mut state)).ok()?;
         Ok(state.unwrap())
     }
 }
@@ -2074,11 +2103,11 @@ fn create_blend_state_for_subpixel_rendering(device: &ID3D11Device) -> Result<ID
     desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
     desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
     desc.RenderTarget[0].RenderTargetWriteMask =
-        D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8 & !D3D11_COLOR_WRITE_ENABLE_ALPHA.0 as u8;
+        D3D11_COLOR_WRITE_ENABLE_ALL as u8 & !D3D11_COLOR_WRITE_ENABLE_ALPHA as u8;
 
     unsafe {
         let mut state = None;
-        device.CreateBlendState(&desc, Some(&mut state))?;
+        device.CreateBlendState(&desc, Some(&mut state)).ok()?;
         Ok(state.unwrap())
     }
 }
@@ -2095,10 +2124,10 @@ fn create_blend_state_for_path_rasterization(device: &ID3D11Device) -> Result<ID
     desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
     desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
     desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
-    desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
+    desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL as u8;
     unsafe {
         let mut state = None;
-        device.CreateBlendState(&desc, Some(&mut state))?;
+        device.CreateBlendState(&desc, Some(&mut state)).ok()?;
         Ok(state.unwrap())
     }
 }
@@ -2115,10 +2144,10 @@ fn create_blend_state_for_path_sprite(device: &ID3D11Device) -> Result<ID3D11Ble
     desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
     desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
     desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ONE;
-    desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
+    desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL as u8;
     unsafe {
         let mut state = None;
-        device.CreateBlendState(&desc, Some(&mut state))?;
+        device.CreateBlendState(&desc, Some(&mut state)).ok()?;
         Ok(state.unwrap())
     }
 }
@@ -2129,10 +2158,10 @@ fn create_blend_state_for_path_sprite(device: &ID3D11Device) -> Result<ID3D11Ble
 fn create_blend_state_no_blend(device: &ID3D11Device) -> Result<ID3D11BlendState> {
     let mut desc = D3D11_BLEND_DESC::default();
     desc.RenderTarget[0].BlendEnable = false.into();
-    desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
+    desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL as u8;
     unsafe {
         let mut state = None;
-        device.CreateBlendState(&desc, Some(&mut state))?;
+        device.CreateBlendState(&desc, Some(&mut state)).ok()?;
         Ok(state.unwrap())
     }
 }
@@ -2141,7 +2170,9 @@ fn create_blend_state_no_blend(device: &ID3D11Device) -> Result<ID3D11BlendState
 fn create_vertex_shader(device: &ID3D11Device, bytes: &[u8]) -> Result<ID3D11VertexShader> {
     unsafe {
         let mut shader = None;
-        device.CreateVertexShader(bytes, None, Some(&mut shader))?;
+        device
+            .CreateVertexShader(bytes, None, Some(&mut shader))
+            .ok()?;
         Ok(shader.unwrap())
     }
 }
@@ -2150,7 +2181,9 @@ fn create_vertex_shader(device: &ID3D11Device, bytes: &[u8]) -> Result<ID3D11Ver
 fn create_fragment_shader(device: &ID3D11Device, bytes: &[u8]) -> Result<ID3D11PixelShader> {
     unsafe {
         let mut shader = None;
-        device.CreatePixelShader(bytes, None, Some(&mut shader))?;
+        device
+            .CreatePixelShader(bytes, None, Some(&mut shader))
+            .ok()?;
         Ok(shader.unwrap())
     }
 }
@@ -2161,13 +2194,13 @@ fn create_constant_buffer<T>(device: &ID3D11Device) -> Result<Option<ID3D11Buffe
     let desc = D3D11_BUFFER_DESC {
         ByteWidth: std::mem::size_of::<T>() as u32,
         Usage: D3D11_USAGE_DYNAMIC,
-        BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
-        CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+        BindFlags: D3D11_BIND_CONSTANT_BUFFER as u32,
+        CPUAccessFlags: D3D11_CPU_ACCESS_WRITE as u32,
         MiscFlags: 0,
         StructureByteStride: 0,
     };
     let mut buffer = None;
-    unsafe { device.CreateBuffer(&desc, None, Some(&mut buffer)) }?;
+    unsafe { device.CreateBuffer(&desc, None, Some(&mut buffer)).ok() }?;
     Ok(buffer)
 }
 
@@ -2180,13 +2213,13 @@ fn create_buffer(
     let desc = D3D11_BUFFER_DESC {
         ByteWidth: (element_size * buffer_size) as u32,
         Usage: D3D11_USAGE_DYNAMIC,
-        BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-        CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
-        MiscFlags: D3D11_RESOURCE_MISC_BUFFER_STRUCTURED.0 as u32,
+        BindFlags: D3D11_BIND_SHADER_RESOURCE as u32,
+        CPUAccessFlags: D3D11_CPU_ACCESS_WRITE as u32,
+        MiscFlags: D3D11_RESOURCE_MISC_BUFFER_STRUCTURED as u32,
         StructureByteStride: element_size as u32,
     };
     let mut buffer = None;
-    unsafe { device.CreateBuffer(&desc, None, Some(&mut buffer)) }?;
+    unsafe { device.CreateBuffer(&desc, None, Some(&mut buffer)).ok() }?;
     Ok(buffer.unwrap())
 }
 
@@ -2196,7 +2229,7 @@ fn create_buffer_view(
     buffer: &ID3D11Buffer,
 ) -> Result<Option<ID3D11ShaderResourceView>> {
     let mut view = None;
-    unsafe { device.CreateShaderResourceView(buffer, None, Some(&mut view)) }?;
+    unsafe { device.CreateShaderResourceView(buffer, None, Some(&mut view)) }.ok()?;
     Ok(view)
 }
 
@@ -2208,7 +2241,9 @@ fn update_buffer<T>(
 ) -> Result<()> {
     unsafe {
         let mut dest = std::mem::zeroed();
-        device_context.Map(buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut dest))?;
+        device_context
+            .Map(buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut dest))
+            .ok()?;
         std::ptr::copy_nonoverlapping(data.as_ptr(), dest.pData as _, data.len());
         device_context.Unmap(buffer, 0);
     }
@@ -2243,7 +2278,9 @@ fn set_pipeline_state(
     unsafe {
         device_context.VSSetShaderResources(1, Some(buffer_view));
         device_context.PSSetShaderResources(1, Some(buffer_view));
-        device_context.IASetPrimitiveTopology(topology);
+        device_context.IASetPrimitiveTopology(
+            crate::bindings::Windows::Win32::D3D11_PRIMITIVE_TOPOLOGY(topology as _),
+        );
         device_context.VSSetShader(vertex_shader, None);
         device_context.PSSetShader(fragment_shader, None);
         device_context.OMSetBlendState(blend_state, None, 0xFFFFFFFF);
@@ -2254,7 +2291,9 @@ fn set_pipeline_state(
 fn report_live_objects(device: &ID3D11Device) -> Result<()> {
     let debug_device: ID3D11Debug = device.cast()?;
     unsafe {
-        debug_device.ReportLiveDeviceObjects(D3D11_RLDO_DETAIL)?;
+        debug_device
+            .ReportLiveDeviceObjects(D3D11_RLDO_DETAIL)
+            .ok()?;
     }
     Ok(())
 }
@@ -2265,13 +2304,10 @@ pub(crate) mod shader_resources {
     use anyhow::Result;
 
     #[cfg(debug_assertions)]
-    use crate::bindings::Windows::{
-        Win32::Graphics::Direct3D::{
-            Fxc::{D3DCOMPILE_DEBUG, D3DCOMPILE_SKIP_OPTIMIZATION, D3DCompileFromFile},
-            ID3DBlob,
-        },
+    use crate::bindings::Windows::Win32::{
+        D3DCOMPILE_DEBUG, D3DCOMPILE_SKIP_OPTIMIZATION, D3DCompileFromFile, ID3D10Blob,
     };
-use windows_core::{HSTRING, PCSTR};
+    use windows_core::{HSTRING, PCSTR};
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
     pub(crate) enum ShaderModule {
@@ -2299,7 +2335,7 @@ use windows_core::{HSTRING, PCSTR};
         inner: &'t [u8],
 
         #[cfg(debug_assertions)]
-        _blob: ID3DBlob,
+        _blob: ID3D10Blob,
     }
 
     impl<'t> RawShaderBytes<'t> {
@@ -2382,11 +2418,12 @@ use windows_core::{HSTRING, PCSTR};
     }
 
     #[cfg(debug_assertions)]
-    pub(super) fn build_shader_blob(entry: ShaderModule, target: ShaderTarget) -> Result<ID3DBlob> {
+    pub(super) fn build_shader_blob(
+        entry: ShaderModule,
+        target: ShaderTarget,
+    ) -> Result<ID3D10Blob> {
         unsafe {
-            use crate::bindings::Windows::Win32::Graphics::{
-                Direct3D::ID3DInclude, Hlsl::D3D_COMPILE_STANDARD_FILE_INCLUDE,
-            };
+            use crate::bindings::Windows::Win32::ID3DInclude;
 
             let shader_name = if matches!(entry, ShaderModule::EmojiRasterization) {
                 "color_text_raster.hlsl"
@@ -2418,9 +2455,7 @@ use windows_core::{HSTRING, PCSTR};
             let target_cstr = PCSTR::from_raw(target.as_ptr());
 
             // really dirty trick because winapi bindings are unhappy otherwise
-            let include_handler = &std::mem::transmute::<usize, ID3DInclude>(
-                D3D_COMPILE_STANDARD_FILE_INCLUDE as usize,
-            );
+            let include_handler = &std::mem::transmute::<usize, ID3DInclude>(1usize);
 
             let ret = D3DCompileFromFile(
                 &HSTRING::from(shader_path.to_str().unwrap()),
@@ -2428,11 +2463,12 @@ use windows_core::{HSTRING, PCSTR};
                 include_handler,
                 entry_point,
                 target_cstr,
-                D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION,
+                (D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION) as u32,
                 0,
                 &mut compile_blob,
-                Some(&mut error_blob),
-            );
+                &mut error_blob,
+            )
+            .ok();
             if ret.is_err() {
                 let Some(error_blob) = error_blob else {
                     return Err(anyhow::anyhow!("{ret:?}"));
@@ -2494,10 +2530,8 @@ mod tests {
 }
 
 mod dxgi {
-    use crate::bindings::Windows::{
-        Win32::Graphics::Dxgi::{IDXGIAdapter1, IDXGIDevice},
-    };
-use windows_core::Interface;
+    use crate::bindings::Windows::Win32::{IDXGIAdapter1, IDXGIDevice};
+    use windows_core::Interface;
 
     pub(super) fn get_driver_version(adapter: &IDXGIAdapter1) -> anyhow::Result<String> {
         let number = unsafe { adapter.CheckInterfaceSupport(&IDXGIDevice::IID as _) }?;

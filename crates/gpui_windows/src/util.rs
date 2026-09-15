@@ -1,17 +1,43 @@
 use std::sync::OnceLock;
 
-use crate::bindings::Windows::{
-    UI::{
-        Color,
-        ViewManagement::{UIColorType, UISettings},
-    },
-    Win32::{Foundation::*, Graphics::Dwm::*, UI::WindowsAndMessaging::*},
-};
-use windows_core::BOOL;
+use crate::bindings::Windows::UI::Color;
+use crate::bindings::Windows::UI::ViewManagement::{UIColorType, UISettings};
+use crate::bindings::Windows::Win32::*;
 use gpui_util::ResultExt;
+use windows_core::BOOL;
 
 use super::SafeCursor;
 use gpui::*;
+
+// Win32 handles returned directly by windows-bindgen 0.100 need explicit
+// validation before they can be used as fallible API results.
+macro_rules! handle_is_invalid {
+    ($($handle:ty => $invalid_minus_one:expr),* $(,)?) => { $(
+        impl $handle {
+            pub(crate) fn is_invalid(self) -> bool {
+                self.0.is_null() || ($invalid_minus_one && self.0 as isize == -1)
+            }
+        }
+    )* };
+}
+
+macro_rules! handle_result {
+    ($($handle:ty),* $(,)?) => { $(
+        impl $handle {
+            pub(crate) fn ok(self) -> windows_core::Result<Self> {
+                if self.is_invalid() {
+                    Err(windows_core::Error::from_thread())
+                } else {
+                    Ok(self)
+                }
+            }
+        }
+    )* };
+}
+
+handle_is_invalid!(HANDLE => true, HWND => false, HINSTANCE => false,
+    HMONITOR => true, HIMC => true, HPOWERNOTIFY => false);
+handle_result!(HANDLE, HWND, HINSTANCE, HPOWERNOTIFY);
 
 pub(crate) trait HiLoWord {
     fn hiword(&self) -> u16;
@@ -56,7 +82,7 @@ impl HiLoWord for LPARAM {
     }
 }
 
-pub(crate) unsafe fn get_window_long(hwnd: HWND, nindex: WINDOW_LONG_PTR_INDEX) -> isize {
+pub(crate) unsafe fn get_window_long(hwnd: HWND, nindex: i32) -> isize {
     #[cfg(target_pointer_width = "64")]
     unsafe {
         GetWindowLongPtrW(hwnd, nindex)
@@ -67,11 +93,7 @@ pub(crate) unsafe fn get_window_long(hwnd: HWND, nindex: WINDOW_LONG_PTR_INDEX) 
     }
 }
 
-pub(crate) unsafe fn set_window_long(
-    hwnd: HWND,
-    nindex: WINDOW_LONG_PTR_INDEX,
-    dwnewlong: isize,
-) -> isize {
+pub(crate) unsafe fn set_window_long(hwnd: HWND, nindex: i32, dwnewlong: isize) -> isize {
     #[cfg(target_pointer_width = "64")]
     unsafe {
         SetWindowLongPtrW(hwnd, nindex, dwnewlong)
@@ -115,11 +137,21 @@ pub(crate) fn load_cursor(style: CursorStyle) -> Option<HCURSOR> {
     };
     Some(
         *(*lock.get_or_init(|| {
-            HCURSOR(
-                unsafe { LoadImageW(None, name, IMAGE_CURSOR, 0, 0, LR_DEFAULTSIZE | LR_SHARED) }
-                    .log_err()
-                    .unwrap_or_default()
-                    .0,
+            HICON(
+                unsafe {
+                    LoadImageW(
+                        None,
+                        name,
+                        IMAGE_CURSOR as u32,
+                        0,
+                        0,
+                        (LR_DEFAULTSIZE | LR_SHARED) as u32,
+                    )
+                    .ok()
+                }
+                .log_err()
+                .unwrap_or_default()
+                .0,
             )
             .into()
         })),
@@ -135,10 +167,11 @@ pub(crate) fn configure_dwm_dark_mode(hwnd: HWND, appearance: WindowAppearance) 
     unsafe {
         DwmSetWindowAttribute(
             hwnd,
-            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
             &dark_mode_enabled as *const _ as _,
             std::mem::size_of::<BOOL>() as u32,
         )
+        .ok()
         .log_err();
     }
 }

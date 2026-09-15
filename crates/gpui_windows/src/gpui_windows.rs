@@ -51,4 +51,4 @@ pub(crate) use wrapper::*;
 
 pub use platform::WindowsPlatform;
 
-pub(crate) use crate::bindings::Windows::Win32::Foundation::HWND;
+pub(crate) use crate::bindings::Windows::Win32::HWND;

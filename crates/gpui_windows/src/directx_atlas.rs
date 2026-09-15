@@ -1,13 +1,10 @@
+use crate::bindings::Windows::Win32::{
+    D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Device,
+    ID3D11DeviceContext, ID3D11ShaderResourceView, ID3D11Texture2D, *,
+};
 use collections::FxHashMap;
 use etagere::BucketedAtlasAllocator;
 use parking_lot::Mutex;
-use crate::bindings::Windows::Win32::Graphics::{
-    Direct3D11::{
-        D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-        ID3D11Device, ID3D11DeviceContext, ID3D11ShaderResourceView, ID3D11Texture2D,
-    },
-    Dxgi::Common::*,
-};
 
 use gpui::{
     AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTextureList, AtlasTile, Bounds, DevicePixels,
@@ -213,7 +210,7 @@ impl DirectXAtlasState {
                 Quality: 0,
             },
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: bind_flag.0 as u32,
+            BindFlags: bind_flag as u32,
             CPUAccessFlags: 0,
             MiscFlags: 0,
         };
@@ -223,6 +220,7 @@ impl DirectXAtlasState {
             // So it's ok to return None here.
             self.device
                 .CreateTexture2D(&texture_desc, None, Some(&mut texture))
+                .ok()
                 .ok()?;
         }
         let texture = texture.unwrap();
@@ -237,6 +235,7 @@ impl DirectXAtlasState {
             let mut view = None;
             self.device
                 .CreateShaderResourceView(&texture, None, Some(&mut view))
+                .ok()
                 .ok()?;
             [view]
         };
@@ -356,15 +355,12 @@ fn etagere_point_to_device(value: etagere::Point) -> Point<DevicePixels> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bindings::Windows::Win32::{
+        D3D_DRIVER_TYPE_WARP, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
+        D3D11CreateDevice, HMODULE,
+    };
     use gpui::{ImageId, RenderImageParams};
     use std::borrow::Cow;
-    use crate::bindings::Windows::Win32::{
-        Foundation::HMODULE,
-        Graphics::{
-            Direct3D::D3D_DRIVER_TYPE_WARP,
-            Direct3D11::{D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11CreateDevice},
-        },
-    };
 
     fn create_atlas() -> Option<DirectXAtlas> {
         let mut device: Option<ID3D11Device> = None;
@@ -374,13 +370,14 @@ mod tests {
                 None,
                 D3D_DRIVER_TYPE_WARP,
                 HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT as u32,
                 None,
-                D3D11_SDK_VERSION,
+                D3D11_SDK_VERSION as u32,
                 Some(&mut device),
                 None,
                 Some(&mut device_context),
             )
+            .ok()
         }
         .ok()?;
         Some(DirectXAtlas::new(&device?, &device_context?))

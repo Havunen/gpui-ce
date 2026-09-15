@@ -167,6 +167,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
 ] }
 objc2-quartz-core = { version = "0.3", default-features = false, features = ["CALayer"] }
 semver = { version = "1", features = ["serde"] }
+# Keep these compatible with the checked-in windows-bindgen 0.100 bindings.
 windows-collections = "0.100"
 windows-core = "0.100"
 windows-link = "0.100"

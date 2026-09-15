@@ -5,5 +5,5 @@ edition.workspace = true
 publish = false
 
 [dependencies]
-# Keep the generator compatible with the windows-core 0.62 runtime.
+# Keep the generator compatible with the windows-core 0.100 runtime.
 windows-bindgen = "=0.100.0"

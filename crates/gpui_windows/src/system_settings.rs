@@ -3,11 +3,10 @@ use std::{
     ffi::{c_uint, c_void},
 };
 
-use gpui_util::ResultExt;
-use crate::bindings::Windows::Win32::UI::WindowsAndMessaging::{
-    SPI_GETWHEELSCROLLCHARS, SPI_GETWHEELSCROLLLINES, SYSTEM_PARAMETERS_INFO_ACTION,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+use crate::bindings::Windows::Win32::{
+    SPI_GETWHEELSCROLLCHARS, SPI_GETWHEELSCROLLLINES, SystemParametersInfoW,
 };
+use gpui_util::ResultExt;
 
 /// Windows settings pulled from SystemParametersInfo
 /// https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-systemparametersinfow
@@ -36,7 +35,7 @@ impl WindowsSystemSettings {
     }
 
     pub(crate) fn update(&self, wparam: usize) {
-        match SYSTEM_PARAMETERS_INFO_ACTION(wparam as u32) {
+        match wparam as i32 {
             SPI_GETWHEELSCROLLLINES | SPI_GETWHEELSCROLLCHARS => self.update_mouse_wheel_settings(),
             _ => {}
         }
@@ -57,11 +56,12 @@ impl MouseWheelSettings {
         let mut value = c_uint::default();
         let result = unsafe {
             SystemParametersInfoW(
-                SPI_GETWHEELSCROLLCHARS,
+                SPI_GETWHEELSCROLLCHARS as u32,
                 0,
-                Some((&mut value) as *mut c_uint as *mut c_void),
-                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS::default(),
+                (&mut value) as *mut c_uint as *mut c_void,
+                u32::default(),
             )
+            .ok()
         };
 
         if result.log_err() != None && self.wheel_scroll_chars.get() != value {
@@ -73,11 +73,12 @@ impl MouseWheelSettings {
         let mut value = c_uint::default();
         let result = unsafe {
             SystemParametersInfoW(
-                SPI_GETWHEELSCROLLLINES,
+                SPI_GETWHEELSCROLLLINES as u32,
                 0,
-                Some((&mut value) as *mut c_uint as *mut c_void),
-                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS::default(),
+                (&mut value) as *mut c_uint as *mut c_void,
+                u32::default(),
             )
+            .ok()
         };
 
         if result.log_err() != None && self.wheel_scroll_lines.get() != value {
