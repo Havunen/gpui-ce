@@ -279,7 +279,7 @@ x11 = "2.21"
 x11-clipboard = "0.9"
 x11-dl = "2.21"
 x11rb = "0.14"
-xkbcommon = "0.9"
+xkbcommon = { version = "0.9", default-features = false }
 
 gpui = { path = "./crates/gpui/", version = "0.2.2", package = "gpui-ce" }
 gpui_render = { path = "./crates/gpui_render/", version = "0.1.0", package = "gpui_ce_render" }
