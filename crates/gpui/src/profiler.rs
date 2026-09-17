@@ -566,6 +566,9 @@ pub struct ThreadTimings {
     pub thread_id: ThreadId,
     pub timings: TaskTimings,
     pub running: Option<ActiveTiming>,
+    // Outer polls keep their original start, including time spent in nested polls.
+    #[cfg(feature = "profiler")]
+    suspended: Vec<ActiveTiming>,
     pub stats: TaskStatistics,
     pub total_pushed: u64,
 }
@@ -579,6 +582,8 @@ impl ThreadTimings {
             stats: TaskStatistics::default(),
             total_pushed: 0,
             running: None,
+            #[cfg(feature = "profiler")]
+            suspended: Vec::new(),
         }
     }
 
@@ -589,11 +594,14 @@ impl ThreadTimings {
         location: &'static std::panic::Location<'_>,
     ) {
         let start = Instant::now();
-        self.running = Some(ActiveTiming {
+        let new_timing = ActiveTiming {
             spawned,
             location,
             start,
-        });
+        };
+        if let Some(previous) = self.running.replace(new_timing) {
+            self.suspended.push(previous);
+        }
     }
     #[cfg(not(feature = "profiler"))]
     pub fn update_running_task(&mut self, _: SpawnTime, _: &'static std::panic::Location<'_>) {}
@@ -607,7 +615,8 @@ impl ThreadTimings {
         } = self
             .running
             .take()
-            .expect("this function is only ever called after register_task_start");
+            .expect("task completion must have a matching update_running_task");
+        self.running = self.suspended.pop();
 
         let timing = TaskTiming {
             location,
@@ -712,6 +721,7 @@ static TRACE_STATE: AtomicU64 = AtomicU64::new(0);
 /// task buffers and the frame-event buffer are cleared so stale data isn't
 /// reported after a later re-enable. Active trace scopes keep collection enabled
 /// until the last scope ends. Calls with the current setting are a no-op.
+/// Active and suspended task timings survive tracing transitions.
 pub fn set_trace_enabled(enabled: bool) -> bool {
     let mut state = TRACE_STATE.load(Ordering::Acquire);
     loop {
@@ -1248,6 +1258,322 @@ impl FrameTimingCollector {
 mod tests {
     use super::*;
     use std::sync::{Mutex, MutexGuard};
+
+    #[test]
+    fn nested_tasks_restore_outer_timing() {
+        let _trace_test_guard = TraceTestGuard::new();
+        let mut timings = ThreadTimings::new(None, std::thread::current().id());
+        let origin = Instant::now() - Duration::from_secs(1);
+        let a = start_test_task(&mut timings, origin);
+        let b = start_test_task(&mut timings, origin + Duration::from_millis(10));
+
+        let b_end = YieldTime(origin + Duration::from_millis(30));
+        let completed_b = timings.save_task_timing(b_end);
+        let restored = timings.running;
+        let a_end = YieldTime(origin + Duration::from_millis(50));
+        let completed_a = timings.save_task_timing(a_end);
+
+        assert_task_timing(completed_b, b, b_end);
+        assert_task_timing(completed_a, a, a_end);
+        assert_active_timing(restored.expect("A should resume after B"), a);
+        assert!(timings.running.is_none());
+        // A's original start is retained, so its duration includes B's work.
+        assert_eq!(completed_a.poll_duration(), Duration::from_millis(49));
+    }
+
+    #[test]
+    fn sequential_tasks_preserve_timings_without_allocating_a_stack() {
+        check_task_sequence(&[(true, 0), (false, 0), (true, 1), (false, 1)]);
+    }
+
+    #[test]
+    fn three_nested_tasks_restore_each_parent() {
+        check_task_sequence(&[
+            (true, 0),
+            (true, 1),
+            (true, 2),
+            (false, 2),
+            (false, 1),
+            (false, 0),
+        ]);
+    }
+
+    #[test]
+    fn successive_nested_tasks_preserve_outer_timing() {
+        check_task_sequence(&[
+            (true, 0),
+            (true, 1),
+            (false, 1),
+            (true, 2),
+            (false, 2),
+            (false, 0),
+        ]);
+    }
+
+    fn check_task_sequence(steps: &[(bool, usize)]) {
+        let _trace_test_guard = TraceTestGuard::new();
+        for tracing in [false, true] {
+            set_trace_enabled(tracing);
+            let mut timings = ThreadTimings::new(None, std::thread::current().id());
+            let origin = Instant::now() - Duration::from_secs(1);
+            let locations = [
+                std::panic::Location::caller(),
+                std::panic::Location::caller(),
+                std::panic::Location::caller(),
+            ];
+            let expected: [_; 3] = std::array::from_fn(|index| ActiveTiming {
+                location: locations[index],
+                spawned: SpawnTime(origin + Duration::from_millis(index as u64 * 10)),
+                start: origin + Duration::from_millis(index as u64 * 10 + 1),
+            });
+            let mut active = Vec::new();
+            let mut completed = Vec::new();
+            let mut nested = false;
+            for (step, &(starting, index)) in steps.iter().enumerate() {
+                let task = expected[index];
+                if starting {
+                    nested |= !active.is_empty();
+                    timings.update_running_task(task.spawned, task.location);
+                    timings.running.as_mut().unwrap().start = task.start;
+                    active.push(index);
+                } else {
+                    let ended = YieldTime(origin + Duration::from_millis(100 + step as u64));
+                    assert_task_timing(timings.save_task_timing(ended), task, ended);
+                    assert_eq!(active.pop(), Some(index));
+                    completed.push((task, ended));
+                }
+                if let Some(&index) = active.last() {
+                    assert_active_timing(timings.running.unwrap(), expected[index]);
+                } else {
+                    assert!(timings.running.is_none());
+                }
+                assert_eq!(
+                    timings.timings.len(),
+                    if tracing { completed.len() } else { 0 }
+                );
+                assert_eq!(timings.total_pushed as usize, timings.timings.len());
+                if tracing {
+                    for (&actual, &(task, ended)) in timings.timings.iter().zip(&completed) {
+                        assert_task_timing(actual, task, ended);
+                    }
+                }
+            }
+            assert!(timings.suspended.is_empty());
+            if !nested {
+                assert_eq!(timings.suspended.capacity(), 0);
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "task completion must have a matching update_running_task")]
+    fn unmatched_task_completion_still_panics() {
+        ThreadTimings::new(None, std::thread::current().id())
+            .save_task_timing(YieldTime(Instant::now()));
+    }
+
+    #[test]
+    fn running_snapshots_follow_the_current_nested_task() {
+        let _trace_test_guard = TraceTestGuard::new();
+        let timings = Arc::new(spin::Mutex::new(ThreadTimings::new(
+            None,
+            std::thread::current().id(),
+        )));
+        let origin = Instant::now() - Duration::from_secs(1);
+        let a = start_test_task(&mut timings.lock(), origin);
+        check_running_snapshots(&timings, Some(a));
+        let b = start_test_task(&mut timings.lock(), origin + Duration::from_millis(10));
+        check_running_snapshots(&timings, Some(b));
+        timings.lock().save_task_timing(YieldTime(Instant::now()));
+        check_running_snapshots(&timings, Some(a));
+        timings.lock().save_task_timing(YieldTime(Instant::now()));
+        check_running_snapshots(&timings, None);
+    }
+
+    fn check_running_snapshots(timings: &Arc<GuardedTaskTimings>, expected: Option<ActiveTiming>) {
+        let handles = || vec![(std::thread::current().id(), Arc::clone(timings))];
+        for include_running in [false, true] {
+            let included = || {
+                if include_running {
+                    TasksIncluded::CompletedAndRunning
+                } else {
+                    TasksIncluded::OnlyCompleted
+                }
+            };
+            let expected = expected.filter(|_| include_running);
+            let local = timings.lock().get_thread_task_timings(included());
+            let collected = ThreadTaskTimings::collect(handles(), included());
+            for snapshot in [&local, &collected[0]] {
+                assert_eq!(snapshot.timings.len(), usize::from(expected.is_some()));
+                if let Some(task) = expected {
+                    let actual = snapshot.timings[0];
+                    assert_task_timing(actual, task, actual.end);
+                }
+            }
+            // Isolate the running contribution from previously completed polls.
+            timings.lock().stats = TaskStatistics::default();
+            let stats = ThreadTaskStatistics::collect_and_reset(handles(), included());
+            for records in [
+                &stats[0].stats.longest_poll_times,
+                &stats[0].stats.longest_runtimes,
+            ] {
+                let recorded = records
+                    .iter()
+                    .filter(|timing| !timing.poll_duration().is_zero())
+                    .collect::<Vec<_>>();
+                assert_eq!(recorded.len(), usize::from(expected.is_some()));
+                if let Some(task) = expected {
+                    assert_task_timing(*recorded[0], task, recorded[0].end);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tracing_transitions_preserve_active_and_suspended_tasks() {
+        let _trace_test_guard = TraceTestGuard::new();
+        std::thread::spawn(|| {
+            set_trace_enabled(true);
+            let origin = Instant::now() - Duration::from_secs(1);
+            THREAD_TIMINGS.with(|timings| {
+                let mut timings = timings.lock();
+                start_test_task(&mut timings, origin);
+                timings.save_task_timing(YieldTime(Instant::now()));
+                assert_eq!(timings.timings.len(), 1);
+            });
+            let (a, b) = THREAD_TIMINGS.with(|timings| {
+                let mut timings = timings.lock();
+                let a = start_test_task(&mut timings, origin + Duration::from_millis(10));
+                let b = start_test_task(&mut timings, origin + Duration::from_millis(20));
+                (a, b)
+            });
+            set_trace_enabled(false);
+            THREAD_TIMINGS.with(|timings| {
+                let timings = timings.lock();
+                assert!(timings.timings.is_empty());
+                assert_eq!(timings.total_pushed, 0);
+                assert_active_timing(timings.running.unwrap(), b);
+                assert_eq!(timings.suspended.len(), 1);
+                assert_active_timing(timings.suspended[0], a);
+            });
+            set_trace_enabled(true);
+            THREAD_TIMINGS.with(|timings| {
+                let mut timings = timings.lock();
+                let ended = YieldTime(Instant::now());
+                assert_task_timing(timings.save_task_timing(ended), b, ended);
+                assert_active_timing(timings.running.unwrap(), a);
+                assert_eq!(timings.timings.len(), 1);
+            });
+            set_trace_enabled(false);
+            set_trace_enabled(true);
+            THREAD_TIMINGS.with(|timings| {
+                let mut timings = timings.lock();
+                let ended = YieldTime(Instant::now());
+                assert_task_timing(timings.save_task_timing(ended), a, ended);
+                assert_eq!(timings.timings.len(), 1);
+                assert_eq!(timings.total_pushed, 1);
+                assert_task_timing(timings.timings[0], a, ended);
+                assert!(timings.running.is_none());
+                assert!(timings.suspended.is_empty());
+            });
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn public_nested_tasks_balance_foreground_journal() {
+        use journal::{ForegroundEvent, ForegroundJournalEntry, IntervalBoundary};
+
+        let _trace_test_guard = TraceTestGuard::new();
+        set_trace_enabled(true);
+        std::thread::spawn(|| {
+            let (journal, _journal_guard) = journal::install_test_foreground_journal(16, 16);
+            let mut collector = journal.collector();
+            let origin = Instant::now() - Duration::from_secs(1);
+            let a = start_public_test_task(origin);
+            let b = start_public_test_task(origin + Duration::from_millis(10));
+            save_task_timing();
+            let inner = collector.collect_unseen();
+            assert_eq!(inner.lost, 0);
+            let [ForegroundJournalEntry::Event(ForegroundEvent::TaskPoll(completed_b))] =
+                inner.entries.as_slice()
+            else {
+                panic!(
+                    "inner completion must record B without an idle boundary: {:?}",
+                    inner.entries
+                );
+            };
+            assert_task_timing(*completed_b, b, completed_b.end);
+            THREAD_TIMINGS.with(|timings| assert_active_timing(timings.lock().running.unwrap(), a));
+
+            save_task_timing();
+            let outer = collector.collect_unseen();
+            assert_eq!(outer.lost, 0);
+            let [
+                ForegroundJournalEntry::Event(ForegroundEvent::TaskPoll(completed_a)),
+                ForegroundJournalEntry::Boundary(IntervalBoundary::Idle { ended_at }),
+            ] = outer.entries.as_slice()
+            else {
+                panic!(
+                    "outer completion must record A and return to idle: {:?}",
+                    outer.entries
+                );
+            };
+            assert_task_timing(*completed_a, a, YieldTime(*ended_at));
+            let snapshot = get_current_thread_task_timings(TasksIncluded::CompletedAndRunning);
+            assert_eq!(snapshot.total_pushed, 2);
+            assert_eq!(snapshot.timings.len(), 2);
+            assert_task_timing(snapshot.timings[0], b, completed_b.end);
+            assert_task_timing(snapshot.timings[1], a, completed_a.end);
+            THREAD_TIMINGS.with(|timings| {
+                let timings = timings.lock();
+                assert!(timings.running.is_none());
+                assert!(timings.suspended.is_empty());
+            });
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[track_caller]
+    fn start_public_test_task(spawned: Instant) -> ActiveTiming {
+        update_running_task(SpawnTime(spawned), std::panic::Location::caller());
+        THREAD_TIMINGS.with(|timings| {
+            let mut timings = timings.lock();
+            // Ensure a retained journal poll deterministically, without sleeping.
+            let running = timings.running.as_mut().unwrap();
+            running.start = spawned + Duration::from_millis(1);
+            *running
+        })
+    }
+
+    #[track_caller]
+    fn start_test_task(timings: &mut ThreadTimings, spawned: Instant) -> ActiveTiming {
+        timings.update_running_task(SpawnTime(spawned), std::panic::Location::caller());
+        // Control the start timestamp without sleeps or clock-resolution assumptions.
+        let running = timings.running.as_mut().expect("task should be active");
+        running.start = spawned + Duration::from_millis(1);
+        *running
+    }
+
+    fn assert_active_timing(actual: ActiveTiming, expected: ActiveTiming) {
+        assert_eq!(actual.location, expected.location);
+        assert_eq!(actual.spawned.0, expected.spawned.0);
+        assert_eq!(actual.start, expected.start);
+    }
+
+    fn assert_task_timing(actual: TaskTiming, expected: ActiveTiming, ended: YieldTime) {
+        assert_active_timing(
+            ActiveTiming {
+                location: actual.location,
+                spawned: actual.spawned,
+                start: actual.start,
+            },
+            expected,
+        );
+        assert_eq!(actual.end.0, ended.0);
+    }
 
     #[test]
     fn records_draw_events_only_while_tracing() {
