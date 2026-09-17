@@ -117,7 +117,8 @@ jobs:
         run: cargo test --workspace --lib --tests --target ${{ matrix.target }}
 
       - name: Run profiler tests
-        run: cargo test -p gpui-ce --features profiler --lib profiler:: --target ${{ matrix.target }}
+        run: |
+          cargo test -p gpui-ce --features profiler --lib profiler:: --target ${{ matrix.target }}
 
   ubuntu-container-build:
     name: Ubuntu ${{ matrix.ubuntu_version }} container x86_64
@@ -188,7 +189,8 @@ jobs:
         run: cargo test --workspace --lib --tests --target x86_64-unknown-linux-gnu
 
       - name: Run profiler tests
-        run: cargo test -p gpui-ce --features profiler --lib profiler:: --target x86_64-unknown-linux-gnu
+        run: |
+          cargo test -p gpui-ce --features profiler --lib profiler:: --target x86_64-unknown-linux-gnu
 
   check-target-variations:
     name: ${{ matrix.name }}
