@@ -1510,6 +1510,11 @@ pub mod Windows {
             unsafe { FlashWindowEx(pfwi) }
         }
         #[inline]
+        pub unsafe fn FreeLibrary(hlibmodule: HMODULE) -> windows_core::BOOL {
+            windows_core::link!("kernel32.dll" "system" fn FreeLibrary(hlibmodule : HMODULE) -> windows_core::BOOL);
+            unsafe { FreeLibrary(hlibmodule) }
+        }
+        #[inline]
         pub unsafe fn GetActiveWindow() -> HWND {
             windows_core::link!("user32.dll" "system" fn GetActiveWindow() -> HWND);
             unsafe { GetActiveWindow() }
@@ -1862,6 +1867,14 @@ pub mod Windows {
                     fuload,
                 )
             }
+        }
+        #[inline]
+        pub unsafe fn LoadLibraryA<P0>(lplibfilename: P0) -> HMODULE
+        where
+            P0: windows_core::Param<windows_core::PCSTR>,
+        {
+            windows_core::link!("kernel32.dll" "system" fn LoadLibraryA(lplibfilename : windows_core::PCSTR) -> HMODULE);
+            unsafe { LoadLibraryA(lplibfilename.param().abi()) }
         }
         #[inline]
         pub unsafe fn MapVirtualKeyW(ucode: u32, umaptype: u32) -> u32 {
@@ -2682,6 +2695,8 @@ pub mod Windows {
             pub NumElements: u32,
             pub Flags: u32,
         }
+        pub type D3D11_BUFFEREX_SRV_FLAG = i32;
+        pub const D3D11_BUFFEREX_SRV_FLAG_RAW: D3D11_BUFFEREX_SRV_FLAG = 1;
         #[repr(C)]
         #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
         pub struct D3D11_BUFFER_DESC {
@@ -2894,6 +2909,7 @@ pub mod Windows {
                 unsafe { core::mem::zeroed() }
             }
         }
+        pub const D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS: D3D11_RESOURCE_MISC_FLAG = 32;
         pub const D3D11_RESOURCE_MISC_BUFFER_STRUCTURED: D3D11_RESOURCE_MISC_FLAG = 64;
         pub type D3D11_RESOURCE_MISC_FLAG = i32;
         pub const D3D11_RLDO_DETAIL: D3D11_RLDO_FLAGS = 2;
@@ -2955,6 +2971,7 @@ pub mod Windows {
         #[repr(transparent)]
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
         pub struct D3D11_SRV_DIMENSION(pub D3D_SRV_DIMENSION);
+        pub const D3D11_SRV_DIMENSION_BUFFEREX: D3D_SRV_DIMENSION = 11;
         pub const D3D11_STANDARD_MULTISAMPLE_PATTERN: D3D11_STANDARD_MULTISAMPLE_QUALITY_LEVELS =
             -1;
         pub type D3D11_STANDARD_MULTISAMPLE_QUALITY_LEVELS = i32;
@@ -3712,6 +3729,8 @@ pub mod Windows {
         pub const DXGI_ALPHA_MODE_IGNORE: DXGI_ALPHA_MODE = 3;
         pub const DXGI_ALPHA_MODE_PREMULTIPLIED: DXGI_ALPHA_MODE = 1;
         pub const DXGI_CREATE_FACTORY_DEBUG: i32 = 1;
+        pub const DXGI_ERROR_NOT_FOUND: windows_core::HRESULT =
+            windows_core::HRESULT(0x887A0002_u32 as _);
         pub type DXGI_FEATURE = i32;
         pub type DXGI_FORMAT = i32;
         pub const DXGI_FORMAT_420_OPAQUE: DXGI_FORMAT = 106;
@@ -11356,6 +11375,7 @@ pub mod Windows {
         pub const SWP_NOSENDCHANGING: i32 = 1024;
         pub const SWP_NOSIZE: i32 = 1;
         pub const SWP_NOZORDER: i32 = 4;
+        pub const SW_HIDE: i32 = 0;
         pub const SW_MAXIMIZE: i32 = 3;
         pub const SW_MINIMIZE: i32 = 6;
         pub const SW_NORMAL: i32 = 1;
@@ -11731,6 +11751,7 @@ pub mod Windows {
         pub const WS_EX_TOPMOST: i32 = 8;
         pub const WS_MAXIMIZEBOX: i32 = 65536;
         pub const WS_MINIMIZEBOX: i32 = 131072;
+        pub const WS_OVERLAPPED: i32 = 0;
         pub const WS_POPUP: u32 = 2147483648;
         pub const WS_SYSMENU: i32 = 524288;
         pub const WS_THICKFRAME: i32 = 262144;

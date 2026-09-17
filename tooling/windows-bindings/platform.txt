@@ -87,6 +87,10 @@ Windows.Win32.D3D11_RASTERIZER_DESC
 Windows.Win32.D3D11_RENDER_TARGET_BLEND_DESC
 Windows.Win32.D3D11_RENDER_TARGET_VIEW_DESC
 Windows.Win32.D3D11_RESOURCE_MISC_BUFFER_STRUCTURED
+Windows.Win32.D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS
+Windows.Win32.D3D11_BUFFEREX_SRV_FLAG_RAW
+Windows.Win32.D3D11_SRV_DIMENSION_BUFFEREX
+Windows.Win32.D3D11_SHADER_RESOURCE_VIEW_DESC
 Windows.Win32.D3D11_RLDO_DETAIL
 Windows.Win32.D3D11_RTV_DIMENSION_TEXTURE2D
 Windows.Win32.D3D11_SAMPLER_DESC
@@ -258,6 +262,11 @@ Windows.Win32.GetModuleHandleW
 Windows.Win32.GetMonitorInfoW
 Windows.Win32.GetPointerType
 Windows.Win32.GetProcAddress
+Windows.Win32.LoadLibraryA
+Windows.Win32.FreeLibrary
+Windows.Win32.DXGI_ERROR_NOT_FOUND
+Windows.Win32.SW_HIDE
+Windows.Win32.WS_OVERLAPPED
 Windows.Win32.GetSystemMetrics
 Windows.Win32.GetSystemMetricsForDpi
 Windows.Win32.GetSystemTimeAsFileTime

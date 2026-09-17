@@ -13,12 +13,17 @@ fn main() {
             "crates/gpui_zed_util/src/windows_bindings.rs",
             true,
         ),
+        (
+            include_str!("../shaders.txt"),
+            "crates/gpui_render/windows_bindings.rs",
+            false,
+        ),
     ] {
         let output = root.join(output);
         let mut args = vec!["--out", output.to_str().unwrap()];
         if sys {
             args.push("--sys");
-        } else {
+        } else if output.ends_with("gpui_windows/src/bindings.rs") {
             args.extend([
                 "--implement",
                 "Windows.Win32.IDirectManipulationViewportEventHandler",

@@ -10,13 +10,14 @@ use crate::bindings::Windows::Win32::{
 };
 use crate::collections::HashMap;
 use anyhow::{Context, Result};
+use gpui_render::shaders::emoji_rasterization::GlyphLayerTextureParams;
 use gpui_util::{ResultExt, maybe};
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
+use wgsl_rs::std::{vec2i, vec3f, vec4f};
 use windows_core::*;
 use windows_numerics::Vector2;
 
-use super::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
-use super::{DirectXDevices, DirectXRenderer, try_to_recover_from_device_lost};
+use crate::*;
 use gpui::*;
 
 #[derive(Debug)]
@@ -130,20 +131,16 @@ impl GPUState {
             sampler
         };
 
+        let bytecode = shader_resources::ShaderModule::EmojiRasterization.bytecode()?;
         let vertex_shader = {
-            let source =
-                RawShaderBytes::new(ShaderModule::EmojiRasterization, ShaderTarget::Vertex)?;
             let mut shader = None;
-            unsafe { device.CreateVertexShader(source.as_bytes(), None, Some(&mut shader)) }
-                .ok()?;
+            unsafe { device.CreateVertexShader(bytecode.vertex, None, Some(&mut shader)) }.ok()?;
             shader.unwrap()
         };
 
         let pixel_shader = {
-            let source =
-                RawShaderBytes::new(ShaderModule::EmojiRasterization, ShaderTarget::Fragment)?;
             let mut shader = None;
-            unsafe { device.CreatePixelShader(source.as_bytes(), None, Some(&mut shader)) }.ok()?;
+            unsafe { device.CreatePixelShader(bytecode.fragment, None, Some(&mut shader)) }.ok()?;
             shader.unwrap()
         };
 
@@ -160,8 +157,7 @@ impl GPUState {
 
 impl DirectWriteTextSystem {
     pub(crate) fn new(directx_devices: &DirectXDevices) -> Result<Self> {
-        let factory: IDWriteFactory5 = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }
-            .context("Creating DirectWrite factory")?;
+        let factory: IDWriteFactory5 = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)? };
         // The `IDWriteInMemoryFontFileLoader` here is supported starting from
         // Windows 10 Creators Update, which consequently requires the entire
         // `DirectWriteTextSystem` to run on `win10 1703`+.
@@ -176,7 +172,7 @@ impl DirectWriteTextSystem {
         let locale = HSTRING::from_wide(&locale);
         let text_renderer = TextRendererWrapper::new(locale.clone());
 
-        let gpu_state = GPUState::new(directx_devices).context("Creating DirectWrite GPU state")?;
+        let gpu_state = GPUState::new(directx_devices)?;
 
         let system_subpixel_rendering = get_system_subpixel_rendering();
         let system_ui_font_name = get_system_ui_font_name();
@@ -198,13 +194,11 @@ impl DirectWriteTextSystem {
                 .ok()?;
             result.context("Failed to get system font collection")?
         };
-        let custom_font_set = unsafe { components.builder.CreateFontSet() }
-            .context("Creating DirectWrite custom font set")?;
+        let custom_font_set = unsafe { components.builder.CreateFontSet()? };
         let custom_font_collection = unsafe {
             components
                 .factory
-                .CreateFontCollectionFromFontSet(&custom_font_set)
-                .context("Creating DirectWrite custom font collection from font set")?
+                .CreateFontCollectionFromFontSet(&custom_font_set)?
         };
 
         Ok(Self {
@@ -385,6 +379,9 @@ impl DirectWriteState {
         let set = unsafe { components.builder.CreateFontSet()? };
         let collection = unsafe { components.factory.CreateFontCollectionFromFontSet(&set)? };
         self.custom_font_collection = collection;
+        // New custom faces take precedence over previously selected system faces.
+        // Existing FontIds stay valid for shaped lines; future requests must reselect.
+        self.font_to_font_id.clear();
 
         Ok(())
     }
@@ -1171,10 +1168,10 @@ impl DirectWriteState {
                 device_context.ClearRenderTargetView(render_target_view, &[0.0, 0.0, 0.0, 0.0]);
             }
         }
-        unsafe { device_context.PSSetSamplers(0, Some(std::slice::from_ref(&gpu_state.sampler))) };
+        unsafe { device_context.PSSetSamplers(2, Some(std::slice::from_ref(&gpu_state.sampler))) };
         unsafe { device_context.OMSetBlendState(&gpu_state.blend_state, None, 0xffffffff) };
 
-        let super::FontInfo {
+        let crate::FontInfo {
             gamma_ratios,
             grayscale_enhanced_contrast,
             ..
@@ -1182,11 +1179,22 @@ impl DirectWriteState {
 
         for layer in glyph_layers {
             let params = GlyphLayerTextureParams {
-                run_color: layer.run_color,
-                bounds: layer.bounds,
-                gamma_ratios: *gamma_ratios,
+                bounds_origin: vec2i(layer.bounds.origin.x, layer.bounds.origin.y),
+                bounds_size: vec2i(layer.bounds.size.width, layer.bounds.size.height),
+                run_color: vec4f(
+                    layer.run_color.red,
+                    layer.run_color.green,
+                    layer.run_color.blue,
+                    layer.run_color.alpha,
+                ),
+                gamma_ratios: vec4f(
+                    gamma_ratios[0],
+                    gamma_ratios[1],
+                    gamma_ratios[2],
+                    gamma_ratios[3],
+                ),
                 grayscale_enhanced_contrast: *grayscale_enhanced_contrast,
-                _pad: [0f32; 3],
+                padding: vec3f(0.0, 0.0, 0.0),
             };
             unsafe {
                 let mut dest = std::mem::zeroed();
@@ -1207,7 +1215,7 @@ impl DirectWriteState {
             };
 
             let texture = [Some(layer.texture_view.clone())];
-            unsafe { device_context.PSSetShaderResources(0, Some(&texture)) };
+            unsafe { device_context.PSSetShaderResources(1, Some(&texture)) };
 
             let viewport = [D3D11_VIEWPORT {
                 TopLeftX: layer.bounds.origin.x as f32,
@@ -1417,15 +1425,6 @@ impl GlyphLayerTexture {
             _texture: texture,
         })
     }
-}
-
-#[repr(C)]
-struct GlyphLayerTextureParams {
-    bounds: Bounds<i32>,
-    run_color: Rgba,
-    gamma_ratios: [f32; 4],
-    grayscale_enhanced_contrast: f32,
-    _pad: [f32; 3],
 }
 
 struct TextRendererWrapper(IDWriteTextRenderer);

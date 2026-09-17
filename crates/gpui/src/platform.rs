@@ -18,6 +18,39 @@ mod test;
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 mod visual_test;
 
+#[cfg(all(feature = "screen-capture", target_os = "windows"))]
+pub mod screen_capture;
+#[cfg(target_os = "windows")]
+mod windows_screen_capture;
+#[cfg(target_os = "windows")]
+pub use windows_screen_capture::WindowsScreenCaptureFrame;
+
+#[cfg(all(target_os = "windows", feature = "screen-capture"))]
+pub(crate) type PlatformScreenCaptureFrame = WindowsScreenCaptureFrame;
+#[cfg(not(feature = "screen-capture"))]
+pub(crate) type PlatformScreenCaptureFrame = ();
+#[cfg(all(target_os = "macos", feature = "screen-capture"))]
+pub(crate) type PlatformScreenCaptureFrame = core_video::image_buffer::CVImageBuffer;
+#[cfg(all(
+    feature = "screen-capture",
+    not(any(target_os = "macos", target_os = "windows"))
+))]
+// Screen capture currently has native frame representations only on macOS and Windows. Keep the
+// cross-platform API well-formed for enabled-but-unsupported targets; source enumeration simply
+// yields no platform sources there.
+pub(crate) type PlatformScreenCaptureFrame = ();
+
+use crate::{
+    Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
+    DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Edges, ExternalDragPayload, Font,
+    FontId, FontMetrics, FontRun, ForegroundExecutor, GlyphId, GpuSpecs, ImageSource, Keymap,
+    LineLayout, Pixels, PlatformGestures, PlatformInput, Point, Priority, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString,
+    Size, SvgRenderer, SystemWindowTab, Task, Window, WindowControlArea, hash, point, px, size,
+};
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+use anyhow::bail;
+use anyhow::{Context as _, Result};
 use async_task::Runnable;
 use futures::channel::oneshot;
 #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
@@ -46,8 +79,6 @@ use std::{
 };
 use strum::EnumIter;
 use uuid::Uuid;
-#[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
-pub use visual_test::VisualTestPlatform;
 
 pub use app_menu::*;
 pub use keyboard::*;
@@ -57,22 +88,13 @@ pub use keystroke::*;
 pub(crate) use test::*;
 
 #[cfg(any(test, feature = "test-support"))]
-pub use test::TestDispatcher;
+pub use test::{TestDispatcher, TestScreenCaptureSource, TestScreenCaptureStream};
 
 #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 pub use threaded_dispatcher::ThreadedDispatcher;
 
-use crate::{
-    Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
-    DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Edges, ExternalDragPayload, Font,
-    FontId, FontMetrics, FontRun, ForegroundExecutor, GlyphId, GpuSpecs, ImageSource, Keymap,
-    LineLayout, Pixels, PlatformGestures, PlatformInput, Point, Priority, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Scene, ShapedGlyph, ShapedRun, SharedString,
-    Size, SvgRenderer, SystemWindowTab, Task, Window, WindowControlArea, hash, point, px, size,
-};
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
-use anyhow::bail;
-use anyhow::{Context as _, Result};
+#[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
+pub use visual_test::VisualTestPlatform;
 
 // TODO(jk): return an enum instead of a string
 /// Return which compositor we're guessing we'll use.
@@ -138,6 +160,22 @@ pub trait Platform: 'static {
     fn active_window(&self) -> Option<AnyWindowHandle>;
     fn window_stack(&self) -> Option<Vec<AnyWindowHandle>> {
         None
+    }
+
+    fn is_screen_capture_supported(&self) -> bool {
+        false
+    }
+
+    fn screen_capture_sources(
+        &self,
+    ) -> oneshot::Receiver<anyhow::Result<Vec<Rc<dyn ScreenCaptureSource>>>> {
+        let (sources_tx, sources_rx) = oneshot::channel();
+        sources_tx
+            .send(Err(anyhow::anyhow!(
+                "gpui was compiled without the screen-capture feature"
+            )))
+            .ok();
+        sources_rx
     }
 
     fn open_window(
@@ -323,7 +361,6 @@ pub trait Platform: 'static {
     /// Register additional GPU device requirements (features, limits) before
     /// the first window is opened.  The concrete type inside the `Box` must be
     /// `gpui_wgpu::WgpuDeviceRequirements`.
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn set_gpu_requirements(&self, _requirements: Box<dyn std::any::Any>) {}
 
     /// Sets the label applied to credentials stored in the system keyring.
@@ -436,6 +473,42 @@ pub enum HapticFeedbackStyle {
     /// discrete state changes.
     LevelChange,
 }
+
+/// Metadata for a given [ScreenCaptureSource]
+#[derive(Clone)]
+pub struct SourceMetadata {
+    /// Opaque identifier of this screen.
+    pub id: u64,
+    /// Human-readable label for this source.
+    pub label: Option<SharedString>,
+    /// Whether this source is the main display.
+    pub is_main: Option<bool>,
+    /// Video resolution of this source.
+    pub resolution: Size<DevicePixels>,
+}
+
+/// A source of on-screen video content that can be captured.
+pub trait ScreenCaptureSource {
+    /// Returns metadata for this source.
+    fn metadata(&self) -> Result<SourceMetadata>;
+
+    /// Start capture video from this source, invoking the given callback
+    /// with each frame.
+    fn stream(
+        &self,
+        foreground_executor: &ForegroundExecutor,
+        frame_callback: Box<dyn Fn(ScreenCaptureFrame) + Send>,
+    ) -> oneshot::Receiver<Result<Box<dyn ScreenCaptureStream>>>;
+}
+
+/// A video stream captured from a screen.
+pub trait ScreenCaptureStream {
+    /// Returns metadata for this source.
+    fn metadata(&self) -> Result<SourceMetadata>;
+}
+
+/// A frame of video captured from a screen.
+pub struct ScreenCaptureFrame(pub PlatformScreenCaptureFrame);
 
 /// An opaque identifier for a hardware display
 #[derive(PartialEq, Eq, Hash, Copy, Clone)]
@@ -827,6 +900,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn background_appearance(&self) -> WindowBackgroundAppearance;
     fn set_title(&mut self, title: &str);
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance);
+    /// Show or hide the window without explicitly requesting focus.
+    ///
+    /// The default implementation does nothing for platforms that do not support
+    /// changing window visibility at runtime.
+    fn set_visible(&self, _visible: bool) {}
     fn minimize(&self);
     fn zoom(&self);
     fn toggle_fullscreen(&self);
@@ -913,12 +991,16 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
 
     /// Returns the GPU context for this window's renderer.
     /// The returned `Box` contains `(Arc<wgpu::Device>, Arc<wgpu::Queue>)`.
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "freebsd",
-        all(target_os = "windows", feature = "wgpu-surfaces")
-    ))]
+    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))]
     fn gpu_context(&self) -> Option<Box<dyn std::any::Any>> {
+        None
+    }
+
+    /// Returns typed backend-specific GPU context information for custom
+    /// controls. The value is intentionally type-erased in this crate so the
+    /// core UI crate does not depend on a rendering backend.
+    #[cfg(any(target_family = "wasm", target_os = "linux", target_os = "freebsd"))]
+    fn gpu_context_info(&self) -> Option<Box<dyn std::any::Any>> {
         None
     }
 
@@ -928,11 +1010,7 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// captured the device from `gpu_context` should stop submitting while
     /// this is `Some(true)` and re-acquire the device once it reads
     /// `Some(false)` again.
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "freebsd",
-        all(target_os = "windows", feature = "wgpu-surfaces")
-    ))]
+    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "windows"))]
     fn gpu_device_lost(&self) -> Option<bool> {
         None
     }
@@ -1352,6 +1430,9 @@ pub trait PlatformAtlas {
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>>;
     fn remove(&self, key: &AtlasKey);
+    /// A counter that advances whenever tiles handed out earlier may no longer
+    /// be valid (a full clear, or a texture being deallocated). A frame built
+    /// against an older generation must be redrawn rather than presented.
     fn generation(&self) -> u64 {
         0
     }
@@ -1437,6 +1518,31 @@ pub enum AtlasTextureKind {
     Monochrome = 0,
     Polychrome = 1,
     Subpixel = 2,
+}
+
+impl AtlasTextureKind {
+    /// Validates a tightly packed bitmap before an atlas allocates or caches its tile.
+    /// Monochrome tiles contain one coverage byte; color and LCD tiles contain four bytes.
+    pub fn validate_upload(self, size: Size<DevicePixels>, bytes: &[u8]) -> Result<()> {
+        anyhow::ensure!(
+            size.width.0 > 0 && size.height.0 > 0,
+            "{self:?} atlas upload requires positive dimensions, got {size:?}"
+        );
+        let channels = match self {
+            Self::Monochrome => 1,
+            Self::Polychrome | Self::Subpixel => 4,
+        };
+        let expected = (size.width.0 as usize)
+            .checked_mul(size.height.0 as usize)
+            .and_then(|pixels| pixels.checked_mul(channels))
+            .ok_or_else(|| anyhow::anyhow!("atlas upload byte count overflow for {size:?}"))?;
+        anyhow::ensure!(
+            bytes.len() == expected,
+            "{self:?} atlas upload for {size:?} requires {expected} bytes, got {}",
+            bytes.len()
+        );
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

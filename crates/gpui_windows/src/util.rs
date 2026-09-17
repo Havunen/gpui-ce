@@ -6,7 +6,7 @@ use crate::bindings::Windows::Win32::*;
 use gpui_util::ResultExt;
 use windows_core::BOOL;
 
-use super::SafeCursor;
+use crate::*;
 use gpui::*;
 
 // Win32 handles returned directly by windows-bindgen 0.100 need explicit

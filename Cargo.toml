@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "./crates/gpui/",
+    "./crates/gpui_render/",
     "./crates/gpui_web/",
     "./crates/gpui_wgpu/",
     "./crates/gpui_linux/",
@@ -42,6 +43,7 @@ rust-version = "1.97"
 
 [workspace.dependencies]
 accesskit = { version = "0.25", features = ["enumn"] }
+accesskit_consumer = "0.39"
 accesskit_macos = "0.27"
 accesskit_unix = "0.23"
 accesskit_windows = "0.35"
@@ -97,7 +99,7 @@ tracing = { version = "0.1.44", features = ["attributes"] }
 hdrhistogram = "7"
 pollster = "1"
 url = "2"
-uuid = { version = "1", features = ["v4", "v5", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
 web-time = "1.1"
 core-foundation = "0.10"
 core-foundation-sys = "0.8"
@@ -106,7 +108,8 @@ media = { path = "./crates/gpui_media/", version = "0.2.2", package = "gpui_ce_m
 objc = "0.2"
 block2 = "0.6"
 objc2-foundation = { version = "=0.3.2", default-features = false, features = [
-    "NSArray",
+  "NSArray",
+    "NSAutoreleasePool",
     "NSAttributedString",
     "NSBundle",
     "NSCoder",
@@ -125,8 +128,10 @@ objc2-foundation = { version = "=0.3.2", default-features = false, features = [
     "NSRunLoop",
     "NSSet",
     "NSString",
+    "NSThread",
     "NSURL",
     "NSUndoManager",
+    "NSUserDefaults",
     "NSValue",
     "objc2-core-foundation",
     "std",
@@ -134,6 +139,10 @@ objc2-foundation = { version = "=0.3.2", default-features = false, features = [
 objc2-user-notifications = "0.3"
 mach2 = "0.7"
 metal = "0.33"
+windows-capture = "1.5"
+# Compatibility types exposed by windows-capture and wgpu-hal, respectively.
+windows-062 = { package = "windows", version = "0.62" }
+windows-061 = { package = "windows", version = "0.61" }
 env_logger = "0.11"
 unicode-segmentation = "1.13"
 wasm-bindgen = "0.2"
@@ -153,19 +162,60 @@ ashpd = { version = "0.13", default-features = false, features = [
 libc = "0.2"
 smol = "2"
 wgpu = "29.0.4"
+wgsl-rs = { git = "https://github.com/schell/wgsl-rs", rev = "b2de16a1b81e67d76bc265c296184f882864badb", default-features = false, features = [
+  "validation",
+] }
 criterion = { version = "0.8", features = ["html_reports"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = [
-    "NSAlert",
-    "NSApplication",
-    "NSButton",
-    "NSControl",
-    "NSGraphics",
-    "NSResponder",
-    "NSView",
-    "NSWindow",
-    "block2",
+  "objc2-core-foundation",
+  "objc2-core-graphics",
+  "NSAlert",
+  "NSApplication",
+  "NSDocumentController",
+  "NSAppearance",
+  "NSButton",
+  "NSCell",
+  "NSControl",
+  "NSEvent",
+  "NSGraphics",
+  "NSHapticFeedback",
+  "NSCursor",
+  "NSPanel",
+  "NSMenu",
+  "NSMenuItem",
+  "NSOpenPanel",
+  "NSSavePanel",
+  "NSScroller",
+  "NSWorkspace",
+  "NSVisualEffectView",
+  "NSPasteboard",
+  "NSPasteboardItem",
+  "NSResponder",
+  "NSRunningApplication",
+  "NSScreen",
+  "NSTextInputClient",
+  "NSView",
+  "NSWindow",
+  "block2",
 ] }
-objc2-quartz-core = { version = "0.3", default-features = false, features = ["CALayer"] }
+objc2-core-media = { version = "0.3", default-features = false, features = [
+  "CMSampleBuffer",
+  "objc2",
+] }
+objc2-quartz-core = { version = "0.3", default-features = false, features = [
+  "CALayer",
+  "CAMetalLayer",
+] }
+objc2-screen-capture-kit = { version = "0.3", default-features = false, features = [
+  "std",
+  "SCShareableContent",
+  "SCStream",
+  "block2",
+  "dispatch2",
+  "objc2-core-foundation",
+  "objc2-core-graphics",
+  "objc2-core-media",
+] }
 semver = { version = "1", features = ["serde"] }
 # Keep these compatible with the checked-in windows-bindgen 0.100 bindings.
 windows-collections = "0.100"
@@ -183,7 +233,6 @@ block = "0.1"
 bytemuck = "1"
 calloop = "0.14"
 calloop-wayland-source = "0.4"
-cbindgen = { version = "0.29", default-features = false }
 console_error_panic_hook = "0.1"
 core-graphics = "0.25"
 core-text = "22"
@@ -234,9 +283,10 @@ x11 = "2.21"
 x11-clipboard = "0.9"
 x11-dl = "2.21"
 x11rb = "0.14"
-xkbcommon = "0.9"
+xkbcommon = { version = "0.9", default-features = false }
 
 gpui = { path = "./crates/gpui/", version = "0.2.2", package = "gpui-ce" }
+gpui_render = { path = "./crates/gpui_render/", version = "0.1.0", package = "gpui_ce_render" }
 gpui_platform = { path = "./crates/gpui_platform/", version = "0.1.0", package = "gpui_ce_platform" }
 gpui_linux = { path = "./crates/gpui_linux/", version = "0.1.0", package = "gpui_ce_linux" }
 gpui_macos = { path = "./crates/gpui_macos/", version = "0.1.0", package = "gpui_ce_macos" }
