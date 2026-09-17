@@ -1,19 +1,20 @@
+use super::bindings::Windows::Win32::{
+    CloseHandle, HANDLE, ID3D11DeviceContext4, ID3D11Fence, ID3D11Texture2D, ID3D12CommandQueue,
+    ID3D12Device, ID3D12Fence, ID3D12Resource,
+};
 use super::{
     capture_size, capture_texture_descriptor, source_descriptor, validate_capture_descriptor,
 };
 use anyhow::{Context as _, Result};
-use windows_061::{
-    Win32::Graphics::Direct3D11::{ID3D11DeviceContext4, ID3D11Fence, ID3D11Texture2D},
-    core::Interface as _,
-};
+use windows_core::Interface as _;
 
 pub(super) struct SharedTexture {
     pub(super) size: wgpu::Extent3d,
     destination: ID3D11Texture2D,
     context: ID3D11DeviceContext4,
     d3d11_fence: ID3D11Fence,
-    d3d12_fence: windows_062::Win32::Graphics::Direct3D12::ID3D12Fence,
-    d3d12_queue: windows_062::Win32::Graphics::Direct3D12::ID3D12CommandQueue,
+    d3d12_fence: ID3D12Fence,
+    d3d12_queue: ID3D12CommandQueue,
     fence_value: u64,
 }
 
@@ -23,24 +24,19 @@ impl SharedTexture {
         hal_device: &wgpu::hal::dx12::Device,
         source: &ID3D11Texture2D,
     ) -> Result<(Self, wgpu::Texture)> {
-        use windows_061::Win32::{
-            Foundation::GENERIC_ALL,
-            Graphics::{
-                Direct3D11::{
-                    D3D11_BIND_SHADER_RESOURCE, D3D11_FENCE_FLAG_SHARED,
-                    D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_USAGE_DEFAULT, ID3D11Device5,
-                },
-                Dxgi::{Common::DXGI_FORMAT_B8G8R8A8_TYPELESS, IDXGIResource1},
-            },
+        use super::bindings::Windows::Win32::{
+            D3D11_BIND_SHADER_RESOURCE, D3D11_FENCE_FLAG_SHARED,
+            D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_USAGE_DEFAULT,
+            DXGI_FORMAT_B8G8R8A8_TYPELESS, GENERIC_ALL, ID3D11Device5, IDXGIResource1,
         };
 
         let mut descriptor = source_descriptor(source);
         validate_capture_descriptor(&descriptor)?;
         descriptor.Format = DXGI_FORMAT_B8G8R8A8_TYPELESS;
         descriptor.Usage = D3D11_USAGE_DEFAULT;
-        descriptor.BindFlags = D3D11_BIND_SHADER_RESOURCE.0 as u32;
+        descriptor.BindFlags = D3D11_BIND_SHADER_RESOURCE as u32;
         descriptor.CPUAccessFlags = 0;
-        descriptor.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 as u32;
+        descriptor.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE as u32;
 
         let source_device =
             unsafe { source.GetDevice() }.context("getting capture D3D11 device")?;
@@ -56,6 +52,7 @@ impl SharedTexture {
                 Some(std::ptr::addr_of_mut!(destination)),
             )
         }
+        .ok()
         .context("creating shared D3D11 capture texture")?;
         let destination = destination.context("D3D11 returned no shared texture")?;
 
@@ -76,19 +73,23 @@ impl SharedTexture {
         let resource: IDXGIResource1 = destination
             .cast()
             .context("querying shared DXGI resource")?;
-        let resource_handle = unsafe { resource.CreateSharedHandle(None, GENERIC_ALL.0, None) }
-            .map(OwnedHandle)
-            .context("creating capture resource handle")?;
-        let fence_handle = unsafe { d3d11_fence.CreateSharedHandle(None, GENERIC_ALL.0, None) }
-            .map(OwnedHandle)
-            .context("creating capture fence handle")?;
+        let resource_handle =
+            unsafe { resource.CreateSharedHandle(None, GENERIC_ALL as u32, None) }
+                .map(OwnedHandle)
+                .context("creating capture resource handle")?;
+        let fence_handle =
+            unsafe { d3d11_fence.CreateSharedHandle(None, GENERIC_ALL as u32, None) }
+                .map(OwnedHandle)
+                .context("creating capture fence handle")?;
         let (d3d12_resource, d3d12_fence) =
             open_shared_resources(hal_device, &resource_handle, &fence_handle)?;
 
         let size = capture_size(&descriptor);
         let hal_texture = unsafe {
             wgpu::hal::dx12::Device::texture_from_raw(
-                d3d12_resource,
+                // WGPU's bindings use the same ID3D12Resource COM ABI. Transfer
+                // ownership into the HAL so it releases this reference with the texture.
+                std::mem::transmute(d3d12_resource),
                 wgpu::TextureFormat::Bgra8Unorm,
                 wgpu::TextureDimension::D2,
                 size,
@@ -109,7 +110,9 @@ impl SharedTexture {
                 context,
                 d3d11_fence,
                 d3d12_fence,
-                d3d12_queue: hal_device.raw_queue().clone(),
+                // Transfer an owned ID3D12CommandQueue reference between bindings
+                // with identical COM layout and reference-counting semantics.
+                d3d12_queue: unsafe { std::mem::transmute(hal_device.raw_queue().clone()) },
                 fence_value: 0,
             },
             texture,
@@ -127,12 +130,14 @@ impl SharedTexture {
             .context("capture fence value exhausted")?;
         unsafe { self.context.CopyResource(&self.destination, source) };
         unsafe { self.context.Signal(&self.d3d11_fence, fence_value) }
+            .ok()
             .context("signaling capture copy completion")?;
         // D3D11 immediate contexts can defer command submission. Flush after the
         // producer signal so the D3D12 queue wait below cannot wait on work that
         // is still sitting in the D3D11 command buffer.
         unsafe { self.context.Flush() };
         unsafe { self.d3d12_queue.Wait(&self.d3d12_fence, fence_value) }
+            .ok()
             .context("waiting for D3D11 capture copy")?;
         self.fence_value = fence_value;
         Ok(())
@@ -143,16 +148,10 @@ fn open_shared_resources(
     hal_device: &wgpu::hal::dx12::Device,
     resource_handle: &OwnedHandle,
     fence_handle: &OwnedHandle,
-) -> Result<(
-    windows_062::Win32::Graphics::Direct3D12::ID3D12Resource,
-    windows_062::Win32::Graphics::Direct3D12::ID3D12Fence,
-)> {
-    use windows_062::Win32::{
-        Foundation::HANDLE,
-        Graphics::Direct3D12::{ID3D12Fence, ID3D12Resource},
-    };
-
-    let raw_device = hal_device.raw_device();
+) -> Result<(ID3D12Resource, ID3D12Fence)> {
+    // Clone before transferring this ABI-stable ID3D12Device pointer so our
+    // generated binding owns a reference independent of the HAL device.
+    let raw_device: ID3D12Device = unsafe { std::mem::transmute(hal_device.raw_device().clone()) };
     let mut resource: Option<ID3D12Resource> = None;
     let mut fence: Option<ID3D12Fence> = None;
     unsafe {
@@ -172,7 +171,7 @@ fn open_shared_resources(
     ))
 }
 
-struct OwnedHandle(windows_061::Win32::Foundation::HANDLE);
+struct OwnedHandle(HANDLE);
 
 impl OwnedHandle {
     fn raw(&self) -> *mut std::ffi::c_void {
@@ -182,7 +181,7 @@ impl OwnedHandle {
 
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
-        if let Err(error) = unsafe { windows_061::Win32::Foundation::CloseHandle(self.0) } {
+        if let Err(error) = unsafe { CloseHandle(self.0) }.ok() {
             log::error!("failed to close shared capture handle: {error}");
         }
     }

@@ -4,6 +4,16 @@ fn main() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     for (filters, output, sys) in [
         (
+            include_str!("../capture.txt"),
+            "crates/gpui/src/platform/windows_screen_capture/bindings.rs",
+            false,
+        ),
+        (
+            include_str!("../wgpu.txt"),
+            "crates/gpui_wgpu/src/wgpu_renderer/surfaces/windows/bindings.rs",
+            false,
+        ),
+        (
             include_str!("../platform.txt"),
             "crates/gpui_windows/src/bindings.rs",
             false,

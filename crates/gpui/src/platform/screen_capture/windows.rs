@@ -136,6 +136,9 @@ impl windows_capture::capture::GraphicsCaptureApiHandler for CaptureHandler {
         _control: windows_capture::graphics_capture_api::InternalCaptureControl,
     ) -> std::result::Result<(), Self::Error> {
         let texture = unsafe { frame.as_raw_texture() }.clone();
+        // Both bindings represent ID3D11Texture2D as the same COM interface pointer.
+        // Transfer the owned clone to our generated bindings, preserving its reference count.
+        let texture = unsafe { std::mem::transmute(texture) };
         let frame = WindowsScreenCaptureFrame::new(
             texture,
             crate::size(

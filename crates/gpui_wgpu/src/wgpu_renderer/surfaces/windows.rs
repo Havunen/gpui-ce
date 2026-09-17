@@ -1,10 +1,11 @@
 use super::*;
 use anyhow::Result;
 use collections::FxHashMap;
-use windows_061::{
-    Win32::Graphics::Direct3D11::{D3D11_TEXTURE2D_DESC, ID3D11Texture2D},
-    core::Interface as _,
-};
+use windows_core::Interface as _;
+
+#[path = "windows/bindings.rs"]
+mod bindings;
+use bindings::Windows::Win32::{D3D11_TEXTURE2D_DESC, ID3D11Texture2D};
 
 #[path = "windows/shared.rs"]
 mod shared;
@@ -52,7 +53,11 @@ pub(super) fn draw_surfaces(
             log::error!("surface source cannot be imported by the Windows renderer");
             return Err(frame::DrawError::ExternalSurface);
         };
-        let source = frame.texture();
+        let raw_source = frame.texture().as_raw();
+        // The frame owns this ID3D11Texture2D for the entire draw. Borrow its
+        // ABI-stable COM pointer using this renderer's generated bindings.
+        let source = unsafe { ID3D11Texture2D::from_raw_borrowed(&raw_source) }
+            .expect("capture texture is non-null");
         let key = CaptureFrameKey::from_frame(frame);
         let size = source_size(source);
         if cache
@@ -221,9 +226,7 @@ fn source_size(source: &ID3D11Texture2D) -> wgpu::Extent3d {
 }
 
 fn validate_capture_descriptor(descriptor: &D3D11_TEXTURE2D_DESC) -> Result<()> {
-    use windows_061::Win32::Graphics::Dxgi::Common::{
-        DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
-    };
+    use bindings::Windows::Win32::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB};
 
     anyhow::ensure!(
         descriptor.Width > 0 && descriptor.Height > 0,
@@ -237,7 +240,7 @@ fn validate_capture_descriptor(descriptor: &D3D11_TEXTURE2D_DESC) -> Result<()> 
         descriptor.Format == DXGI_FORMAT_B8G8R8A8_UNORM
             || descriptor.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
         "capture texture format {} is not BGRA8",
-        descriptor.Format.0
+        descriptor.Format
     );
     Ok(())
 }

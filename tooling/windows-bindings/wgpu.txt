@@ -1,0 +1,25 @@
+// APIs used to import Windows capture frames into WGPU.
+Windows.Win32.CloseHandle
+Windows.Win32.GENERIC_ALL
+Windows.Win32.D3D11_BIND_SHADER_RESOURCE
+Windows.Win32.D3D11_CPU_ACCESS_READ
+Windows.Win32.D3D11_FENCE_FLAG_SHARED
+Windows.Win32.D3D11_MAP_READ
+Windows.Win32.D3D11_RESOURCE_MISC_SHARED_NTHANDLE
+Windows.Win32.D3D11_USAGE_DEFAULT
+Windows.Win32.D3D11_USAGE_STAGING
+Windows.Win32.DXGI_FORMAT_B8G8R8A8_TYPELESS
+Windows.Win32.DXGI_FORMAT_B8G8R8A8_UNORM
+Windows.Win32.DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+Windows.Win32.ID3D11Device::{CreateTexture2D, GetImmediateContext}
+Windows.Win32.ID3D11Device5::CreateFence
+Windows.Win32.ID3D11DeviceChild::GetDevice
+Windows.Win32.ID3D11DeviceContext::{CopyResource, Map, Unmap, Flush}
+Windows.Win32.ID3D11DeviceContext4::Signal
+Windows.Win32.ID3D11Fence::CreateSharedHandle
+Windows.Win32.ID3D11Texture2D::GetDesc
+Windows.Win32.ID3D12CommandQueue::Wait
+Windows.Win32.ID3D12Device::OpenSharedHandle
+Windows.Win32.ID3D12Fence::{}
+Windows.Win32.ID3D12Resource::{}
+Windows.Win32.IDXGIResource1::CreateSharedHandle

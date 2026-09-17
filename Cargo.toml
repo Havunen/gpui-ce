@@ -140,9 +140,6 @@ objc2-user-notifications = "0.3"
 mach2 = "0.7"
 metal = "0.33"
 windows-capture = "1.5"
-# Compatibility types exposed by windows-capture and wgpu-hal, respectively.
-windows-062 = { package = "windows", version = "0.62" }
-windows-061 = { package = "windows", version = "0.61" }
 env_logger = "0.11"
 unicode-segmentation = "1.13"
 wasm-bindgen = "0.2"

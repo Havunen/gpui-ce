@@ -40,7 +40,6 @@ raw-window-handle.workspace = true
 smallvec.workspace = true
 uuid.workspace = true
 windows-collections.workspace = true
-windows-061 = { workspace = true, features = ["Win32_Graphics_Direct3D11"] }
 windows-core.workspace = true
 windows-numerics.workspace = true
 windows-registry.workspace = true

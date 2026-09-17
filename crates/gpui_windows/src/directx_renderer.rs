@@ -23,7 +23,6 @@ use gpui_render::{
 use gpui_util::ResultExt;
 use smallvec::SmallVec;
 use wgsl_rs::std::{vec2f, vec4f};
-use windows_061::core::Interface as _;
 use windows_core::{HSTRING, Interface, PCSTR};
 
 use crate::directx_renderer::shader_resources::ShaderModule;
@@ -1177,8 +1176,8 @@ impl DirectXRenderer {
                 resources.surface_views.entry(key)
             {
                 let mut srv = None;
-                // Screen capture uses windows 0.61 while this renderer uses 0.100 bindings. COM interface
-                // pointers are ABI-stable; transferring an owned clone keeps the texture alive.
+                // Both generated bindings use the same COM interface ABI; transferring
+                // an owned clone keeps the texture alive.
                 let texture =
                     unsafe { ID3D11Texture2D::from_raw(frame.texture().clone().into_raw()) };
                 unsafe {

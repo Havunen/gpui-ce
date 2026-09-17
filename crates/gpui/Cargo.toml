@@ -130,7 +130,7 @@ objc2-metal = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-capture = { workspace = true, optional = true }
-windows-061 = { workspace = true, features = ["Win32_Graphics_Direct3D11"] }
+windows-core.workspace = true
 
 [dev-dependencies]
 accesskit_consumer.workspace = true
