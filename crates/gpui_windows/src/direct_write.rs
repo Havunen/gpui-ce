@@ -975,9 +975,12 @@ impl DirectWriteState {
 
         let mut glyph_layers = Vec::new();
         let mut alpha_data = Vec::new();
-        loop {
+        // The enumerator starts before the first layer; GetCurrentRun is only
+        // valid after MoveNext reports a current run.
+        while unsafe { color_enumerator.MoveNext() }?.as_bool() {
             let color_run = unsafe { color_enumerator.GetCurrentRun() }?;
-            let color_run = unsafe { &*color_run };
+            let color_run = unsafe { color_run.as_ref() }
+                .context("DirectWrite returned no current color glyph run")?;
             let image_format = color_run.glyphImageFormat & !DWRITE_GLYPH_IMAGE_FORMATS_TRUETYPE;
             if image_format == DWRITE_GLYPH_IMAGE_FORMATS_COLR {
                 let color_analysis = unsafe {
@@ -1026,13 +1029,6 @@ impl DirectWriteState {
                         &alpha_data,
                     )?);
                 }
-            }
-
-            let has_next = unsafe { color_enumerator.MoveNext() }
-                .map(|e| e.as_bool())
-                .unwrap_or(false);
-            if !has_next {
-                break;
             }
         }
 
@@ -2123,6 +2119,15 @@ mod tests {
             .iter()
             .map(|(params, bounds)| text_system.rasterize_glyph(params, *bounds))
             .collect::<Result<_>>()?;
+
+        for (_, bitmap) in &first {
+            assert!(
+                bitmap
+                    .chunks_exact(4)
+                    .any(|pixel| { pixel[3] > 0 && pixel[..3].iter().any(|channel| *channel > 0) }),
+                "color glyph rasterization produced an empty or monochrome fallback bitmap"
+            );
+        }
 
         // Churn the texture heap with further rasterization passes. If the color
         // compositing leaks leftover texture data (the render target is not cleared),
