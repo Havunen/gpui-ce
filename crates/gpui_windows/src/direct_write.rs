@@ -814,8 +814,9 @@ impl DirectWriteState {
                 .GetGlyphIndices(&raw const codepoints, 1, &raw mut glyph_indices)
                 .ok()
                 .log_err()
-        }
-        .map(|_| GlyphId(glyph_indices as u32))
+        }?;
+        // DirectWrite returns glyph 0 (.notdef) for characters absent from the font.
+        (glyph_indices != 0).then_some(GlyphId(glyph_indices as u32))
     }
 
     fn rasterize_glyph(
@@ -975,9 +976,12 @@ impl DirectWriteState {
 
         let mut glyph_layers = Vec::new();
         let mut alpha_data = Vec::new();
-        loop {
+        // The enumerator starts before the first layer; GetCurrentRun is only
+        // valid after MoveNext reports a current run.
+        while unsafe { color_enumerator.MoveNext() }?.as_bool() {
             let color_run = unsafe { color_enumerator.GetCurrentRun() }?;
-            let color_run = unsafe { &*color_run };
+            let color_run = unsafe { color_run.as_ref() }
+                .context("DirectWrite returned no current color glyph run")?;
             let image_format = color_run.glyphImageFormat & !DWRITE_GLYPH_IMAGE_FORMATS_TRUETYPE;
             if image_format == DWRITE_GLYPH_IMAGE_FORMATS_COLR {
                 let color_analysis = unsafe {
@@ -1026,13 +1030,6 @@ impl DirectWriteState {
                         &alpha_data,
                     )?);
                 }
-            }
-
-            let has_next = unsafe { color_enumerator.MoveNext() }
-                .map(|e| e.as_bool())
-                .unwrap_or(false);
-            if !has_next {
-                break;
             }
         }
 
@@ -2084,6 +2081,21 @@ mod tests {
     }
 
     #[test]
+    fn glyph_for_char_returns_none_for_missing_character() -> Result<()> {
+        let devices = DirectXDevices::new()?;
+        let text_system = DirectWriteTextSystem::new(&devices)?;
+        let font_id = text_system.font_id(&Font {
+            family: "Segoe UI".into(),
+            ..Default::default()
+        })?;
+
+        assert!(text_system.glyph_for_char(font_id, 'A').is_some());
+        // U+10FFFF is a noncharacter, so this remains absent across font versions.
+        assert_eq!(text_system.glyph_for_char(font_id, '\u{10ffff}'), None);
+        Ok(())
+    }
+
+    #[test]
     fn color_emoji_rasterization_is_stable_across_batches() -> Result<()> {
         let devices = DirectXDevices::new()?;
         let text_system = DirectWriteTextSystem::new(&devices)?;
@@ -2096,6 +2108,8 @@ mod tests {
 
         let mut params_list = Vec::new();
         for ch in ['🫠', '🥹', '🧗', '🏋', '🚀', '🥺'] {
+            // Older system font versions lack some of these emoji. Skip missing
+            // characters instead of testing their monochrome .notdef glyph.
             let Some(glyph_id) = text_system.glyph_for_char(font_id, ch) else {
                 log::info!("no glyph found for {ch}");
                 continue;
@@ -2115,27 +2129,40 @@ mod tests {
                 log::info!("raster bounds are empty for {ch}");
                 continue;
             }
-            params_list.push((params, raster_bounds));
+            params_list.push((ch, params, raster_bounds));
         }
-        assert!(!params_list.is_empty());
+        assert!(
+            !params_list.is_empty(),
+            "Segoe UI Emoji has no rasterizable glyphs for the test characters"
+        );
 
         let first: Vec<_> = params_list
             .iter()
-            .map(|(params, bounds)| text_system.rasterize_glyph(params, *bounds))
+            .map(|(_, params, bounds)| text_system.rasterize_glyph(params, *bounds))
             .collect::<Result<_>>()?;
+
+        for ((ch, params, _), (_, bitmap)) in params_list.iter().zip(&first) {
+            assert!(
+                bitmap
+                    .chunks_exact(4)
+                    .any(|pixel| { pixel[3] > 0 && pixel[..3].iter().any(|channel| *channel > 0) }),
+                "color glyph rasterization for {ch} (glyph {}) produced an empty or monochrome fallback bitmap",
+                params.glyph_id.0
+            );
+        }
 
         // Churn the texture heap with further rasterization passes. If the color
         // compositing leaks leftover texture data (the render target is not cleared),
         // the second batch can pick up different contents and differ from the first.
         // With an explicit clear both batches are deterministic and identical.
         for _ in 0..3 {
-            for (params, bounds) in &params_list {
+            for (_, params, bounds) in &params_list {
                 text_system.rasterize_glyph(params, *bounds)?;
             }
         }
         let second: Vec<_> = params_list
             .iter()
-            .map(|(params, bounds)| text_system.rasterize_glyph(params, *bounds))
+            .map(|(_, params, bounds)| text_system.rasterize_glyph(params, *bounds))
             .collect::<Result<_>>()?;
 
         assert_eq!(
