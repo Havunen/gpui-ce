@@ -1,0 +1,2 @@
+// Native texture ownership shared with the platform renderers.
+Windows.Win32.ID3D11Texture2D::{}

@@ -3,19 +3,17 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::bindings::Windows::Win32::{
+    DWM_TIMING_INFO, DwmFlush, DwmGetCompositionTimingInfo, HWND, QueryPerformanceFrequency,
+};
 use anyhow::{Context, Result};
 use gpui_util::ResultExt;
-use windows::Win32::{
-    Foundation::HWND,
-    Graphics::Dwm::{DWM_TIMING_INFO, DwmFlush, DwmGetCompositionTimingInfo},
-    System::Performance::QueryPerformanceFrequency,
-};
 
 static QPC_TICKS_PER_SECOND: LazyLock<u64> = LazyLock::new(|| {
     let mut frequency = 0;
     // On systems that run Windows XP or later, the function will always succeed and
     // will thus never return zero.
-    unsafe { QueryPerformanceFrequency(&mut frequency).unwrap() };
+    unsafe { QueryPerformanceFrequency(&mut frequency).ok().unwrap() };
     frequency as u64
 });
 
@@ -33,7 +31,7 @@ impl VSyncProvider {
             .context("Failed to get DWM interval")
             .log_err()
             .unwrap_or(DEFAULT_VSYNC_INTERVAL);
-        let f = Box::new(|| unsafe { DwmFlush().is_ok() });
+        let f = Box::new(|| unsafe { DwmFlush().ok().is_ok() });
         Self { interval, f }
     }
 
@@ -60,8 +58,8 @@ fn get_dwm_interval() -> Result<Duration> {
         cbSize: std::mem::size_of::<DWM_TIMING_INFO>() as u32,
         ..Default::default()
     };
-    unsafe { DwmGetCompositionTimingInfo(HWND::default(), &mut timing_info) }?;
-    let interval = retrieve_duration(timing_info.qpcRefreshPeriod, *QPC_TICKS_PER_SECOND);
+    unsafe { DwmGetCompositionTimingInfo(HWND::default(), &mut timing_info).ok() }?;
+    let interval = retrieve_duration(timing_info.qpcRefreshPeriod.0, *QPC_TICKS_PER_SECOND);
     // Check for interval values that are impossibly low. A 29 microsecond
     // interval was seen (from a qpcRefreshPeriod of 60).
     if interval < VSYNC_INTERVAL_THRESHOLD {

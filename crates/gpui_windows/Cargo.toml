@@ -39,11 +39,12 @@ rand.workspace = true
 raw-window-handle.workspace = true
 smallvec.workspace = true
 uuid.workspace = true
-windows.workspace = true
-windows-061 = { workspace = true, features = ["Win32_Graphics_Direct3D11"] }
+windows-collections.workspace = true
 windows-core.workspace = true
 windows-numerics.workspace = true
 windows-registry.workspace = true
+windows-version.workspace = true
 
-[target.'cfg(target_os = "windows")'.build-dependencies]
-windows-registry.workspace = true
+# Dependency crates do not inherit cfg(test); expose the matching test-only APIs.
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

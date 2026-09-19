@@ -15,6 +15,9 @@ pub mod shell;
 pub mod shell_builder;
 #[cfg(not(target_family = "wasm"))]
 pub mod shell_env;
+#[cfg(windows)]
+#[rustfmt::skip]
+mod windows_bindings;
 
 pub mod disambiguate;
 pub mod markdown;
