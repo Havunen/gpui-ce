@@ -10,10 +10,11 @@ use anyhow::{Result, anyhow};
 use hdrhistogram::Histogram;
 
 use crate::{
-    AnyView, AnyWindowHandle, App, AppCell, AppContext, BackgroundExecutor, Bounds, Context, Empty,
-    Entity, EntityId, EventEmitter, Focusable, ForegroundExecutor, Global, Platform,
-    PlatformHeadlessRenderer, PlatformTextSystem, Render, Reservation, Task, TestPlatform,
-    ThreadedDispatcher, VisualContext, Window, WindowBounds, WindowHandle, WindowOptions,
+    AnyView, AnyWindowHandle, App, AppCell, AppContext, AssetRegistry, BackgroundExecutor, Bounds,
+    Context, Empty, Entity, EntityId, EventEmitter, Focusable, ForegroundExecutor, Global,
+    Platform, PlatformHeadlessRenderer, PlatformTextSystem, Render, Reservation, Task,
+    TestPlatform, ThreadedDispatcher, VisualContext, Window, WindowBounds, WindowHandle,
+    WindowOptions,
     app::GpuiBorrow,
     profiler::{
         self, FrameEvent, FrameTimingCollector,
@@ -526,13 +527,12 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
              ThreadedDispatcher; construct one with gpui::bench_platform"
         );
         let foreground_executor = platform.foreground_executor();
-        let asset_source = Arc::new(());
         // Benchmark setup must not make accidental network requests. The
         // production `BlockedHttpClient` is available without enabling the
         // configurable test double through `test-support`.
         let http_client: Arc<dyn crate::http_client::HttpClient> =
             Arc::new(crate::http_client::BlockedHttpClient::new());
-        let app = App::new_app(platform, asset_source, http_client);
+        let app = App::new_app(platform, AssetRegistry::default().into(), http_client);
 
         Self {
             app,

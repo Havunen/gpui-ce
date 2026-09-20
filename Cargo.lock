@@ -2391,6 +2391,7 @@ dependencies = [
  "raw-window-handle",
  "regex",
  "resvg",
+ "rust-embed",
  "schemars",
  "seahash",
  "serde",
