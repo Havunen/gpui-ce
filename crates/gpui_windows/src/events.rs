@@ -1,34 +1,22 @@
 use std::{cell::Cell, rc::Rc, sync::atomic::Ordering};
 
+use crate::bindings::Windows::Win32::*;
 use anyhow::Context as _;
 use gpui_util::ResultExt;
-use windows::{
-    Win32::{
-        Foundation::*,
-        Graphics::Gdi::*,
-        System::SystemServices::*,
-        UI::{
-            Controls::*,
-            HiDpi::*,
-            Input::{Ime::*, KeyboardAndMouse::*},
-            WindowsAndMessaging::*,
-        },
-    },
-    core::PCWSTR,
-};
+use windows_core::PCWSTR;
 
 use crate::*;
 use gpui::*;
 
-pub(crate) const WM_GPUI_CURSOR_STYLE_CHANGED: u32 = WM_USER + 1;
-pub(crate) const WM_GPUI_CLOSE_ONE_WINDOW: u32 = WM_USER + 2;
-pub(crate) const WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD: u32 = WM_USER + 3;
-pub(crate) const WM_GPUI_DOCK_MENU_ACTION: u32 = WM_USER + 4;
-pub(crate) const WM_GPUI_FORCE_UPDATE_WINDOW: u32 = WM_USER + 5;
-pub(crate) const WM_GPUI_KEYBOARD_LAYOUT_CHANGED: u32 = WM_USER + 6;
-pub(crate) const WM_GPUI_GPU_DEVICE_LOST: u32 = WM_USER + 7;
-pub(crate) const WM_GPUI_KEYDOWN: u32 = WM_USER + 8;
-pub(crate) const WM_GPUI_END_SESSION: u32 = WM_USER + 9;
+pub(crate) const WM_GPUI_CURSOR_STYLE_CHANGED: i32 = WM_USER + 1;
+pub(crate) const WM_GPUI_CLOSE_ONE_WINDOW: i32 = WM_USER + 2;
+pub(crate) const WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD: i32 = WM_USER + 3;
+pub(crate) const WM_GPUI_DOCK_MENU_ACTION: i32 = WM_USER + 4;
+pub(crate) const WM_GPUI_FORCE_UPDATE_WINDOW: i32 = WM_USER + 5;
+pub(crate) const WM_GPUI_KEYBOARD_LAYOUT_CHANGED: i32 = WM_USER + 6;
+pub(crate) const WM_GPUI_GPU_DEVICE_LOST: i32 = WM_USER + 7;
+pub(crate) const WM_GPUI_KEYDOWN: i32 = WM_USER + 8;
+pub(crate) const WM_GPUI_END_SESSION: i32 = WM_USER + 9;
 
 const SIZE_MOVE_LOOP_TIMER_ID: usize = 1;
 
@@ -86,7 +74,7 @@ impl WindowsWindowInner {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
-        let handled = match msg {
+        let handled = match msg as i32 {
             // `DefWindowProc` answers `MA_NOACTIVATE` for a left click on `HTCAPTION`.
             // The activation is only triggered when `DefWindowProc` handles the following `WM_NCLBUTTONDOWN`.
             // The GPUI event is dispatched in between, so a click handler runs while `active_window` is still
@@ -178,9 +166,9 @@ impl WindowsWindowInner {
             unsafe {
                 SendMessageW(
                     self.platform_window_handle,
-                    WM_GPUI_END_SESSION,
-                    Some(WPARAM(self.validation_number)),
-                    None,
+                    WM_GPUI_END_SESSION as u32,
+                    WPARAM(self.validation_number),
+                    LPARAM::default(),
                 );
             }
         }
@@ -204,7 +192,7 @@ impl WindowsWindowInner {
             || center_y > monitor_bounds.bottom().as_f32()
         {
             // center of the window may have moved to another monitor
-            let monitor = unsafe { MonitorFromWindow(handle, MONITOR_DEFAULTTONULL) };
+            let monitor = unsafe { MonitorFromWindow(handle, MONITOR_DEFAULTTONULL as u32) };
             // minimize the window can trigger this event too, in this case,
             // monitor is invalid, we do nothing.
             if !monitor.is_invalid() && self.state.display.get().handle != monitor {
@@ -293,7 +281,7 @@ impl WindowsWindowInner {
             let ret = SetTimer(
                 Some(handle),
                 SIZE_MOVE_LOOP_TIMER_ID,
-                USER_TIMER_MINIMUM,
+                USER_TIMER_MINIMUM as u32,
                 None,
             );
             if ret == 0 {
@@ -311,11 +299,15 @@ impl WindowsWindowInner {
         // https://github.com/rust-windowing/winit/blob/9674d8ceef6976326fe9583a81f2e684daac05d6/winit-win32/src/event_loop.rs#L1234-L1243
         if self.state.dragging.get() {
             self.state.dragging.set(false);
-            let _ = unsafe { PostMessageW(Some(handle), WM_LBUTTONUP, WPARAM(0), LPARAM(0)) };
+            let _ = unsafe {
+                PostMessageW(Some(handle), WM_LBUTTONUP as u32, WPARAM(0), LPARAM(0)).ok()
+            };
         }
 
         unsafe {
-            KillTimer(Some(handle), SIZE_MOVE_LOOP_TIMER_ID).log_err();
+            KillTimer(Some(handle), SIZE_MOVE_LOOP_TIMER_ID)
+                .ok()
+                .log_err();
         }
         None
     }
@@ -359,17 +351,18 @@ impl WindowsWindowInner {
         unsafe {
             PostMessageW(
                 Some(self.platform_window_handle),
-                WM_GPUI_CLOSE_ONE_WINDOW,
+                WM_GPUI_CLOSE_ONE_WINDOW as u32,
                 WPARAM(self.validation_number),
                 LPARAM(handle.0 as isize),
             )
+            .ok()
             .log_err();
         }
         Some(0)
     }
 
     fn handle_mouse_move_msg(&self, handle: HWND, lparam: LPARAM, wparam: WPARAM) -> Option<isize> {
-        self.start_tracking_mouse(handle, TME_LEAVE);
+        self.start_tracking_mouse(handle, TME_LEAVE as u32);
         self.restore_cursor_after_hide();
 
         let Some(mut func) = self.state.callbacks.input.take() else {
@@ -377,14 +370,14 @@ impl WindowsWindowInner {
         };
         let scale_factor = self.state.scale_factor.get();
 
-        let pressed_button = match MODIFIERKEYS_FLAGS(wparam.loword() as u32) {
-            flags if flags.contains(MK_LBUTTON) => Some(MouseButton::Left),
-            flags if flags.contains(MK_RBUTTON) => Some(MouseButton::Right),
-            flags if flags.contains(MK_MBUTTON) => Some(MouseButton::Middle),
-            flags if flags.contains(MK_XBUTTON1) => {
+        let pressed_button = match wparam.loword() as u32 {
+            flags if flags & MK_LBUTTON as u32 != 0 => Some(MouseButton::Left),
+            flags if flags & MK_RBUTTON as u32 != 0 => Some(MouseButton::Right),
+            flags if flags & MK_MBUTTON as u32 != 0 => Some(MouseButton::Middle),
+            flags if flags & MK_XBUTTON1 as u32 != 0 => {
                 Some(MouseButton::Navigate(NavigationDirection::Back))
             }
-            flags if flags.contains(MK_XBUTTON2) => {
+            flags if flags & MK_XBUTTON2 as u32 != 0 => {
                 Some(MouseButton::Navigate(NavigationDirection::Forward))
             }
             _ => None,
@@ -522,7 +515,7 @@ impl WindowsWindowInner {
         button: MouseButton,
         lparam: LPARAM,
     ) -> Option<isize> {
-        unsafe { ReleaseCapture().log_err() };
+        unsafe { ReleaseCapture().ok().log_err() };
 
         let Some(mut func) = self.state.callbacks.input.take() else {
             return Some(1);
@@ -551,7 +544,7 @@ impl WindowsWindowInner {
         lparam: LPARAM,
         handler: impl Fn(&Self, HWND, MouseButton, LPARAM) -> Option<isize>,
     ) -> Option<isize> {
-        let nav_dir = match wparam.hiword() {
+        let nav_dir = match wparam.hiword() as i32 {
             XBUTTON1 => NavigationDirection::Back,
             XBUTTON2 => NavigationDirection::Forward,
             _ => return Some(1),
@@ -678,7 +671,7 @@ impl WindowsWindowInner {
             ImmSetCompositionWindow(
                 *ctx,
                 &COMPOSITIONFORM {
-                    dwStyle: CFS_POINT,
+                    dwStyle: (CFS_POINT as u32),
                     ptCurrentPos: caret_position,
                     ..Default::default()
                 },
@@ -689,7 +682,7 @@ impl WindowsWindowInner {
             ImmSetCandidateWindow(
                 *ctx,
                 &CANDIDATEFORM {
-                    dwStyle: CFS_CANDIDATEPOS,
+                    dwStyle: (CFS_CANDIDATEPOS as u32),
                     ptCurrentPos: caret_position,
                     ..Default::default()
                 },
@@ -709,7 +702,7 @@ impl WindowsWindowInner {
         self.state.ime_enabled.set(ime_enabled);
         unsafe {
             if ime_enabled {
-                ImmAssociateContextEx(handle, HIMC::default(), IACE_DEFAULT)
+                ImmAssociateContextEx(handle, HIMC::default(), IACE_DEFAULT as u32)
                     .ok()
                     .log_err();
             } else {
@@ -718,7 +711,7 @@ impl WindowsWindowInner {
                 if GetFocus() == handle
                     && let Some(ctx) = ImeContext::get(handle)
                 {
-                    ImmNotifyIME(*ctx, NI_COMPOSITIONSTR, CPS_COMPLETE, 0)
+                    ImmNotifyIME(*ctx, NI_COMPOSITIONSTR as u32, CPS_COMPLETE as u32, 0)
                         .ok()
                         .log_err();
                 }
@@ -744,17 +737,17 @@ impl WindowsWindowInner {
             })?;
             Some(0)
         } else {
-            if lparam & GCS_RESULTSTR.0 > 0 {
-                let comp_result = parse_ime_composition_string(ctx, GCS_RESULTSTR)?;
+            if lparam & (GCS_RESULTSTR as u32) > 0 {
+                let comp_result = parse_ime_composition_string(ctx, GCS_RESULTSTR as u32)?;
                 self.with_input_handler(|input_handler| {
                     input_handler
                         .replace_text_in_range(None, &String::from_utf16_lossy(&comp_result));
                 })?;
             }
-            if lparam & GCS_COMPSTR.0 > 0 {
-                let comp_string = parse_ime_composition_string(ctx, GCS_COMPSTR)?;
-                let caret_pos =
-                    (!comp_string.is_empty() && lparam & GCS_CURSORPOS.0 > 0).then(|| {
+            if lparam & (GCS_COMPSTR as u32) > 0 {
+                let comp_string = parse_ime_composition_string(ctx, GCS_COMPSTR as u32)?;
+                let caret_pos = (!comp_string.is_empty() && lparam & (GCS_CURSORPOS as u32) > 0)
+                    .then(|| {
                         let cursor_pos = retrieve_composition_cursor_position(ctx);
                         let pos = if should_use_ime_cursor_position(ctx, cursor_pos) {
                             cursor_pos
@@ -771,7 +764,7 @@ impl WindowsWindowInner {
                     );
                 })?;
             }
-            if lparam & (GCS_RESULTSTR.0 | GCS_COMPSTR.0) > 0 {
+            if lparam & ((GCS_RESULTSTR | GCS_COMPSTR) as u32) > 0 {
                 return Some(0);
             }
 
@@ -793,7 +786,7 @@ impl WindowsWindowInner {
         unsafe {
             let params = lparam.0 as *mut NCCALCSIZE_PARAMS;
             let saved_top = (*params).rgrc[0].top;
-            let result = DefWindowProcW(handle, WM_NCCALCSIZE, wparam, lparam);
+            let result = DefWindowProcW(handle, WM_NCCALCSIZE as u32, wparam, lparam);
             (*params).rgrc[0].top = saved_top;
             if self.state.is_maximized() {
                 let dpi = GetDpiForWindow(handle);
@@ -897,7 +890,7 @@ impl WindowsWindowInner {
 
         if is_maximized {
             // Get the monitor and its work area at the new DPI
-            let monitor = unsafe { MonitorFromWindow(handle, MONITOR_DEFAULTTONEAREST) };
+            let monitor = unsafe { MonitorFromWindow(handle, MONITOR_DEFAULTTONEAREST as u32) };
             let mut monitor_info: MONITORINFO = unsafe { std::mem::zeroed() };
             monitor_info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
             if unsafe { GetMonitorInfoW(monitor, &mut monitor_info) }.as_bool() {
@@ -915,8 +908,9 @@ impl WindowsWindowInner {
                         work_area.top,
                         width,
                         height,
-                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                        (SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED) as u32,
                     )
+                    .ok()
                     .context("unable to set maximized window position after dpi has changed")
                     .log_err();
                 }
@@ -942,8 +936,9 @@ impl WindowsWindowInner {
                     rect.top,
                     width,
                     height,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
+                    (SWP_NOZORDER | SWP_NOACTIVATE) as u32,
                 )
+                .ok()
                 .context("unable to set window position after dpi has changed")
                 .log_err();
             }
@@ -953,7 +948,7 @@ impl WindowsWindowInner {
     }
 
     fn handle_display_change_msg(&self, handle: HWND) -> Option<isize> {
-        let new_monitor = unsafe { MonitorFromWindow(handle, MONITOR_DEFAULTTONULL) };
+        let new_monitor = unsafe { MonitorFromWindow(handle, MONITOR_DEFAULTTONULL as u32) };
         if new_monitor.is_invalid() {
             log::error!("No monitor detected!");
             return None;
@@ -1016,7 +1011,7 @@ impl WindowsWindowInner {
                 HTTOPLEFT
             } else {
                 let mut rect = Default::default();
-                unsafe { GetWindowRect(handle, &mut rect) }.log_err();
+                unsafe { GetWindowRect(handle, &mut rect).ok() }.log_err();
                 // right and bottom bounds of RECT are exclusive, thus `-1`
                 let right = rect.right - rect.left - 1;
                 // the bounds include the padding frames, so accommodate for both of them
@@ -1032,7 +1027,7 @@ impl WindowsWindowInner {
     }
 
     fn handle_nc_mouse_move_msg(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
-        self.start_tracking_mouse(handle, TME_LEAVE | TME_NONCLIENT);
+        self.start_tracking_mouse(handle, (TME_LEAVE | TME_NONCLIENT) as u32);
         self.restore_cursor_after_hide();
 
         let mut func = self.state.callbacks.input.take()?;
@@ -1089,7 +1084,7 @@ impl WindowsWindowInner {
 
         // Since these are handled in handle_nc_mouse_up_msg we must prevent the default window proc
         if button == MouseButton::Left {
-            match wparam.0 as u32 {
+            match wparam.0 as i32 {
                 HTMINBUTTON => self.state.nc_button_pressed.set(Some(HTMINBUTTON)),
                 HTMAXBUTTON => self.state.nc_button_pressed.set(Some(HTMAXBUTTON)),
                 HTCLOSE => self.state.nc_button_pressed.set(Some(HTCLOSE)),
@@ -1135,7 +1130,7 @@ impl WindowsWindowInner {
         if button == MouseButton::Left
             && let Some(last_pressed) = last_pressed
         {
-            let handled = match (wparam.0 as u32, last_pressed) {
+            let handled = match (wparam.0 as i32, last_pressed) {
                 (HTMINBUTTON, HTMINBUTTON) if self.is_minimizable => {
                     unsafe { ShowWindowAsync(handle, SW_MINIMIZE).ok().log_err() };
                     true
@@ -1152,8 +1147,14 @@ impl WindowsWindowInner {
                 (HTMAXBUTTON, HTMAXBUTTON) => true,
                 (HTCLOSE, HTCLOSE) => {
                     unsafe {
-                        PostMessageW(Some(handle), WM_CLOSE, WPARAM::default(), LPARAM::default())
-                            .log_err()
+                        PostMessageW(
+                            Some(handle),
+                            WM_CLOSE as u32,
+                            WPARAM::default(),
+                            LPARAM::default(),
+                        )
+                        .ok()
+                        .log_err()
                     };
                     true
                 }
@@ -1173,7 +1174,7 @@ impl WindowsWindowInner {
         self.state.current_cursor.set(if lparam.0 == 0 {
             None
         } else {
-            Some(HCURSOR(lparam.0 as _))
+            Some(HICON(lparam.0 as _))
         });
 
         if had_cursor != self.state.current_cursor.get().is_some() {
@@ -1186,7 +1187,7 @@ impl WindowsWindowInner {
     fn handle_set_cursor(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
         if unsafe { !IsWindowEnabled(handle).as_bool() }
             || matches!(
-                lparam.loword() as u32,
+                lparam.loword() as i32,
                 HTLEFT
                     | HTRIGHT
                     | HTTOP
@@ -1259,10 +1260,11 @@ impl WindowsWindowInner {
         unsafe {
             PostMessageW(
                 Some(self.platform_window_handle),
-                WM_GPUI_KEYBOARD_LAYOUT_CHANGED,
+                WM_GPUI_KEYBOARD_LAYOUT_CHANGED as u32,
                 WPARAM(self.validation_number),
                 LPARAM(0),
             )
+            .ok()
             .log_err();
         }
         Some(0)
@@ -1386,7 +1388,7 @@ impl WindowsWindowInner {
         }
     }
 
-    fn start_tracking_mouse(&self, handle: HWND, flags: TRACKMOUSEEVENT_FLAGS) {
+    fn start_tracking_mouse(&self, handle: HWND, flags: u32) {
         if !self.state.hovered.get() {
             self.state.hovered.set(true);
             unsafe {
@@ -1396,6 +1398,7 @@ impl WindowsWindowInner {
                     hwndTrack: handle,
                     dwHoverTime: HOVER_DEFAULT,
                 })
+                .ok()
                 .log_err()
             };
             if let Some(mut callback) = self.state.callbacks.hovered_status_change.take() {
@@ -1470,7 +1473,7 @@ fn handle_key_event<F>(
 where
     F: FnOnce(Keystroke, bool) -> PlatformInput,
 {
-    let virtual_key = VIRTUAL_KEY(wparam.loword());
+    let virtual_key = wparam.loword() as i32;
     let modifiers = current_modifiers();
 
     match virtual_key {
@@ -1511,7 +1514,7 @@ where
     }
 }
 
-fn parse_immutable(vkey: VIRTUAL_KEY) -> Option<String> {
+fn parse_immutable(vkey: i32) -> Option<String> {
     Some(
         match vkey {
             VK_SPACE => "space",
@@ -1563,7 +1566,7 @@ fn parse_immutable(vkey: VIRTUAL_KEY) -> Option<String> {
 }
 
 fn parse_normal_key(
-    vkey: VIRTUAL_KEY,
+    vkey: i32,
     lparam: LPARAM,
     mut modifiers: Modifiers,
 ) -> Option<(Keystroke, bool)> {
@@ -1584,10 +1587,10 @@ fn parse_normal_key(
     ))
 }
 
-fn process_key(vkey: VIRTUAL_KEY, scan_code: u16) -> (Option<String>, bool) {
+fn process_key(vkey: i32, scan_code: u16) -> (Option<String>, bool) {
     let mut keyboard_state = [0u8; 256];
     unsafe {
-        if GetKeyboardState(&mut keyboard_state).is_err() {
+        if GetKeyboardState(keyboard_state.as_mut_ptr()).ok().is_err() {
             return (None, false);
         }
     }
@@ -1595,10 +1598,11 @@ fn process_key(vkey: VIRTUAL_KEY, scan_code: u16) -> (Option<String>, bool) {
     let mut buffer_c = [0u16; 8];
     let result_c = unsafe {
         ToUnicode(
-            vkey.0 as u32,
+            vkey as u32,
             scan_code as u32,
-            Some(&keyboard_state),
-            &mut buffer_c,
+            Some(keyboard_state.as_ptr()),
+            windows_core::PWSTR(buffer_c.as_mut_ptr()),
+            buffer_c.len() as i32,
             0x4,
         )
     };
@@ -1622,10 +1626,10 @@ fn process_key(vkey: VIRTUAL_KEY, scan_code: u16) -> (Option<String>, bool) {
 
     // Workaround for some bug that makes the compiler think keyboard_state is still zeroed out
     let keyboard_state = std::hint::black_box(keyboard_state);
-    let ctrl_down = (keyboard_state[VK_CONTROL.0 as usize] & 0x80) != 0;
-    let alt_down = (keyboard_state[VK_MENU.0 as usize] & 0x80) != 0;
-    let win_down = (keyboard_state[VK_LWIN.0 as usize] & 0x80) != 0
-        || (keyboard_state[VK_RWIN.0 as usize] & 0x80) != 0;
+    let ctrl_down = (keyboard_state[VK_CONTROL as usize] & 0x80) != 0;
+    let alt_down = (keyboard_state[VK_MENU as usize] & 0x80) != 0;
+    let win_down = (keyboard_state[VK_LWIN as usize] & 0x80) != 0
+        || (keyboard_state[VK_RWIN as usize] & 0x80) != 0;
 
     let has_modifiers = ctrl_down || alt_down || win_down;
     if !has_modifiers {
@@ -1633,22 +1637,23 @@ fn process_key(vkey: VIRTUAL_KEY, scan_code: u16) -> (Option<String>, bool) {
     }
 
     let mut state_no_modifiers = keyboard_state;
-    state_no_modifiers[VK_CONTROL.0 as usize] = 0;
-    state_no_modifiers[VK_LCONTROL.0 as usize] = 0;
-    state_no_modifiers[VK_RCONTROL.0 as usize] = 0;
-    state_no_modifiers[VK_MENU.0 as usize] = 0;
-    state_no_modifiers[VK_LMENU.0 as usize] = 0;
-    state_no_modifiers[VK_RMENU.0 as usize] = 0;
-    state_no_modifiers[VK_LWIN.0 as usize] = 0;
-    state_no_modifiers[VK_RWIN.0 as usize] = 0;
+    state_no_modifiers[VK_CONTROL as usize] = 0;
+    state_no_modifiers[VK_LCONTROL as usize] = 0;
+    state_no_modifiers[VK_RCONTROL as usize] = 0;
+    state_no_modifiers[VK_MENU as usize] = 0;
+    state_no_modifiers[VK_LMENU as usize] = 0;
+    state_no_modifiers[VK_RMENU as usize] = 0;
+    state_no_modifiers[VK_LWIN as usize] = 0;
+    state_no_modifiers[VK_RWIN as usize] = 0;
 
     let mut buffer_c_no_modifiers = [0u16; 8];
     let result_c_no_modifiers = unsafe {
         ToUnicode(
-            vkey.0 as u32,
+            vkey as u32,
             scan_code as u32,
-            Some(&state_no_modifiers),
-            &mut buffer_c_no_modifiers,
+            Some(state_no_modifiers.as_ptr()),
+            windows_core::PWSTR(buffer_c_no_modifiers.as_mut_ptr()),
+            buffer_c_no_modifiers.len() as i32,
             0x4,
         )
     };
@@ -1660,7 +1665,7 @@ fn process_key(vkey: VIRTUAL_KEY, scan_code: u16) -> (Option<String>, bool) {
     )
 }
 
-fn parse_ime_composition_string(ctx: HIMC, comp_type: IME_COMPOSITION_STRING) -> Option<Vec<u16>> {
+fn parse_ime_composition_string(ctx: HIMC, comp_type: u32) -> Option<Vec<u16>> {
     unsafe {
         let string_len = ImmGetCompositionStringW(ctx, comp_type, None, 0);
         if string_len >= 0 {
@@ -1684,11 +1689,12 @@ fn parse_ime_composition_string(ctx: HIMC, comp_type: IME_COMPOSITION_STRING) ->
 
 #[inline]
 fn retrieve_composition_cursor_position(ctx: HIMC) -> usize {
-    unsafe { ImmGetCompositionStringW(ctx, GCS_CURSORPOS, None, 0) as usize }
+    unsafe { ImmGetCompositionStringW(ctx, GCS_CURSORPOS as u32, None, 0) as usize }
 }
 
 fn should_use_ime_cursor_position(ctx: HIMC, cursor_pos: usize) -> bool {
-    let attrs_size = unsafe { ImmGetCompositionStringW(ctx, GCS_COMPATTR, None, 0) } as usize;
+    let attrs_size =
+        unsafe { ImmGetCompositionStringW(ctx, GCS_COMPATTR as u32, None, 0) } as usize;
     if attrs_size == 0 {
         return false;
     }
@@ -1697,7 +1703,7 @@ fn should_use_ime_cursor_position(ctx: HIMC, cursor_pos: usize) -> bool {
     let result = unsafe {
         ImmGetCompositionStringW(
             ctx,
-            GCS_COMPATTR,
+            GCS_COMPATTR as u32,
             Some(attrs.as_mut_ptr() as *mut _),
             attrs_size as u32,
         )
@@ -1717,8 +1723,8 @@ fn should_use_ime_cursor_position(ctx: HIMC, cursor_pos: usize) -> bool {
 }
 
 #[inline]
-fn is_virtual_key_pressed(vkey: VIRTUAL_KEY) -> bool {
-    unsafe { GetKeyState(vkey.0 as i32) < 0 }
+fn is_virtual_key_pressed(vkey: i32) -> bool {
+    unsafe { GetKeyState(vkey) < 0 }
 }
 
 #[inline]
@@ -1734,7 +1740,7 @@ pub(crate) fn current_modifiers() -> Modifiers {
 
 #[inline]
 pub(crate) fn current_capslock() -> Capslock {
-    let on = unsafe { GetKeyState(VK_CAPITAL.0 as i32) & 1 } > 0;
+    let on = unsafe { GetKeyState(VK_CAPITAL) & 1 } > 0;
     Capslock { on }
 }
 
@@ -1763,7 +1769,7 @@ fn notify_frame_changed(handle: HWND) {
             0,
             0,
             0,
-            SWP_FRAMECHANGED
+            (SWP_FRAMECHANGED
                 | SWP_NOACTIVATE
                 | SWP_NOCOPYBITS
                 | SWP_NOMOVE
@@ -1771,8 +1777,9 @@ fn notify_frame_changed(handle: HWND) {
                 | SWP_NOREPOSITION
                 | SWP_NOSENDCHANGING
                 | SWP_NOSIZE
-                | SWP_NOZORDER,
+                | SWP_NOZORDER) as u32,
         )
+        .ok()
         .log_err();
     }
 }

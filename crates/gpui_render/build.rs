@@ -11,6 +11,10 @@ mod path_types;
 #[path = "src/shaders/mod.rs"]
 mod shaders;
 
+#[cfg(windows)]
+#[rustfmt::skip]
+mod windows_bindings;
+
 use std::{collections::BTreeSet, env, fmt::Write as _, fs, path::PathBuf};
 
 #[cfg(windows)]
@@ -1047,10 +1051,8 @@ fn write_dx11_bytecode(
     source: &str,
     pipeline: &shaders::interface::Pipeline,
 ) -> Option<Dx11BytecodePaths> {
-    use windows::{
-        Win32::Graphics::Direct3D::{Fxc::D3DCompile, ID3DInclude},
-        core::PCSTR,
-    };
+    use windows_bindings::Windows::Win32::{D3DCompile, ID3DInclude};
+    use windows_core::PCSTR;
 
     fn compile(source: &str, label: &str, entry: &str, profile: &[u8]) -> Vec<u8> {
         let entry = CString::new(entry).expect("shader entry point contains NUL");
@@ -1068,9 +1070,10 @@ fn write_dx11_bytecode(
                 0,
                 0,
                 &mut blob,
-                Some(&mut errors),
+                &mut errors,
             )
         }
+        .ok()
         .unwrap_or_else(|error| {
             let details = errors.as_ref().map(|errors| unsafe {
                 std::ffi::CStr::from_ptr(errors.GetBufferPointer().cast())

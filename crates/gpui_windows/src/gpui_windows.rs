@@ -1,5 +1,8 @@
 #![cfg(target_os = "windows")]
 
+#[rustfmt::skip]
+mod bindings;
+
 mod clipboard;
 mod destination_list;
 mod direct_manipulation;
@@ -40,4 +43,4 @@ pub(crate) use wrapper::*;
 
 pub use platform::WindowsPlatform;
 
-pub(crate) use windows::Win32::Foundation::HWND;
+pub(crate) use crate::bindings::Windows::Win32::HWND;

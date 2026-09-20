@@ -26,6 +26,7 @@ members = [
     "./crates/gpui_ce_util/",
     "./crates/gpui_path/",
     "./tooling/perf/",
+    "./tooling/windows-bindings/",
 ]
 default-members = ["./crates/gpui/"]
 resolver = "3"
@@ -139,7 +140,6 @@ objc2-user-notifications = "0.3"
 mach2 = "0.7"
 metal = "0.33"
 windows-capture = "1.5"
-windows-061 = { package = "windows", version = "0.61" }
 env_logger = "0.11"
 unicode-segmentation = "1.13"
 wasm-bindgen = "0.2"
@@ -214,10 +214,10 @@ objc2-screen-capture-kit = { version = "0.3", default-features = false, features
   "objc2-core-media",
 ] }
 semver = { version = "1", features = ["serde"] }
-# These types cross `windows` API boundaries and must remain on the versions
-# used by `windows` 0.62.x. `windows-registry` is versioned independently.
-# https://github.com/microsoft/windows-rs/issues/4884
-windows-core = "0.62"
+# Keep these compatible with the checked-in windows-bindgen 0.100 bindings.
+windows-collections = "0.100"
+windows-core = "0.100"
+windows-link = "0.100"
 tokio = { version = "1" }
 gpui_util = { path = "./crates/gpui_ce_util/", version = "0.2.6", package = "gpui_ce_util" }
 xim = { path = "./crates/xim/", package = "gpui_xim" }
@@ -273,8 +273,9 @@ wayland-protocols = "0.32"
 wayland-protocols-plasma = "0.3"
 wayland-protocols-wlr = "0.3"
 web-sys = "0.3"
-windows-numerics = "0.3"
-windows-registry = "0.6"
+windows-numerics = "0.100"
+windows-registry = "0.100"
+windows-version = "0.100"
 x11 = "2.21"
 x11-clipboard = "0.9"
 x11-dl = "2.21"
@@ -295,72 +296,6 @@ gpui_wgpu = { path = "./crates/gpui_wgpu/", version = "0.1.0", package = "gpui_c
 gpui_macros = { path = "./crates/gpui_macros/", version = "0.1.0", package = "gpui_ce_macros" }
 gpui_shared_string = { path = "./crates/gpui_shared_string/", version = "0.1.0", package = "gpui_ce_shared_string" }
 gpui_tokio = { path = "./crates/gpui_tokio/", version = "0.1.0", package = "gpui_ce_tokio" }
-
-[workspace.dependencies.windows]
-version = "0.62.2"
-features = [
-  "Foundation_Numerics",
-  "Globalization_DateTimeFormatting",
-  "Storage_Search",
-  "Storage_Streams",
-  "System_Threading",
-  "UI_ViewManagement",
-  "Wdk_System_SystemServices",
-  "Win32_Foundation",
-  "Win32_Globalization",
-  "Win32_Graphics_Direct3D",
-  "Win32_Graphics_Direct3D11",
-  "Win32_Graphics_Direct3D_Fxc",
-  "Win32_Graphics_DirectComposition",
-  "Win32_Graphics_DirectWrite",
-  "Win32_Graphics_DirectManipulation",
-  "Win32_Graphics_Dwm",
-  "Win32_Graphics_Dxgi",
-  "Win32_Graphics_Dxgi_Common",
-  "Win32_Graphics_Gdi",
-  "Win32_Graphics_Imaging",
-  "Win32_Graphics_Hlsl",
-  "Win32_Networking_WinSock",
-  "Win32_Security",
-  "Win32_Security_Credentials",
-  "Win32_Security_Cryptography",
-  "Win32_Storage_FileSystem",
-  "Win32_System_Com",
-  "Win32_System_Com_StructuredStorage",
-  "Win32_System_Console",
-  "Win32_System_Diagnostics_Debug",
-  "Win32_System_DataExchange",
-  "Win32_System_IO",
-  "Win32_System_LibraryLoader",
-  "Win32_System_Memory",
-  "Win32_System_Ole",
-  "Win32_System_Performance",
-  "Win32_System_Power",
-  "Win32_System_Pipes",
-  "Win32_System_RestartManager",
-  "Win32_System_SystemInformation",
-  "Win32_System_SystemServices",
-  "Win32_System_Threading",
-  "Win32_System_Variant",
-  "Win32_System_WinRT",
-  "Win32_UI_Controls",
-  "Win32_UI_HiDpi",
-  "Win32_UI_Input_Ime",
-  "Win32_UI_Input_KeyboardAndMouse",
-  "Win32_UI_Input_Pointer",
-  "Win32_UI_Shell",
-  "Win32_UI_Shell_Common",
-  "Win32_UI_Shell_PropertiesSystem",
-  "Win32_UI_WindowsAndMessaging",
-  "Win32_Media",
-  "Data",
-  "Data_Xml",
-  "Data_Xml_Dom",
-  "Win32_Storage_Packaging",
-  "Win32_Storage_Packaging_Appx",
-  "Win32_System_JobObjects",
-  "UI_Notifications",
-]
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "allow" }

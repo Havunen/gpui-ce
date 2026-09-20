@@ -1,14 +1,14 @@
+// Brazilian ABNT keyboard extra key, defined by the Windows SDK.
+const VK_ABNT_C1: i32 = 0xC1;
+
+use crate::bindings::Windows::Win32::{
+    GetKeyboardLayoutNameW, KL_NAMELENGTH, MAPVK_VK_TO_CHAR, MAPVK_VK_TO_VSC, MapVirtualKeyW,
+    ToUnicode, VK_CONTROL, VK_MENU, VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6,
+    VK_OEM_7, VK_OEM_8, VK_OEM_102, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS,
+    VK_SHIFT,
+};
 use crate::collections::HashMap;
 use anyhow::Result;
-use windows::Win32::UI::{
-    Input::KeyboardAndMouse::{
-        GetKeyboardLayoutNameW, MAPVK_VK_TO_CHAR, MAPVK_VK_TO_VSC, MapVirtualKeyW, ToUnicode,
-        VIRTUAL_KEY, VK_0, VK_1, VK_2, VK_3, VK_4, VK_5, VK_6, VK_7, VK_8, VK_9, VK_ABNT_C1,
-        VK_CONTROL, VK_MENU, VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7,
-        VK_OEM_8, VK_OEM_102, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS, VK_SHIFT,
-    },
-    WindowsAndMessaging::KL_NAMELENGTH,
-};
 
 use gpui::{
     KeybindingKeystroke, Keystroke, Modifiers, PlatformKeyboardLayout, PlatformKeyboardMapper,
@@ -20,9 +20,9 @@ pub(crate) struct WindowsKeyboardLayout {
 }
 
 pub(crate) struct WindowsKeyboardMapper {
-    key_to_vkey: HashMap<String, (u16, bool)>,
-    vkey_to_key: HashMap<u16, String>,
-    vkey_to_shifted: HashMap<u16, String>,
+    key_to_vkey: HashMap<String, (i32, bool)>,
+    vkey_to_key: HashMap<i32, String>,
+    vkey_to_shifted: HashMap<i32, String>,
 }
 
 impl PlatformKeyboardLayout for WindowsKeyboardLayout {
@@ -93,7 +93,7 @@ impl PlatformKeyboardMapper for WindowsKeyboardMapper {
 impl WindowsKeyboardLayout {
     pub(crate) fn new() -> Result<Self> {
         let mut buffer = [0u16; KL_NAMELENGTH as usize]; // KL_NAMELENGTH includes the null terminator
-        unsafe { GetKeyboardLayoutNameW(&mut buffer)? };
+        unsafe { GetKeyboardLayoutNameW(windows_core::PWSTR(buffer.as_mut_ptr())).ok()? };
         let id = String::from_utf16_lossy(&buffer[..buffer.len() - 1]); // Remove the null terminator
         let entry = windows_registry::LOCAL_MACHINE.open(format!(
             "System\\CurrentControlSet\\Control\\Keyboard Layouts\\{id}"
@@ -115,18 +115,18 @@ impl WindowsKeyboardMapper {
         let mut key_to_vkey = HashMap::default();
         let mut vkey_to_key = HashMap::default();
         let mut vkey_to_shifted = HashMap::default();
-        for vkey in CANDIDATE_VKEYS {
-            if let Some(key) = get_key_from_vkey(*vkey) {
-                key_to_vkey.insert(key.clone(), (vkey.0, false));
-                vkey_to_key.insert(vkey.0, key);
+        for &vkey in CANDIDATE_VKEYS {
+            if let Some(key) = get_key_from_vkey(vkey) {
+                key_to_vkey.insert(key.clone(), (vkey, false));
+                vkey_to_key.insert(vkey, key);
             }
-            let scan_code = unsafe { MapVirtualKeyW(vkey.0 as u32, MAPVK_VK_TO_VSC) };
+            let scan_code = unsafe { MapVirtualKeyW(vkey as u32, MAPVK_VK_TO_VSC as u32) };
             if scan_code == 0 {
                 continue;
             }
-            if let Some(shifted_key) = get_shifted_key(*vkey, scan_code) {
-                key_to_vkey.insert(shifted_key.clone(), (vkey.0, true));
-                vkey_to_shifted.insert(vkey.0, shifted_key);
+            if let Some(shifted_key) = get_shifted_key(vkey, scan_code) {
+                key_to_vkey.insert(shifted_key.clone(), (vkey, true));
+                vkey_to_shifted.insert(vkey, shifted_key);
             }
         }
         Self {
@@ -136,7 +136,7 @@ impl WindowsKeyboardMapper {
         }
     }
 
-    fn get_vkey_from_key(&self, key: &str, use_key_equivalents: bool) -> Option<(u16, bool)> {
+    fn get_vkey_from_key(&self, key: &str, use_key_equivalents: bool) -> Option<(i32, bool)> {
         if use_key_equivalents {
             get_vkey_from_key_with_us_layout(key)
         } else {
@@ -146,7 +146,7 @@ impl WindowsKeyboardMapper {
 }
 
 pub(crate) fn get_keystroke_key(
-    vkey: VIRTUAL_KEY,
+    vkey: i32,
     scan_code: u32,
     modifiers: &mut Modifiers,
 ) -> Option<String> {
@@ -159,8 +159,8 @@ pub(crate) fn get_keystroke_key(
     }
 }
 
-fn get_key_from_vkey(vkey: VIRTUAL_KEY) -> Option<String> {
-    let key_data = unsafe { MapVirtualKeyW(vkey.0 as u32, MAPVK_VK_TO_CHAR) };
+fn get_key_from_vkey(vkey: i32) -> Option<String> {
+    let key_data = unsafe { MapVirtualKeyW(vkey as u32, MAPVK_VK_TO_CHAR as u32) };
     if key_data == 0 {
         return None;
     }
@@ -172,7 +172,7 @@ fn get_key_from_vkey(vkey: VIRTUAL_KEY) -> Option<String> {
 }
 
 #[inline]
-fn need_to_convert_to_shifted_key(vkey: VIRTUAL_KEY) -> bool {
+fn need_to_convert_to_shifted_key(vkey: i32) -> bool {
     matches!(
         vkey,
         VK_OEM_3
@@ -189,25 +189,16 @@ fn need_to_convert_to_shifted_key(vkey: VIRTUAL_KEY) -> bool {
             | VK_OEM_102
             | VK_OEM_8
             | VK_ABNT_C1
-            | VK_0
-            | VK_1
-            | VK_2
-            | VK_3
-            | VK_4
-            | VK_5
-            | VK_6
-            | VK_7
-            | VK_8
-            | VK_9
+            | 0x30..=0x39
     )
 }
 
-fn get_shifted_key(vkey: VIRTUAL_KEY, scan_code: u32) -> Option<String> {
+fn get_shifted_key(vkey: i32, scan_code: u32) -> Option<String> {
     generate_key_char(vkey, scan_code, false, true, false)
 }
 
 pub(crate) fn generate_key_char(
-    vkey: VIRTUAL_KEY,
+    vkey: i32,
     scan_code: u32,
     control: bool,
     shift: bool,
@@ -215,17 +206,26 @@ pub(crate) fn generate_key_char(
 ) -> Option<String> {
     let mut state = [0; 256];
     if control {
-        state[VK_CONTROL.0 as usize] = 0x80;
+        state[VK_CONTROL as usize] = 0x80;
     }
     if shift {
-        state[VK_SHIFT.0 as usize] = 0x80;
+        state[VK_SHIFT as usize] = 0x80;
     }
     if alt {
-        state[VK_MENU.0 as usize] = 0x80;
+        state[VK_MENU as usize] = 0x80;
     }
 
     let mut buffer = [0; 8];
-    let len = unsafe { ToUnicode(vkey.0 as u32, scan_code, Some(&state), &mut buffer, 0x5) };
+    let len = unsafe {
+        ToUnicode(
+            vkey as u32,
+            scan_code,
+            Some(state.as_ptr()),
+            windows_core::PWSTR(buffer.as_mut_ptr()),
+            buffer.len() as i32,
+            0x5,
+        )
+    };
 
     match len {
         len if len > 0 => String::from_utf16(&buffer[..len as usize])
@@ -238,57 +238,57 @@ pub(crate) fn generate_key_char(
     }
 }
 
-fn get_vkey_from_key_with_us_layout(key: &str) -> Option<(u16, bool)> {
+fn get_vkey_from_key_with_us_layout(key: &str) -> Option<(i32, bool)> {
     match key {
         // ` => VK_OEM_3
-        "`" => Some((VK_OEM_3.0, false)),
-        "~" => Some((VK_OEM_3.0, true)),
-        "1" => Some((VK_1.0, false)),
-        "!" => Some((VK_1.0, true)),
-        "2" => Some((VK_2.0, false)),
-        "@" => Some((VK_2.0, true)),
-        "3" => Some((VK_3.0, false)),
-        "#" => Some((VK_3.0, true)),
-        "4" => Some((VK_4.0, false)),
-        "$" => Some((VK_4.0, true)),
-        "5" => Some((VK_5.0, false)),
-        "%" => Some((VK_5.0, true)),
-        "6" => Some((VK_6.0, false)),
-        "^" => Some((VK_6.0, true)),
-        "7" => Some((VK_7.0, false)),
-        "&" => Some((VK_7.0, true)),
-        "8" => Some((VK_8.0, false)),
-        "*" => Some((VK_8.0, true)),
-        "9" => Some((VK_9.0, false)),
-        "(" => Some((VK_9.0, true)),
-        "0" => Some((VK_0.0, false)),
-        ")" => Some((VK_0.0, true)),
-        "-" => Some((VK_OEM_MINUS.0, false)),
-        "_" => Some((VK_OEM_MINUS.0, true)),
-        "=" => Some((VK_OEM_PLUS.0, false)),
-        "+" => Some((VK_OEM_PLUS.0, true)),
-        "[" => Some((VK_OEM_4.0, false)),
-        "{" => Some((VK_OEM_4.0, true)),
-        "]" => Some((VK_OEM_6.0, false)),
-        "}" => Some((VK_OEM_6.0, true)),
-        "\\" => Some((VK_OEM_5.0, false)),
-        "|" => Some((VK_OEM_5.0, true)),
-        ";" => Some((VK_OEM_1.0, false)),
-        ":" => Some((VK_OEM_1.0, true)),
-        "'" => Some((VK_OEM_7.0, false)),
-        "\"" => Some((VK_OEM_7.0, true)),
-        "," => Some((VK_OEM_COMMA.0, false)),
-        "<" => Some((VK_OEM_COMMA.0, true)),
-        "." => Some((VK_OEM_PERIOD.0, false)),
-        ">" => Some((VK_OEM_PERIOD.0, true)),
-        "/" => Some((VK_OEM_2.0, false)),
-        "?" => Some((VK_OEM_2.0, true)),
+        "`" => Some((VK_OEM_3, false)),
+        "~" => Some((VK_OEM_3, true)),
+        "1" => Some(((b'1' as i32), false)),
+        "!" => Some(((b'1' as i32), true)),
+        "2" => Some(((b'2' as i32), false)),
+        "@" => Some(((b'2' as i32), true)),
+        "3" => Some(((b'3' as i32), false)),
+        "#" => Some(((b'3' as i32), true)),
+        "4" => Some(((b'4' as i32), false)),
+        "$" => Some(((b'4' as i32), true)),
+        "5" => Some(((b'5' as i32), false)),
+        "%" => Some(((b'5' as i32), true)),
+        "6" => Some(((b'6' as i32), false)),
+        "^" => Some(((b'6' as i32), true)),
+        "7" => Some(((b'7' as i32), false)),
+        "&" => Some(((b'7' as i32), true)),
+        "8" => Some(((b'8' as i32), false)),
+        "*" => Some(((b'8' as i32), true)),
+        "9" => Some(((b'9' as i32), false)),
+        "(" => Some(((b'9' as i32), true)),
+        "0" => Some(((b'0' as i32), false)),
+        ")" => Some(((b'0' as i32), true)),
+        "-" => Some((VK_OEM_MINUS, false)),
+        "_" => Some((VK_OEM_MINUS, true)),
+        "=" => Some((VK_OEM_PLUS, false)),
+        "+" => Some((VK_OEM_PLUS, true)),
+        "[" => Some((VK_OEM_4, false)),
+        "{" => Some((VK_OEM_4, true)),
+        "]" => Some((VK_OEM_6, false)),
+        "}" => Some((VK_OEM_6, true)),
+        "\\" => Some((VK_OEM_5, false)),
+        "|" => Some((VK_OEM_5, true)),
+        ";" => Some((VK_OEM_1, false)),
+        ":" => Some((VK_OEM_1, true)),
+        "'" => Some((VK_OEM_7, false)),
+        "\"" => Some((VK_OEM_7, true)),
+        "," => Some((VK_OEM_COMMA, false)),
+        "<" => Some((VK_OEM_COMMA, true)),
+        "." => Some((VK_OEM_PERIOD, false)),
+        ">" => Some((VK_OEM_PERIOD, true)),
+        "/" => Some((VK_OEM_2, false)),
+        "?" => Some((VK_OEM_2, true)),
         _ => None,
     }
 }
 
-const CANDIDATE_VKEYS: &[VIRTUAL_KEY] = &[
-    VK_OEM_3,
+const CANDIDATE_VKEYS: &[i32] = &[
+    (VK_OEM_3),
     VK_OEM_MINUS,
     VK_OEM_PLUS,
     VK_OEM_4,
@@ -302,28 +302,28 @@ const CANDIDATE_VKEYS: &[VIRTUAL_KEY] = &[
     VK_OEM_102,
     VK_OEM_8,
     VK_ABNT_C1,
-    VK_0,
-    VK_1,
-    VK_2,
-    VK_3,
-    VK_4,
-    VK_5,
-    VK_6,
-    VK_7,
-    VK_8,
-    VK_9,
+    (b'0' as i32),
+    (b'1' as i32),
+    (b'2' as i32),
+    (b'3' as i32),
+    (b'4' as i32),
+    (b'5' as i32),
+    (b'6' as i32),
+    (b'7' as i32),
+    (b'8' as i32),
+    (b'9' as i32),
 ];
 
 #[cfg(test)]
 mod tests {
-    use super::{VK_4, WindowsKeyboardMapper};
+    use super::WindowsKeyboardMapper;
     use gpui::{Keystroke, Modifiers, PlatformKeyboardMapper};
 
     #[test]
     fn test_keyboard_mapper() {
         let mapper = WindowsKeyboardMapper::new();
-        let base_key = mapper.vkey_to_key.get(&VK_4.0).unwrap().clone();
-        let shifted_key = mapper.vkey_to_shifted.get(&VK_4.0).unwrap().clone();
+        let base_key = mapper.vkey_to_key.get(&(b'4' as i32)).unwrap().clone();
+        let shifted_key = mapper.vkey_to_shifted.get(&(b'4' as i32)).unwrap().clone();
 
         // Normal case
         let keystroke = Keystroke {

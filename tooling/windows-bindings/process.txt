@@ -1,0 +1,15 @@
+// Windows APIs used by gpui_zed_util, including its tests.
+Windows.Win32.HANDLE
+Windows.Win32.STILL_ACTIVE
+Windows.Win32.AssignProcessToJobObject
+Windows.Win32.CreateJobObjectW
+Windows.Win32.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+Windows.Win32.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+Windows.Win32.JobObjectExtendedLimitInformation
+Windows.Win32.SetInformationJobObject
+Windows.Win32.TerminateJobObject
+Windows.Win32.GetExitCodeProcess
+Windows.Win32.OpenProcess
+Windows.Win32.PROCESS_QUERY_LIMITED_INFORMATION
+Windows.Win32.PROCESS_SET_QUOTA
+Windows.Win32.PROCESS_TERMINATE

@@ -1,12 +1,14 @@
+use super::bindings::Windows::Win32::{
+    D3D11_MAPPED_SUBRESOURCE, ID3D11DeviceContext, ID3D11Texture2D,
+};
 use super::{
     capture_size, capture_texture_descriptor, source_descriptor, validate_capture_descriptor,
 };
 use anyhow::{Context as _, Result};
-use windows_061::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 
 pub(super) struct UploadedTexture {
     pub(super) size: wgpu::Extent3d,
-    context: windows_061::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+    context: ID3D11DeviceContext,
     staging: ID3D11Texture2D,
     pixels: Vec<u8>,
     texture: wgpu::Texture,
@@ -17,15 +19,13 @@ impl UploadedTexture {
         device: &wgpu::Device,
         source: &ID3D11Texture2D,
     ) -> Result<(Self, wgpu::Texture)> {
-        use windows_061::Win32::Graphics::Direct3D11::{
-            D3D11_CPU_ACCESS_READ, D3D11_USAGE_STAGING,
-        };
+        use super::bindings::Windows::Win32::{D3D11_CPU_ACCESS_READ, D3D11_USAGE_STAGING};
 
         let mut descriptor = source_descriptor(source);
         validate_capture_descriptor(&descriptor)?;
         descriptor.Usage = D3D11_USAGE_STAGING;
         descriptor.BindFlags = 0;
-        descriptor.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+        descriptor.CPUAccessFlags = D3D11_CPU_ACCESS_READ as u32;
         descriptor.MiscFlags = 0;
         let size = capture_size(&descriptor);
 
@@ -37,6 +37,7 @@ impl UploadedTexture {
         unsafe {
             source_device.CreateTexture2D(&descriptor, None, Some(std::ptr::addr_of_mut!(staging)))
         }
+        .ok()
         .context("creating D3D11 capture staging texture")?;
         let staging = staging.context("D3D11 returned no staging texture")?;
         let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -80,20 +81,18 @@ impl UploadedTexture {
 }
 
 struct MappedTexture<'a> {
-    context: &'a windows_061::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+    context: &'a ID3D11DeviceContext,
     texture: &'a ID3D11Texture2D,
-    mapped: windows_061::Win32::Graphics::Direct3D11::D3D11_MAPPED_SUBRESOURCE,
+    mapped: D3D11_MAPPED_SUBRESOURCE,
 }
 
 impl<'a> MappedTexture<'a> {
-    fn new(
-        context: &'a windows_061::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
-        texture: &'a ID3D11Texture2D,
-    ) -> Result<Self> {
-        use windows_061::Win32::Graphics::Direct3D11::{D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE};
+    fn new(context: &'a ID3D11DeviceContext, texture: &'a ID3D11Texture2D) -> Result<Self> {
+        use super::bindings::Windows::Win32::D3D11_MAP_READ;
 
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         unsafe { context.Map(texture, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
+            .ok()
             .context("mapping D3D11 capture texture")?;
         Ok(Self {
             context,
