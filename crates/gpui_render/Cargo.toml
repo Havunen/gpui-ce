@@ -21,7 +21,7 @@ windows-core.workspace = true
 windows-link.workspace = true
 
 [build-dependencies]
-naga = { version = "29.0.4", features = [
+naga = { version = "=29.0.4", features = [
   "glsl-out",
   "hlsl-out",
   "msl-out",
@@ -35,4 +35,4 @@ gpui = { path = "../gpui", version = "0.2.2", package = "gpui-ce", default-featu
 wgsl-rs.workspace = true
 
 [dev-dependencies]
-naga = { version = "29.0.4", features = ["wgsl-in"] }
+naga = { version = "=29.0.4", features = ["wgsl-in"] }
