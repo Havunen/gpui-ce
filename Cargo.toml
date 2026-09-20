@@ -139,7 +139,7 @@ objc2-foundation = { version = "=0.3.2", default-features = false, features = [
 objc2-user-notifications = "0.3"
 mach2 = "0.7"
 metal = "0.33"
-windows-capture = "1.5"
+windows-capture = "2.0"
 env_logger = "0.11"
 unicode-segmentation = "1.13"
 wasm-bindgen = "0.2"
@@ -158,7 +158,7 @@ ashpd = { version = "0.13", default-features = false, features = [
 ] }
 libc = "0.2"
 smol = "2"
-wgpu = "29.0.4"
+wgpu = "=29.0.4"
 wgsl-rs = { git = "https://github.com/schell/wgsl-rs", rev = "b2de16a1b81e67d76bc265c296184f882864badb", default-features = false, features = [
   "validation",
 ] }
