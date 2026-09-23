@@ -35,9 +35,18 @@ pub(crate) struct DirectXDevices {
 // to the immediate device context when rendering.
 unsafe impl Send for DirectXDevices {}
 
+/// Whether DirectX devices are created with the D3D11/DXGI debug layer:
+/// `auto` (the default) enables it in debug builds only, `on` enables it in any
+/// build, and `off` disables it. The layer validates every API call, which
+/// makes rendering considerably slower.
+const D3D_DEBUG: &str = "GPUI_D3D_DEBUG";
+
 impl DirectXDevices {
     pub(crate) fn new() -> Result<Self> {
-        let debug_layer_available = check_debug_layer_available();
+        Self::with_debug_layer(check_debug_layer_available())
+    }
+
+    pub(crate) fn with_debug_layer(debug_layer_available: bool) -> Result<Self> {
         let dxgi_factory =
             get_dxgi_factory(debug_layer_available).context("Creating DXGI factory")?;
         let (adapter, device, device_context, feature_level) =
@@ -61,19 +70,39 @@ impl DirectXDevices {
     }
 }
 
-#[inline]
 fn check_debug_layer_available() -> bool {
-    #[cfg(debug_assertions)]
-    {
-        use crate::bindings::Windows::Win32::{DXGIGetDebugInterface1, IDXGIInfoQueue};
+    use crate::bindings::Windows::Win32::{DXGIGetDebugInterface1, IDXGIInfoQueue};
 
-        unsafe { DXGIGetDebugInterface1::<IDXGIInfoQueue>(0) }
-            .log_err()
-            .is_some()
+    let mode = std::env::var(D3D_DEBUG).unwrap_or_default();
+    let requested = debug_layer_requested(&mode, cfg!(debug_assertions)).unwrap_or_else(|| {
+        log::warn!("Ignoring {D3D_DEBUG}={mode:?}; expected auto, on, or off.");
+        cfg!(debug_assertions)
+    });
+    if !requested {
+        return false;
     }
-    #[cfg(not(debug_assertions))]
-    {
-        false
+    let available = unsafe { DXGIGetDebugInterface1::<IDXGIInfoQueue>(0) }
+        .log_err()
+        .is_some();
+    if !available {
+        log::warn!(
+            "Failed to get DXGI debug interface. DirectX debugging features will be disabled."
+        );
+    }
+    available
+}
+
+/// Parses a [`D3D_DEBUG`] value, returning `None` if it isn't recognized.
+fn debug_layer_requested(mode: &str, debug_build: bool) -> Option<bool> {
+    let mode = mode.trim();
+    if mode.is_empty() || mode.eq_ignore_ascii_case("auto") {
+        Some(debug_build)
+    } else if mode.eq_ignore_ascii_case("on") {
+        Some(true)
+    } else if mode.eq_ignore_ascii_case("off") {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -82,10 +111,6 @@ fn get_dxgi_factory(debug_layer_available: bool) -> Result<IDXGIFactory6> {
     let factory_flag = if debug_layer_available {
         DXGI_CREATE_FACTORY_DEBUG
     } else {
-        #[cfg(debug_assertions)]
-        log::warn!(
-            "Failed to get DXGI debug interface. DirectX debugging features will be disabled."
-        );
         0
     };
     unsafe { Ok(CreateDXGIFactory2(factory_flag as u32)?) }
@@ -168,4 +193,27 @@ fn get_device(
     // FL11.0/11.1 guarantees the compute/raw-buffer capabilities required by the SM5 DXBC
     // artifacts, so no legacy D3D10.x optional-feature probe is needed here.
     Ok(device)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::debug_layer_requested;
+
+    #[test]
+    fn debug_layer_follows_the_build_unless_overridden() {
+        for debug_build in [false, true] {
+            for auto in ["", "auto", " Auto ", "AUTO"] {
+                assert_eq!(debug_layer_requested(auto, debug_build), Some(debug_build));
+            }
+            for on in ["on", " on ", "ON"] {
+                assert_eq!(debug_layer_requested(on, debug_build), Some(true));
+            }
+            for off in ["off", "Off\n"] {
+                assert_eq!(debug_layer_requested(off, debug_build), Some(false));
+            }
+            for unrecognized in ["1", "true", "o n", "typo"] {
+                assert_eq!(debug_layer_requested(unrecognized, debug_build), None);
+            }
+        }
+    }
 }

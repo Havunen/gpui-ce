@@ -422,7 +422,10 @@ impl<'a, T: 'static> Context<'a, T> {
             })
     }
 
-    /// Register a callback to be invoked when the window is resized.
+    /// Register a callback to be invoked when the window is resized or moved.
+    ///
+    /// Moving a window doesn't re-render its views on its own, so a view that
+    /// renders from `window.bounds().origin` should call `cx.notify()` here.
     pub fn observe_window_bounds(
         &self,
         window: &mut Window,
