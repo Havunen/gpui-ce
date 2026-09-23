@@ -206,6 +206,12 @@ impl WindowsWindowInner {
             callback();
             self.state.callbacks.moved.set(Some(callback));
         }
+        // Moving the window doesn't move an open IME candidate window along with
+        // it. Re-sending the caret position makes the IME reposition it. Only do
+        // that mid-composition: it asks the app for the caret on every move.
+        update_ime_position_on_move(handle, is_composing, || {
+            self.handle_ime_position(handle);
+        });
         Some(0)
     }
 
@@ -314,10 +320,7 @@ impl WindowsWindowInner {
 
     fn handle_timer_msg(&self, handle: HWND, wparam: WPARAM) -> Option<isize> {
         if wparam.0 == SIZE_MOVE_LOOP_TIMER_ID {
-            let mut runnables = self.main_receiver.clone().try_iter();
-            while let Some(Ok(runnable)) = runnables.next() {
-                WindowsDispatcher::execute_runnable(runnable);
-            }
+            WindowsDispatcher::drain_modal_tasks(&mut self.main_receiver.clone());
             self.handle_paint_msg(handle)
         } else {
             None
@@ -1434,6 +1437,22 @@ impl WindowsWindowInner {
     }
 }
 
+// Keep the native context lookup in the move handler's testable path. Injecting
+// the composition query lets tests exercise it without an interactive IME.
+fn update_ime_position_on_move(
+    handle: HWND,
+    is_composing: impl FnOnce(HIMC) -> bool,
+    update_position: impl FnOnce(),
+) {
+    // Windows share the thread's default IME context, so a background window
+    // must not reposition the focused window's active composition.
+    if unsafe { GetFocus() } == handle
+        && ImeContext::get(handle).is_some_and(|ctx| is_composing(*ctx))
+    {
+        update_position();
+    }
+}
+
 struct ImeContext {
     hwnd: HWND,
     himc: HIMC,
@@ -1461,6 +1480,108 @@ impl Drop for ImeContext {
         unsafe {
             ImmReleaseContext(self.hwnd, self.himc).ok().log_err();
         }
+    }
+}
+
+#[cfg(test)]
+mod ime_move_tests {
+    use super::{ImeContext, update_ime_position_on_move};
+    use crate::bindings::Windows::Win32::{
+        CreateWindowExW, DestroyWindow, GetFocus, HWND, IACE_DEFAULT, ImmAssociateContextEx,
+        SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetFocus, SetWindowPos, WS_OVERLAPPED,
+    };
+    use anyhow::Result;
+    use std::cell::Cell;
+    use windows_core::w;
+
+    struct HiddenWindow(HWND);
+
+    impl HiddenWindow {
+        fn new() -> Result<Self> {
+            let handle = unsafe {
+                CreateWindowExW(
+                    0,
+                    w!("STATIC"),
+                    w!("gpui IME move test"),
+                    WS_OVERLAPPED as u32,
+                    0,
+                    0,
+                    200,
+                    100,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .ok()?;
+            let window = Self(handle);
+            // Match update_ime_enabled: text inputs use the thread's default context.
+            unsafe { ImmAssociateContextEx(handle, Default::default(), IACE_DEFAULT as u32) }
+                .ok()?;
+            Ok(window)
+        }
+    }
+
+    impl Drop for HiddenWindow {
+        fn drop(&mut self) {
+            let _ = unsafe { DestroyWindow(self.0) }.ok();
+        }
+    }
+
+    #[test]
+    fn moving_unfocused_window_does_not_reposition_shared_ime() -> Result<()> {
+        let focused = HiddenWindow::new()?;
+        let background = HiddenWindow::new()?;
+        unsafe { SetFocus(Some(focused.0)) };
+        assert_eq!(unsafe { GetFocus() }, focused.0);
+
+        let focused_context = ImeContext::get(focused.0).expect("focused window IME context");
+        let background_context =
+            ImeContext::get(background.0).expect("background window IME context");
+        assert_eq!(
+            *focused_context, *background_context,
+            "both text inputs must share the thread's default IME context"
+        );
+
+        // Simulate a composition in that shared context. The context lookup and
+        // focus are real Win32 state; no particular keyboard layout is required.
+        let composing = |context| {
+            assert_eq!(context, *focused_context);
+            true
+        };
+        let focused_caret = (20, 30);
+        let background_caret = (140, 80);
+        let candidate_position = Cell::new((0, 0));
+        update_ime_position_on_move(focused.0, composing, || {
+            candidate_position.set(focused_caret);
+        });
+        assert_eq!(candidate_position.get(), focused_caret);
+
+        // toggle_fullscreen also moves windows with SWP_NOACTIVATE. Deliver its
+        // move-time IME update explicitly since these windows use STATIC's wndproc.
+        unsafe {
+            SetWindowPos(
+                background.0,
+                None,
+                100,
+                100,
+                0,
+                0,
+                (SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER) as u32,
+            )
+        }
+        .ok()?;
+        assert_eq!(unsafe { GetFocus() }, focused.0);
+        update_ime_position_on_move(background.0, composing, || {
+            candidate_position.set(background_caret);
+        });
+        assert_eq!(
+            candidate_position.get(),
+            focused_caret,
+            "moving an unfocused window must preserve the active composition's candidate position"
+        );
+        Ok(())
     }
 }
 
@@ -1685,6 +1806,11 @@ fn parse_ime_composition_string(ctx: HIMC, comp_type: u32) -> Option<Vec<u16>> {
             None
         }
     }
+}
+
+#[inline]
+fn is_composing(ctx: HIMC) -> bool {
+    unsafe { ImmGetCompositionStringW(ctx, GCS_COMPSTR as u32, None, 0) > 0 }
 }
 
 #[inline]

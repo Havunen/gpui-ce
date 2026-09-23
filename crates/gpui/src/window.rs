@@ -1780,7 +1780,7 @@ impl Window {
             let mut cx = cx.to_async();
             move || {
                 handle
-                    .update(&mut cx, |_, window, cx| window.bounds_changed(cx))
+                    .update(&mut cx, |_, window, cx| window.moved(cx))
                     .log_err();
             }
         }));
@@ -2542,6 +2542,30 @@ impl Window {
 
         self.refresh();
 
+        self.notify_bounds_observers(cx);
+    }
+
+    /// Handles the platform reporting that the window's origin moved.
+    ///
+    /// A move that keeps the window's size, scale factor, display, and the
+    /// cursor's window-relative position can't change anything views render
+    /// from window state, and the compositor reuses the existing surface. Such
+    /// moves only notify bounds observers, so dragging a window doesn't
+    /// re-render every view on each step of the drag. Any other move falls back
+    /// to [`Window::bounds_changed`].
+    fn moved(&mut self, cx: &mut App) {
+        if self.viewport_size == self.platform_window.content_size()
+            && self.scale_factor == self.platform_window.scale_factor()
+            && self.display_id == self.platform_window.display().map(|display| display.id())
+            && self.mouse_position == self.platform_window.mouse_position()
+        {
+            self.notify_bounds_observers(cx);
+        } else {
+            self.bounds_changed(cx);
+        }
+    }
+
+    fn notify_bounds_observers(&mut self, cx: &mut App) {
         self.bounds_observers
             .clone()
             .retain(&(), |callback| callback(self, cx));
@@ -7611,8 +7635,8 @@ mod tests {
         IntoElement, LongPressEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement,
         Pixels, Point, Render, RenderImage, RequestFrameOptions, ShaderBool,
         StatefulInteractiveElement as _, Styled, TestAppContext, TouchDragEvent, TouchEvent,
-        TouchId, TouchPhase, Window, WindowAppearance, WindowOptions, canvas, div, hsla, img,
-        linear_color_stop, linear_gradient, point, px, size, white,
+        TouchId, TouchPhase, Window, WindowAppearance, WindowHandle, WindowOptions, canvas, div,
+        hsla, img, linear_color_stop, linear_gradient, point, px, size, white,
     };
     use image::{Frame as ImageFrame, ImageBuffer, Rgba};
     use smallvec::smallvec;
@@ -7911,6 +7935,146 @@ mod tests {
             test_window.frame_wake_count() > baseline,
             "scheduling a next-frame callback in an idle window must wake the frame source"
         );
+    }
+
+    struct RenderCounter(Rc<Cell<usize>>);
+
+    impl Render for RenderCounter {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.0.set(self.0.get() + 1);
+            div().size_full()
+        }
+    }
+
+    /// A window whose view counts its renders, plus the origin passed to each
+    /// bounds notification.
+    struct MoveProbe {
+        window: WindowHandle<RenderCounter>,
+        renders: Rc<Cell<usize>>,
+        origins: Rc<RefCell<Vec<Point<Pixels>>>>,
+    }
+
+    impl MoveProbe {
+        /// With `notify_on_bounds`, the bounds observer also asks for a
+        /// re-render, as a view that renders from the window's origin must.
+        fn open(cx: &mut TestAppContext, notify_on_bounds: bool) -> Self {
+            let renders = Rc::new(Cell::new(0));
+            let origins = Rc::new(RefCell::new(Vec::new()));
+            let window = cx.add_window({
+                let renders = renders.clone();
+                let origins = origins.clone();
+                move |window, cx| {
+                    cx.observe_window_bounds(window, move |_, window, cx| {
+                        origins.borrow_mut().push(window.bounds().origin);
+                        if notify_on_bounds {
+                            cx.notify();
+                        }
+                    })
+                    .detach();
+                    RenderCounter(renders)
+                }
+            });
+            // Present the frame drawn by `add_window` so the window is idle.
+            cx.test_window(window.into())
+                .simulate_frame_request(RequestFrameOptions::default());
+            Self {
+                window,
+                renders,
+                origins,
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn test_window_move_notifies_observers_without_rerendering(cx: &mut TestAppContext) {
+        let probe = MoveProbe::open(cx, false);
+        let mut test_window = cx.test_window(probe.window.into());
+        let renders = probe.renders.get();
+        let wakes = test_window.frame_wake_count();
+
+        let origin = point(px(100.), px(200.));
+        test_window.simulate_move(origin);
+        assert_eq!(*probe.origins.borrow(), [origin]);
+        assert_eq!(
+            probe.renders.get(),
+            renders,
+            "the compositor reuses the surface for a plain move"
+        );
+        assert_eq!(
+            test_window.frame_wake_count(),
+            wakes,
+            "a plain move must not request a frame"
+        );
+
+        test_window.simulate_resize(size(px(700.), px(500.)));
+        assert!(
+            probe.renders.get() > renders,
+            "a resize still needs a fresh frame"
+        );
+        assert_eq!(probe.origins.borrow().len(), 2);
+    }
+
+    #[gpui::test]
+    fn test_window_move_rerenders_views_that_notify_from_bounds_observers(cx: &mut TestAppContext) {
+        let probe = MoveProbe::open(cx, true);
+        let test_window = cx.test_window(probe.window.into());
+        let renders = probe.renders.get();
+
+        let origin = point(px(100.), px(200.));
+        test_window.simulate_move(origin);
+        assert_eq!(*probe.origins.borrow(), [origin]);
+        assert_eq!(probe.renders.get(), renders + 1);
+    }
+
+    #[gpui::test]
+    fn test_window_move_rerenders_when_window_state_changed(cx: &mut TestAppContext) {
+        let probe = MoveProbe::open(cx, false);
+        let test_window = cx.test_window(probe.window.into());
+        let stale_states: [(&str, fn(&mut Window)); 4] = [
+            ("content size", |window| {
+                window.viewport_size = size(px(1.), px(1.))
+            }),
+            ("scale factor", |window| window.scale_factor = 1.),
+            ("display", |window| window.display_id = None),
+            ("window-relative cursor", |window| {
+                window.mouse_position = point(px(30.), px(40.))
+            }),
+        ];
+
+        let mut offset = 0.;
+        let mut next_origin = || {
+            offset += 10.;
+            point(px(offset), px(offset))
+        };
+        for (change, make_stale) in stale_states {
+            probe
+                .window
+                .update(cx, |_, window, _| make_stale(window))
+                .unwrap();
+            let renders = probe.renders.get();
+            let notifications = probe.origins.borrow().len();
+            let origin = next_origin();
+            test_window.simulate_move(origin);
+            assert!(
+                probe.renders.get() > renders,
+                "a move that changed the {change} must re-render"
+            );
+            assert_eq!(
+                probe.origins.borrow().len(),
+                notifications + 1,
+                "a move that changed the {change} must notify observers once"
+            );
+            assert_eq!(probe.origins.borrow().last(), Some(&origin));
+
+            // The fallback re-reads window state, so the next move is plain.
+            let renders = probe.renders.get();
+            test_window.simulate_move(next_origin());
+            assert_eq!(
+                probe.renders.get(),
+                renders,
+                "after re-reading the {change}, a plain move must not re-render"
+            );
+        }
     }
 
     /// A frame request that arrives while next-frame callbacks are pending

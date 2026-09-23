@@ -447,7 +447,6 @@ impl DirectXRenderer {
         let disable_direct_composition = self.direct_composition.is_none();
 
         unsafe {
-            #[cfg(debug_assertions)]
             if let Some(devices) = &self.devices {
                 report_live_objects(&devices.device)
                     .context("Failed to report live objects after device lost")
@@ -459,7 +458,6 @@ impl DirectXRenderer {
                 devices.device_context.OMSetRenderTargets(None, None);
                 devices.device_context.ClearState();
                 devices.device_context.Flush();
-                #[cfg(debug_assertions)]
                 report_live_objects(&devices.device)
                     .context("Failed to report live objects after device lost")
                     .log_err();
@@ -2044,7 +2042,6 @@ impl<T> PipelineState<T> {
 
 impl Drop for DirectXRenderer {
     fn drop(&mut self) {
-        #[cfg(debug_assertions)]
         if let Some(devices) = &self.devices {
             report_live_objects(&devices.device).ok();
         }
@@ -2527,9 +2524,12 @@ fn instance_range(range: &std::ops::Range<usize>) -> Result<InstanceRange> {
         .with_context(|| format!("batch {range:?} exceeds the D3D11 instance limit"))
 }
 
-#[cfg(debug_assertions)]
+/// Logs the device's live objects through the D3D11 debug layer. Does nothing
+/// for a device created without the debug layer.
 fn report_live_objects(device: &ID3D11Device) -> Result<()> {
-    let debug_device: ID3D11Debug = device.cast()?;
+    let Ok(debug_device) = device.cast::<ID3D11Debug>() else {
+        return Ok(());
+    };
     unsafe {
         debug_device
             .ReportLiveDeviceObjects(D3D11_RLDO_DETAIL)
@@ -2871,9 +2871,9 @@ mod tests {
     //! batch starts past the beginning of the frame's instance buffer.
 
     // Explicit imports: a glob of `super` would also pull in gpui's `#[test]` proc macro.
-    use super::DirectXRenderer;
-    use crate::bindings::Windows::Win32::HWND;
+    use super::{DirectXRenderer, report_live_objects};
     use crate::bindings::Windows::Win32::{CreateWindowExW, DestroyWindow, WS_OVERLAPPED};
+    use crate::bindings::Windows::Win32::{HWND, ID3D11Debug};
     use crate::directx_devices::DirectXDevices;
     use anyhow::Result;
     use gpui::{
@@ -2883,7 +2883,7 @@ mod tests {
         WindowBackgroundAppearance, hsla, rgb, rgb_to_hsla, solid_background,
     };
     use std::borrow::Cow;
-    use windows_core::w;
+    use windows_core::{Interface, w};
 
     struct HiddenWindow(HWND);
 
@@ -2914,6 +2914,18 @@ mod tests {
         fn drop(&mut self) {
             let _ = unsafe { DestroyWindow(self.0) }.ok();
         }
+    }
+
+    /// `GPUI_D3D_DEBUG=off` in a debug build creates devices without the debug
+    /// layer; reporting their live objects after a device loss must not fail.
+    #[test]
+    fn live_object_reports_skip_devices_without_the_debug_layer() -> Result<()> {
+        let devices = DirectXDevices::with_debug_layer(false)?;
+        assert!(
+            devices.device.cast::<ID3D11Debug>().is_err(),
+            "the device must be created without the debug layer"
+        );
+        report_live_objects(&devices.device)
     }
 
     fn scaled(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {

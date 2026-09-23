@@ -1070,12 +1070,10 @@ impl WindowsPlatformInner {
 
     #[inline]
     fn run_foreground_task(&self) -> Option<isize> {
-        const MAIN_TASK_TIMEOUT: u128 = 10;
-
         let start = std::time::Instant::now();
         'tasks: loop {
             'timeout_loop: loop {
-                if start.elapsed().as_millis() >= MAIN_TASK_TIMEOUT {
+                if start.elapsed() >= MAIN_TASK_BUDGET {
                     log::debug!("foreground task timeout reached");
                     // we spent our budget on gpui tasks, we likely have a lot of work queued so drain system events first to stay responsive
                     // then quit out of foreground work to allow us to process other gpui events first before returning back to foreground task work

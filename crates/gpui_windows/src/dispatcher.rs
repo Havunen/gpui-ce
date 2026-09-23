@@ -18,8 +18,14 @@ use gpui_util::ResultExt;
 
 use crate::{HWND, SafeHwnd, WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD};
 use gpui::{
-    PlatformDispatcher, Priority, PriorityQueueSender, RunnableVariant, TimerResolutionGuard,
+    PlatformDispatcher, Priority, PriorityQueueReceiver, PriorityQueueSender, RunnableVariant,
+    TimerResolutionGuard,
 };
+
+/// How long the main thread runs queued foreground tasks before it goes back
+/// to painting and input, both in the ordinary message loop and in native
+/// modal loops.
+pub(crate) const MAIN_TASK_BUDGET: Duration = Duration::from_millis(10);
 
 pub(crate) struct WindowsDispatcher {
     pub(crate) wake_posted: AtomicBool,
@@ -92,6 +98,23 @@ impl WindowsDispatcher {
         gpui::profiler::update_running_task(spawned, location);
         runnable.run();
         gpui::profiler::save_task_timing();
+    }
+
+    /// Runs queued foreground tasks from inside a native modal loop (window
+    /// drag or resize, menu tracking) until the queue is empty or
+    /// [`MAIN_TASK_BUDGET`] is spent. At least one task runs if any are queued.
+    ///
+    /// Tasks left over stay queued for the modal loop's next timer tick, or
+    /// for the ordinary loop once the modal loop exits. `wake_posted` is left
+    /// alone: only the ordinary loop's `run_foreground_task` clears it.
+    pub(crate) fn drain_modal_tasks(receiver: &mut PriorityQueueReceiver<RunnableVariant>) {
+        let start = std::time::Instant::now();
+        while start.elapsed() < MAIN_TASK_BUDGET {
+            let Ok(Some(runnable)) = receiver.try_pop() else {
+                break;
+            };
+            Self::execute_runnable(runnable);
+        }
     }
 }
 
@@ -186,4 +209,121 @@ unsafe extern "system" fn run_timer_callback(
     let runnable = unsafe { RunnableVariant::from_raw(NonNull::new_unchecked(context as *mut ())) };
     WindowsDispatcher::execute_runnable(runnable);
     unsafe { CloseThreadpoolTimer(timer) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bindings::Windows::Win32::{MSG, PeekMessageW};
+    use std::{
+        cell::Cell,
+        pin::Pin,
+        rc::Rc,
+        sync::Arc,
+        task::{self, Poll},
+    };
+
+    /// A main-thread queue whose wakes post to this test thread's message queue.
+    struct MainThread {
+        dispatcher: Arc<WindowsDispatcher>,
+        executor: gpui::ForegroundExecutor,
+        receiver: PriorityQueueReceiver<RunnableVariant>,
+    }
+
+    impl MainThread {
+        fn new() -> Self {
+            let (sender, receiver) = PriorityQueueReceiver::new();
+            let dispatcher = Arc::new(WindowsDispatcher::new(sender, HWND::default(), 0));
+            let executor = gpui::ForegroundExecutor::new(dispatcher.clone());
+            Self {
+                dispatcher,
+                executor,
+                receiver,
+            }
+        }
+
+        fn spawn_counted(&self, completed: &Rc<Cell<usize>>, work: Duration) {
+            let completed = completed.clone();
+            self.executor
+                .spawn(async move {
+                    std::thread::sleep(work);
+                    completed.set(completed.get() + 1);
+                })
+                .detach();
+        }
+
+        fn drain_modal_tasks(&mut self) {
+            WindowsDispatcher::drain_modal_tasks(&mut self.receiver);
+        }
+
+        /// Whether the ordinary message loop has a wake waiting to run tasks.
+        fn wake_pending(&self) -> bool {
+            let mut msg = MSG::default();
+            let wake = WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD as u32;
+            // A flag of 0 is PM_NOREMOVE.
+            unsafe { PeekMessageW(&mut msg, None, wake, wake, 0) }.as_bool()
+        }
+    }
+
+    /// Wakes itself on every poll, so it is always queued again.
+    struct Reschedules(Rc<Cell<usize>>);
+
+    impl Future for Reschedules {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<()> {
+            self.0.set(self.0.get() + 1);
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+
+    #[test]
+    fn modal_drain_runs_every_task_that_fits_in_the_budget() {
+        let mut main = MainThread::new();
+        let completed = Rc::new(Cell::new(0));
+        for _ in 0..100 {
+            main.spawn_counted(&completed, Duration::ZERO);
+        }
+        main.drain_modal_tasks();
+        assert_eq!(completed.get(), 100);
+        assert!(main.receiver.is_empty());
+    }
+
+    #[test]
+    fn modal_drain_leaves_tasks_past_the_budget_for_later() {
+        let mut main = MainThread::new();
+        let completed = Rc::new(Cell::new(0));
+        // Each task alone overruns the budget, so each drain runs one.
+        for _ in 0..2 {
+            main.spawn_counted(&completed, MAIN_TASK_BUDGET + Duration::from_millis(1));
+        }
+        main.drain_modal_tasks();
+        assert_eq!(completed.get(), 1);
+        assert!(!main.receiver.is_empty());
+        // The leftover task still runs if the modal loop exits before its next
+        // tick: the ordinary loop's wake stays posted, and stays claimed so no
+        // duplicate is posted.
+        assert!(main.wake_pending());
+        assert!(main.dispatcher.wake_posted.load(Ordering::Acquire));
+
+        main.drain_modal_tasks();
+        assert_eq!(completed.get(), 2);
+        assert!(main.receiver.is_empty());
+    }
+
+    #[test]
+    fn modal_drain_returns_while_a_task_keeps_rescheduling_itself() {
+        // Draining until the queue emptied never returned here, which froze
+        // window drags and resizes.
+        let mut main = MainThread::new();
+        let polls = Rc::new(Cell::new(0));
+        main.executor.spawn(Reschedules(polls.clone())).detach();
+        main.drain_modal_tasks();
+        assert!(
+            polls.get() > 1,
+            "the task must keep running within the budget"
+        );
+        assert!(!main.receiver.is_empty());
+    }
 }
