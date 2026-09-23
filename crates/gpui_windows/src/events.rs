@@ -1444,7 +1444,11 @@ fn update_ime_position_on_move(
     is_composing: impl FnOnce(HIMC) -> bool,
     update_position: impl FnOnce(),
 ) {
-    if ImeContext::get(handle).is_some_and(|ctx| is_composing(*ctx)) {
+    // Windows share the thread's default IME context, so a background window
+    // must not reposition the focused window's active composition.
+    if unsafe { GetFocus() } == handle
+        && ImeContext::get(handle).is_some_and(|ctx| is_composing(*ctx))
+    {
         update_position();
     }
 }
