@@ -17,14 +17,15 @@
 
 use crate::{
     Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, AppContext, Bounds, ClickEvent,
-    CursorStyle, DispatchPhase, Display, Element, ElementId, Entity, EntityId, ExternalDragPayload,
-    FocusHandle, Global, GlobalElementId, Hitbox, HitboxBehavior, HitboxId, InspectorElementId,
-    IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent,
-    LayoutId, ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseExitEvent,
-    MouseMoveEvent, MousePressureEvent, MouseUpEvent, OngoingScroll, Overflow, ParentElement,
-    PinchEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
-    StyleRefinement, StyleTransitionContext, StyleTransitionState, StyleTransitions, Styled, Task,
-    TooltipId, Visibility, Window, WindowControlArea, point, px, size,
+    CursorStyle, DispatchPhase, Display, DragMoveRefresh, Element, ElementId, Entity, EntityId,
+    ExternalDragPayload, FocusHandle, Global, GlobalElementId, Hitbox, HitboxBehavior, HitboxId,
+    InspectorElementId, IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton,
+    KeyboardClickEvent, LayoutId, ModifiersChangedEvent, MouseButton, MouseClickEvent,
+    MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent,
+    OngoingScroll, Overflow, ParentElement, PinchEvent, Pixels, Point, Render, ScrollWheelEvent,
+    SharedString, Size, Style, StyleRefinement, StyleTransitionContext, StyleTransitionState,
+    StyleTransitions, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
+    size,
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -703,6 +704,7 @@ impl Interactivity {
                 view: view.into(),
                 value: value.clone(),
                 cursor_offset,
+                move_refresh: DragMoveRefresh::default(),
                 cursor_style,
                 external_payload_source: None,
             }
@@ -729,6 +731,14 @@ impl Interactivity {
         self.drag_listener = Some(Box::new(listener));
     }
 
+    /// Choose how pointer movement invalidates the UI. Call after `on_drag`.
+    /// With `Preview`, handlers must notify any other views that change.
+    pub fn drag_move_refresh(&mut self, refresh: DragMoveRefresh) {
+        self.map_drag_listener("drag_move_refresh", move |any_drag| {
+            any_drag.move_refresh = refresh;
+        });
+    }
+
     /// Registers a callback resolving a payload to offer the platform if a drag started by this
     /// element leaves the window. It is invoked at most once per drag gesture, when the pointer
     /// exits the viewport. Must be called after [`Self::on_drag`], with the same dragged value
@@ -740,14 +750,29 @@ impl Interactivity {
         Self: Sized,
         T: 'static,
     {
-        let Some(drag_listener) = self.drag_listener.take() else {
-            debug_assert!(false, "external_drag_payload must be called after on_drag");
-            return;
-        };
+        self.set_external_drag_payload("external_drag_payload", move |value, window, cx| {
+            crate::ExternalDragPayloadResolution::Ready(resolver(value, window, cx))
+        });
+    }
 
+    /// Prepare a native payload asynchronously after a drag leaves the viewport.
+    pub fn external_drag_payload_async<T: 'static>(
+        &mut self,
+        resolver: impl Fn(&T, &mut Window, &mut App) -> crate::Task<Option<ExternalDragPayload>>
+        + 'static,
+    ) {
+        self.set_external_drag_payload("external_drag_payload_async", move |value, window, cx| {
+            crate::ExternalDragPayloadResolution::Pending(resolver(value, window, cx))
+        });
+    }
+
+    fn set_external_drag_payload<T: 'static>(
+        &mut self,
+        caller: &str,
+        resolver: impl Fn(&T, &mut Window, &mut App) -> crate::ExternalDragPayloadResolution + 'static,
+    ) {
         let resolver = Rc::new(resolver);
-        self.on_drag_alt(move |cursor_offset, cursor_style, window, cx| {
-            let mut any_drag = drag_listener(cursor_offset, cursor_style, window, cx);
+        self.map_drag_listener(caller, move |any_drag| {
             debug_assert!(
                 any_drag.external_payload_source.is_none(),
                 "calling external_drag_payload more than once on the same element is not supported"
@@ -762,6 +787,19 @@ impl Interactivity {
                     resolver(value_ref, window, cx)
                 }
             }));
+        });
+    }
+
+    /// Wraps the registered drag listener so `update` can adjust each drag it starts.
+    fn map_drag_listener(&mut self, caller: &str, update: impl Fn(&mut AnyDrag) + 'static) {
+        let Some(drag_listener) = self.drag_listener.take() else {
+            debug_assert!(false, "{caller} must be called after on_drag");
+            return;
+        };
+
+        self.on_drag_alt(move |cursor_offset, cursor_style, window, cx| {
+            let mut any_drag = drag_listener(cursor_offset, cursor_style, window, cx);
+            update(&mut any_drag);
             any_drag
         });
     }
@@ -1860,6 +1898,13 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Choose how pointer movement invalidates the UI. Call after `on_drag`.
+    /// With `Preview`, handlers must notify any other views that change.
+    fn drag_move_refresh(mut self, refresh: DragMoveRefresh) -> Self {
+        self.interactivity().drag_move_refresh(refresh);
+        self
+    }
+
     /// Registers a callback resolving a payload to offer the platform if a drag started by this
     /// element leaves the window. It is invoked at most once per drag gesture, when the pointer
     /// exits the viewport. Must be called after [`Self::on_drag`], with the same dragged value
@@ -1874,6 +1919,19 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         T: 'static,
     {
         self.interactivity().external_drag_payload(resolver);
+        self
+    }
+
+    /// Prepare metadata on a background worker before starting native dragging.
+    fn external_drag_payload_async<T: 'static>(
+        mut self,
+        resolver: impl Fn(&T, &mut Window, &mut App) -> crate::Task<Option<ExternalDragPayload>>
+        + 'static,
+    ) -> Self
+    where
+        Self: Sized,
+    {
+        self.interactivity().external_drag_payload_async(resolver);
         self
     }
 

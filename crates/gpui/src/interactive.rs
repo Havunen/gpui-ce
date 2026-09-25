@@ -711,17 +711,46 @@ pub enum ExternalDragPayload {
 /// Paths handed to the platform for a native file drag. Directory metadata is
 /// provided by the caller to avoid querying it when the platform drag starts.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
-pub struct FileDragPaths(SmallVec<[(PathBuf, bool); 2]>);
+pub struct FileDragPaths {
+    entries: SmallVec<[(PathBuf, bool); 2]>,
+    /// Requested operation. Platforms may negotiate a copy modifier.
+    pub operation: crate::FileTransferOperation,
+    /// Application token used to match final completion to its source snapshot.
+    pub ownership: u64,
+}
 
 impl FileDragPaths {
     /// Creates a native file-drag payload from paths paired with whether each path is a directory.
     pub fn new(entries: impl IntoIterator<Item = (PathBuf, bool)>) -> Self {
-        Self(entries.into_iter().collect())
+        Self {
+            entries: entries.into_iter().collect(),
+            operation: crate::FileTransferOperation::Copy,
+            ownership: 0,
+        }
     }
 
     /// The dragged paths, each paired with whether it is a directory.
     pub fn entries(&self) -> &[(PathBuf, bool)] {
-        &self.0
+        &self.entries
+    }
+
+    /// Attach a requested operation and caller-owned completion token.
+    pub fn with_transfer(
+        mut self,
+        operation: crate::FileTransferOperation,
+        ownership: u64,
+    ) -> Self {
+        self.operation = operation;
+        self.ownership = ownership;
+        self
+    }
+    /// Typed native file payload corresponding to these entries.
+    pub fn transfer(&self) -> crate::FileTransfer {
+        crate::FileTransfer {
+            paths: ExternalPaths(self.entries.iter().map(|(p, _)| p.clone()).collect()),
+            operation: self.operation,
+            ownership: self.ownership,
+        }
     }
 }
 
@@ -752,10 +781,19 @@ pub enum FileDropEvent {
         /// The position of the mouse relative to the window.
         position: Point<Pixels>,
     },
+    /// A drop with deferred native protocol completion.
+    SubmitWithTransfer {
+        /// Position in the receiving window.
+        position: Point<Pixels>,
+        /// Retain this lease until filesystem work completes.
+        transfer: crate::FileDropTransfer,
+    },
     /// The user has stopped dragging the files over the window.
     Exited,
     /// The platform-owned drag session has ended.
     Ended,
+    /// Transfer protocol completion, including operation and source ownership.
+    Completed(crate::FileTransferCompletion),
 }
 
 impl Sealed for FileDropEvent {}

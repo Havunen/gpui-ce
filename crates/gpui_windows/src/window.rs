@@ -5,7 +5,6 @@ use std::{
     num::NonZeroIsize,
     path::PathBuf,
     rc::{Rc, Weak},
-    str::FromStr,
     sync::{Arc, Once, atomic::AtomicBool},
     time::{Duration, Instant},
 };
@@ -606,6 +605,37 @@ impl Drop for WindowsWindow {
 }
 
 impl PlatformWindow for WindowsWindow {
+    fn can_start_external_drag(&self) -> bool {
+        true
+    }
+
+    fn start_external_drag(&self, payload: &gpui::ExternalDragPayload) -> bool {
+        let gpui::ExternalDragPayload::Files(paths) = payload;
+        if paths.entries().is_empty() {
+            return false;
+        }
+        let inner = self.0.clone();
+        let files = paths.transfer();
+        // Enter the OLE modal drag loop after GPUI has handed over its gesture.
+        self.0
+            .executor
+            .spawn(async move {
+                let result = crate::file_transfer::drag_files(inner.hwnd, files);
+                if let Some(mut callback) = inner.state.callbacks.input.take() {
+                    callback(PlatformInput::FileDrop(
+                        result
+                            .map(FileDropEvent::Completed)
+                            .unwrap_or(FileDropEvent::Ended),
+                    ));
+                    inner.state.callbacks.input.set(Some(callback));
+                } else if let Some(result) = result {
+                    result.report();
+                }
+            })
+            .detach();
+        true
+    }
+
     fn bounds(&self) -> Bounds<Pixels> {
         self.state.bounds()
     }
@@ -1187,7 +1217,7 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
             };
             let cursor_position = POINT { x: pt.x, y: pt.y };
             if idata_obj.QueryGetData(&config as _) == S_OK {
-                *pdweffect = DROPEFFECT_COPY as u32;
+                *pdweffect = drop_effect(*pdweffect);
                 let Some(mut idata) = idata_obj.GetData(&config as _).log_err() else {
                     return Ok(());
                 };
@@ -1196,11 +1226,7 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
                 }
                 let hdrop = HDROP(idata.Anonymous.hGlobal.0);
                 let mut paths = SmallVec::<[PathBuf; 2]>::new();
-                with_file_names(hdrop, |file_name| {
-                    if let Some(path) = PathBuf::from_str(&file_name).log_err() {
-                        paths.push(path);
-                    }
-                });
+                with_file_names(hdrop, |file_name| paths.push(PathBuf::from(file_name)));
                 ReleaseStgMedium(&mut idata);
                 let mut cursor_position = cursor_position;
                 ScreenToClient(self.0.hwnd, &mut cursor_position)
@@ -1236,7 +1262,7 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
     ) -> windows_core::Result<()> {
         let mut cursor_position = POINT { x: pt.x, y: pt.y };
         unsafe {
-            *pdweffect = DROPEFFECT_COPY as u32;
+            *pdweffect = drop_effect(*pdweffect);
             self.0
                 .drop_target_helper
                 .DragOver(&cursor_position, *pdweffect)
@@ -1278,6 +1304,12 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
     ) -> windows_core::Result<()> {
         let idata_obj = pdataobj.ok()?;
         let mut cursor_position = POINT { x: pt.x, y: pt.y };
+        let operation = if drop_effect(unsafe { *pdweffect }) == DROPEFFECT_MOVE as u32 {
+            gpui::FileTransferOperation::Move
+        } else {
+            gpui::FileTransferOperation::Copy
+        };
+        let transfer = crate::file_transfer::capture_drop(idata_obj, operation);
         unsafe {
             *pdweffect = DROPEFFECT_COPY as u32;
             self.0
@@ -1290,16 +1322,26 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
                 .log_err();
         }
         let scale_factor = self.0.state.scale_factor.get();
-        let input = PlatformInput::FileDrop(FileDropEvent::Submit {
+        let input = PlatformInput::FileDrop(FileDropEvent::SubmitWithTransfer {
             position: logical_point(
                 cursor_position.x as f32,
                 cursor_position.y as f32,
                 scale_factor,
             ),
+            transfer,
         });
         self.handle_drag_drop(input);
 
         Ok(())
+    }
+}
+
+/// Moves only when the source allows it and Shift is held; copies otherwise.
+fn drop_effect(allowed: u32) -> u32 {
+    if current_modifiers().shift && allowed & DROPEFFECT_MOVE as u32 != 0 {
+        DROPEFFECT_MOVE as u32
+    } else {
+        DROPEFFECT_COPY as u32
     }
 }
 

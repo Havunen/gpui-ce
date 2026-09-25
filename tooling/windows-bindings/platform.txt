@@ -18,6 +18,7 @@ Windows.Win32.APPMODEL_ERROR_NO_PACKAGE
 Windows.Win32.ATTR_INPUT
 Windows.Win32.AdjustWindowRectEx
 Windows.Win32.Arc
+Windows.Win32.BHID_DataObject
 Windows.Win32.CANDIDATEFORM
 Windows.Win32.CFS_CANDIDATEPOS
 Windows.Win32.CFS_POINT
@@ -27,6 +28,7 @@ Windows.Win32.CF_UNICODETEXT
 Windows.Win32.CLSCTX_ALL
 Windows.Win32.CLSCTX_INPROC_SERVER
 Windows.Win32.CLSID_DragDropHelper
+Windows.Win32.CLSID_RecycleBin
 Windows.Win32.COLORREF
 Windows.Win32.COMDLG_FILTERSPEC
 Windows.Win32.COMPOSITIONFORM
@@ -134,6 +136,7 @@ Windows.Win32.DIRECTMANIPULATION_VIEWPORT_OPTIONS_DISABLEPIXELSNAPPING
 Windows.Win32.DIRECTMANIPULATION_VIEWPORT_OPTIONS_MANUALUPDATE
 Windows.Win32.DM_POINTERHITTEST
 Windows.Win32.DROPEFFECT_COPY
+Windows.Win32.DROPEFFECT_MOVE
 Windows.Win32.DROPEFFECT_NONE
 Windows.Win32.DVASPECT_CONTENT
 Windows.Win32.DWMSBT_MAINWINDOW
@@ -212,8 +215,10 @@ Windows.Win32.DwmSetWindowAttribute
 Windows.Win32.ERROR_FILE_NOT_FOUND
 Windows.Win32.ERROR_INSUFFICIENT_BUFFER
 Windows.Win32.ERROR_NOT_FOUND
+Windows.Win32.E_ABORT
 Windows.Win32.E_INVALIDARG
 Windows.Win32.E_NOTIMPL
+Windows.Win32.E_OUTOFMEMORY
 Windows.Win32.E_POINTER
 Windows.Win32.EmptyClipboard
 Windows.Win32.EnableWindow
@@ -244,6 +249,7 @@ Windows.Win32.GetActiveWindow
 Windows.Win32.GetClientRect
 Windows.Win32.GetClipboardData
 Windows.Win32.GetClipboardFormatNameW
+Windows.Win32.GetClipboardSequenceNumber
 Windows.Win32.GetCurrentPackageFullName
 Windows.Win32.GetCurrentThread
 Windows.Win32.GetCursorPos
@@ -392,7 +398,8 @@ Windows.Win32.IDXGIInfoQueue::{}
 Windows.Win32.IDXGIObject::{}
 Windows.Win32.IDXGISwapChain1::{GetDesc1}
 Windows.Win32.IDXGISwapChain::{GetBuffer, GetDesc, Present, ResizeBuffers}
-Windows.Win32.IDataObject::{GetData, QueryGetData}
+Windows.Win32.IDataObject
+Windows.Win32.IDataObjectAsyncCapability
 Windows.Win32.IDirectManipulationContent::{GetContentTransform, SetTag}
 Windows.Win32.IDirectManipulationManager::{Activate, CreateViewport, Deactivate, GetUpdateManager}
 Windows.Win32.IDirectManipulationUpdateManager::{Update}
@@ -416,7 +423,7 @@ Windows.Win32.IPropertyStore::{Commit, GetAt, GetCount, SetValue}
 Windows.Win32.ISequentialStream::{}
 Windows.Win32.IShellFolder::{ParseDisplayName}
 Windows.Win32.IShellItem::{GetDisplayName}
-Windows.Win32.IShellItemArray::{GetCount, GetItemAt}
+Windows.Win32.IShellItemArray::{BindToHandler, GetCount, GetItemAt}
 Windows.Win32.IShellLinkW::{GetDescription, SetArguments, SetDescription, SetIconLocation, SetPath}
 Windows.Win32.IStorage::{Commit}
 Windows.Win32.IStream::{Commit}
@@ -466,7 +473,9 @@ Windows.Win32.MonitorFromPoint
 Windows.Win32.MonitorFromWindow
 Windows.Win32.NCCALCSIZE_PARAMS
 Windows.Win32.NI_COMPOSITIONSTR
+Windows.Win32.OleGetClipboard
 Windows.Win32.OleInitialize
+Windows.Win32.OleSetClipboard
 Windows.Win32.OleUninitialize
 Windows.Win32.OpenClipboard
 Windows.Win32.PBT_APMRESUMEAUTOMATIC
@@ -498,7 +507,10 @@ Windows.Win32.ReleaseStgMedium
 Windows.Win32.RemovePropW
 Windows.Win32.RevokeDragDrop
 Windows.Win32.SHCreateItemFromParsingName
+Windows.Win32.SHCreateShellItemArrayFromIDLists
+Windows.Win32.SHDoDragDrop
 Windows.Win32.SHGetDesktopFolder
+Windows.Win32.SHParseDisplayName
 Windows.Win32.SHOpenFolderAndSelectItems
 Windows.Win32.SIGDN_FILESYSPATH
 Windows.Win32.SIZE

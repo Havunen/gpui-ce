@@ -75,7 +75,7 @@ impl<T: ReceiveData> DataOffer<T> {
         self.mime_types.push(mime_type)
     }
 
-    fn has_mime_type(&self, mime_type: &str) -> bool {
+    pub(crate) fn has_mime_type(&self, mime_type: &str) -> bool {
         self.mime_types.iter().any(|t| t == mime_type)
     }
 
@@ -181,6 +181,15 @@ impl Clipboard {
     }
 
     pub fn send(&self, _mime_type: String, fd: OwnedFd) {
+        if let Some(bytes) = self
+            .contents
+            .as_ref()
+            .and_then(|c| c.file_transfer())
+            .and_then(|f| f.encode(&_mime_type))
+        {
+            self.send_bytes(fd, bytes);
+            return;
+        }
         if let Some(text) = self.contents.as_ref().and_then(|contents| contents.text()) {
             self.send_bytes(fd, text.as_bytes().to_owned());
         }
@@ -206,9 +215,35 @@ impl Clipboard {
             return self.contents.clone();
         }
 
-        let item = offer
-            .read_text(&self.connection)
-            .or_else(|| offer.read_image(&self.connection))?;
+        let files = [
+            gpui::FILE_TRANSFER_MIME,
+            gpui::COPIED_FILES_MIME,
+            gpui::URI_LIST_MIME,
+        ]
+        .into_iter()
+        .find_map(|mime| {
+            if !offer.has_mime_type(mime) {
+                return None;
+            }
+            let mut files =
+                gpui::FileTransfer::decode(&offer.read_bytes(&self.connection, mime)?, mime)?;
+            if mime == gpui::URI_LIST_MIME
+                && offer.has_mime_type(gpui::KDE_CUT_MIME)
+                && offer
+                    .read_bytes(&self.connection, gpui::KDE_CUT_MIME)
+                    .is_some_and(|b| b == b"1")
+            {
+                files.operation = gpui::FileTransferOperation::Move;
+            }
+            Some(ClipboardItem {
+                entries: vec![ClipboardEntry::Files(files)],
+            })
+        });
+        let item = files.or_else(|| {
+            offer
+                .read_text(&self.connection)
+                .or_else(|| offer.read_image(&self.connection))
+        })?;
 
         self.cached_read = Some(item.clone());
         Some(item)
@@ -259,5 +294,26 @@ impl Clipboard {
                 },
             )
             .unwrap();
+    }
+
+    /// File formats the *clipboard* data source should advertise, on top of the
+    /// text types it always offers. Describes `contents` only; the primary
+    /// selection carries text and must not consult this.
+    pub fn file_mime_types(&self) -> &'static [&'static str] {
+        if self
+            .contents
+            .as_ref()
+            .and_then(|c| c.file_transfer())
+            .is_some()
+        {
+            &[
+                gpui::FILE_TRANSFER_MIME,
+                gpui::COPIED_FILES_MIME,
+                gpui::URI_LIST_MIME,
+                gpui::KDE_CUT_MIME,
+            ]
+        } else {
+            &[]
+        }
     }
 }

@@ -8,7 +8,7 @@ mod text_system;
 #[cfg(feature = "wayland")]
 mod wayland;
 #[cfg(feature = "x11")]
-mod x11;
+pub(crate) mod x11;
 
 #[cfg(any(feature = "wayland", feature = "x11"))]
 mod xdg_desktop_portal;

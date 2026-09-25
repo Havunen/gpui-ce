@@ -1,9 +1,9 @@
-use objc2::rc::Retained;
+use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_app_kit::{
     NSPasteboard, NSPasteboardNameFind, NSPasteboardType, NSPasteboardTypeFileURL,
-    NSPasteboardTypeString,
+    NSPasteboardTypeString, NSPasteboardWriting,
 };
-use objc2_foundation::{NSData, NSString};
+use objc2_foundation::{NSArray, NSData, NSString, NSURL};
 use smallvec::SmallVec;
 use strum::IntoEnumIterator as _;
 
@@ -42,6 +42,16 @@ impl Pasteboard {
     }
 
     pub fn read(&self) -> Option<ClipboardItem> {
+        // GPUI file clipboards also carry the copy/move intent and ownership token.
+        if let Some(files) = self
+            .data_for_type(&NSString::from_str(gpui::FILE_TRANSFER_MIME))
+            .and_then(|bytes| gpui::FileTransfer::decode(&bytes, gpui::FILE_TRANSFER_MIME))
+        {
+            return Some(ClipboardItem {
+                entries: vec![ClipboardEntry::Files(files)],
+            });
+        }
+
         // Modern pasteboards represent each selected file as an item with a
         // file-URL payload. This avoids the deprecated filename property list
         // and validates the URL before it becomes a native path.
@@ -136,6 +146,11 @@ impl Pasteboard {
     }
 
     pub fn write(&self, item: ClipboardItem) {
+        if let Some(files) = item.file_transfer() {
+            self.write_files(&files, &item);
+            return;
+        }
+
         match item.entries.as_slice() {
             [] => {
                 // Writing an empty list of entries just clears the clipboard.
@@ -175,6 +190,45 @@ impl Pasteboard {
 
                 self.write_plaintext(&combined);
             }
+        }
+    }
+
+    fn write_files(&self, files: &gpui::FileTransfer, item: &ClipboardItem) {
+        self.inner.clearContents();
+
+        // Finder and other applications read one native file URL per item.
+        let urls = files
+            .paths
+            .paths()
+            .iter()
+            .filter_map(NSURL::from_file_path)
+            .map(ProtocolObject::<dyn NSPasteboardWriting>::from_retained)
+            .collect::<Vec<_>>();
+        self.inner
+            .writeObjects(&NSArray::from_retained_slice(&urls));
+
+        if let Some(bytes) = files.encode(gpui::FILE_TRANSFER_MIME) {
+            let data = NSData::with_bytes(&bytes);
+            self.inner
+                .setData_forType(Some(&data), &NSString::from_str(gpui::FILE_TRANSFER_MIME));
+        }
+
+        // An item can carry text alongside its paths. `file_transfer` also
+        // matches plain `ExternalPaths`, so returning without writing the text
+        // would silently drop it for items that used to be written as text.
+        // The pasteboard holds both types.
+        let text = item
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                ClipboardEntry::String(string) => Some(string.text().as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        if !text.is_empty() {
+            let text_bytes = NSData::with_bytes(text.as_bytes());
+            self.inner
+                .setData_forType(Some(&text_bytes), unsafe { NSPasteboardTypeString });
         }
     }
 
@@ -358,6 +412,37 @@ mod tests {
 
         assert_eq!(pasteboard.text_hash_type.to_string(), "zed-text-hash");
         assert_eq!(pasteboard.metadata_type.to_string(), "zed-metadata");
+    }
+
+    #[test]
+    fn native_file_urls_and_owned_move_payload_roundtrip() {
+        let (_guard, pasteboard) = unique_pasteboard();
+        let files = gpui::FileTransfer {
+            paths: gpui::ExternalPaths(
+                [PathBuf::from("/tmp/a b.txt"), PathBuf::from("/tmp/folder")].into(),
+            ),
+            operation: gpui::FileTransferOperation::Move,
+            ownership: 23,
+        };
+        pasteboard.write(ClipboardItem {
+            entries: vec![ClipboardEntry::Files(files.clone())],
+        });
+        assert_eq!(
+            pasteboard.read().and_then(|item| item.file_transfer()),
+            Some(files)
+        );
+        let classes = NSArray::from_slice(&[objc2::class!(NSURL)]);
+        let urls = unsafe {
+            pasteboard
+                .inner
+                .readObjectsForClasses_options(&classes, None)
+        }
+        .expect("should read native URLs");
+        assert_eq!(
+            urls.count(),
+            2,
+            "Finder must receive a native URL for every file"
+        );
     }
 
     #[test]

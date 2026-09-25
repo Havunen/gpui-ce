@@ -36,6 +36,8 @@ fn main() {
         } else if output.ends_with("gpui_windows/src/bindings.rs") {
             args.extend([
                 "--implement",
+                "Windows.Win32.IDataObject",
+                "Windows.Win32.IDataObjectAsyncCapability",
                 "Windows.Win32.IDirectManipulationViewportEventHandler",
                 "Windows.Win32.IDWritePixelSnapping",
                 "Windows.Win32.IDWriteTextRenderer",

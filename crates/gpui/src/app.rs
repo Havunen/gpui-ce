@@ -1469,6 +1469,11 @@ impl App {
         self.platform.button_layout()
     }
 
+    /// Capture the current native file data object for transfer completion.
+    pub fn capture_file_paste(&self, files: &crate::FileTransfer) -> Option<crate::FilePaste> {
+        self.platform.capture_file_paste(files)
+    }
+
     /// Reads data from the platform clipboard.
     pub fn read_from_clipboard(&self) -> Option<ClipboardItem> {
         self.platform.read_from_clipboard()
@@ -3080,6 +3085,17 @@ impl<G: Global> DerefMut for GlobalLease<G> {
     }
 }
 
+/// How pointer movement invalidates the UI during a drag.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DragMoveRefresh {
+    /// Refresh the whole window, including cached views (the default).
+    #[default]
+    Window,
+    /// Invalidate only the preview. Drag handlers must notify views whose
+    /// appearance changes, including custom drop targets and drag-over styles.
+    Preview,
+}
+
 /// Contains state associated with an active drag operation, started by dragging an element
 /// within the window or by dragging into the app from the underlying platform.
 pub struct AnyDrag {
@@ -3092,6 +3108,9 @@ pub struct AnyDrag {
     /// This is used to render the dragged item in the same place
     /// on the original element that the drag was initiated
     pub cursor_offset: Point<Pixels>,
+
+    /// Which views to invalidate when the pointer moves.
+    pub move_refresh: DragMoveRefresh,
 
     /// The cursor style to use while dragging
     pub cursor_style: Option<CursorStyle>,
@@ -3107,6 +3126,7 @@ impl AnyDrag {
             view: view.into(),
             value: Arc::new(value),
             cursor_offset: Point::default(),
+            move_refresh: DragMoveRefresh::default(),
             cursor_style: None,
             external_payload_source: None,
         }
@@ -3115,6 +3135,12 @@ impl AnyDrag {
     /// Assigns the offset of the view from the cursor when dragging begins.
     pub fn offset(mut self, offset: Point<Pixels>) -> Self {
         self.cursor_offset = offset;
+        self
+    }
+
+    /// Assigns which views to invalidate when the pointer moves during this drag.
+    pub fn move_refresh(mut self, refresh: DragMoveRefresh) -> Self {
+        self.move_refresh = refresh;
         self
     }
 
@@ -3129,7 +3155,21 @@ impl AnyDrag {
         mut self,
         predicate: impl FnOnce(&mut Window, &mut App) -> Option<ExternalDragPayload> + 'static,
     ) -> Self {
-        self.external_payload_source = Some(Box::new(predicate));
+        self.external_payload_source = Some(Box::new(move |window, cx| {
+            crate::ExternalDragPayloadResolution::Ready(predicate(window, cx))
+        }));
+        self
+    }
+
+    /// Assigns a constructor of an external payload that is prepared asynchronously when the
+    /// drag moves outside of the application window.
+    pub fn external_payload_async(
+        mut self,
+        predicate: impl FnOnce(&mut Window, &mut App) -> Task<Option<ExternalDragPayload>> + 'static,
+    ) -> Self {
+        self.external_payload_source = Some(Box::new(move |window, cx| {
+            crate::ExternalDragPayloadResolution::Pending(predicate(window, cx))
+        }));
         self
     }
 
@@ -3142,7 +3182,7 @@ impl AnyDrag {
 /// Lazily resolves the payload handed to the platform when an internal drag is
 /// promoted to a native drag session.
 pub type ExternalDragPayloadSource =
-    Box<dyn FnOnce(&mut Window, &mut App) -> Option<ExternalDragPayload> + 'static>;
+    Box<dyn FnOnce(&mut Window, &mut App) -> crate::ExternalDragPayloadResolution + 'static>;
 
 /// Contains state associated with a tooltip. You'll only need this struct if you're implementing
 /// tooltip behavior on a custom element. Otherwise, use [Div::tooltip](crate::Interactivity::tooltip).
