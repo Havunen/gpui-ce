@@ -1,5 +1,4 @@
 use crate::{BackgroundExecutor, Task};
-pub use gpui_util::debug_panic;
 use std::{
     future::Future,
     pin::Pin,

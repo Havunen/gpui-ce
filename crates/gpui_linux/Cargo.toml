@@ -37,14 +37,15 @@ x11 = [
   "gpui_wgpu",
   "ashpd",
 
-    "as-raw-xcb-connection",
-    "x11rb",
-    "xkbcommon",
-    "xim",
-    "x11-clipboard",
-    "filedescriptor",
-    "open",
+  "as-raw-xcb-connection",
+  "x11rb",
+  "xkbcommon/x11",
+  "xim",
+  "x11-clipboard",
+  "filedescriptor",
+  "open",
 ]
+
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 accesskit.workspace = true
@@ -81,7 +82,7 @@ ashpd = { workspace = true, optional = true }
 bitflags = { workspace = true, optional = true }
 filedescriptor = { workspace = true, optional = true }
 open = { workspace = true, optional = true }
-xkbcommon = { workspace = true, features = ["wayland", "x11"], optional = true }
+xkbcommon = { workspace = true, default-features = false, optional = true }
 
 # Wayland
 calloop-wayland-source = { workspace = true, optional = true }

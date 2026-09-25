@@ -10,10 +10,11 @@ use anyhow::{Result, anyhow};
 use hdrhistogram::Histogram;
 
 use crate::{
-    AnyView, AnyWindowHandle, App, AppCell, AppContext, BackgroundExecutor, Bounds, Context, Empty,
-    Entity, EntityId, EventEmitter, Focusable, ForegroundExecutor, Global, Platform,
-    PlatformHeadlessRenderer, PlatformTextSystem, Render, Reservation, Task, TestPlatform,
-    ThreadedDispatcher, VisualContext, Window, WindowBounds, WindowHandle, WindowOptions,
+    AnyView, AnyWindowHandle, App, AppCell, AppContext, AssetRegistry, BackgroundExecutor, Bounds,
+    Context, Empty, Entity, EntityId, EventEmitter, Focusable, ForegroundExecutor, Global,
+    Platform, PlatformHeadlessRenderer, PlatformTextSystem, Render, Reservation, Task,
+    TestPlatform, ThreadedDispatcher, VisualContext, Window, WindowBounds, WindowHandle,
+    WindowOptions,
     app::GpuiBorrow,
     profiler::{
         self, FrameEvent, FrameTimingCollector,
@@ -526,13 +527,12 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
              ThreadedDispatcher; construct one with gpui::bench_platform"
         );
         let foreground_executor = platform.foreground_executor();
-        let asset_source = Arc::new(());
         // Benchmark setup must not make accidental network requests. The
         // production `BlockedHttpClient` is available without enabling the
         // configurable test double through `test-support`.
         let http_client: Arc<dyn crate::http_client::HttpClient> =
             Arc::new(crate::http_client::BlockedHttpClient::new());
-        let app = App::new_app(platform, asset_source, http_client);
+        let app = App::new_app(platform, AssetRegistry::default().into(), http_client);
 
         Self {
             app,
@@ -1303,6 +1303,45 @@ mod tests {
             "expected a ~20ms task poll to be recorded, got {:?}",
             summary.max
         );
+    }
+
+    #[test]
+    fn benchmark_contexts_forward_global_entity_operations() {
+        struct GlobalEntity;
+
+        let platform = bench_platform(None, Arc::new(crate::NoopTextSystem::new()));
+        let name = "benchmark_contexts_forward_global_entity_operations";
+        let mut criterion = criterion::Criterion::default()
+            .without_plots()
+            .sample_size(10)
+            .warm_up_time(Duration::from_millis(1))
+            .measurement_time(Duration::from_millis(1));
+
+        criterion.bench_function(name, |bencher| {
+            let mut app_cx = BenchAppContext::new(platform.clone(), Some(name), bencher);
+            let app_entity = app_cx.new(|_| GlobalEntity);
+            let mut window_cx = app_cx.add_empty_window();
+            let window_entity = window_cx.new(|_| GlobalEntity);
+
+            app_cx.bench_iter(|cx| {
+                cx.insert_global_entity(app_entity.clone());
+                assert_eq!(cx.global_entities::<GlobalEntity>().count(), 1);
+
+                window_cx.insert_global_entity(window_entity.clone());
+                assert_eq!(window_cx.global_entities::<GlobalEntity>().count(), 2);
+
+                window_cx.remove_global_entity(&window_entity);
+                assert_eq!(window_cx.global_entities::<GlobalEntity>().count(), 1);
+
+                cx.remove_global_entity(&app_entity);
+                assert!(cx.global_entities::<GlobalEntity>().next().is_none());
+            });
+
+            drop(window_entity);
+            drop(app_entity);
+            drop(window_cx);
+            app_cx.teardown();
+        });
     }
 
     #[test]

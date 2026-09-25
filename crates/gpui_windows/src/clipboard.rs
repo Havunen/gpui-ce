@@ -1,22 +1,17 @@
 use std::{ffi::OsString, os::windows::ffi::OsStringExt, sync::LazyLock, time::Duration};
 
+use crate::bindings::Windows::Win32::GlobalFree;
+use crate::bindings::Windows::Win32::{
+    CF_DIB, CF_HDROP, CF_UNICODETEXT, CloseClipboard, CountClipboardFormats, DragQueryFileW,
+    EmptyClipboard, EnumClipboardFormats, GMEM_MOVEABLE, GetClipboardData, GetClipboardFormatNameW,
+    GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, HDROP, HGLOBAL, OpenClipboard,
+    RegisterClipboardFormatW, SetClipboardData,
+};
 use crate::collections::FxHashMap;
 use anyhow::Result;
+use gpui_util::defer;
 use itertools::Itertools;
-use windows::Win32::{
-    Foundation::{HANDLE, HGLOBAL},
-    System::{
-        DataExchange::{
-            CloseClipboard, CountClipboardFormats, EmptyClipboard, EnumClipboardFormats,
-            GetClipboardData, GetClipboardFormatNameW, OpenClipboard, RegisterClipboardFormatW,
-            SetClipboardData,
-        },
-        Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
-        Ole::{CF_DIB, CF_HDROP, CF_UNICODETEXT},
-    },
-    UI::Shell::{DragQueryFileW, HDROP},
-};
-use windows::core::{Owned, PCWSTR};
+use windows_core::PCWSTR;
 
 use gpui::{
     ClipboardEntry, ClipboardItem, ClipboardString, ExternalPaths, Image, ImageFormat, hash,
@@ -25,22 +20,22 @@ use gpui::{
 const DRAGDROP_GET_FILES_COUNT: u32 = 0xFFFFFFFF;
 
 static CLIPBOARD_HASH_FORMAT: LazyLock<u32> =
-    LazyLock::new(|| register_clipboard_format(windows::core::w!("GPUI internal text hash")));
+    LazyLock::new(|| register_clipboard_format(windows_core::w!("GPUI internal text hash")));
 static CLIPBOARD_METADATA_FORMAT: LazyLock<u32> =
-    LazyLock::new(|| register_clipboard_format(windows::core::w!("GPUI internal metadata")));
+    LazyLock::new(|| register_clipboard_format(windows_core::w!("GPUI internal metadata")));
 static CLIPBOARD_SVG_FORMAT: LazyLock<u32> =
-    LazyLock::new(|| register_clipboard_format(windows::core::w!("image/svg+xml")));
+    LazyLock::new(|| register_clipboard_format(windows_core::w!("image/svg+xml")));
 static CLIPBOARD_GIF_FORMAT: LazyLock<u32> =
-    LazyLock::new(|| register_clipboard_format(windows::core::w!("GIF")));
+    LazyLock::new(|| register_clipboard_format(windows_core::w!("GIF")));
 static CLIPBOARD_PNG_FORMAT: LazyLock<u32> =
-    LazyLock::new(|| register_clipboard_format(windows::core::w!("PNG")));
+    LazyLock::new(|| register_clipboard_format(windows_core::w!("PNG")));
 static FILE_TRANSFER_FORMAT: LazyLock<u32> = LazyLock::new(|| {
-    register_clipboard_format(windows::core::w!("application/x-gpui-file-transfer"))
+    register_clipboard_format(windows_core::w!("application/x-gpui-file-transfer"))
 });
 static PREFERRED_DROP_EFFECT: LazyLock<u32> =
-    LazyLock::new(|| register_clipboard_format(windows::core::w!("Preferred DropEffect")));
+    LazyLock::new(|| register_clipboard_format(windows_core::w!("Preferred DropEffect")));
 static CLIPBOARD_JPG_FORMAT: LazyLock<u32> =
-    LazyLock::new(|| register_clipboard_format(windows::core::w!("JFIF")));
+    LazyLock::new(|| register_clipboard_format(windows_core::w!("JFIF")));
 
 static IMAGE_FORMATS_MAP: LazyLock<FxHashMap<u32, ImageFormat>> = LazyLock::new(|| {
     let mut map = FxHashMap::default();
@@ -68,7 +63,10 @@ fn register_clipboard_format(format: PCWSTR) -> u32 {
 }
 
 fn get_clipboard_data(format: u32) -> Option<LockedGlobal> {
-    let global = HGLOBAL(unsafe { GetClipboardData(format).ok() }?.0);
+    let global = unsafe { GetClipboardData(format) };
+    if global.is_invalid() {
+        return None;
+    }
     LockedGlobal::lock(global)
 }
 
@@ -84,7 +82,7 @@ pub(crate) fn write_to_clipboard(item: ClipboardItem) {
     };
 
     let result: Result<()> = (|| {
-        unsafe { EmptyClipboard()? };
+        unsafe { EmptyClipboard().ok()? };
         for entry in item.entries() {
             match entry {
                 ClipboardEntry::String(string) => write_string(string)?,
@@ -148,7 +146,7 @@ pub(crate) fn read_from_clipboard() -> Option<ClipboardItem> {
     for _ in 0..count {
         format = unsafe { EnumClipboardFormats(format) };
 
-        if !have_text && format == CF_UNICODETEXT.0 as u32 {
+        if !have_text && format == CF_UNICODETEXT as u32 {
             if let Some(entry) = read_string() {
                 entries.push(entry);
                 have_text = true;
@@ -158,7 +156,7 @@ pub(crate) fn read_from_clipboard() -> Option<ClipboardItem> {
                 entries.push(entry);
                 have_image = true;
             }
-        } else if !have_files && format == CF_HDROP.0 as u32 {
+        } else if !have_files && format == CF_HDROP as u32 {
             if let Some(entry) = read_files() {
                 entries.push(entry);
                 have_files = true;
@@ -177,11 +175,18 @@ pub(crate) fn with_file_names<F>(hdrop: HDROP, mut f: F)
 where
     F: FnMut(OsString),
 {
-    let file_count = unsafe { DragQueryFileW(hdrop, DRAGDROP_GET_FILES_COUNT, None) };
+    let file_count = unsafe { DragQueryFileW(hdrop, DRAGDROP_GET_FILES_COUNT, None, 0) };
     for file_index in 0..file_count {
-        let filename_length = unsafe { DragQueryFileW(hdrop, file_index, None) } as usize;
+        let filename_length = unsafe { DragQueryFileW(hdrop, file_index, None, 0) } as usize;
         let mut buffer = vec![0u16; filename_length + 1];
-        let ret = unsafe { DragQueryFileW(hdrop, file_index, Some(buffer.as_mut_slice())) };
+        let ret = unsafe {
+            DragQueryFileW(
+                hdrop,
+                file_index,
+                Some(windows_core::PWSTR(buffer.as_mut_ptr())),
+                buffer.len() as u32,
+            )
+        };
         if ret == 0 {
             log::error!("unable to read file name of dragged file");
             continue;
@@ -192,14 +197,26 @@ where
 
 fn set_clipboard_bytes<T>(data: &[T], format: u32) -> Result<()> {
     unsafe {
-        let global = Owned::new(GlobalAlloc(GMEM_MOVEABLE, std::mem::size_of_val(data))?);
-        let ptr = GlobalLock(*global);
+        let global = GlobalAlloc(GMEM_MOVEABLE as u32, std::mem::size_of_val(data));
+        anyhow::ensure!(
+            !global.is_invalid(),
+            "GlobalAlloc failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let free_global = defer(|| {
+            GlobalFree(global);
+        });
+        let ptr = GlobalLock(global);
         anyhow::ensure!(!ptr.is_null(), "GlobalLock returned null");
         std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as _, data.len());
-        GlobalUnlock(*global).ok();
-        SetClipboardData(format, Some(HANDLE(global.0)))?;
+        let _ = GlobalUnlock(global);
+        anyhow::ensure!(
+            !SetClipboardData(format, Some(global)).is_invalid(),
+            "SetClipboardData failed: {}",
+            std::io::Error::last_os_error()
+        );
         // SetClipboardData succeeded — the system now owns the memory.
-        std::mem::forget(global);
+        std::mem::forget(free_global);
     }
     Ok(())
 }
@@ -217,12 +234,12 @@ fn get_clipboard_string(format: u32) -> Option<String> {
 }
 
 fn is_image_format(format: u32) -> bool {
-    IMAGE_FORMATS_MAP.contains_key(&format) || format == CF_DIB.0 as u32
+    IMAGE_FORMATS_MAP.contains_key(&format) || format == CF_DIB as u32
 }
 
 fn write_string(item: &ClipboardString) -> Result<()> {
     let wide: Vec<u16> = item.text.encode_utf16().chain(Some(0)).collect_vec();
-    set_clipboard_bytes(&wide, CF_UNICODETEXT.0 as u32)?;
+    set_clipboard_bytes(&wide, CF_UNICODETEXT as u32)?;
 
     if let Some(metadata) = item.metadata.as_ref() {
         let hash_bytes = ClipboardString::text_hash(&item.text).to_ne_bytes();
@@ -248,7 +265,7 @@ fn write_files(files: &gpui::FileTransfer) -> Result<()> {
         }
     }
     bytes.extend(0u16.to_le_bytes());
-    set_clipboard_bytes(&bytes, CF_HDROP.0 as u32)?;
+    set_clipboard_bytes(&bytes, CF_HDROP as u32)?;
     let effect = if files.operation == gpui::FileTransferOperation::Move {
         2u32
     } else {
@@ -298,7 +315,7 @@ fn convert_to_png(bytes: &[u8], format: ImageFormat) -> Option<Vec<u8>> {
 }
 
 fn read_string() -> Option<ClipboardEntry> {
-    let text = get_clipboard_string(CF_UNICODETEXT.0 as u32)?;
+    let text = get_clipboard_string(CF_UNICODETEXT as u32)?;
     let metadata = read_clipboard_metadata(&text);
     Some(ClipboardEntry::String(ClipboardString { text, metadata }))
 }
@@ -315,7 +332,7 @@ fn read_clipboard_metadata(text: &str) -> Option<String> {
 
 fn read_image(format: u32) -> Option<ClipboardEntry> {
     let locked = get_clipboard_data(format)?;
-    let (bytes, image_format) = if format == CF_DIB.0 as u32 {
+    let (bytes, image_format) = if format == CF_DIB as u32 {
         (convert_dib_to_bmp(locked.as_bytes())?, ImageFormat::Bmp)
     } else {
         let image_format = *IMAGE_FORMATS_MAP.get(&format)?;
@@ -330,7 +347,7 @@ fn read_image(format: u32) -> Option<ClipboardEntry> {
 }
 
 fn read_files() -> Option<ClipboardEntry> {
-    let locked = get_clipboard_data(CF_HDROP.0 as u32)?;
+    let locked = get_clipboard_data(CF_HDROP as u32)?;
     let hdrop = HDROP(locked.ptr as *mut _);
     let mut filenames = Vec::new();
     with_file_names(hdrop, |name| filenames.push(std::path::PathBuf::from(name)));
@@ -380,7 +397,13 @@ fn log_unsupported_clipboard_formats() {
     for _ in 0..count {
         format = unsafe { EnumClipboardFormats(format) };
         let mut buffer = [0u16; 64];
-        unsafe { GetClipboardFormatNameW(format, &mut buffer) };
+        unsafe {
+            GetClipboardFormatNameW(
+                format,
+                windows_core::PWSTR(buffer.as_mut_ptr()),
+                buffer.len() as i32,
+            )
+        };
         let format_name = String::from_utf16_lossy(&buffer);
         log::warn!(
             "Try to paste with unsupported clipboard format: {}, {}.",
@@ -413,7 +436,7 @@ impl ClipboardGuard {
         const OPEN_CLIPBOARD_RETRY_DELAY: Duration = Duration::from_millis(10);
 
         for attempt in 0..OPEN_CLIPBOARD_RETRY_COUNT {
-            match unsafe { OpenClipboard(None) } {
+            match unsafe { OpenClipboard(None).ok() } {
                 Ok(()) => return Some(Self),
                 Err(e) if attempt + 1 == OPEN_CLIPBOARD_RETRY_COUNT => {
                     log::error!("Failed to open clipboard: {e}");
@@ -431,7 +454,7 @@ impl ClipboardGuard {
 
 impl Drop for ClipboardGuard {
     fn drop(&mut self) {
-        if let Err(e) = unsafe { CloseClipboard() } {
+        if let Err(e) = unsafe { CloseClipboard().ok() } {
             log::error!("Failed to close clipboard: {e}");
         }
     }
@@ -464,6 +487,6 @@ impl LockedGlobal {
 
 impl Drop for LockedGlobal {
     fn drop(&mut self) {
-        unsafe { GlobalUnlock(self.global).ok() };
+        let _ = unsafe { GlobalUnlock(self.global) };
     }
 }

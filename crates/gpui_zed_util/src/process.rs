@@ -133,44 +133,43 @@ impl Child {
 
 #[cfg(windows)]
 mod windows_job {
-    use crate::ResultExt as _;
-    use anyhow::{Context as _, Result};
-    use windows::Win32::{
-        Foundation::{CloseHandle, HANDLE},
-        System::{
-            JobObjects::{
-                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-                SetInformationJobObject, TerminateJobObject,
-            },
-            Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE},
-        },
+    use std::{
+        io,
+        os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+        ptr,
     };
+
+    use crate::windows_bindings::Windows::Win32::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation, OpenProcess,
+        PROCESS_SET_QUOTA, PROCESS_TERMINATE, SetInformationJobObject, TerminateJobObject,
+    };
+    use anyhow::{Context as _, Result};
 
     /// A Win32 job object configured with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`:
     /// all processes assigned to the job (and their descendants) are terminated
     /// when the last handle to the job is closed, which happens when this struct
     /// is dropped, or when the OS closes the owning process's handles after it
     /// exits for any reason.
-    pub(crate) struct JobObject(HANDLE);
-
-    // SAFETY: Job object handles can be used from any thread.
-    unsafe impl Send for JobObject {}
-    unsafe impl Sync for JobObject {}
+    pub(crate) struct JobObject(OwnedHandle);
 
     impl JobObject {
         pub(crate) fn new() -> Result<Self> {
             unsafe {
-                let job =
-                    Self(CreateJobObjectW(None, None).context("failed to create job object")?);
+                let handle = CreateJobObjectW(ptr::null(), ptr::null());
+                if handle.is_null() {
+                    return Err(io::Error::last_os_error()).context("failed to create job object");
+                }
+                // SAFETY: CreateJobObjectW returned a valid, newly owned handle.
+                let job = Self(OwnedHandle::from_raw_handle(handle));
                 let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-                SetInformationJobObject(
-                    job.0,
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE as u32;
+                check_bool(SetInformationJobObject(
+                    job.0.as_raw_handle(),
                     JobObjectExtendedLimitInformation,
                     &info as *const _ as *const _,
                     size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                )
+                ))
                 .context("failed to set job object limits")?;
                 Ok(job)
             }
@@ -178,25 +177,31 @@ mod windows_job {
 
         pub(crate) fn assign_process(&self, pid: u32) -> Result<()> {
             unsafe {
-                let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid)
-                    .context("failed to open process")?;
-                let result = AssignProcessToJobObject(self.0, process)
-                    .context("failed to assign process to job object");
-                CloseHandle(process).log_err();
-                result
+                let process = OpenProcess((PROCESS_SET_QUOTA | PROCESS_TERMINATE) as u32, 0, pid);
+                if process.is_null() {
+                    return Err(io::Error::last_os_error()).context("failed to open process");
+                }
+                // SAFETY: OpenProcess returned a valid, newly owned handle.
+                let process = OwnedHandle::from_raw_handle(process);
+                check_bool(AssignProcessToJobObject(
+                    self.0.as_raw_handle(),
+                    process.as_raw_handle(),
+                ))
+                .context("failed to assign process to job object")
             }
         }
 
         pub(crate) fn terminate(&self) -> Result<()> {
-            unsafe { TerminateJobObject(self.0, 1).context("failed to terminate job object") }
+            unsafe { check_bool(TerminateJobObject(self.0.as_raw_handle(), 1)) }
+                .context("failed to terminate job object")
         }
     }
 
-    impl Drop for JobObject {
-        fn drop(&mut self) {
-            unsafe {
-                CloseHandle(self.0).log_err();
-            }
+    fn check_bool(success: i32) -> io::Result<()> {
+        if success == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
         }
     }
 }
@@ -206,44 +211,52 @@ mod windows_tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    /// Spawns a process tree `shell -> ping` via `Child::spawn` and
+    /// Spawns a process tree `powershell -> ping` via `Child::spawn` and
     /// returns the `Child` along with the pid of the grandchild (`ping`).
-    fn spawn_process_tree(temp_dir: &std::path::Path) -> Option<(Child, u32)> {
+    fn spawn_process_tree(temp_dir: &std::path::Path) -> (Child, u32) {
         let pid_file = temp_dir.join("grandchild_pid");
-        let script = format!(
-            "$p = Start-Process -FilePath ping.exe -ArgumentList @('-n','60','127.0.0.1') -PassThru -WindowStyle Hidden; \
-             Set-Content -LiteralPath '{}' -Value $p.Id; \
-             Wait-Process -Id $p.Id",
-            pid_file.display()
-        );
-        let mut child = None;
-        for shell in ["pwsh.exe", "powershell.exe"] {
-            let mut command = std::process::Command::new(shell);
-            command.args(["-NoProfile", "-Command"]).arg(&script);
-            if let Ok(spawned) = Child::spawn(command, Stdio::null(), Stdio::null(), Stdio::null())
-            {
-                child = Some(spawned);
-                break;
-            }
-        }
-        let child = match child {
-            Some(child) => child,
-            None => {
-                eprintln!("skipping: neither pwsh.exe nor powershell.exe is available");
-                return None;
-            }
-        };
+        // Single quotes don't escape themselves in PowerShell; double them so
+        // temp paths containing `'` can't break out of the literal.
+        let pid_file_literal = pid_file.display().to_string().replace('\'', "''");
+        let mut command = std::process::Command::new("powershell.exe");
+        // `-ExecutionPolicy Bypass` keeps locked-down CI images from refusing
+        // to run the snippet, and writing the pid with the .NET API (rather
+        // than `Set-Content`) pins the encoding to plain ASCII without a BOM
+        // on both Windows PowerShell 5.1 and PowerShell 7+.
+        command
+            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"])
+            .arg(format!(
+                "$ErrorActionPreference='Stop'; \
+                 $p = Start-Process -FilePath ping.exe -ArgumentList @('-n','60','127.0.0.1') -PassThru -WindowStyle Hidden; \
+                 [System.IO.File]::WriteAllText('{pid_file_literal}', \"$($p.Id)\", [System.Text.Encoding]::ASCII); \
+                 Wait-Process -Id $p.Id"
+            ));
+        // Capture powershell's stderr so a startup failure (missing binary,
+        // policy violation, bad path quoting, ...) is visible in the panic
+        // below instead of vanishing into the null device.
+        let stderr_log = std::fs::File::create(temp_dir.join("powershell-stderr.log"))
+            .expect("failed to create powershell stderr log");
+        let child = Child::spawn(
+            command,
+            Stdio::null(),
+            Stdio::null(),
+            Stdio::from(stderr_log),
+        )
+        .expect("failed to spawn powershell");
 
-        let deadline = Instant::now() + Duration::from_secs(30);
+        // PowerShell cold start (JIT + Defender scan) can take several seconds
+        // on CI, especially with sibling tests starting their own instances
+        // concurrently, so allow ample headroom before declaring the handoff
+        // lost.
+        let deadline = Instant::now() + Duration::from_secs(20);
         let grandchild_pid = loop {
-            if let Ok(contents) = std::fs::read_to_string(&pid_file)
-                && let Ok(pid) = contents.trim().parse::<u32>()
-            {
+            if let Some(pid) = read_grandchild_pid(&pid_file) {
                 break pid;
             }
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting for grandchild pid file"
+                "timed out waiting for grandchild pid file: {}",
+                describe_pid_handoff(temp_dir, &pid_file)
             );
             std::thread::sleep(Duration::from_millis(50));
         };
@@ -251,43 +264,90 @@ mod windows_tests {
             process_is_alive(grandchild_pid),
             "grandchild should be alive after spawning"
         );
-        Some((child, grandchild_pid))
+        (child, grandchild_pid)
     }
 
     fn process_is_alive(pid: u32) -> bool {
-        use windows::Win32::{
-            Foundation::{CloseHandle, STILL_ACTIVE},
-            System::Threading::{
-                GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-            },
+        use crate::windows_bindings::Windows::Win32::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, STILL_ACTIVE,
         };
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
         unsafe {
-            let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION as u32, 0, pid);
+            if handle.is_null() {
                 return false;
-            };
+            }
+            // SAFETY: OpenProcess returned a valid, newly owned handle.
+            let handle = OwnedHandle::from_raw_handle(handle);
             let mut exit_code = 0u32;
-            let alive = GetExitCodeProcess(handle, &mut exit_code).is_ok()
-                && exit_code == STILL_ACTIVE.0 as u32;
-            CloseHandle(handle).expect("failed to close process handle");
-            alive
+            GetExitCodeProcess(handle.as_raw_handle(), &mut exit_code) != 0
+                && exit_code == STILL_ACTIVE as u32
         }
     }
 
+    /// Reads the grandchild pid without assuming an encoding: PowerShell
+    /// output may carry a BOM or trailing newlines depending on version and
+    /// host configuration, so decode lossily and parse the digit run.
+    fn read_grandchild_pid(pid_file: &std::path::Path) -> Option<u32> {
+        let bytes = std::fs::read(pid_file).ok()?;
+        let text = String::from_utf8_lossy(&bytes);
+        // Strip a UTF-8/UTF-16 BOM if one was emitted, then accept the pid
+        // surrounded by arbitrary whitespace/newlines.
+        let text = text.trim().trim_start_matches('\u{feff}').trim();
+        text.parse::<u32>().ok()
+    }
+
+    /// Builds a diagnostic summary for a pid-handoff timeout: whether the
+    /// file appeared (and what it contains), what else is in the temp dir,
+    /// and any stderr PowerShell left behind.
+    fn describe_pid_handoff(temp_dir: &std::path::Path, pid_file: &std::path::Path) -> String {
+        let pid_state = match std::fs::read(pid_file) {
+            Ok(bytes) => format!(
+                "pid file exists ({} bytes, contents: {:?})",
+                bytes.len(),
+                String::from_utf8_lossy(&bytes)
+            ),
+            Err(error) => format!("pid file missing ({error})"),
+        };
+        let dir_state = match std::fs::read_dir(temp_dir) {
+            Ok(entries) => {
+                let names: Vec<String> = entries
+                    .filter_map(|entry| {
+                        entry
+                            .ok()
+                            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    })
+                    .collect();
+                format!("temp dir entries: {names:?}")
+            }
+            Err(error) => format!("temp dir unreadable ({error})"),
+        };
+        let stderr_state = match std::fs::read_to_string(temp_dir.join("powershell-stderr.log")) {
+            Ok(log) if log.trim().is_empty() => "powershell stderr: <empty>".to_string(),
+            Ok(log) => format!("powershell stderr: {log:?}"),
+            Err(error) => format!("powershell stderr log unreadable ({error})"),
+        };
+        format!(
+            "{pid_state}; {dir_state}; {stderr_state}; pid file: {}",
+            pid_file.display()
+        )
+    }
+
     fn assert_process_exits(pid: u32, message: &str) {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // Job-object termination is normally near-instant, but allow headroom
+        // for a loaded CI worker to reap the whole tree.
+        let deadline = Instant::now() + Duration::from_secs(10);
         while process_is_alive(pid) {
             assert!(Instant::now() < deadline, "{message} (pid {pid})");
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 
     #[test]
     fn test_kill_terminates_grandchildren() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let Some((mut child, grandchild_pid)) = spawn_process_tree(temp_dir.path()) else {
-            return;
-        };
+        let (mut child, grandchild_pid) = spawn_process_tree(temp_dir.path());
 
         child.kill().expect("failed to kill child");
 
@@ -300,9 +360,7 @@ mod windows_tests {
     #[test]
     fn test_drop_terminates_grandchildren() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let Some((child, grandchild_pid)) = spawn_process_tree(temp_dir.path()) else {
-            return;
-        };
+        let (child, grandchild_pid) = spawn_process_tree(temp_dir.path());
 
         drop(child);
 

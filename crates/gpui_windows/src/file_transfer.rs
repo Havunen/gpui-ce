@@ -1,32 +1,29 @@
 //! Shell data object wrapper retaining transfer-result formats for the caller.
+use crate::bindings::Windows::Win32::*;
 use gpui::{FileTransfer, FileTransferCompletion, FileTransferOperation};
 use std::{cell::RefCell, os::windows::ffi::OsStrExt, rc::Rc, sync::LazyLock};
-use windows::{
-    Win32::{
-        Foundation::{E_INVALIDARG, E_OUTOFMEMORY, GlobalFree, HWND},
-        System::{Com::*, DataExchange::RegisterClipboardFormatW, Memory::*, Ole::*},
-        UI::Shell::*,
-    },
-    core::{BOOL, HRESULT, PCWSTR, Ref, Result, implement},
-};
+use windows_core::{BOOL, Error, GUID, HRESULT, Interface, PCWSTR, Ref, Result, implement};
+
+const EFFECT_COPY: u32 = DROPEFFECT_COPY as u32;
+const EFFECT_MOVE: u32 = DROPEFFECT_MOVE as u32;
 
 static PREFERRED: LazyLock<u16> = LazyLock::new(|| unsafe {
-    RegisterClipboardFormatW(windows::core::w!("Preferred DropEffect")) as u16
+    RegisterClipboardFormatW(windows_core::w!("Preferred DropEffect")) as u16
 });
 static PERFORMED: LazyLock<u16> = LazyLock::new(|| unsafe {
-    RegisterClipboardFormatW(windows::core::w!("Performed DropEffect")) as u16
+    RegisterClipboardFormatW(windows_core::w!("Performed DropEffect")) as u16
 });
 static LOGICAL: LazyLock<u16> = LazyLock::new(|| unsafe {
-    RegisterClipboardFormatW(windows::core::w!("Logical Performed DropEffect")) as u16
+    RegisterClipboardFormatW(windows_core::w!("Logical Performed DropEffect")) as u16
 });
 static PASTED: LazyLock<u16> = LazyLock::new(|| unsafe {
-    RegisterClipboardFormatW(windows::core::w!("Paste Succeeded")) as u16
+    RegisterClipboardFormatW(windows_core::w!("Paste Succeeded")) as u16
 });
 static PRIVATE: LazyLock<u16> = LazyLock::new(|| unsafe {
-    RegisterClipboardFormatW(windows::core::w!("application/x-gpui-file-transfer")) as u16
+    RegisterClipboardFormatW(windows_core::w!("application/x-gpui-file-transfer")) as u16
 });
 static TARGET_CLSID: LazyLock<u16> =
-    LazyLock::new(|| unsafe { RegisterClipboardFormatW(windows::core::w!("TargetCLSID")) as u16 });
+    LazyLock::new(|| unsafe { RegisterClipboardFormatW(windows_core::w!("TargetCLSID")) as u16 });
 
 #[derive(Default)]
 struct TransferResult {
@@ -48,19 +45,29 @@ struct FileDataObject {
     clipboard: bool,
 }
 
+/// Forwards an inner result unchanged. `HRESULT::ok` would collapse success
+/// codes such as `S_FALSE` or `DATA_S_SAMEFORMATETC` into `S_OK`.
+fn forward(result: HRESULT) -> Result<()> {
+    if result == S_OK {
+        Ok(())
+    } else {
+        Err(Error::from_hresult(result))
+    }
+}
+
 #[allow(non_snake_case)]
 impl IDataObject_Impl for FileDataObject_Impl {
     fn GetData(&self, f: *const FORMATETC) -> Result<STGMEDIUM> {
         unsafe { self.inner.GetData(f) }
     }
     fn GetDataHere(&self, f: *const FORMATETC, m: *mut STGMEDIUM) -> Result<()> {
-        unsafe { self.inner.GetDataHere(f, m) }
+        forward(unsafe { self.inner.GetDataHere(f, m) })
     }
-    fn QueryGetData(&self, f: *const FORMATETC) -> HRESULT {
-        unsafe { self.inner.QueryGetData(f) }
+    fn QueryGetData(&self, f: *const FORMATETC) -> Result<()> {
+        forward(unsafe { self.inner.QueryGetData(f) })
     }
-    fn GetCanonicalFormatEtc(&self, f: *const FORMATETC, out: *mut FORMATETC) -> HRESULT {
-        unsafe { self.inner.GetCanonicalFormatEtc(f, out) }
+    fn GetCanonicalFormatEtc(&self, f: *const FORMATETC, out: *mut FORMATETC) -> Result<()> {
+        forward(unsafe { self.inner.GetCanonicalFormatEtc(f, out) })
     }
     fn EnumFormatEtc(&self, direction: u32) -> Result<IEnumFORMATETC> {
         unsafe { self.inner.EnumFormatEtc(direction) }
@@ -69,7 +76,7 @@ impl IDataObject_Impl for FileDataObject_Impl {
         unsafe { self.inner.DAdvise(f, flags, sink.as_ref()) }
     }
     fn DUnadvise(&self, connection: u32) -> Result<()> {
-        unsafe { self.inner.DUnadvise(connection) }
+        forward(unsafe { self.inner.DUnadvise(connection) })
     }
     fn EnumDAdvise(&self) -> Result<IEnumSTATDATA> {
         unsafe { self.inner.EnumDAdvise() }
@@ -80,18 +87,18 @@ impl IDataObject_Impl for FileDataObject_Impl {
         }
         // The caller owns valid FORMATETC/STGMEDIUM arguments for this COM call.
         // Read before forwarding: the underlying object may consume the medium.
-        let format = unsafe { (*f).cfFormat };
+        let format = unsafe { (*f).cfFormat.0 };
         let recycle_bin = unsafe {
             if format == *TARGET_CLSID
-                && (*medium).tymed == TYMED_HGLOBAL.0 as u32
-                && GlobalSize((*medium).u.hGlobal) >= std::mem::size_of::<windows::core::GUID>()
+                && (*medium).tymed == TYMED_HGLOBAL as u32
+                && GlobalSize((*medium).Anonymous.hGlobal) >= std::mem::size_of::<GUID>()
             {
-                let ptr = GlobalLock((*medium).u.hGlobal);
+                let ptr = GlobalLock((*medium).Anonymous.hGlobal);
                 if ptr.is_null() {
                     false
                 } else {
-                    let clsid = std::ptr::read_unaligned(ptr.cast::<windows::core::GUID>());
-                    let _ = GlobalUnlock((*medium).u.hGlobal);
+                    let clsid = std::ptr::read_unaligned(ptr.cast::<GUID>());
+                    let _ = GlobalUnlock((*medium).Anonymous.hGlobal);
                     clsid == CLSID_RecycleBin
                 }
             } else {
@@ -99,13 +106,15 @@ impl IDataObject_Impl for FileDataObject_Impl {
             }
         };
         let value = unsafe {
-            if (*medium).tymed == TYMED_HGLOBAL.0 as u32 && GlobalSize((*medium).u.hGlobal) >= 4 {
-                let ptr = GlobalLock((*medium).u.hGlobal);
+            if (*medium).tymed == TYMED_HGLOBAL as u32
+                && GlobalSize((*medium).Anonymous.hGlobal) >= 4
+            {
+                let ptr = GlobalLock((*medium).Anonymous.hGlobal);
                 if ptr.is_null() {
                     None
                 } else {
                     let value = std::ptr::read_unaligned(ptr.cast::<u32>());
-                    let _ = GlobalUnlock((*medium).u.hGlobal);
+                    let _ = GlobalUnlock((*medium).Anonymous.hGlobal);
                     Some(value)
                 }
             } else {
@@ -113,7 +122,7 @@ impl IDataObject_Impl for FileDataObject_Impl {
             }
         };
         unsafe {
-            self.inner.SetData(f, medium, release.as_bool())?;
+            forward(self.inner.SetData(f, medium, release.as_bool()))?;
         }
         if let Some(value) = value {
             let mut state = self.result.borrow_mut();
@@ -129,9 +138,9 @@ impl IDataObject_Impl for FileDataObject_Impl {
             }
             if self.clipboard && format == *PASTED && !state.reported && !state.in_operation {
                 state.reported = true;
-                let operation = if value != 0 && state.recycle_bin || value == DROPEFFECT_MOVE.0 {
+                let operation = if value != 0 && state.recycle_bin || value == EFFECT_MOVE {
                     Some(FileTransferOperation::Move)
-                } else if value == DROPEFFECT_COPY.0 {
+                } else if value == EFFECT_COPY {
                     Some(FileTransferOperation::Copy)
                 } else {
                     None
@@ -141,8 +150,7 @@ impl IDataObject_Impl for FileDataObject_Impl {
                 FileTransferCompletion {
                     files: self.files.clone(),
                     operation,
-                    source_removed: !state.recycle_bin
-                        && state.performed != Some(DROPEFFECT_MOVE.0),
+                    source_removed: !state.recycle_bin && state.performed != Some(EFFECT_MOVE),
                 }
                 .report();
             }
@@ -152,9 +160,9 @@ impl IDataObject_Impl for FileDataObject_Impl {
 }
 
 fn transfer_operation(effect: u32) -> Option<FileTransferOperation> {
-    if effect == DROPEFFECT_MOVE.0 {
+    if effect == EFFECT_MOVE {
         Some(FileTransferOperation::Move)
-    } else if effect == DROPEFFECT_COPY.0 {
+    } else if effect == EFFECT_COPY {
         Some(FileTransferOperation::Copy)
     } else {
         None
@@ -202,7 +210,7 @@ impl IDataObjectAsyncCapability_Impl for FileDataObject_Impl {
             FileTransferCompletion {
                 files: self.files.clone(),
                 operation,
-                source_removed: !state.recycle_bin && effects != DROPEFFECT_MOVE.0,
+                source_removed: !state.recycle_bin && effects != EFFECT_MOVE,
             }
             .report();
         }
@@ -225,28 +233,31 @@ impl Drop for FileDataObject {
 
 fn set_bytes(object: &IDataObject, format: u16, bytes: &[u8]) -> Result<()> {
     unsafe {
-        let memory = GlobalAlloc(GMEM_MOVEABLE, bytes.len())?;
+        let memory = GlobalAlloc(GMEM_MOVEABLE as u32, bytes.len());
+        if memory.is_invalid() {
+            return Err(Error::from_thread());
+        }
         let ptr = GlobalLock(memory);
         if ptr.is_null() {
-            let _ = GlobalFree(Some(memory));
-            return Err(windows::core::Error::from(E_OUTOFMEMORY));
+            let _ = GlobalFree(memory);
+            return Err(E_OUTOFMEMORY.into());
         }
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast(), bytes.len());
         let _ = GlobalUnlock(memory);
         let format = FORMATETC {
-            cfFormat: format,
+            cfFormat: CLIPFORMAT(format),
             ptd: std::ptr::null_mut(),
-            dwAspect: DVASPECT_CONTENT.0,
+            dwAspect: DVASPECT_CONTENT as u32,
             lindex: -1,
-            tymed: TYMED_HGLOBAL.0 as u32,
+            tymed: TYMED_HGLOBAL as u32,
         };
         let medium = STGMEDIUM {
-            tymed: TYMED_HGLOBAL.0 as u32,
-            u: STGMEDIUM_0 { hGlobal: memory },
+            tymed: TYMED_HGLOBAL as u32,
+            Anonymous: uSTGMEDIUM_0 { hGlobal: memory },
             pUnkForRelease: std::mem::ManuallyDrop::new(None),
         };
-        if let Err(error) = object.SetData(&format, &medium, true) {
-            let _ = GlobalFree(Some(memory));
+        if let Err(error) = object.SetData(&format, &medium, true).ok() {
+            let _ = GlobalFree(memory);
             return Err(error);
         }
     }
@@ -257,11 +268,11 @@ fn data_object(
     files: FileTransfer,
     clipboard: bool,
 ) -> Result<(IDataObject, Rc<RefCell<TransferResult>>)> {
-    struct IdLists(Vec<*mut Common::ITEMIDLIST>);
+    struct IdLists(Vec<LPITEMIDLIST>);
     impl Drop for IdLists {
         fn drop(&mut self) {
             for list in &self.0 {
-                unsafe { CoTaskMemFree(Some((*list).cast())) };
+                unsafe { CoTaskMemFree(list.cast()) };
             }
         }
     }
@@ -274,7 +285,14 @@ fn data_object(
         native.push(0);
         let mut pidl = std::ptr::null_mut();
         unsafe {
-            SHParseDisplayName(PCWSTR(native.as_ptr()), None, &mut pidl, 0, None)?;
+            SHParseDisplayName(
+                PCWSTR(native.as_ptr()),
+                None::<&IBindCtx>,
+                &mut pidl,
+                SFGAOF(0),
+                None,
+            )
+            .ok()?;
         }
         lists.0.push(pidl);
     }
@@ -283,13 +301,13 @@ fn data_object(
             &lists.0.iter().map(|p| p.cast_const()).collect::<Vec<_>>(),
         )?
     };
-    let inner: IDataObject = unsafe { items.BindToHandler(None, &BHID_DataObject)? };
+    let inner: IDataObject = unsafe { items.BindToHandler(None::<&IBindCtx>, &BHID_DataObject)? };
     let preferred = if files.operation == FileTransferOperation::Move {
-        DROPEFFECT_MOVE
+        EFFECT_MOVE
     } else {
-        DROPEFFECT_COPY
+        EFFECT_COPY
     };
-    set_bytes(&inner, *PREFERRED, &preferred.0.to_le_bytes())?;
+    set_bytes(&inner, *PREFERRED, &preferred.to_le_bytes())?;
     if let Some(bytes) = files.encode(gpui::FILE_TRANSFER_MIME) {
         set_bytes(&inner, *PRIVATE, &bytes)?;
     }
@@ -309,7 +327,7 @@ fn data_object(
 
 pub(crate) fn write_files(files: FileTransfer) -> Result<()> {
     let (object, _) = data_object(files, true)?;
-    unsafe { OleSetClipboard(&object) }
+    unsafe { OleSetClipboard(&object).ok() }
 }
 
 pub(crate) fn drag_files(window: HWND, files: FileTransfer) -> Option<FileTransferCompletion> {
@@ -320,28 +338,28 @@ pub(crate) fn drag_files(window: HWND, files: FileTransfer) -> Option<FileTransf
     };
     if let Ok((object, result)) = data_object(files.clone(), false) {
         let allowed = if files.operation == FileTransferOperation::Move {
-            DROPEFFECT_COPY | DROPEFFECT_MOVE
+            EFFECT_COPY | EFFECT_MOVE
         } else {
-            DROPEFFECT_COPY
+            EFFECT_COPY
         };
-        if let Ok(effect) = unsafe { SHDoDragDrop(Some(window), &object, None, allowed) } {
+        if let Ok(effect) =
+            unsafe { SHDoDragDrop(Some(window), &object, None::<&IDropSource>, allowed) }
+        {
             let mut state = result.borrow_mut();
-            state.drag_effect = Some(effect.0);
+            state.drag_effect = Some(effect);
             if state.in_operation || state.reported {
                 return None;
             }
-            let logical = state.logical.unwrap_or(effect.0);
-            completion.operation =
-                if logical != 0 && state.recycle_bin || logical == DROPEFFECT_MOVE.0 {
-                    Some(FileTransferOperation::Move)
-                } else if logical == DROPEFFECT_COPY.0 {
-                    Some(FileTransferOperation::Copy)
-                } else {
-                    None
-                };
+            let logical = state.logical.unwrap_or(effect);
+            completion.operation = if logical != 0 && state.recycle_bin || logical == EFFECT_MOVE {
+                Some(FileTransferOperation::Move)
+            } else if logical == EFFECT_COPY {
+                Some(FileTransferOperation::Copy)
+            } else {
+                None
+            };
             completion.source_removed = !state.recycle_bin
-                && (effect != DROPEFFECT_MOVE
-                    || state.performed.is_some_and(|p| p != DROPEFFECT_MOVE.0));
+                && (effect != EFFECT_MOVE || state.performed.is_some_and(|p| p != EFFECT_MOVE));
         }
     }
     Some(completion)
@@ -350,7 +368,6 @@ pub(crate) fn drag_files(window: HWND, files: FileTransfer) -> Option<FileTransf
 /// Shell completion is delivered to the captured IDataObject, never to whichever
 /// application happens to own the clipboard after the filesystem worker ends.
 pub(crate) fn capture_paste(files: &FileTransfer) -> Option<gpui::FilePaste> {
-    use windows::Win32::System::{DataExchange::GetClipboardSequenceNumber, Ole::OleGetClipboard};
     let sequence = unsafe { GetClipboardSequenceNumber() };
     let object = unsafe { OleGetClipboard() }.ok()?;
     if crate::clipboard::read_from_clipboard()?
@@ -366,16 +383,16 @@ pub(crate) fn capture_paste(files: &FileTransfer) -> Option<gpui::FilePaste> {
             return;
         };
         let logical = if operation == FileTransferOperation::Move {
-            DROPEFFECT_MOVE.0
+            EFFECT_MOVE
         } else {
-            DROPEFFECT_COPY.0
+            EFFECT_COPY
         };
         // Our filesystem service has already moved the originals. Reporting
         // an optimized move prevents the source from deleting them again.
         let performed = if operation == FileTransferOperation::Move {
             0u32
         } else {
-            DROPEFFECT_COPY.0
+            EFFECT_COPY
         };
         let result = set_bytes(&object, *PERFORMED, &performed.to_le_bytes())
             .and_then(|_| set_bytes(&object, *LOGICAL, &logical.to_le_bytes()))
@@ -392,7 +409,6 @@ pub(crate) fn capture_drop(
     object: &IDataObject,
     operation: FileTransferOperation,
 ) -> gpui::FileDropTransfer {
-    use windows::core::Interface;
     let object = object.clone();
     let asynchronous =
         object
@@ -402,7 +418,7 @@ pub(crate) fn capture_drop(
                 capability
                     .GetAsyncMode()
                     .is_ok_and(|enabled| enabled.as_bool())
-                    && capability.StartOperation(None).is_ok()
+                    && capability.StartOperation(None::<&IBindCtx>).is_ok()
             });
     gpui::FileDropTransfer {
         operation,
@@ -410,13 +426,13 @@ pub(crate) fn capture_drop(
         completion: gpui::FilePaste::new(move |completed| {
             let logical = completed.map_or(0, |operation| {
                 if operation == FileTransferOperation::Move {
-                    DROPEFFECT_MOVE.0
+                    EFFECT_MOVE
                 } else {
-                    DROPEFFECT_COPY.0
+                    EFFECT_COPY
                 }
             });
             let performed = if completed == Some(FileTransferOperation::Copy) {
-                DROPEFFECT_COPY.0
+                EFFECT_COPY
             } else {
                 0
             };
@@ -426,12 +442,10 @@ pub(crate) fn capture_drop(
                 log::error!("Could not report file drop completion: {error}");
             }
             if let Some(capability) = asynchronous {
-                let result = if completed.is_some() {
-                    windows::Win32::Foundation::S_OK
-                } else {
-                    windows::Win32::Foundation::E_ABORT
-                };
-                if let Err(error) = unsafe { capability.EndOperation(result, None, performed) } {
+                let result = if completed.is_some() { S_OK } else { E_ABORT };
+                if let Err(error) =
+                    unsafe { capability.EndOperation(result, None::<&IBindCtx>, performed) }.ok()
+                {
                     log::error!("Could not finish asynchronous file drop: {error}");
                 }
             }

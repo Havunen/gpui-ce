@@ -1,0 +1,3 @@
+// Windows shader compiler used by gpui_render's build script.
+Windows.Win32.D3DCompile
+Windows.Win32.ID3D10Blob::{GetBufferPointer, GetBufferSize}

@@ -1,15 +1,14 @@
 #![cfg(target_os = "windows")]
 
+#[rustfmt::skip]
+mod bindings;
+
 mod clipboard;
 mod destination_list;
 mod direct_manipulation;
-#[cfg(not(feature = "wgpu"))]
 mod direct_write;
-#[cfg(not(feature = "wgpu"))]
 mod directx_atlas;
-#[cfg(not(feature = "wgpu"))]
 mod directx_devices;
-#[cfg(not(feature = "wgpu"))]
 mod directx_renderer;
 mod dispatcher;
 mod display;
@@ -27,13 +26,9 @@ mod wrapper;
 pub(crate) use self::util::*;
 pub(crate) use clipboard::*;
 pub(crate) use destination_list::*;
-#[cfg(not(feature = "wgpu"))]
 pub(crate) use direct_write::*;
-#[cfg(not(feature = "wgpu"))]
 pub(crate) use directx_atlas::*;
-#[cfg(not(feature = "wgpu"))]
 pub(crate) use directx_devices::*;
-#[cfg(not(feature = "wgpu"))]
 pub(crate) use directx_renderer::*;
 pub(crate) use dispatcher::*;
 pub(crate) use display::*;
@@ -49,4 +44,4 @@ pub(crate) use wrapper::*;
 
 pub use platform::WindowsPlatform;
 
-pub(crate) use windows::Win32::Foundation::HWND;
+pub(crate) use crate::bindings::Windows::Win32::HWND;

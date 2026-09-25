@@ -118,6 +118,13 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Sets the whitespace of the element.
+    /// [Docs](https://tailwindcss.com/docs/whitespace)
+    fn whitespace(mut self, white_space: WhiteSpace) -> Self {
+        self.text_style().white_space = Some(white_space);
+        self
+    }
+
     /// Sets the whitespace of the element to `normal`.
     /// [Docs](https://tailwindcss.com/docs/whitespace#normal)
     fn whitespace_normal(mut self) -> Self {
@@ -569,6 +576,20 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Sets the length of each border dash as a multiple of the border width.
+    fn border_dashed_length(mut self, length_per_border_width: f32) -> Self {
+        self.style().border_dashed_length = Some(length_per_border_width.max(0.0));
+
+        self
+    }
+
+    /// Sets the gap between border dashes as a multiple of the border width.
+    fn border_dashed_gap(mut self, gap_per_border_width: f32) -> Self {
+        self.style().border_dashed_gap = Some(gap_per_border_width.max(0.0));
+
+        self
+    }
+
     /// Returns a mutable reference to the text style that has been configured on this element.
     fn text_style(&mut self) -> &mut TextStyleRefinement {
         let style: &mut StyleRefinement = self.style();
@@ -966,6 +987,23 @@ pub trait Styled: Sized {
     #[cfg(debug_assertions)]
     fn debug_below(mut self) -> Self {
         self.style().debug_below = Some(true);
+        self
+    }
+
+    /// Sets the amount of smoothing applied to rounded corners.
+    /// Use values from `0.0` for circular corners to `1.0` for maximum smoothing.
+    fn rounded_smoothing(mut self, amount: f32) -> Self {
+        debug_assert!(
+            (0.0..=1.0).contains(&amount),
+            "corner smoothing must be between 0 and 1"
+        );
+        self.style().corner_smoothing = Some(amount);
+        self
+    }
+
+    /// Sets corner smoothing to `0.6` for iOS-style corners.
+    fn rounded_smoothing_ios(mut self) -> Self {
+        self.style().corner_smoothing = Some(0.6);
         self
     }
 }

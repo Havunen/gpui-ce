@@ -458,7 +458,7 @@ mod tests {
 
     use proptest::prelude::*;
     use rand::prelude::*;
-    use scheduler::SpawnTime;
+    use scheduler::{Instant, SpawnTime};
 
     use crate::{
         self as gpui, Context, FocusHandle, InteractiveElement, IntoElement, Modifiers,
@@ -479,8 +479,8 @@ mod tests {
 
     actions!(hang_test, [HangyAction]);
 
-    // Well above legitimate per-event work in a test app (layout of one div,
-    // empty polls), well below the injected hangs.
+    // Injected hangs exceed this threshold. Ordinary work can also exceed it
+    // when the test runner is busy.
     const HANG_THRESHOLD: Duration = Duration::from_millis(10);
     // Equal to the threshold, mirroring how production wires the detector
     // today.
@@ -492,7 +492,7 @@ mod tests {
     /// dirty-to-present association.
     #[test]
     fn a_hang_outliving_the_frame_deadline_keeps_its_frame_association() {
-        let start = scheduler::Instant::now();
+        let start = Instant::now();
         let window_id = WindowId::from(0x51E17);
         let hang_end = start + FRAME_DEADLINE * 5;
         let presented_at = hang_end + Duration::from_millis(16);
@@ -538,7 +538,7 @@ mod tests {
 
     #[test]
     fn serialized_incident_reports_presented_seal_fields() {
-        let startup = scheduler::Instant::now();
+        let startup = Instant::now();
         let at = |ms: u64| startup + Duration::from_millis(ms);
         let window_id = WindowId::from(0xF1E1D);
 
@@ -624,7 +624,7 @@ mod tests {
 
     #[test]
     fn serialized_incident_reports_idle_seal_fields() {
-        let startup = scheduler::Instant::now();
+        let startup = Instant::now();
         let at = |ms: u64| startup + Duration::from_millis(ms);
 
         let idle = FrameSnapshot {
@@ -650,7 +650,7 @@ mod tests {
 
     #[test]
     fn phase_is_startup_until_the_first_present() {
-        let startup = scheduler::Instant::now();
+        let startup = Instant::now();
         let at = |ms: u64| startup + Duration::from_millis(ms);
         let snapshot = FrameSnapshot {
             interval_start: at(500),
@@ -688,7 +688,7 @@ mod tests {
         let mut detector = HangDetector::new(journal, HANG_THRESHOLD, FRAME_BUDGET);
         let window_id = WindowId::from(0x1A7C4);
 
-        let first_present_end = scheduler::Instant::now();
+        let first_present_end = Instant::now();
         record_present(
             presentation(window_id, first_present_end),
             Some(frame(window_id, first_present_end)),
@@ -716,7 +716,7 @@ mod tests {
     /// (PR #62779 review finding 5).
     #[test]
     fn busy_fraction_excludes_small_polls_outside_the_active_window() {
-        let startup = scheduler::Instant::now();
+        let startup = Instant::now();
         let at = |ms: u64| startup + Duration::from_millis(ms);
         let snapshot = FrameSnapshot {
             interval_start: at(0),
@@ -750,7 +750,7 @@ mod tests {
     /// what filled the interval.
     #[test]
     fn an_interval_of_small_work_over_budget_is_an_incident() {
-        let startup = scheduler::Instant::now();
+        let startup = Instant::now();
         let at = |ms: u64| startup + Duration::from_millis(ms);
         let window_id = WindowId::from(0xB0D6E7);
         let snapshot = FrameSnapshot {
@@ -797,7 +797,7 @@ mod tests {
 
     #[test]
     fn a_journal_gap_suppresses_budget_inference_but_retains_observed_hangs() {
-        let start = scheduler::Instant::now();
+        let start = Instant::now();
         let at = |ms: u64| start + Duration::from_millis(ms);
         let mut sealer = super::super::journal::IntervalSealer::new(start);
         let snapshots = sealer.push_entries([
@@ -836,7 +836,7 @@ mod tests {
     /// the budget measures foreground spend, not dirty-to-present time.
     #[test]
     fn a_slow_frame_with_little_foreground_spend_is_not_an_incident() {
-        let startup = scheduler::Instant::now();
+        let startup = Instant::now();
         let at = |ms: u64| startup + Duration::from_millis(ms);
         let window_id = WindowId::from(0xFA57);
         let snapshot = FrameSnapshot {
@@ -870,7 +870,7 @@ mod tests {
     /// with accumulated sub-threshold work.
     #[test]
     fn an_idle_sealed_interval_over_budget_is_an_incident() {
-        let startup = scheduler::Instant::now();
+        let startup = Instant::now();
         let at = |ms: u64| startup + Duration::from_millis(ms);
         let snapshot = FrameSnapshot {
             interval_start: at(0),
@@ -899,7 +899,7 @@ mod tests {
     /// blocks of equal wall time.
     #[test]
     fn serialized_contributors_are_chronological_with_nesting_depths() {
-        let startup = scheduler::Instant::now();
+        let startup = Instant::now();
         let at = |ms: u64| startup + Duration::from_millis(ms);
         let window_id = WindowId::from(0x2E57ED);
         let snapshot = FrameSnapshot {
@@ -950,7 +950,7 @@ mod tests {
     /// has no contributors and the small-poll summary carries the story.
     #[test]
     fn small_poll_spend_alone_can_reach_the_budget() {
-        let startup = scheduler::Instant::now();
+        let startup = Instant::now();
         let at = |ms: u64| startup + Duration::from_millis(ms);
         let window_id = WindowId::from(0xDE1A7);
         let snapshot = FrameSnapshot {
@@ -1007,7 +1007,7 @@ mod tests {
             frame_budget_ms in 0u16..=500,
             small_poll_total_ms in 0u16..=100,
         ) {
-            let origin = scheduler::Instant::now();
+            let origin = Instant::now();
             let mut cursor_ms = 0u64;
             let events = durations_ms
                 .iter()
@@ -1084,6 +1084,15 @@ mod tests {
         render: Rc<Cell<Option<Duration>>>,
         input: Rc<Cell<Option<Duration>>>,
         action: Rc<Cell<Option<Duration>>>,
+        completed: Rc<Cell<Option<(Instant, Instant)>>>,
+    }
+
+    impl HangControls {
+        fn block_for(&self, duration: Duration) {
+            let start = Instant::now();
+            thread::sleep(duration);
+            self.completed.set(Some((start, Instant::now())));
+        }
     }
 
     struct HangyView {
@@ -1094,7 +1103,7 @@ mod tests {
     impl Render for HangyView {
         fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             if let Some(duration) = self.controls.render.take() {
-                thread::sleep(duration);
+                self.controls.block_for(duration);
             }
             let action_controls = self.controls.clone();
             let input_controls = self.controls.clone();
@@ -1103,12 +1112,12 @@ mod tests {
                 .track_focus(&self.focus_handle)
                 .on_action(cx.listener(move |_, _: &HangyAction, _, _| {
                     if let Some(duration) = action_controls.action.take() {
-                        thread::sleep(duration);
+                        action_controls.block_for(duration);
                     }
                 }))
                 .on_mouse_down(MouseButton::Left, move |_, _, _| {
                     if let Some(duration) = input_controls.input.take() {
-                        thread::sleep(duration);
+                        input_controls.block_for(duration);
                     }
                 })
         }
@@ -1120,6 +1129,13 @@ mod tests {
         Input,
         Action,
         Poll,
+    }
+
+    #[derive(Debug)]
+    struct InjectedHang {
+        kind: HangKind,
+        start: Instant,
+        end: Instant,
     }
 
     /// Renders a real element tree and injects randomly ordered, randomly
@@ -1141,7 +1157,7 @@ mod tests {
         });
         draw_window(cx);
 
-        let mut injected: Vec<(HangKind, Duration)> = Vec::new();
+        let mut injected = Vec::new();
         for _ in 0..rng.random_range(1..=4) {
             let duration = HANG_THRESHOLD + Duration::from_millis(rng.random_range(5..25));
             let kind = match rng.random_range(0..4) {
@@ -1166,11 +1182,15 @@ mod tests {
                     HangKind::Action
                 }
                 _ => {
-                    simulate_blocked_foreground_poll(duration);
+                    simulate_blocked_foreground_poll(&controls, duration);
                     HangKind::Poll
                 }
             };
-            injected.push((kind, duration));
+            let (start, end) = controls
+                .completed
+                .take()
+                .expect("hang callback did not run");
+            injected.push(InjectedHang { kind, start, end });
 
             // Innocent interleaved activity that must not confuse detection.
             if rng.random_bool(0.5) {
@@ -1190,49 +1210,76 @@ mod tests {
             .flat_map(|incident| incident.contributors.iter().copied())
             .collect();
 
-        for kind in [
-            HangKind::Render,
-            HangKind::Input,
-            HangKind::Action,
-            HangKind::Poll,
-        ] {
-            let expected: Vec<Duration> = injected
-                .iter()
-                .filter(|(injected_kind, _)| *injected_kind == kind)
-                .map(|(_, duration)| *duration)
-                .collect();
-            let observed: Vec<Duration> = contributors
-                .iter()
-                .filter(|event| matches_kind(event, kind) && event.duration() >= HANG_THRESHOLD)
-                .map(|event| event.duration())
-                .collect();
-            assert_all_matched(kind, expected, observed);
-        }
+        assert_all_matched(&injected, &contributors);
     }
 
     /// Every injected hang must be covered by a distinct observed contributor
-    /// at least as long as the injected sleep (sleeps never wake early).
-    fn assert_all_matched(
-        kind: HangKind,
-        mut expected: Vec<Duration>,
-        mut observed: Vec<Duration>,
-    ) {
-        assert_eq!(
-            observed.len(),
-            expected.len(),
-            "expected every observed {kind:?} hang to correspond to one injection; \
-             expected {expected:?}, observed {observed:?}"
-        );
-        expected.sort_unstable_by(|a, b| b.cmp(a));
-        observed.sort_unstable_by(|a, b| b.cmp(a));
-        let mut observed = observed.into_iter();
-        for expected_duration in expected {
-            let matched = observed.find(|observed| *observed >= expected_duration);
-            assert!(
-                matched.is_some(),
-                "injected {kind:?} hang of {expected_duration:?} was not detected"
-            );
+    /// spanning its actual sleep. Other slow events are legitimate on a busy
+    /// runner, but must not stand in for missing injections.
+    fn assert_all_matched(expected: &[InjectedHang], observed: &[ForegroundEvent]) {
+        let mut unmatched = observed.to_vec();
+        for injection in expected {
+            let matched = unmatched.iter().position(|event| {
+                matches_kind(event, injection.kind)
+                    && event.start_time() <= injection.start
+                    && event.end_time() >= injection.end
+            });
+            let matched = matched.unwrap_or_else(|| {
+                panic!("injected {injection:?} was not detected; observed {observed:?}")
+            });
+            unmatched.remove(matched);
         }
+    }
+
+    #[test]
+    fn injected_hangs_allow_unrelated_slow_events() {
+        let start = Instant::now();
+        let duration = HANG_THRESHOLD * 2;
+        let injected = [InjectedHang {
+            kind: HangKind::Poll,
+            start: start + duration * 2,
+            end: start + duration * 3,
+        }];
+        let observed = [
+            task_poll_event(start, start + duration),
+            task_poll_event(start + duration * 2, start + duration * 4),
+        ];
+        assert_all_matched(&injected, &observed);
+    }
+
+    #[test]
+    #[should_panic(expected = "was not detected")]
+    fn unrelated_slow_events_cannot_replace_an_injected_hang() {
+        let start = Instant::now();
+        let duration = HANG_THRESHOLD * 2;
+        let injected = [InjectedHang {
+            kind: HangKind::Poll,
+            start: start + duration * 2,
+            end: start + duration * 3,
+        }];
+        let observed = [task_poll_event(start, start + duration)];
+        assert_all_matched(&injected, &observed);
+    }
+
+    #[test]
+    #[should_panic(expected = "was not detected")]
+    fn injected_hangs_require_distinct_contributors() {
+        let start = Instant::now();
+        let duration = HANG_THRESHOLD * 2;
+        let injected = [
+            InjectedHang {
+                kind: HangKind::Poll,
+                start,
+                end: start + duration,
+            },
+            InjectedHang {
+                kind: HangKind::Poll,
+                start: start + duration,
+                end: start + duration * 2,
+            },
+        ];
+        let observed = [task_poll_event(start, start + duration * 2)];
+        assert_all_matched(&injected, &observed);
     }
 
     fn matches_kind(event: &ForegroundEvent, kind: HangKind) -> bool {
@@ -1260,14 +1307,14 @@ mod tests {
     /// The deterministic test scheduler does not bracket runnables with the
     /// profiler hooks, so drive the same public hooks the platform
     /// dispatchers call around a poll that blocks the foreground.
-    fn simulate_blocked_foreground_poll(duration: Duration) {
+    fn simulate_blocked_foreground_poll(controls: &HangControls, duration: Duration) {
         let location = std::panic::Location::caller();
-        crate::profiler::update_running_task(SpawnTime(scheduler::Instant::now()), location);
-        thread::sleep(duration);
+        crate::profiler::update_running_task(SpawnTime(Instant::now()), location);
+        controls.block_for(duration);
         crate::profiler::save_task_timing();
     }
 
-    fn task_poll_event(start: scheduler::Instant, end: scheduler::Instant) -> ForegroundEvent {
+    fn task_poll_event(start: Instant, end: Instant) -> ForegroundEvent {
         ForegroundEvent::TaskPoll(TaskTiming {
             location: std::panic::Location::caller(),
             spawned: SpawnTime(start),
@@ -1276,7 +1323,7 @@ mod tests {
         })
     }
 
-    fn presentation(window_id: WindowId, present_end: scheduler::Instant) -> PresentTiming {
+    fn presentation(window_id: WindowId, present_end: Instant) -> PresentTiming {
         PresentTiming {
             window_id,
             present_start: present_end - Duration::from_millis(1),
@@ -1285,7 +1332,7 @@ mod tests {
         }
     }
 
-    fn frame(window_id: WindowId, draw_end: scheduler::Instant) -> FrameTiming {
+    fn frame(window_id: WindowId, draw_end: Instant) -> FrameTiming {
         FrameTiming {
             window_id,
             dirty_at: Some(draw_end - Duration::from_millis(2)),

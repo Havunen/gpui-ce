@@ -1,15 +1,10 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use crate::bindings::Windows::Win32::*;
 use anyhow::Result;
 use gpui::*;
 use gpui_util::ResultExt;
-use windows::Win32::{
-    Foundation::*,
-    Graphics::{DirectManipulation::*, Gdi::*},
-    System::Com::*,
-    UI::{Input::Pointer::*, WindowsAndMessaging::*},
-};
 
 use crate::*;
 
@@ -45,12 +40,14 @@ impl DirectManipulationHandler {
                 | DIRECTMANIPULATION_CONFIGURATION_RAILS_X
                 | DIRECTMANIPULATION_CONFIGURATION_RAILS_Y
                 | DIRECTMANIPULATION_CONFIGURATION_SCALING;
-            viewport.ActivateConfiguration(configuration)?;
+            viewport.ActivateConfiguration(configuration).ok()?;
 
-            viewport.SetViewportOptions(
-                DIRECTMANIPULATION_VIEWPORT_OPTIONS_MANUALUPDATE
-                    | DIRECTMANIPULATION_VIEWPORT_OPTIONS_DISABLEPIXELSNAPPING,
-            )?;
+            viewport
+                .SetViewportOptions(
+                    DIRECTMANIPULATION_VIEWPORT_OPTIONS_MANUALUPDATE
+                        | DIRECTMANIPULATION_VIEWPORT_OPTIONS_DISABLEPIXELSNAPPING,
+                )
+                .ok()?;
 
             let mut rect = RECT {
                 left: 0,
@@ -58,10 +55,10 @@ impl DirectManipulationHandler {
                 right: DEFAULT_VIEWPORT_SIZE,
                 bottom: DEFAULT_VIEWPORT_SIZE,
             };
-            viewport.SetViewportRect(&mut rect)?;
+            viewport.SetViewportRect(&mut rect).ok()?;
 
-            manager.Activate(window)?;
-            viewport.Enable()?;
+            manager.Activate(window).ok()?;
+            viewport.Enable().ok()?;
 
             let scale_factor = Rc::new(Cell::new(scale_factor));
             let pending_events = Rc::new(RefCell::new(Vec::new()));
@@ -76,7 +73,7 @@ impl DirectManipulationHandler {
 
             let handler_cookie = viewport.AddEventHandler(Some(window), &event_handler)?;
 
-            update_manager.Update(None)?;
+            update_manager.Update(None).ok()?;
 
             Ok(Self {
                 manager,
@@ -98,16 +95,17 @@ impl DirectManipulationHandler {
         unsafe {
             let pointer_id = wparam.loword() as u32;
             let mut pointer_type = POINTER_INPUT_TYPE::default();
-            if GetPointerType(pointer_id, &mut pointer_type).is_ok() && pointer_type == PT_TOUCHPAD
+            if GetPointerType(pointer_id, &mut pointer_type).ok().is_ok()
+                && pointer_type == POINTER_INPUT_TYPE(PT_TOUCHPAD as u32)
             {
-                self.viewport.SetContact(pointer_id).log_err();
+                self.viewport.SetContact(pointer_id).ok().log_err();
             }
         }
     }
 
     pub fn update(&self) {
         unsafe {
-            self.update_manager.Update(None).log_err();
+            self.update_manager.Update(None).ok().log_err();
         }
     }
 
@@ -119,9 +117,9 @@ impl DirectManipulationHandler {
 impl Drop for DirectManipulationHandler {
     fn drop(&mut self) {
         unsafe {
-            self.viewport.Stop().log_err();
-            self.viewport.Abandon().log_err();
-            self.manager.Deactivate(self.window).log_err();
+            self.viewport.Stop().ok().log_err();
+            self.viewport.Abandon().ok().log_err();
+            self.manager.Deactivate(self.window).ok().log_err();
         }
     }
 }
@@ -196,7 +194,7 @@ impl DirectManipulationEventHandler {
         let scale_factor = self.scale_factor.get();
         unsafe {
             let mut point: POINT = std::mem::zeroed();
-            let _ = GetCursorPos(&mut point);
+            let _ = GetCursorPos(&mut point).ok();
             let _ = ScreenToClient(self.window, &mut point);
             logical_point(point.x as f32, point.y as f32, scale_factor)
         }
@@ -238,6 +236,7 @@ impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHan
                                 DEFAULT_VIEWPORT_SIZE as f32,
                                 false,
                             )
+                            .ok()
                             .log_err();
                     }
                 }
@@ -268,7 +267,9 @@ impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHan
         // Get the 6-element content transform: [scale, 0, 0, scale, tx, ty]
         let mut xform = [0.0f32; 6];
         unsafe {
-            content.GetContentTransform(&mut xform)?;
+            content
+                .GetContentTransform(xform.as_mut_ptr(), xform.len() as u32)
+                .ok()?;
         }
 
         let scale = xform[0];

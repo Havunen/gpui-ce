@@ -493,10 +493,11 @@ impl Element for Img {
                         .get_bounds(bounds, data.size(layout_state.frame_index));
                     let corner_radii = style.corner_radii.to_pixels(window.rem_size());
                     window
-                        .paint_image(
+                        .paint_image_with_corner_smoothing(
                             bounds,
                             new_bounds,
                             corner_radii,
+                            style.corner_smoothing.unwrap_or_default(),
                             data,
                             layout_state.frame_index,
                             self.style.grayscale,
@@ -628,7 +629,7 @@ impl Asset for ImageAssetLoader {
         // TODO: Can we make SVGs always rescale?
         // let scale_factor = cx.scale_factor();
         let svg_renderer = cx.svg_renderer();
-        let asset_source = cx.asset_source().clone();
+        let asset_registry = cx.assets().clone();
         async move {
             let bytes = match source.clone() {
                 Resource::Path(uri) => fs::read(uri.as_ref())?,
@@ -652,7 +653,7 @@ impl Asset for ImageAssetLoader {
                     response.body
                 }
                 Resource::Embedded(path) => {
-                    let data = asset_source.load(&path).ok().flatten();
+                    let data = asset_registry.load(&path);
                     if let Some(data) = data {
                         data.to_vec()
                     } else {

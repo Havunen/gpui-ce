@@ -45,6 +45,7 @@ pub(crate) struct TestWindowState {
     input_handler: Option<PlatformInputHandler>,
     text_input_configurations: Vec<TextInputConfiguration>,
     text_input_state_changes: Vec<TextInputStateChange>,
+    visible: bool,
     is_fullscreen: bool,
     appearance: WindowAppearance,
     external_drag_files: Vec<(PathBuf, bool)>,
@@ -109,6 +110,7 @@ impl TestWindow {
             input_handler: None,
             text_input_configurations: Vec::new(),
             text_input_state_changes: Vec::new(),
+            visible: params.show,
             is_fullscreen: false,
             appearance: WindowAppearance::Light,
             external_drag_files: Vec::new(),
@@ -138,6 +140,11 @@ impl TestWindow {
         self.0.lock().frame_scheduled
     }
 
+    /// Returns whether this test window is visible.
+    pub fn is_visible(&self) -> bool {
+        self.0.lock().visible
+    }
+
     /// Every [`TextInputConfiguration`] forwarded to this window, in order.
     pub fn text_input_configurations(&self) -> Vec<TextInputConfiguration> {
         self.0.lock().text_input_configurations.clone()
@@ -158,6 +165,19 @@ impl TestWindow {
         drop(lock);
         callback(size, scale_factor);
         self.0.lock().resize_callback = Some(callback);
+    }
+
+    /// Moves the window to `origin` without resizing it and delivers the
+    /// platform's moved callback.
+    pub fn simulate_move(&self, origin: Point<Pixels>) {
+        let mut lock = self.0.lock();
+        lock.bounds.origin = origin;
+        let Some(mut callback) = lock.moved_callback.take() else {
+            return;
+        };
+        drop(lock);
+        callback();
+        self.0.lock().moved_callback = Some(callback);
     }
 
     pub(crate) fn simulate_active_status_change(&self, active: bool) {
@@ -340,6 +360,10 @@ impl PlatformWindow for TestWindow {
 
     fn set_background_appearance(&self, _background: WindowBackgroundAppearance) {}
 
+    fn set_visible(&self, visible: bool) {
+        self.0.lock().visible = visible;
+    }
+
     fn set_edited(&mut self, edited: bool) {
         self.0.lock().edited = edited;
     }
@@ -454,11 +478,6 @@ impl PlatformWindow for TestWindow {
 
     fn as_test(&mut self) -> Option<&mut TestWindow> {
         Some(self)
-    }
-
-    #[cfg(target_os = "windows")]
-    fn get_raw_handle(&self) -> windows::Win32::Foundation::HWND {
-        unimplemented!()
     }
 
     fn show_window_menu(&self, _position: Point<Pixels>) {

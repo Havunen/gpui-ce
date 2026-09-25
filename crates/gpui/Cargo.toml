@@ -11,15 +11,16 @@ homepage = "https://gpui-ce.github.io/"
 readme = "README.md"
 keywords = ["desktop", "gui", "immediate"]
 categories = ["gui"]
-
+rust-version = "1.95" # required for Vec::push_mut
 
 [lints]
 workspace = true
 
 [features]
 default = ["font-kit", "wayland", "x11", "windows-manifest"]
-# Enables `SurfaceSource::Texture` + `gpu_context()` on Windows. Turned on by
-# `gpui_windows/wgpu`, which is what actually puts the wgpu renderer there.
+# Enables the opt-in custom WGPU control API on platforms that support shared
+# texture surfaces.
+custom-gpu = []
 wgpu-surfaces = []
 test-support = [
   "leak-detection",
@@ -35,9 +36,11 @@ inspector = ["gpui_macros/inspector"]
 leak-detection = ["backtrace"]
 wayland = []
 x11 = []
+screen-capture = ["dep:windows-capture"]
 windows-manifest = ["dep:embed-resource"]
 profiler = ["dep:hdrhistogram"]
 stacker = ["dep:stacksafe"]
+embedded-assets = ["dep:rust-embed"]
 
 [lib]
 name = "gpui"
@@ -84,6 +87,7 @@ resvg = { workspace = true, default-features = false, features = [
     "memmap-fonts",
     "raster-images"
 ] }
+rust-embed = { version = "8.12", optional = true }
 usvg = { workspace = true, default-features = false }
 skrifa.workspace = true
 schemars.workspace = true
@@ -127,10 +131,11 @@ objc2 = { workspace = true, optional = true }
 objc2-metal = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.62", features = ["Win32_Foundation"] }
-
+windows-capture = { workspace = true, optional = true }
+windows-core.workspace = true
 
 [dev-dependencies]
+accesskit_consumer.workspace = true
 backtrace.workspace = true
 smol.workspace = true
 collections = { workspace = true, features = ["test-support"] }
@@ -217,6 +222,10 @@ path = "examples/learn/haptic_feedback.rs"
 [[example]]
 name = "blur"
 path = "examples/learn/blur.rs"
+
+[[example]]
+name = "corner_smoothing"
+path = "examples/learn/corner_smoothing.rs"
 
 [[example]]
 name = "keyring"

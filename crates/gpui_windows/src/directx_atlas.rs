@@ -1,13 +1,10 @@
+use crate::bindings::Windows::Win32::{
+    D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Device,
+    ID3D11DeviceContext, ID3D11ShaderResourceView, ID3D11Texture2D, *,
+};
 use collections::FxHashMap;
 use etagere::BucketedAtlasAllocator;
 use parking_lot::Mutex;
-use windows::Win32::Graphics::{
-    Direct3D11::{
-        D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-        ID3D11Device, ID3D11DeviceContext, ID3D11ShaderResourceView, ID3D11Texture2D,
-    },
-    Dxgi::Common::*,
-};
 
 use gpui::{
     AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTextureList, AtlasTile, Bounds, DevicePixels,
@@ -90,6 +87,13 @@ impl PlatformAtlas for DirectXAtlas {
             let Some((size, bytes)) = build()? else {
                 return Ok(None);
             };
+            // Validate before allocation: a rejected bitmap must never leave a cached,
+            // uninitialized tile that every later glyph/SVG lookup treats as successful.
+            key.texture_kind().validate_upload(size, &bytes)?;
+            anyhow::ensure!(
+                size.width.0 <= 16384 && size.height.0 <= 16384,
+                "atlas tile {size:?} exceeds the Direct3D 11 texture limit"
+            );
             let tile = lock
                 .allocate(size, key.texture_kind())
                 .ok_or_else(|| anyhow::anyhow!("failed to allocate"))?;
@@ -213,7 +217,7 @@ impl DirectXAtlasState {
                 Quality: 0,
             },
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: bind_flag.0 as u32,
+            BindFlags: bind_flag as u32,
             CPUAccessFlags: 0,
             MiscFlags: 0,
         };
@@ -223,6 +227,7 @@ impl DirectXAtlasState {
             // So it's ok to return None here.
             self.device
                 .CreateTexture2D(&texture_desc, None, Some(&mut texture))
+                .ok()
                 .ok()?;
         }
         let texture = texture.unwrap();
@@ -237,6 +242,7 @@ impl DirectXAtlasState {
             let mut view = None;
             self.device
                 .CreateShaderResourceView(&texture, None, Some(&mut view))
+                .ok()
                 .ok()?;
             [view]
         };
@@ -296,24 +302,8 @@ impl DirectXAtlasTexture {
         bounds: Bounds<DevicePixels>,
         bytes: &[u8],
     ) {
-        // `UpdateSubresource` reads `row_pitch * height` bytes from `bytes` based on the
-        // `D3D11_BOX` below. If the caller hands us a slice shorter than that, the driver would
-        // over-read past the end of the source buffer (potentially by multiple megabytes), so bail
-        // out instead. This is a first-insert path rather than a per-frame one, so the check is
-        // effectively free.
-        let row_bytes = bounds.size.width.to_bytes(self.bytes_per_pixel as u8) as usize;
-        let expected = row_bytes * bounds.size.height.0.max(0) as usize;
-        if bytes.len() < expected {
-            log::error!(
-                "DirectXAtlasTexture::upload: source slice is {} bytes but the {}x{} region \
-                 requires {} bytes; skipping upload to avoid a driver over-read",
-                bytes.len(),
-                bounds.size.width.0,
-                bounds.size.height.0,
-                expected,
-            );
-            return;
-        }
+        // The insertion boundary validates the exact byte count before allocating this tile.
+        debug_assert!(self.id.kind.validate_upload(bounds.size, bytes).is_ok());
         unsafe {
             device_context.UpdateSubresource(
                 &self.texture,
@@ -356,15 +346,12 @@ fn etagere_point_to_device(value: etagere::Point) -> Point<DevicePixels> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bindings::Windows::Win32::{
+        D3D_DRIVER_TYPE_WARP, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
+        D3D11CreateDevice, HMODULE,
+    };
     use gpui::{ImageId, RenderImageParams};
     use std::borrow::Cow;
-    use windows::Win32::{
-        Foundation::HMODULE,
-        Graphics::{
-            Direct3D::D3D_DRIVER_TYPE_WARP,
-            Direct3D11::{D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11CreateDevice},
-        },
-    };
 
     fn create_atlas() -> Option<DirectXAtlas> {
         let mut device: Option<ID3D11Device> = None;
@@ -374,13 +361,14 @@ mod tests {
                 None,
                 D3D_DRIVER_TYPE_WARP,
                 HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT as u32,
                 None,
-                D3D11_SDK_VERSION,
+                D3D11_SDK_VERSION as u32,
                 Some(&mut device),
                 None,
                 Some(&mut device_context),
             )
+            .ok()
         }
         .ok()?;
         Some(DirectXAtlas::new(&device?, &device_context?))

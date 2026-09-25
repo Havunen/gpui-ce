@@ -23,14 +23,17 @@ use itertools::Itertools;
 use parking_lot::RwLock;
 use slotmap::SlotMap;
 
-use crate::collections::{FxHashMap, FxHashSet, HashMap, TypeIdHashMap, TypeIdHashSet, VecDeque};
-use crate::util::debug_panic;
+use crate::{
+    AssetRegistry,
+    http_client::{HttpClient, NullHttpClient},
+};
 pub use async_context::*;
 #[cfg(feature = "bench-support")]
 pub use bench_context::{BenchAppContext, BenchReport, BenchWindowContext, bench_platform};
+use collections::{FxHashMap, FxHashSet, HashMap, TypeIdHashMap, TypeIdHashSet, VecDeque};
 pub use context::*;
 pub use entity_map::*;
-use gpui_util::ResultExt;
+use gpui_util::{ResultExt, debug_panic};
 #[cfg(any(test, feature = "test-support"))]
 pub use headless_app_context::*;
 use smallvec::SmallVec;
@@ -47,19 +50,18 @@ use crate::InspectorElementRegistry;
 use crate::MacActivationPolicy;
 use crate::{
     Action, ActionBuildError, ActionRegistry, Any, AnyView, AnyWindowHandle, AppContext, Arena,
-    ArenaBox, Asset, AssetSource, BackgroundExecutor, Bounds, ClipboardItem, ClipboardReadError,
-    CursorStyle, DispatchPhase, DisplayId, EventEmitter, FocusHandle, FocusMap, ForegroundExecutor,
-    Global, HapticFeedbackStyle, KeyBinding, KeyContext, Keymap, Keystroke, LayoutId, Menu,
-    MenuItem, OwnedMenu, PathPromptOptions, Pixels, Platform, PlatformDisplay,
+    ArenaBox, Asset, BackgroundExecutor, Bounds, ClipboardItem, ClipboardReadError, CursorStyle,
+    DispatchPhase, DisplayId, EventEmitter, ExternalDragPayload, FocusHandle, FocusMap,
+    ForegroundExecutor, Global, HapticFeedbackStyle, KeyBinding, KeyContext, Keymap, Keystroke,
+    LayoutId, Menu, MenuItem, OwnedMenu, PathPromptOptions, Pixels, Platform, PlatformDisplay,
     PlatformKeyboardLayout, PlatformKeyboardMapper, Point, Priority, PromptBuilder, PromptButton,
     PromptHandle, PromptLevel, Render, RenderImage, RenderablePromptHandle, Reservation,
-    SharedString, SubscriberSet, Subscription, SvgRenderer, SystemNotification,
-    SystemNotificationResponse, Task, TextRenderingMode, TextSystem, ThermalState, Window,
-    WindowAppearance, WindowButtonLayout, WindowHandle, WindowId, WindowInvalidator,
+    ScreenCaptureSource, SharedString, SubscriberSet, Subscription, SvgRenderer,
+    SystemNotification, SystemNotificationResponse, Task, TextRenderingMode, TextSystem,
+    ThermalState, Window, WindowAppearance, WindowButtonLayout, WindowHandle, WindowId,
+    WindowInvalidator,
     colors::{Colors, GlobalColors},
-    hash,
-    http_client::{HttpClient, NullHttpClient},
-    init_app_menus,
+    hash, init_app_menus,
 };
 
 mod async_context;
@@ -181,7 +183,7 @@ impl Application {
     pub fn with_platform(platform: Rc<dyn Platform>) -> Self {
         Self(App::new_app(
             platform,
-            Arc::new(()),
+            AssetRegistry::default().into(),
             Arc::new(NullHttpClient),
         ))
     }
@@ -202,11 +204,11 @@ impl Application {
     }
 
     /// Assigns the source of assets for the application.
-    pub fn with_assets(self, asset_source: impl AssetSource) -> Self {
+    pub fn with_assets(self, assets: impl Into<AssetRegistry>) -> Self {
         let mut context_lock = self.0.borrow_mut();
-        let asset_source = Arc::new(asset_source);
-        context_lock.asset_source = asset_source.clone();
-        context_lock.svg_renderer = SvgRenderer::new(asset_source);
+        let asset_registry = Arc::new(assets.into());
+        context_lock.asset_registry = asset_registry.clone();
+        context_lock.svg_renderer = SvgRenderer::new(asset_registry);
         drop(context_lock);
         self
     }
@@ -760,7 +762,7 @@ pub struct App {
 
     // assets
     pub(crate) loading_assets: FxHashMap<(TypeId, u64), Box<dyn Any>>,
-    asset_source: Arc<dyn AssetSource>,
+    asset_registry: Arc<AssetRegistry>,
     pub(crate) svg_renderer: SvgRenderer,
     http_client: Arc<dyn HttpClient>,
 
@@ -808,7 +810,7 @@ impl App {
     #[allow(clippy::new_ret_no_self)]
     pub(crate) fn new_app(
         platform: Rc<dyn Platform>,
-        asset_source: Arc<dyn AssetSource>,
+        asset_registry: Arc<AssetRegistry>,
         http_client: Arc<dyn HttpClient>,
     ) -> Rc<AppCell> {
         let background_executor = platform.background_executor();
@@ -845,9 +847,9 @@ impl App {
                 foreground_executor,
                 #[cfg(feature = "profiler")]
                 foreground_journal,
-                svg_renderer: SvgRenderer::new(asset_source.clone()),
+                svg_renderer: SvgRenderer::new(asset_registry.clone()),
                 loading_assets: Default::default(),
-                asset_source,
+                asset_registry,
                 http_client,
                 globals_by_type: Default::default(),
                 global_entities: Default::default(),
@@ -1288,7 +1290,6 @@ impl App {
     /// Register additional GPU device requirements (extra features and/or
     /// limits) before opening any windows.  The `Box` must contain a
     /// `gpui_wgpu::WgpuDeviceRequirements`.
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     pub fn set_gpu_requirements(&self, requirements: Box<dyn std::any::Any>) {
         self.platform.set_gpu_requirements(requirements);
     }
@@ -1370,6 +1371,18 @@ impl App {
     /// Returns the primary display that will be used for new windows.
     pub fn primary_display(&self) -> Option<Rc<dyn PlatformDisplay>> {
         self.platform.primary_display()
+    }
+
+    /// Returns whether `screen_capture_sources` may work.
+    pub fn is_screen_capture_supported(&self) -> bool {
+        self.platform.is_screen_capture_supported()
+    }
+
+    /// Returns a list of available screen capture sources.
+    pub fn screen_capture_sources(
+        &self,
+    ) -> oneshot::Receiver<Result<Vec<Rc<dyn ScreenCaptureSource>>>> {
+        self.platform.screen_capture_sources()
     }
 
     /// Returns the display with the given ID, if one exists.
@@ -2057,8 +2070,8 @@ impl App {
     }
 
     /// Accessor for the application's asset source, which is provided when constructing the `App`.
-    pub fn asset_source(&self) -> &Arc<dyn AssetSource> {
-        &self.asset_source
+    pub fn assets(&self) -> &Arc<AssetRegistry> {
+        &self.asset_registry
     }
 
     /// Accessor for the text system.
@@ -2577,21 +2590,44 @@ impl App {
         self.active_drag.is_some()
     }
 
+    /// Returns a reference to the current drag payload.
+    pub fn active_drag(&self) -> Option<&AnyDrag> {
+        self.active_drag.as_ref()
+    }
+
     /// Gets the cursor style of the currently active drag operation.
     pub fn active_drag_cursor_style(&self) -> Option<CursorStyle> {
         self.active_drag.as_ref().and_then(|drag| drag.cursor_style)
     }
 
-    /// Stops active drag and clears any related effects.
-    pub fn stop_active_drag(&mut self, window: &mut Window) -> bool {
-        if self.active_drag.is_some() {
-            self.active_drag = None;
-            if self.platform_owned_drag.as_ref().is_some_and(|drag| {
-                drag.source_window == window.window_handle().window_id()
-                    && matches!(&drag.state, PlatformOwnedDragState::RestoredInSourceWindow)
-            }) {
+    /// Sets the current drag payload. Its recommended the window be refreshed when this is called.
+    pub fn start_drag(&mut self, drag: AnyDrag) {
+        debug_assert!(self.active_drag.is_none());
+        self.active_drag = Some(drag);
+    }
+
+    /// Takes the current drag payload. Its recommended the window be refreshed when this is called.
+    /// If there is a platform drag interop active, it is canceled.
+    pub fn stop_drag(&mut self, window: &Window) -> Option<Arc<dyn Any>> {
+        let drag = self.active_drag.take();
+        if drag.is_some()
+            && let Some(platform_drag) = self.platform_owned_drag.as_ref()
+        {
+            if platform_drag.source_window == window.window_handle().window_id()
+                && matches!(
+                    &platform_drag.state,
+                    PlatformOwnedDragState::RestoredInSourceWindow
+                )
+            {
                 self.platform_owned_drag = None;
             }
+        }
+        Some(drag?.value)
+    }
+
+    /// Stops active drag and clears any related effects.
+    pub fn stop_active_drag(&mut self, window: &mut Window) -> bool {
+        if self.stop_drag(window).is_some() {
             window.refresh();
             true
         } else {
@@ -3082,6 +3118,65 @@ pub struct AnyDrag {
     /// Resolves the payload to offer the platform if the drag leaves the window.
     /// Invoked at most once per drag gesture, at promotion time.
     pub external_payload_source: Option<ExternalDragPayloadSource>,
+}
+impl AnyDrag {
+    /// Constructs a new drag with a value and view.
+    pub fn new<T: 'static + Sized>(value: T, view: impl Into<AnyView>) -> Self {
+        Self {
+            view: view.into(),
+            value: Arc::new(value),
+            cursor_offset: Point::default(),
+            move_refresh: DragMoveRefresh::default(),
+            cursor_style: None,
+            external_payload_source: None,
+        }
+    }
+
+    /// Assigns the offset of the view from the cursor when dragging begins.
+    pub fn offset(mut self, offset: Point<Pixels>) -> Self {
+        self.cursor_offset = offset;
+        self
+    }
+
+    /// Assigns which views to invalidate when the pointer moves during this drag.
+    pub fn move_refresh(mut self, refresh: DragMoveRefresh) -> Self {
+        self.move_refresh = refresh;
+        self
+    }
+
+    /// Assigns the style of the cursor while dragging is active.
+    pub fn cursor_style(mut self, style: Option<CursorStyle>) -> Self {
+        self.cursor_style = style;
+        self
+    }
+
+    /// Assigns a constructor of an external payload to be called when the drag moves outside of the application window.
+    pub fn external_payload(
+        mut self,
+        predicate: impl FnOnce(&mut Window, &mut App) -> Option<ExternalDragPayload> + 'static,
+    ) -> Self {
+        self.external_payload_source = Some(Box::new(move |window, cx| {
+            crate::ExternalDragPayloadResolution::Ready(predicate(window, cx))
+        }));
+        self
+    }
+
+    /// Assigns a constructor of an external payload that is prepared asynchronously when the
+    /// drag moves outside of the application window.
+    pub fn external_payload_async(
+        mut self,
+        predicate: impl FnOnce(&mut Window, &mut App) -> Task<Option<ExternalDragPayload>> + 'static,
+    ) -> Self {
+        self.external_payload_source = Some(Box::new(move |window, cx| {
+            crate::ExternalDragPayloadResolution::Pending(predicate(window, cx))
+        }));
+        self
+    }
+
+    /// Returns true if the type of the internal value matches the provided type.
+    pub fn is_type<T: 'static>(&self) -> bool {
+        self.value.type_id() == TypeId::of::<T>()
+    }
 }
 
 /// Lazily resolves the payload handed to the platform when an internal drag is

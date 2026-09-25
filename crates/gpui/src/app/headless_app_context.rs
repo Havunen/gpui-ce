@@ -2,17 +2,16 @@
 //!
 //! This replaces the macOS-only `HeadlessMetalAppContext` with a platform-neutral
 //! implementation backed by `TestPlatform`. Tests supply a real `PlatformTextSystem`
-//! (e.g. `DirectWriteTextSystem` on Windows, `MacTextSystem` on macOS) to get
-//! accurate glyph measurements while keeping everything else deterministic.
+//! (e.g. `CosmicTextSystem` on Windows, `MacTextSystem` on macOS) for accurate glyphs.
 //!
 //! Optionally, a renderer factory can be provided to enable real GPU rendering
 //! and screenshot capture via [`HeadlessAppContext::capture_screenshot`].
 
 use crate::{
-    AnyView, AnyWindowHandle, App, AppCell, AppContext, AssetSource, BackgroundExecutor, Bounds,
-    Context, Entity, EntityId, EventEmitter, ForegroundExecutor, Global, Pixels,
-    PlatformHeadlessRenderer, PlatformTextSystem, Render, Reservation, Size, Task, TestDispatcher,
-    TestPlatform, TextSystem, Window, WindowBounds, WindowHandle, WindowOptions,
+    AnyView, AnyWindowHandle, App, AppCell, AppContext, AssetRegistry, AssetSource,
+    BackgroundExecutor, Bounds, Context, Entity, EntityId, EventEmitter, ForegroundExecutor,
+    Global, Pixels, PlatformHeadlessRenderer, PlatformTextSystem, Render, Reservation, Size, Task,
+    TestDispatcher, TestPlatform, TextSystem, Window, WindowBounds, WindowHandle, WindowOptions,
     app::{GpuiBorrow, GpuiMode},
 };
 use anyhow::Result;
@@ -88,7 +87,11 @@ impl HeadlessAppContext {
 
         let text_system = Arc::new(TextSystem::new(platform_text_system));
         let http_client = crate::http_client::FakeHttpClient::with_404_response();
-        let app = App::new_app(platform, asset_source, http_client);
+        let app = App::new_app(
+            platform,
+            AssetRegistry::from(asset_source).into(),
+            http_client,
+        );
         app.borrow_mut().mode = GpuiMode::test();
 
         Self {

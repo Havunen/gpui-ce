@@ -22,4 +22,4 @@ core-video.workspace = true
 objc.workspace = true
 
 [build-dependencies]
-bindgen = "0.72"
+bindgen = "0.73"
