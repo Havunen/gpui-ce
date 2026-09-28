@@ -62,6 +62,14 @@ impl SerialTracker {
     pub fn selection_serial(&self) -> Option<SelectionSerial> {
         self.selection_serial
     }
+
+    /// Serial for an xdg-activation request: the latest key or mouse press, else the last
+    /// mouse press (raw 0 if neither was tracked).
+    pub fn activation_serial(&self) -> Serial {
+        self.selection_serial
+            .map(|SelectionSerial(serial)| serial)
+            .unwrap_or_else(|| self.get(SerialKind::MousePress))
+    }
 }
 
 #[cfg(test)]
@@ -114,6 +122,38 @@ mod tests {
         serial_tracker.update(SerialKind::DataDevice, 7000);
 
         assert_eq!(raw_selection_serial(&serial_tracker), None);
+    }
+
+    #[test]
+    fn test_activation_serial_uses_latest_key_press() {
+        let mut serial_tracker = SerialTracker::new();
+        serial_tracker.update(SerialKind::MousePress, 3783);
+        serial_tracker.update(SerialKind::KeyPress, 3787);
+        serial_tracker.update(SerialKind::MouseEnter, 6000);
+
+        assert_eq!(serial_tracker.activation_serial().as_raw(), 3787);
+    }
+
+    #[test]
+    fn test_activation_serial_uses_latest_mouse_press() {
+        let mut serial_tracker = SerialTracker::new();
+        serial_tracker.update(SerialKind::KeyPress, 3787);
+        serial_tracker.update(SerialKind::MousePress, 3790);
+        serial_tracker.update(SerialKind::InputMethod, 5011);
+
+        assert_eq!(serial_tracker.activation_serial().as_raw(), 3790);
+    }
+
+    #[test]
+    fn test_activation_serial_is_zero_without_press() {
+        let mut serial_tracker = SerialTracker::new();
+
+        assert_eq!(serial_tracker.activation_serial().as_raw(), 0);
+
+        serial_tracker.update(SerialKind::MouseEnter, 6000);
+        serial_tracker.update(SerialKind::DataDevice, 7000);
+
+        assert_eq!(serial_tracker.activation_serial().as_raw(), 0);
     }
 
     #[test]

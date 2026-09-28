@@ -1912,20 +1912,28 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn activate(&self) {
-        // Try to request an activation token. Even though the activation is likely going to be rejected,
-        // KWin and Mutter can use the app_id to visually indicate we're requesting attention.
         let state = self.borrow();
-        if let (Some(activation), Some(app_id)) = (&state.globals.activation, state.app_id.clone())
-        {
-            state.client.set_pending_activation(state.surface.id());
-            let token = activation.get_activation_token(&state.globals.qh, ());
-            // The serial isn't exactly important here, since the activation is probably going to be rejected anyway.
-            let serial = state.client.get_serial(SerialKind::MousePress);
-            token.set_app_id(app_id);
-            token.set_serial(serial.as_raw(), &state.globals.seat);
-            token.set_surface(&state.surface);
-            token.commit();
-        }
+        let (Some(activation), Some(app_id)) =
+            (state.globals.activation.clone(), state.app_id.clone())
+        else {
+            return;
+        };
+        let client = state.client.clone();
+        let qh = state.globals.qh.clone();
+        let target = state.surface.clone();
+        drop(state);
+
+        // The token must name the surface that received the input, which may be another of our
+        // windows; the target is activated when the token arrives. With no focused window
+        // (e.g. an IPC request) fall back to the target; compositors reject that token and show
+        // an attention hint instead.
+        let (requester, serial, seat) = client.activation_request_source();
+        client.set_pending_activation(target.id());
+        let token = activation.get_activation_token(&qh, ());
+        token.set_app_id(app_id);
+        token.set_serial(serial.as_raw(), &seat);
+        token.set_surface(requester.as_ref().unwrap_or(&target));
+        token.commit();
     }
 
     fn request_attention(&self) {}
