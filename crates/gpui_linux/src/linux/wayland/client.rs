@@ -459,6 +459,11 @@ pub(crate) struct ExternalDrag {
     window: WaylandWindowStatePtr,
 }
 
+/// The window whose input requests an activation: the keyboard focus, else the pointer's window.
+fn activation_requester<T>(keyboard_focused: Option<T>, mouse_focused: Option<T>) -> Option<T> {
+    keyboard_focused.or(mouse_focused)
+}
+
 fn file_uri_list(paths: &FileDragPaths) -> String {
     paths
         .entries()
@@ -610,6 +615,23 @@ impl WaylandClientStatePtr {
     pub fn set_pending_activation(&self, window: ObjectId) {
         self.0.upgrade().unwrap().borrow_mut().pending_activation =
             Some(PendingActivation::Window(window));
+    }
+
+    /// Surface, serial and seat of the input an activation request answers. The surface is
+    /// `None` when none of our windows has keyboard or pointer focus.
+    pub fn activation_request_source(
+        &self,
+    ) -> (Option<wl_surface::WlSurface>, Serial, wl_seat::WlSeat) {
+        let client = self.get_client();
+        let state = client.borrow();
+        let requester = activation_requester(
+            state.keyboard_focused_window.clone(),
+            state.mouse_focused_window.clone(),
+        );
+        let serial = state.serial_tracker.activation_serial();
+        let seat = state.wl_seat.clone();
+        drop(state);
+        (requester.map(|window| window.surface()), serial, seat)
     }
 
     pub fn enable_ime(&self) {
@@ -3424,5 +3446,23 @@ mod tests {
             text_input.cursor_rectangles.borrow().as_slice(),
             &[(10, 20, 1, 18)]
         );
+    }
+
+    #[test]
+    fn activation_requester_prefers_keyboard_focus() {
+        assert_eq!(
+            activation_requester(Some("keyboard"), Some("mouse")),
+            Some("keyboard")
+        );
+    }
+
+    #[test]
+    fn activation_requester_falls_back_to_pointer_focus() {
+        assert_eq!(activation_requester(None, Some("mouse")), Some("mouse"));
+    }
+
+    #[test]
+    fn activation_requester_is_none_without_focus() {
+        assert_eq!(activation_requester::<&str>(None, None), None);
     }
 }
