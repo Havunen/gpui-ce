@@ -1109,9 +1109,17 @@ impl Clipboard {
                     .read(&[self.inner.atoms.KDE_CUT], selection)
                     .is_ok_and(|data| data.bytes == b"1");
             if let Some(files) = decode_file_clipboard(&result.bytes, mime, kde_cut) {
-                return Ok(ClipboardItem {
-                    entries: vec![gpui::ClipboardEntry::Files(files)],
-                });
+                // File managers often advertise labels or newline-separated paths
+                // explicitly. Preserve that representation for text consumers.
+                let mut item = self
+                    .inner
+                    .read(text_format_atoms, selection)
+                    .and_then(|data| self.decode_text(data))
+                    .unwrap_or_else(|_| ClipboardItem {
+                        entries: Vec::new(),
+                    });
+                item.entries.push(gpui::ClipboardEntry::Files(files));
+                return Ok(item);
             }
             // An owner advertising `text/uri-list` has not necessarily put
             // *files* on the clipboard - browsers use it for ordinary links.
@@ -1139,6 +1147,10 @@ impl Clipboard {
             }
         }
 
+        self.decode_text(result)
+    }
+
+    fn decode_text(&self, result: ClipboardData) -> Result<ClipboardItem> {
         let text = if result.format == self.inner.atoms.STRING {
             // ISO Latin-1
             // See: https://stackoverflow.com/questions/28169745/what-are-the-options-to-convert-iso-8859-1-latin-1-to-a-string-utf-8
@@ -1357,7 +1369,7 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn file_clipboard_also_offers_its_pathnames_as_text() {
+    fn file_clipboard_preserves_its_advertised_text() {
         let Some(server) = Xvfb::start() else {
             eprintln!("Xvfb is not available; skipping");
             return;
@@ -1372,7 +1384,7 @@ mod tests {
         owner
             .set_files(
                 &files,
-                "/tmp/a b.txt",
+                "First label\nSecond label",
                 ClipboardKind::Clipboard,
                 WaitConfig::None,
             )
@@ -1383,11 +1395,51 @@ mod tests {
             .inner
             .read(&[reader.inner.atoms.UTF8_STRING], ClipboardKind::Clipboard)
             .expect("text consumers must be able to paste the file clipboard");
-        assert_eq!(text.bytes, b"/tmp/a b.txt");
+        assert_eq!(text.bytes, b"First label\nSecond label");
 
         // A file manager, or another GPUI application, still gets the files.
         let item = reader.get_any(ClipboardKind::Clipboard).unwrap();
         assert_eq!(item.file_transfer(), Some(files));
+        assert_eq!(item.text().as_deref(), Some("First label\nSecond label"));
+    }
+
+    #[test]
+    fn files_survive_missing_or_invalid_text_and_decode_latin1() {
+        let Some(server) = Xvfb::start() else {
+            eprintln!("Xvfb is not available; skipping");
+            return;
+        };
+        let owner = Clipboard::connect(&server.display).unwrap();
+        let reader = Clipboard::connect(&server.display).unwrap();
+        for (text, expected) in [
+            (None, "/tmp/a\n/tmp/b"),
+            (
+                Some((owner.inner.atoms.UTF8_STRING, &b"\xff"[..])),
+                "/tmp/a\n/tmp/b",
+            ),
+            (
+                Some((owner.inner.atoms.STRING, &b"caf\xe9"[..])),
+                "caf\u{e9}",
+            ),
+        ] {
+            let mut data = vec![ClipboardData {
+                format: owner.inner.atoms.URI_LIST,
+                bytes: b"file:///tmp/a\r\nfile:///tmp/b\r\n".to_vec(),
+            }];
+            if let Some((format, bytes)) = text {
+                data.push(ClipboardData {
+                    format,
+                    bytes: bytes.to_vec(),
+                });
+            }
+            owner
+                .inner
+                .write(data, ClipboardKind::Clipboard, WaitConfig::None)
+                .unwrap();
+            let item = reader.get_any(ClipboardKind::Clipboard).unwrap();
+            assert_eq!(item.file_transfer().unwrap().paths.paths().len(), 2);
+            assert_eq!(item.text().as_deref(), Some(expected));
+        }
     }
 
     #[test]

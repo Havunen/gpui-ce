@@ -9416,6 +9416,35 @@ mod tests {
     }
 
     #[gpui::test]
+    fn delayed_drag_completion_preserves_a_newer_gesture(cx: &mut TestAppContext) {
+        let path = PathBuf::from("/tmp/delayed-completion");
+        let drag = start_file_drag(cx, &path, UNTAGGED_COPY, true);
+        cx.update_window(drag.window, |_, window, cx| {
+            drag_pointer(outside(), window, cx);
+            window.dispatch_event(FileDropEvent::Ended.to_platform_input(), cx);
+
+            // Another drag begins in the same source window while the receiver
+            // is still processing the previous drop.
+            let position = point(px(30.), px(30.));
+            press_pointer(position, window, cx);
+            drag_pointer(position + point(px(20.), px(0.)), window, cx);
+            assert!(cx.active_drag.is_some());
+            let generation = cx.drag_generation;
+            crate::FileTransferCompletion::receiver_performed(
+                FileDragPaths::new([(path.clone(), true)]).transfer(),
+                Some(crate::FileTransferOperation::Copy),
+            )
+            .report();
+            assert!(cx.active_drag.is_some());
+            assert_eq!(cx.drag_generation, generation);
+            drag_pointer(outside(), window, cx);
+            assert!(cx.end_platform_drag(drag.window.window_id()));
+        })
+        .unwrap();
+        assert_eq!(take_completions_for(&path).len(), 1);
+    }
+
+    #[gpui::test]
     fn restoring_a_drag_resumes_its_gesture(cx: &mut TestAppContext) {
         let path = PathBuf::from("/tmp/restored-drag");
         let drag = start_file_drag(cx, &path, UNTAGGED_COPY, true);

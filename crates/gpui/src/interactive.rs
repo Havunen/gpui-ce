@@ -793,6 +793,8 @@ pub enum FileDropEvent {
     /// The platform-owned drag session has ended.
     Ended,
     /// Transfer protocol completion, including operation and source ownership.
+    /// Also ends the current platform drag. Asynchronous sources send `Ended`
+    /// when the gesture stops, then report the completion separately.
     Completed(crate::FileTransferCompletion),
 }
 
