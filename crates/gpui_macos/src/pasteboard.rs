@@ -47,9 +47,10 @@ impl Pasteboard {
             .data_for_type(&NSString::from_str(gpui::FILE_TRANSFER_MIME))
             .and_then(|bytes| gpui::FileTransfer::decode(&bytes, gpui::FILE_TRANSFER_MIME))
         {
-            return Some(ClipboardItem {
-                entries: vec![ClipboardEntry::Files(files)],
-            });
+            // `write_files` keeps the text an item carried alongside its paths.
+            let mut entries = vec![ClipboardEntry::Files(files)];
+            entries.extend(self.read_string_from_pasteboard());
+            return Some(ClipboardItem { entries });
         }
 
         // Modern pasteboards represent each selected file as an item with a
@@ -162,7 +163,6 @@ impl Pasteboard {
             [ClipboardEntry::Image(image)] => {
                 self.write_image(image);
             }
-            [ClipboardEntry::ExternalPaths(_)] => {}
             _ => {
                 // Agus NB: We're currently only writing string entries to the clipboard when we have more than one.
                 //
@@ -443,6 +443,25 @@ mod tests {
             2,
             "Finder must receive a native URL for every file"
         );
+    }
+
+    #[test]
+    fn file_clipboard_keeps_the_text_written_alongside_it() {
+        let (_guard, pasteboard) = unique_pasteboard();
+        let files = gpui::FileTransfer {
+            paths: gpui::ExternalPaths([PathBuf::from("/tmp/a")].into_iter().collect()),
+            operation: gpui::FileTransferOperation::Copy,
+            ownership: 4,
+        };
+        pasteboard.write(ClipboardItem {
+            entries: vec![
+                ClipboardEntry::Files(files.clone()),
+                ClipboardEntry::String(ClipboardString::new("a: /tmp/a".to_string())),
+            ],
+        });
+        let item = pasteboard.read().expect("should read clipboard item");
+        assert_eq!(item.file_transfer(), Some(files));
+        assert_eq!(item.text(), Some("a: /tmp/a".to_string()));
     }
 
     #[test]

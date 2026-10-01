@@ -473,6 +473,7 @@ Windows.Win32.MonitorFromPoint
 Windows.Win32.MonitorFromWindow
 Windows.Win32.NCCALCSIZE_PARAMS
 Windows.Win32.NI_COMPOSITIONSTR
+Windows.Win32.OleFlushClipboard
 Windows.Win32.OleGetClipboard
 Windows.Win32.OleInitialize
 Windows.Win32.OleSetClipboard

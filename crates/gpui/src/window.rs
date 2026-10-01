@@ -1374,6 +1374,12 @@ struct PendingInput {
     needs_timeout: bool,
 }
 
+/// Reports a native payload whose drag never started, so its source snapshot is released.
+fn report_external_drag_cancelled(payload: crate::ExternalDragPayload) {
+    let crate::ExternalDragPayload::Files(files) = payload;
+    crate::FileTransferCompletion::cancelled(files.transfer()).report();
+}
+
 pub(crate) struct ElementStateBox {
     pub(crate) inner: Box<dyn Any>,
     #[cfg(debug_assertions)]
@@ -5627,9 +5633,11 @@ impl Window {
                     self.mouse_position = position;
                     let source_window = self.handle.window_id();
                     if !cx.restore_platform_drag(source_window) && cx.active_drag.is_none() {
-                        cx.active_drag = Some(AnyDrag {
-                            value: Arc::new(paths.clone()),
-                            view: cx.new(|_| paths).into(),
+                        let value = Arc::new(paths.clone());
+                        let view = cx.new(|_| paths).into();
+                        cx.start_drag(AnyDrag {
+                            value,
+                            view,
                             cursor_offset: position,
                             move_refresh: crate::DragMoveRefresh::default(),
                             cursor_style: None,
@@ -5770,7 +5778,10 @@ impl Window {
         else {
             return;
         };
-        let value = cx.active_drag.as_ref().map(|drag| drag.value.clone());
+        // The gesture is identified by its generation rather than by the dragged value: a
+        // listener may hand every gesture the same value allocation, which would let a
+        // cancelled gesture's payload promote whichever drag is active when it is ready.
+        let gesture = cx.drag_generation;
         match payload_source(self, cx) {
             crate::ExternalDragPayloadResolution::Ready(Some(payload)) => {
                 self.start_prepared_external_drag(payload, cx)
@@ -5779,38 +5790,21 @@ impl Window {
             crate::ExternalDragPayloadResolution::Pending(task) => {
                 let handle = self.handle;
                 cx.spawn(async move |cx| {
-                    if let Some(payload) = task.await {
-                        let cancelled = payload.clone();
-                        if handle
-                            .update(cx, |_, window, cx| {
-                                if cx
-                                    .active_drag
-                                    .as_ref()
-                                    .zip(value.as_ref())
-                                    .is_some_and(|(drag, value)| Arc::ptr_eq(&drag.value, value))
-                                {
-                                    window.start_prepared_external_drag(payload, cx);
-                                } else {
-                                    let crate::ExternalDragPayload::Files(files) = payload;
-                                    crate::FileTransferCompletion {
-                                        files: files.transfer(),
-                                        operation: None,
-                                        source_removed: false,
-                                    }
-                                    .report();
-                                    window.refresh();
-                                }
-                            })
-                            .is_err()
-                        {
-                            let crate::ExternalDragPayload::Files(files) = cancelled;
-                            crate::FileTransferCompletion {
-                                files: files.transfer(),
-                                operation: None,
-                                source_removed: false,
-                            }
-                            .report();
+                    let Some(payload) = task.await else {
+                        return;
+                    };
+                    let started = handle.update(cx, |_, window, cx| {
+                        let same_gesture =
+                            cx.active_drag.is_some() && cx.drag_generation == gesture;
+                        if same_gesture {
+                            window.start_prepared_external_drag(payload.clone(), cx);
+                        } else {
+                            window.refresh();
                         }
+                        same_gesture
+                    });
+                    if !matches!(started, Ok(true)) {
+                        report_external_drag_cancelled(payload);
                     }
                 })
                 .detach();
@@ -5819,20 +5813,12 @@ impl Window {
     }
 
     fn start_prepared_external_drag(&mut self, payload: crate::ExternalDragPayload, cx: &mut App) {
-        if self.platform_window.start_external_drag(&payload)
-            && cx.hand_active_drag_to_platform(self.handle.window_id())
+        if !self.platform_window.start_external_drag(&payload)
+            || !cx.hand_active_drag_to_platform(self.handle.window_id())
         {
-            self.refresh();
-        } else {
-            let crate::ExternalDragPayload::Files(files) = payload;
-            crate::FileTransferCompletion {
-                files: files.transfer(),
-                operation: None,
-                source_removed: false,
-            }
-            .report();
-            self.refresh();
+            report_external_drag_cancelled(payload);
         }
+        self.refresh();
     }
 
     /// Whether recognized touch pans may use the platform's predicted touch
@@ -7838,10 +7824,11 @@ mod tests {
         FileDropEvent, FocusHandle, ImageSource, InputEvent as _, InteractiveElement as _,
         IntoElement, LongPressEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement,
         Pixels, Point, Render, RenderImage, RequestFrameOptions, ShaderBool,
-        StatefulInteractiveElement as _, Styled, TestAppContext, TouchDragEvent, TouchEvent,
+        StatefulInteractiveElement as _, Styled, Task, TestAppContext, TouchDragEvent, TouchEvent,
         TouchId, TouchPhase, Window, WindowAppearance, WindowHandle, WindowOptions, canvas, div,
         hsla, img, linear_color_stop, linear_gradient, point, px, size, white,
     };
+    use futures::channel::oneshot;
     use image::{Frame as ImageFrame, ImageBuffer, Rgba};
     use smallvec::smallvec;
 
@@ -8694,6 +8681,126 @@ mod tests {
                     move |path: &PathBuf, _, _| observed_drops.borrow_mut().push(path.clone())
                 })
         }
+    }
+
+    /// Starts every gesture with the same dragged value allocation, as a custom drag listener
+    /// may, and prepares its native payload only once a signal arrives.
+    struct SharedValueDragView {
+        value: Arc<PathBuf>,
+        prepared: Rc<RefCell<Option<oneshot::Receiver<()>>>>,
+    }
+
+    impl Render for SharedValueDragView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let value = self.value.clone();
+            let prepared = self.prepared.clone();
+            let mut element = div().id("shared-value-drag").size_full();
+            element
+                .interactivity()
+                .on_drag_alt(move |cursor_offset, cursor_style, _, cx| {
+                    let path = value.as_ref().clone();
+                    let prepared = prepared.clone();
+                    crate::AnyDrag {
+                        view: cx.new(|_| Empty).into(),
+                        value: value.clone(),
+                        cursor_offset,
+                        move_refresh: crate::DragMoveRefresh::default(),
+                        cursor_style,
+                        external_payload_source: None,
+                    }
+                    .external_payload_async(move |_, cx| {
+                        let Some(ready) = prepared.borrow_mut().take() else {
+                            return Task::ready(None);
+                        };
+                        cx.background_spawn(async move {
+                            ready.await.ok()?;
+                            Some(ExternalDragPayload::Files(FileDragPaths::new([(
+                                path, false,
+                            )])))
+                        })
+                    })
+                });
+            element
+        }
+    }
+
+    #[gpui::test]
+    fn cancelled_async_preparation_does_not_promote_a_later_gesture(cx: &mut TestAppContext) {
+        let path = PathBuf::from("/tmp/shared-value-drag");
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let window: AnyWindowHandle = cx
+            .add_window({
+                let path = path.clone();
+                move |_, _| SharedValueDragView {
+                    value: Arc::new(path),
+                    prepared: Rc::new(RefCell::new(Some(ready_rx))),
+                }
+            })
+            .into();
+        cx.test_window(window).set_start_external_drag_result(true);
+        cx.update(|cx| cx.take_file_transfer_completions());
+
+        cx.update_window(window, |_, window, cx| {
+            let start_gesture = |window: &mut Window, cx: &mut crate::App| {
+                window.draw(cx).clear(cx);
+                window.dispatch_event(
+                    MouseDownEvent {
+                        position: point(px(10.), px(10.)),
+                        button: MouseButton::Left,
+                        modifiers: Default::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.dispatch_event(
+                    MouseMoveEvent {
+                        position: point(px(20.), px(20.)),
+                        pressed_button: Some(MouseButton::Left),
+                        modifiers: Default::default(),
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                assert!(cx.active_drag.is_some());
+            };
+
+            start_gesture(window, cx);
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: point(px(-1.), px(20.)),
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(
+                cx.active_drag.is_some(),
+                "the drag stays in the application while its payload is prepared"
+            );
+            window.cancel_drag(cx);
+            assert!(cx.active_drag.is_none());
+
+            // The next gesture shares the first one's value allocation.
+            start_gesture(window, cx);
+        })
+        .unwrap();
+
+        ready_tx.send(()).unwrap();
+        cx.run_until_parked();
+
+        assert!(
+            cx.test_window(window).external_drag_files().is_empty(),
+            "a cancelled gesture's payload must not start a native drag for a later one"
+        );
+        cx.update_window(window, |_, _, cx| assert!(cx.active_drag.is_some()))
+            .unwrap();
+        let completions = cx.update(|cx| cx.take_file_transfer_completions());
+        assert_eq!(completions.len(), 1, "the prepared payload is released");
+        assert_eq!(completions[0].operation, None);
+        assert_eq!(completions[0].files.paths.paths(), [path]);
     }
 
     #[gpui::test]

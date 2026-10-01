@@ -319,12 +319,14 @@ pub mod shadow {
                 vertical_reaches: input.vertical_corner_reaches,
                 smoothing_factors: input.smoothing_factors,
                 superellipse_power: 0.0,
+                superellipse_error: 0.0,
             },
             PreparedCorners {
                 horizontal_reaches: input.element_horizontal_corner_reaches,
                 vertical_reaches: input.element_vertical_corner_reaches,
                 smoothing_factors: input.smoothing_factors,
                 superellipse_power: 0.0,
+                superellipse_error: 0.0,
             },
         );
         let color = paint_color(

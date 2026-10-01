@@ -143,6 +143,8 @@ pub struct Xdnd {
     other_window: xproto::Window,
     drag_type: u32,
     retrieved: bool,
+    /// The selection could not be read, or did not describe local files.
+    failed: bool,
     position: Point<Pixels>,
     action: u32,
     source_actions: Vec<u32>,
@@ -150,6 +152,86 @@ pub struct Xdnd {
     incremental: bool,
     bytes: Vec<u8>,
     pending_drop: Option<xproto::Window>,
+}
+
+/// What an XdndDrop message leads to.
+#[derive(Debug, PartialEq, Eq)]
+enum XdndDrop {
+    /// The files are known: hand the drop to the window.
+    Submit,
+    /// The selection is still being read: hold the drop until it arrives or fails.
+    Deferred,
+    /// Nothing can be read: tell the source the drop was refused.
+    Reject,
+}
+
+impl Xdnd {
+    /// Negotiates the action announced in XdndStatus, where zero means refuse.
+    fn negotiate(&mut self, shift: bool, source_action: u32, atoms: &XcbAtoms) -> u32 {
+        self.action = xdnd_negotiate_action(
+            self.drag_type != 0 && !self.failed,
+            shift,
+            source_action,
+            &self.source_actions,
+            atoms.XdndActionCopy,
+            atoms.XdndActionMove,
+        );
+        self.action
+    }
+
+    fn drop_disposition(&mut self, target: xproto::Window) -> XdndDrop {
+        if self.retrieved {
+            XdndDrop::Submit
+        } else if self.drag_type == 0 || self.failed {
+            XdndDrop::Reject
+        } else {
+            self.pending_drop = Some(target);
+            XdndDrop::Deferred
+        }
+    }
+
+    /// Records that the selection will never yield files. Returns a drop that
+    /// was waiting for them and must now be refused.
+    fn fail(&mut self) -> Option<xproto::Window> {
+        self.failed = true;
+        self.incremental = false;
+        self.bytes.clear();
+        self.pending_drop.take()
+    }
+
+    /// Records that the files arrived. Returns a drop that was waiting for them.
+    fn received(&mut self) -> Option<xproto::Window> {
+        self.retrieved = true;
+        self.pending_drop.take()
+    }
+}
+
+/// Picks the action to perform for a source that suggests `source_action` in
+/// XdndPosition and may publish the actions it supports in XdndActionList.
+/// Shift asks for a move. Everything else becomes a copy, which the drop can
+/// always be taken as, so a missing or unknown action never refuses files.
+fn xdnd_negotiate_action(
+    supported: bool,
+    shift: bool,
+    source_action: u32,
+    source_actions: &[u32],
+    copy: u32,
+    move_: u32,
+) -> u32 {
+    if !supported {
+        return 0;
+    }
+    let offers = |action: u32| source_action == action || source_actions.contains(&action);
+    if shift && offers(move_) {
+        move_
+    } else if offers(copy) {
+        copy
+    } else if offers(move_) {
+        // The source only moves, as for cut files.
+        move_
+    } else {
+        copy
+    }
 }
 
 #[derive(Debug)]
@@ -802,15 +884,12 @@ impl X11Client {
 
     fn receive_xdnd_paths(&self, window: &X11WindowStatePtr, bytes: Vec<u8>) {
         let Some(files) = gpui::FileTransfer::decode(&bytes, gpui::URI_LIST_MIME) else {
+            self.fail_xdnd_transfer();
             return;
         };
         let mut state = self.0.borrow_mut();
-        if state.xdnd_state.drag_type != state.atoms.TextUriList {
-            return;
-        }
-        state.xdnd_state.retrieved = true;
         let position = state.xdnd_state.position;
-        let pending = state.xdnd_state.pending_drop.take();
+        let pending = state.xdnd_state.received();
         drop(state);
         window.handle_input(PlatformInput::FileDrop(FileDropEvent::Entered {
             position,
@@ -818,6 +897,15 @@ impl X11Client {
         }));
         if let Some(target) = pending {
             self.submit_xdnd_drop(window, target);
+        }
+    }
+
+    /// The selection will not yield files. A drop already waiting on them is
+    /// refused now, as the source keeps its drag open until XdndFinished.
+    fn fail_xdnd_transfer(&self) {
+        let mut state = self.0.borrow_mut();
+        if let Some(target) = state.xdnd_state.fail() {
+            reject_xdnd_drop(&mut state, target);
         }
     }
 
@@ -953,20 +1041,15 @@ impl X11Client {
                         state.modifiers.shift = pos.mask.contains(xproto::KeyButMask::SHIFT);
                         state.modifiers.control = pos.mask.contains(xproto::KeyButMask::CONTROL);
                     }
-                    let desired = if state.modifiers.shift {
-                        state.atoms.XdndActionMove
-                    } else {
-                        state.atoms.XdndActionCopy
+                    let action = {
+                        let state = &mut *state;
+                        state
+                            .xdnd_state
+                            .negotiate(state.modifiers.shift, arg4, &state.atoms)
                     };
-                    state.xdnd_state.action =
-                        if arg4 == desired || state.xdnd_state.source_actions.contains(&desired) {
-                            desired
-                        } else {
-                            0
-                        };
-                    if !state.xdnd_state.requested && state.xdnd_state.drag_type != 0 {
+                    if action != 0 && !state.xdnd_state.requested {
                         state.xdnd_state.requested = true;
-                        check_reply(
+                        let requested = check_reply(
                             || "Failed to convert selection for drag and drop",
                             state.xcb_connection.convert_selection(
                                 event.window,
@@ -977,46 +1060,61 @@ impl X11Client {
                             ),
                         )
                         .log_err();
+                        if requested.is_none() {
+                            state.xdnd_state.fail();
+                        }
                     }
                     xdnd_send_status(
                         &state.xcb_connection,
                         &state.atoms,
                         event.window,
                         state.xdnd_state.other_window,
-                        state.xdnd_state.action,
+                        action,
                     );
                     let position = state.xdnd_state.position;
                     drop(state);
                     window
                         .handle_input(PlatformInput::FileDrop(FileDropEvent::Pending { position }));
                 } else if event.type_ == state.atoms.XdndDrop {
-                    if !state.xdnd_state.retrieved {
-                        state.xdnd_state.pending_drop = Some(event.window);
-                    } else {
-                        drop(state);
-                        self.submit_xdnd_drop(&window, event.window);
+                    match state.xdnd_state.drop_disposition(event.window) {
+                        XdndDrop::Submit => {
+                            drop(state);
+                            self.submit_xdnd_drop(&window, event.window);
+                        }
+                        XdndDrop::Deferred => {}
+                        XdndDrop::Reject => reject_xdnd_drop(&mut state, event.window),
                     }
                 }
             }
             Event::SelectionNotify(event) => {
                 let window = self.get_window(event.requestor)?;
                 let mut state = self.0.borrow_mut();
-                if event.property != state.atoms.XDND_DATA || !state.xdnd_state.requested {
+                if event.selection != state.atoms.XdndSelection || !state.xdnd_state.requested {
                     return Some(());
                 }
-                let reply = state
-                    .xcb_connection
-                    .get_property(
-                        true,
-                        event.requestor,
-                        state.atoms.XDND_DATA,
-                        AtomEnum::ANY,
-                        0,
-                        16 * 1024 * 1024,
-                    )
-                    .ok()?
-                    .reply()
-                    .ok()?;
+                // The owner reports a conversion it cannot perform with no property.
+                let reply = (event.property == state.atoms.XDND_DATA)
+                    .then(|| {
+                        state
+                            .xcb_connection
+                            .get_property(
+                                true,
+                                event.requestor,
+                                state.atoms.XDND_DATA,
+                                AtomEnum::ANY,
+                                0,
+                                16 * 1024 * 1024,
+                            )
+                            .ok()?
+                            .reply()
+                            .ok()
+                    })
+                    .flatten();
+                let Some(reply) = reply else {
+                    drop(state);
+                    self.fail_xdnd_transfer();
+                    return Some(());
+                };
                 if reply.type_ == state.atoms.INCR {
                     state.xdnd_state.incremental = true;
                     state.xdnd_state.bytes.clear();
@@ -1025,9 +1123,13 @@ impl X11Client {
                         .delete_property(event.requestor, state.atoms.XDND_DATA)
                         .log_err();
                     state.xcb_connection.flush().log_err();
-                } else if reply.bytes_after == 0 {
+                } else {
                     drop(state);
-                    self.receive_xdnd_paths(&window, reply.value);
+                    if reply.bytes_after == 0 {
+                        self.receive_xdnd_paths(&window, reply.value);
+                    } else {
+                        self.fail_xdnd_transfer();
+                    }
                 }
             }
             Event::ConfigureNotify(event) => {
@@ -1062,15 +1164,18 @@ impl X11Client {
                                 0,
                                 16 * 1024 * 1024,
                             )
-                            .ok()?
-                            .reply()
-                            .ok()?;
-                        if reply.bytes_after != 0
-                            || state.xdnd_state.bytes.len() + reply.value.len() > 64 * 1024 * 1024
-                        {
-                            state.xdnd_state = Xdnd::default();
+                            .ok()
+                            .and_then(|cookie| cookie.reply().ok())
+                            .filter(|reply| {
+                                reply.bytes_after == 0
+                                    && state.xdnd_state.bytes.len() + reply.value.len()
+                                        <= 64 * 1024 * 1024
+                            });
+                        let Some(reply) = reply else {
+                            drop(state);
+                            self.fail_xdnd_transfer();
                             return Some(());
-                        }
+                        };
                         if reply.value.is_empty() {
                             state.xdnd_state.incremental = false;
                             let bytes = std::mem::take(&mut state.xdnd_state.bytes);
@@ -1872,25 +1977,21 @@ impl LinuxClient for X11Client {
 
     fn write_to_clipboard(&self, item: gpui::ClipboardItem) {
         let mut state = self.0.borrow_mut();
-        if let Some(files) = item.file_transfer() {
-            state
-                .clipboard
-                .set_files(
-                    &files,
-                    clipboard::ClipboardKind::Clipboard,
-                    clipboard::WaitConfig::None,
-                )
-                .log_err();
-            state.clipboard_item.replace(item);
-            return;
-        }
-        state
-            .clipboard
-            .set_text(
-                std::borrow::Cow::Owned(item.text().unwrap_or_default()),
+        let text = item.text().unwrap_or_default();
+        let written = match item.file_transfer() {
+            Some(files) => state.clipboard.set_files(
+                &files,
+                &text,
                 clipboard::ClipboardKind::Clipboard,
                 clipboard::WaitConfig::None,
-            )
+            ),
+            None => state.clipboard.set_text(
+                std::borrow::Cow::Owned(text),
+                clipboard::ClipboardKind::Clipboard,
+                clipboard::WaitConfig::None,
+            ),
+        };
+        written
             .context("X11: Failed to write to clipboard (clipboard)")
             .log_with_level(log::Level::Debug);
         state.clipboard_item.replace(item);
@@ -2446,24 +2547,38 @@ fn xdnd_get_supported_atom(
     0
 }
 
+/// Refuses a drop whose files cannot be read, so the source stops waiting on it.
+fn reject_xdnd_drop(state: &mut X11ClientState, target: xproto::Window) {
+    xdnd_send_finished(
+        &state.xcb_connection,
+        state.atoms.XdndFinished,
+        target,
+        state.xdnd_state.other_window,
+        0,
+    );
+    state.xdnd_state = Xdnd::default();
+}
+
+/// Tells the drag source that the drop into `target` is over. A zero `action`
+/// means it was refused or could not be completed.
 fn xdnd_send_finished(
     xcb_connection: &XCBConnection,
     finished_atom: u32,
-    source: xproto::Window,
     target: xproto::Window,
+    source: xproto::Window,
     action: u32,
 ) {
     let message = ClientMessageEvent {
         format: 32,
-        window: target,
+        window: source,
         type_: finished_atom,
-        data: ClientMessageData::from([source, u32::from(action != 0), action, 0, 0]),
+        data: ClientMessageData::from([target, u32::from(action != 0), action, 0, 0]),
         sequence: 0,
         response_type: xproto::CLIENT_MESSAGE_EVENT,
     };
     check_reply(
         || "Failed to send XDnD finished event",
-        xcb_connection.send_event(false, target, EventMask::default(), message),
+        xcb_connection.send_event(false, source, EventMask::default(), message),
     )
     .log_err();
     xcb_connection.flush().log_err();
@@ -2935,6 +3050,77 @@ fn xkb_state_for_key_event(xkb: &xkbc::State, event_state: xproto::KeyButMask) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn xdnd_reading_files() -> Xdnd {
+        Xdnd {
+            drag_type: 7,
+            ..Xdnd::default()
+        }
+    }
+
+    #[test]
+    fn xdnd_drop_waiting_for_the_selection_is_refused_when_it_fails() {
+        // Firefox advertises text/uri-list for a link: the selection is
+        // requested, the drop arrives first, and then decoding finds no files.
+        let mut xdnd = xdnd_reading_files();
+        assert_eq!(xdnd.drop_disposition(42), XdndDrop::Deferred);
+        assert_eq!(
+            xdnd.fail(),
+            Some(42),
+            "the waiting drop must be finished with a refusal"
+        );
+        assert_eq!(xdnd.drop_disposition(42), XdndDrop::Reject);
+    }
+
+    #[test]
+    fn xdnd_drop_after_a_failed_selection_is_refused_at_once() {
+        let mut xdnd = xdnd_reading_files();
+        assert_eq!(xdnd.fail(), None);
+        assert_eq!(xdnd.drop_disposition(42), XdndDrop::Reject);
+    }
+
+    #[test]
+    fn xdnd_drop_of_a_payload_that_was_never_requested_is_refused() {
+        // A text/plain drag has no supported type, so nothing was read.
+        let mut xdnd = Xdnd::default();
+        assert_eq!(xdnd.drop_disposition(42), XdndDrop::Reject);
+    }
+
+    #[test]
+    fn xdnd_drop_is_submitted_once_the_files_arrive() {
+        let mut xdnd = xdnd_reading_files();
+        assert_eq!(xdnd.received(), None);
+        assert_eq!(xdnd.drop_disposition(42), XdndDrop::Submit);
+
+        let mut xdnd = xdnd_reading_files();
+        assert_eq!(xdnd.drop_disposition(42), XdndDrop::Deferred);
+        assert_eq!(xdnd.received(), Some(42));
+    }
+
+    #[test]
+    fn xdnd_status_accepts_every_readable_payload() {
+        const COPY: u32 = 1;
+        const MOVE: u32 = 2;
+        const PRIVATE: u32 = 3;
+        let negotiate = |supported, shift, source_action, list: &[u32]| {
+            xdnd_negotiate_action(supported, shift, source_action, list, COPY, MOVE)
+        };
+
+        // Payloads that are never read must not be accepted either.
+        assert_eq!(negotiate(false, false, COPY, &[COPY, MOVE]), 0);
+
+        // Sources without an XdndActionList offer only what XdndPosition carries.
+        assert_eq!(negotiate(true, false, MOVE, &[]), MOVE);
+        assert_eq!(negotiate(true, true, COPY, &[]), COPY);
+        assert_eq!(negotiate(true, false, PRIVATE, &[]), COPY);
+        assert_eq!(negotiate(true, false, 0, &[]), COPY);
+
+        // Shift moves when the source allows it; otherwise the drop copies.
+        assert_eq!(negotiate(true, true, COPY, &[COPY, MOVE]), MOVE);
+        assert_eq!(negotiate(true, false, MOVE, &[COPY, MOVE]), COPY);
+        assert_eq!(negotiate(true, true, MOVE, &[]), MOVE);
+        assert_eq!(negotiate(true, true, PRIVATE, &[COPY]), COPY);
+    }
 
     fn test_keymap(layouts: &str) -> xkbc::Keymap {
         test_keymap_with_variant(layouts, "")

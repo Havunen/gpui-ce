@@ -7,6 +7,34 @@ use windows_core::{BOOL, Error, GUID, HRESULT, Interface, PCWSTR, Ref, Result, i
 const EFFECT_COPY: u32 = DROPEFFECT_COPY as u32;
 const EFFECT_MOVE: u32 = DROPEFFECT_MOVE as u32;
 
+fn effect_of(operation: FileTransferOperation) -> u32 {
+    if operation == FileTransferOperation::Move {
+        EFFECT_MOVE
+    } else {
+        EFFECT_COPY
+    }
+}
+
+fn transfer_operation(effect: u32) -> Option<FileTransferOperation> {
+    if effect == EFFECT_MOVE {
+        Some(FileTransferOperation::Move)
+    } else if effect == EFFECT_COPY {
+        Some(FileTransferOperation::Copy)
+    } else {
+        None
+    }
+}
+
+/// The operation an effect reports. A drop into the Recycle Bin is a move
+/// whatever effect the Shell reports for it, as long as it reports one.
+fn performed_operation(effect: u32, recycle_bin: bool) -> Option<FileTransferOperation> {
+    if recycle_bin && effect != 0 {
+        Some(FileTransferOperation::Move)
+    } else {
+        transfer_operation(effect)
+    }
+}
+
 static PREFERRED: LazyLock<u16> = LazyLock::new(|| unsafe {
     RegisterClipboardFormatW(windows_core::w!("Preferred DropEffect")) as u16
 });
@@ -138,18 +166,11 @@ impl IDataObject_Impl for FileDataObject_Impl {
             }
             if self.clipboard && format == *PASTED && !state.reported && !state.in_operation {
                 state.reported = true;
-                let operation = if value != 0 && state.recycle_bin || value == EFFECT_MOVE {
-                    Some(FileTransferOperation::Move)
-                } else if value == EFFECT_COPY {
-                    Some(FileTransferOperation::Copy)
-                } else {
-                    None
-                };
                 // Both PasteSucceeded=MOVE and Performed=MOVE are required
                 // before a clipboard source must delete its originals.
                 FileTransferCompletion {
                     files: self.files.clone(),
-                    operation,
+                    operation: performed_operation(value, state.recycle_bin),
                     source_removed: !state.recycle_bin && state.performed != Some(EFFECT_MOVE),
                 }
                 .report();
@@ -159,13 +180,13 @@ impl IDataObject_Impl for FileDataObject_Impl {
     }
 }
 
-fn transfer_operation(effect: u32) -> Option<FileTransferOperation> {
-    if effect == EFFECT_MOVE {
-        Some(FileTransferOperation::Move)
-    } else if effect == EFFECT_COPY {
-        Some(FileTransferOperation::Copy)
-    } else {
-        None
+impl FileDataObject {
+    /// Ends the extraction `StartOperation` began, exactly once.
+    fn end_operation(&self, state: &mut TransferResult) {
+        if state.in_operation {
+            state.in_operation = false;
+            self.files.set_active(false);
+        }
     }
 }
 
@@ -188,8 +209,7 @@ impl IDataObjectAsyncCapability_Impl for FileDataObject_Impl {
     }
     fn EndOperation(&self, result: HRESULT, _: Ref<IBindCtx>, effects: u32) -> Result<()> {
         let mut state = self.result.borrow_mut();
-        state.in_operation = false;
-        self.files.set_active(false);
+        self.end_operation(&mut state);
         if !state.reported {
             state.reported = true;
             let logical = if self.clipboard {
@@ -197,16 +217,11 @@ impl IDataObjectAsyncCapability_Impl for FileDataObject_Impl {
             } else {
                 state.logical.or(state.drag_effect).or(Some(effects))
             };
-            let operation = result
-                .is_ok()
-                .then(|| {
-                    if state.recycle_bin && logical.is_some_and(|effect| effect != 0) {
-                        Some(FileTransferOperation::Move)
-                    } else {
-                        logical.and_then(transfer_operation)
-                    }
-                })
-                .flatten();
+            let operation = if result.is_ok() {
+                logical.and_then(|effect| performed_operation(effect, state.recycle_bin))
+            } else {
+                None
+            };
             FileTransferCompletion {
                 files: self.files.clone(),
                 operation,
@@ -220,13 +235,11 @@ impl IDataObjectAsyncCapability_Impl for FileDataObject_Impl {
 
 impl Drop for FileDataObject {
     fn drop(&mut self) {
-        if !self.result.borrow().reported {
-            FileTransferCompletion {
-                files: self.files.clone(),
-                operation: None,
-                source_removed: false,
-            }
-            .report();
+        let mut state = self.result.borrow_mut();
+        // A target that began extracting and vanished never calls EndOperation.
+        self.end_operation(&mut state);
+        if !state.reported {
+            FileTransferCompletion::cancelled(self.files.clone()).report();
         }
     }
 }
@@ -302,12 +315,11 @@ fn data_object(
         )?
     };
     let inner: IDataObject = unsafe { items.BindToHandler(None::<&IBindCtx>, &BHID_DataObject)? };
-    let preferred = if files.operation == FileTransferOperation::Move {
-        EFFECT_MOVE
-    } else {
-        EFFECT_COPY
-    };
-    set_bytes(&inner, *PREFERRED, &preferred.to_le_bytes())?;
+    set_bytes(
+        &inner,
+        *PREFERRED,
+        &effect_of(files.operation).to_le_bytes(),
+    )?;
     if let Some(bytes) = files.encode(gpui::FILE_TRANSFER_MIME) {
         set_bytes(&inner, *PRIVATE, &bytes)?;
     }
@@ -325,44 +337,45 @@ fn data_object(
     Ok((object, result))
 }
 
-pub(crate) fn write_files(files: FileTransfer) -> Result<()> {
+/// Places the files on the clipboard, with `text` for plain-text consumers.
+pub(crate) fn write_files(files: FileTransfer, text: Option<String>) -> Result<()> {
     let (object, _) = data_object(files, true)?;
+    if let Some(text) = text {
+        let wide: Vec<u8> = text
+            .encode_utf16()
+            .chain(Some(0))
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        set_bytes(&object, CF_UNICODETEXT as u16, &wide)?;
+    }
     unsafe { OleSetClipboard(&object).ok() }
 }
 
+/// Runs the modal drag loop. `None` means the target extracts asynchronously
+/// and the data object reports the result when that ends.
 pub(crate) fn drag_files(window: HWND, files: FileTransfer) -> Option<FileTransferCompletion> {
-    let mut completion = FileTransferCompletion {
-        files: files.clone(),
-        operation: None,
-        source_removed: false,
+    let Ok((object, result)) = data_object(files.clone(), false) else {
+        return Some(FileTransferCompletion::cancelled(files));
     };
-    if let Ok((object, result)) = data_object(files.clone(), false) {
-        let allowed = if files.operation == FileTransferOperation::Move {
-            EFFECT_COPY | EFFECT_MOVE
-        } else {
-            EFFECT_COPY
-        };
-        if let Ok(effect) =
-            unsafe { SHDoDragDrop(Some(window), &object, None::<&IDropSource>, allowed) }
-        {
-            let mut state = result.borrow_mut();
-            state.drag_effect = Some(effect);
-            if state.in_operation || state.reported {
-                return None;
-            }
-            let logical = state.logical.unwrap_or(effect);
-            completion.operation = if logical != 0 && state.recycle_bin || logical == EFFECT_MOVE {
-                Some(FileTransferOperation::Move)
-            } else if logical == EFFECT_COPY {
-                Some(FileTransferOperation::Copy)
-            } else {
-                None
-            };
-            completion.source_removed = !state.recycle_bin
-                && (effect != EFFECT_MOVE || state.performed.is_some_and(|p| p != EFFECT_MOVE));
-        }
+    let allowed = EFFECT_COPY | effect_of(files.operation);
+    let effect = unsafe { SHDoDragDrop(Some(window), &object, None::<&IDropSource>, allowed) }.ok();
+    let mut state = result.borrow_mut();
+    state.drag_effect = effect;
+    if state.in_operation || state.reported {
+        return None;
     }
-    Some(completion)
+    // Reported here: releasing the data object must not add a cancellation.
+    state.reported = true;
+    let Some(effect) = effect else {
+        return Some(FileTransferCompletion::cancelled(files));
+    };
+    let logical = state.logical.unwrap_or(effect);
+    Some(FileTransferCompletion {
+        files,
+        operation: performed_operation(logical, state.recycle_bin),
+        source_removed: !state.recycle_bin
+            && (effect != EFFECT_MOVE || state.performed.is_some_and(|p| p != EFFECT_MOVE)),
+    })
 }
 
 /// Shell completion is delivered to the captured IDataObject, never to whichever
@@ -382,11 +395,7 @@ pub(crate) fn capture_paste(files: &FileTransfer) -> Option<gpui::FilePaste> {
         let Some(operation) = operation else {
             return;
         };
-        let logical = if operation == FileTransferOperation::Move {
-            EFFECT_MOVE
-        } else {
-            EFFECT_COPY
-        };
+        let logical = effect_of(operation);
         // Our filesystem service has already moved the originals. Reporting
         // an optimized move prevents the source from deleting them again.
         let performed = if operation == FileTransferOperation::Move {
@@ -424,13 +433,7 @@ pub(crate) fn capture_drop(
         operation,
         source_owns_move: false,
         completion: gpui::FilePaste::new(move |completed| {
-            let logical = completed.map_or(0, |operation| {
-                if operation == FileTransferOperation::Move {
-                    EFFECT_MOVE
-                } else {
-                    EFFECT_COPY
-                }
-            });
+            let logical = completed.map_or(0, effect_of);
             let performed = if completed == Some(FileTransferOperation::Copy) {
                 EFFECT_COPY
             } else {

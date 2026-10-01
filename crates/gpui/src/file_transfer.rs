@@ -157,23 +157,39 @@ pub struct FileTransferCompletion {
 
 static COMPLETIONS: std::sync::Mutex<Vec<FileTransferCompletion>> =
     std::sync::Mutex::new(Vec::new());
-static ACTIVE_TRANSFERS: std::sync::Mutex<std::collections::BTreeSet<u64>> =
-    std::sync::Mutex::new(std::collections::BTreeSet::new());
+/// Ownership tokens with a native receiver still extracting them, counted per
+/// token: tokens are application-chosen and several transfers may share one
+/// (every untagged payload uses 0), so one finishing must not hide the others.
+static ACTIVE_TRANSFERS: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
 impl FileTransfer {
-    /// Native adapters mark asynchronous extraction before releasing their drag loop.
+    /// Native adapters mark asynchronous extraction before releasing their drag
+    /// loop, and clear it exactly once when that extraction ends. Reporting a
+    /// completion does not clear it.
     pub fn set_active(&self, active: bool) {
         let mut transfers = ACTIVE_TRANSFERS.lock().unwrap_or_else(|e| e.into_inner());
         if active {
-            transfers.insert(self.ownership);
-        } else {
-            transfers.remove(&self.ownership);
+            *transfers.entry(self.ownership).or_default() += 1;
+        } else if let Some(count) = transfers.get_mut(&self.ownership) {
+            *count -= 1;
+            if *count == 0 {
+                transfers.remove(&self.ownership);
+            }
         }
     }
 }
 impl FileTransferCompletion {
+    /// A transfer that was cancelled, rejected, or never started.
+    pub fn cancelled(files: FileTransfer) -> Self {
+        Self {
+            files,
+            operation: None,
+            source_removed: false,
+        }
+    }
+
     /// Native adapters report completion after their protocol's final event.
     pub fn report(self) {
-        self.files.set_active(false);
         COMPLETIONS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -185,7 +201,7 @@ pub(crate) fn transfer_is_active(ownership: u64) -> bool {
     ACTIVE_TRANSFERS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .contains(&ownership)
+        .contains_key(&ownership)
 }
 
 impl crate::App {
@@ -378,30 +394,53 @@ mod tests {
         assert_eq!(as_files.text(), as_external.text());
     }
 
-    #[test]
-    fn transfer_is_active_until_its_completion_is_reported() {
-        let files = FileTransfer {
-            paths: ExternalPaths(
-                [PathBuf::from(if cfg!(windows) {
-                    "C:/tmp/a"
-                } else {
-                    "/tmp/a"
-                })]
-                .into_iter()
-                .collect(),
-            ),
+    fn transfer(path: &str, ownership: u64) -> FileTransfer {
+        let root = if cfg!(windows) { "C:/tmp" } else { "/tmp" };
+        FileTransfer {
+            paths: ExternalPaths([PathBuf::from(root).join(path)].into_iter().collect()),
             operation: FileTransferOperation::Move,
-            ownership: 0x5f1a_2b3c_4d5e_6f70,
-        };
+            ownership,
+        }
+    }
+
+    #[test]
+    fn transfer_is_active_until_its_extraction_ends() {
+        let files = transfer("a", 0x5f1a_2b3c_4d5e_6f70);
         files.set_active(true);
         assert!(transfer_is_active(files.ownership));
+        // Completion is reported separately from activity: a Windows paste can
+        // report before `EndOperation`, and a drag that never started reports
+        // without ever having been active.
         FileTransferCompletion {
             files: files.clone(),
             operation: Some(FileTransferOperation::Move),
             source_removed: false,
         }
         .report();
+        assert!(transfer_is_active(files.ownership));
+        files.set_active(false);
         assert!(!transfer_is_active(files.ownership));
+    }
+
+    #[test]
+    fn overlapping_transfers_sharing_a_token_stay_active_until_the_last_one_ends() {
+        // Untagged payloads all use token 0. Two pastes of such payloads can
+        // overlap on Windows, where each one runs `StartOperation` and
+        // `EndOperation`; the first ending must not report the second finished.
+        let first = transfer("first", 0);
+        let second = transfer("second", 0);
+        first.set_active(true);
+        second.set_active(true);
+        first.set_active(false);
+        assert!(transfer_is_active(0), "second transfer is still extracting");
+        // Completions of transfers that were never active do not end it either.
+        FileTransferCompletion::cancelled(transfer("third", 0)).report();
+        assert!(transfer_is_active(0));
+        second.set_active(false);
+        assert!(!transfer_is_active(0));
+        // Ending an inactive transfer is harmless.
+        second.set_active(false);
+        assert!(!transfer_is_active(0));
     }
 
     #[test]

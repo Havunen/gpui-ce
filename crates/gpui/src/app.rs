@@ -732,6 +732,9 @@ pub struct App {
 
     pub(crate) actions: Rc<ActionRegistry>,
     pub(crate) active_drag: Option<AnyDrag>,
+    /// Counts drag gestures. Asynchronous work started for one gesture checks
+    /// it before acting on whatever drag is active when the work finishes.
+    pub(crate) drag_generation: u64,
     platform_owned_drag: Option<PlatformOwnedDrag>,
     pub(crate) background_executor: BackgroundExecutor,
     pub(crate) foreground_executor: ForegroundExecutor,
@@ -863,6 +866,7 @@ impl App {
                 flushing_effects: false,
                 pending_updates: 0,
                 active_drag: None,
+                drag_generation: 0,
                 platform_owned_drag: None,
                 background_executor,
                 foreground_executor,
@@ -2625,6 +2629,7 @@ impl App {
     /// Sets the current drag payload. Its recommended the window be refreshed when this is called.
     pub fn start_drag(&mut self, drag: AnyDrag) {
         debug_assert!(self.active_drag.is_none());
+        self.drag_generation = self.drag_generation.wrapping_add(1);
         self.active_drag = Some(drag);
     }
 

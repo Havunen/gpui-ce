@@ -72,7 +72,9 @@ fn get_clipboard_data(format: u32) -> Option<LockedGlobal> {
 
 pub(crate) fn write_to_clipboard(item: ClipboardItem) {
     if let Some(files) = item.file_transfer() {
-        if let Err(error) = crate::file_transfer::write_files(files) {
+        // The Shell data object carries the files for Explorer; the text is
+        // what terminals and editors paste, as on the other platforms.
+        if let Err(error) = crate::file_transfer::write_files(files, item.text()) {
             log::error!("Could not write native files to clipboard: {error}");
         }
         return;
@@ -87,12 +89,8 @@ pub(crate) fn write_to_clipboard(item: ClipboardItem) {
             match entry {
                 ClipboardEntry::String(string) => write_string(string)?,
                 ClipboardEntry::Image(image) => write_image(image)?,
-                ClipboardEntry::ExternalPaths(paths) => write_files(&gpui::FileTransfer {
-                    paths: paths.clone(),
-                    operation: gpui::FileTransferOperation::Copy,
-                    ownership: 0,
-                })?,
-                ClipboardEntry::Files(files) => write_files(files)?,
+                // Items with files took the data-object path above.
+                ClipboardEntry::ExternalPaths(_) | ClipboardEntry::Files(_) => {}
             }
         }
         Ok(())
@@ -127,13 +125,15 @@ pub(crate) fn read_from_clipboard() -> Option<ClipboardItem> {
                     .ok()
             })
             .unwrap_or(0);
-        return Some(ClipboardItem {
-            entries: vec![ClipboardEntry::Files(gpui::FileTransfer {
-                paths,
-                operation,
-                ownership,
-            })],
-        });
+        let mut entries = vec![ClipboardEntry::Files(gpui::FileTransfer {
+            paths,
+            operation,
+            ownership,
+        })];
+        // Files written by this crate carry their text too; keep it so text
+        // consumers paste what was copied rather than a rendering of the paths.
+        entries.extend(read_string());
+        return Some(ClipboardItem { entries });
     }
 
     let mut entries = Vec::new();
@@ -248,34 +248,6 @@ fn write_string(item: &ClipboardString) -> Result<()> {
         let wide: Vec<u16> = metadata.encode_utf16().chain(Some(0)).collect_vec();
         set_clipboard_bytes(&wide, *CLIPBOARD_METADATA_FORMAT)?;
     }
-    Ok(())
-}
-
-fn write_files(files: &gpui::FileTransfer) -> Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    // DROPFILES: pFiles, POINT, fNC, fWide. The file list is UTF-16 and
-    // double-NUL terminated; native names must not pass through UTF-8.
-    let mut bytes = Vec::new();
-    for value in [20u32, 0, 0, 0, 1] {
-        bytes.extend(value.to_le_bytes());
-    }
-    for path in files.paths.paths() {
-        for value in path.as_os_str().encode_wide().chain(Some(0)) {
-            bytes.extend(value.to_le_bytes());
-        }
-    }
-    bytes.extend(0u16.to_le_bytes());
-    set_clipboard_bytes(&bytes, CF_HDROP as u32)?;
-    let effect = if files.operation == gpui::FileTransferOperation::Move {
-        2u32
-    } else {
-        1u32
-    };
-    set_clipboard_bytes(&effect.to_le_bytes(), *PREFERRED_DROP_EFFECT)?;
-    set_clipboard_bytes(
-        &files.encode(gpui::FILE_TRANSFER_MIME).unwrap(),
-        *FILE_TRANSFER_FORMAT,
-    )?;
     Ok(())
 }
 

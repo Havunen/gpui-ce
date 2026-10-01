@@ -678,6 +678,9 @@ pub mod quad {
         #[location(12)]
         #[interpolate(flat)]
         pub border_color1: Vec4f,
+        #[location(13)]
+        #[interpolate(flat)]
+        pub superellipse_error: f32,
     }
 
     #[vertex]
@@ -709,6 +712,7 @@ pub mod quad {
             superellipse_power: prepared.superellipse_power,
             border_color0: vertex.border.color0,
             border_color1: vertex.border.color1,
+            superellipse_error: prepared.superellipse_error,
         }
     }
 
@@ -728,6 +732,7 @@ pub mod quad {
             vertical_reaches: input.vertical_corner_reaches,
             smoothing_factors: input.smoothing_factors,
             superellipse_power: input.superellipse_power,
+            superellipse_error: input.superellipse_error,
         };
 
         if Edges::is_zero(quad.border_widths) {

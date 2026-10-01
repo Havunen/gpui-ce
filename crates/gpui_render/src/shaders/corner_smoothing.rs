@@ -373,6 +373,9 @@ mod source {
         pub vertical_reaches: Vec4f,
         pub smoothing_factors: Vec4f,
         pub superellipse_power: f32,
+        /// How far the superellipse shortcut's distance may stray near the edge, in pixels;
+        /// zero without the shortcut.
+        pub superellipse_error: f32,
     }
 
     pub fn figma_smoothing_factors(corner_smoothing: f32) -> Vec4f {
@@ -505,6 +508,7 @@ mod source {
             vertical_reaches: radius_values,
             smoothing_factors: vec4f(0.0, 1.0, 0.0, 0.0),
             superellipse_power: 0.0,
+            superellipse_error: 0.0,
         };
 
         if smoothing <= 0.0 {
@@ -520,6 +524,7 @@ mod source {
             prepared.horizontal_reaches = reaches;
             prepared.vertical_reaches = reaches;
             prepared.superellipse_power = normalized_superellipse_power(smoothing);
+            prepared.superellipse_error = normalized_superellipse_distance_error(radii, smoothing);
             return prepared;
         }
 
@@ -1052,7 +1057,7 @@ mod source {
             );
 
             // Beyond the error from the edge, both distances leave a pixel fully in or out.
-            let error = normalized_superellipse_distance_error(corner_radii, corner_smoothing);
+            let error = prepared.superellipse_error;
             if error <= SUPERELLIPSE_MAX_DISTANCE_ERROR
                 || abs(estimate) >= PIXEL_ANTIALIAS_RADIUS + error
             {
@@ -1507,6 +1512,12 @@ mod tests {
                 let superellipse = prepare_corners(bounds.size, radii, smoothing, true);
                 let figma = prepare_corners(bounds.size, radii, smoothing, false);
                 assert!(superellipse.superellipse_power > 0.0);
+                // The error depends on the shape alone, so it is prepared once per primitive.
+                assert_eq!(
+                    superellipse.superellipse_error,
+                    normalized_superellipse_distance_error(radii, smoothing)
+                );
+                assert_eq!(figma.superellipse_error, 0.0);
                 // Only shapes whose estimate stays close skip the exact distance near the edge.
                 let tolerance = if normalized_superellipse_distance_error(radii, smoothing)
                     <= SUPERELLIPSE_MAX_DISTANCE_ERROR

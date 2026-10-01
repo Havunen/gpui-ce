@@ -21,8 +21,13 @@ fn file_clipboard_bridge() -> Result<&'static linux::x11::clipboard::Clipboard, 
 #[cfg(feature = "x11")]
 pub fn write_files_to_x11_clipboard(files: &gpui::FileTransfer) -> Result<(), String> {
     use linux::x11::clipboard::{ClipboardKind, WaitConfig};
+    let text = gpui::ClipboardItem {
+        entries: vec![gpui::ClipboardEntry::Files(files.clone())],
+    }
+    .text()
+    .unwrap_or_default();
     file_clipboard_bridge()?
-        .set_files(files, ClipboardKind::Clipboard, WaitConfig::None)
+        .set_files(files, &text, ClipboardKind::Clipboard, WaitConfig::None)
         .map_err(|e| e.to_string())
 }
 

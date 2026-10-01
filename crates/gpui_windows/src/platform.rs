@@ -1196,6 +1196,13 @@ impl Drop for WindowsPlatform {
                 .ok()
                 .context("Destroying platform window")
                 .log_err();
+            // A data object placed with OleSetClipboard lives in this process.
+            // Rendering it now keeps copied files pasteable after exit, as
+            // text written with SetClipboardData already is.
+            OleFlushClipboard()
+                .ok()
+                .context("Flushing the OLE clipboard")
+                .log_err();
             OleUninitialize();
         }
     }

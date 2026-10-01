@@ -1908,6 +1908,11 @@ pub mod Windows {
             unsafe { MonitorFromWindow(hwnd, dwflags) }
         }
         #[inline]
+        pub unsafe fn OleFlushClipboard() -> windows_core::HRESULT {
+            windows_core::link!("ole32.dll" "system" fn OleFlushClipboard() -> windows_core::HRESULT);
+            unsafe { OleFlushClipboard() }
+        }
+        #[inline]
         pub unsafe fn OleGetClipboard() -> windows_core::Result<IDataObject> {
             windows_core::link!("ole32.dll" "system" fn OleGetClipboard(ppdataobj : *mut *mut core::ffi::c_void) -> windows_core::HRESULT);
             unsafe {

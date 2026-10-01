@@ -180,12 +180,12 @@ impl Clipboard {
         self.self_mime.clone()
     }
 
-    pub fn send(&self, _mime_type: String, fd: OwnedFd) {
+    pub fn send(&self, mime_type: String, fd: OwnedFd) {
         if let Some(bytes) = self
             .contents
             .as_ref()
             .and_then(|c| c.file_transfer())
-            .and_then(|f| f.encode(&_mime_type))
+            .and_then(|f| f.encode(&mime_type))
         {
             self.send_bytes(fd, bytes);
             return;

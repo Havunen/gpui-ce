@@ -276,6 +276,9 @@ pub mod polychrome_sprite {
         #[location(6)]
         #[interpolate(flat)]
         pub superellipse_power: f32,
+        #[location(7)]
+        #[interpolate(flat)]
+        pub superellipse_error: f32,
     }
 
     #[vertex]
@@ -301,6 +304,7 @@ pub mod polychrome_sprite {
             vertical_corner_reaches: prepared.vertical_reaches,
             smoothing_factors: prepared.smoothing_factors,
             superellipse_power: prepared.superellipse_power,
+            superellipse_error: prepared.superellipse_error,
         }
     }
 
@@ -324,6 +328,7 @@ pub mod polychrome_sprite {
                         vertical_reaches: input.vertical_corner_reaches,
                         smoothing_factors: input.smoothing_factors,
                         superellipse_power: input.superellipse_power,
+                        superellipse_error: input.superellipse_error,
                     },
                 )),
         )

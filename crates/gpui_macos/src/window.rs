@@ -2391,6 +2391,7 @@ impl PlatformWindow for MacWindow {
                 return false;
             }
 
+            // The source operation mask is asked for while the session starts.
             self.0.lock().outbound_files = Some(paths.transfer());
             let session: ObjcId = msg_send![
                 native_view,
@@ -2400,9 +2401,14 @@ impl PlatformWindow for MacWindow {
             ];
 
             let started = !session.is_null();
+            let mut state = self.0.lock();
             if started {
-                self.0.lock().synthetic_drag_counter += 1;
+                state.synthetic_drag_counter += 1;
+            } else {
+                // No session ever ends, so nothing must be left for the next one to report.
+                state.outbound_files = None;
             }
+            drop(state);
             log::debug!(
                 "start_external_drag completed: started={}, item_count={}",
                 started,
@@ -3731,7 +3737,9 @@ unsafe extern "C" fn dragging_session_ended(
             FileDropEvent::Completed(gpui::FileTransferCompletion {
                 files,
                 operation,
-                source_removed: false,
+                // Finder moves dragged file URLs itself, so after a move the
+                // originals are already gone from where they were.
+                source_removed: operation == Some(gpui::FileTransferOperation::Move),
             }),
         );
     } else {
