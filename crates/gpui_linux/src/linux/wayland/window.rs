@@ -1911,12 +1911,23 @@ impl PlatformWindow for WaylandWindow {
         None
     }
 
-    fn activate(&self) {
+    fn activate(&self, token: Option<&str>) -> bool {
         let state = self.borrow();
+        if let Some(token) = token {
+            let Some(activation) = &state.globals.activation else {
+                return false;
+            };
+            if token.is_empty() {
+                return false;
+            }
+            activation.activate(token.to_owned(), &state.surface);
+            return true;
+        }
+
         let (Some(activation), Some(app_id)) =
             (state.globals.activation.clone(), state.app_id.clone())
         else {
-            return;
+            return false;
         };
         let client = state.client.clone();
         let qh = state.globals.qh.clone();
@@ -1934,6 +1945,7 @@ impl PlatformWindow for WaylandWindow {
         token.set_serial(serial.as_raw(), &seat);
         token.set_surface(requester.as_ref().unwrap_or(&target));
         token.commit();
+        true
     }
 
     fn request_attention(&self) {}
