@@ -3222,6 +3222,33 @@ impl Interactivity {
         }
     }
 
+    /// The hitboxes whose hover decides this element's drag-over styles for the
+    /// active drag, each paired with whether it is hovered now.
+    fn drag_over_hover(
+        &self,
+        hitbox: &Hitbox,
+        window: &Window,
+        cx: &mut App,
+    ) -> SmallVec<[(HitboxId, bool); 2]> {
+        let Some(drag_type) = cx
+            .active_drag
+            .as_ref()
+            .map(|drag| drag.value.as_ref().type_id())
+        else {
+            return SmallVec::new();
+        };
+        let own = self.has_drag_over_styles().then_some(hitbox.id);
+        let groups = self
+            .group_drag_over_styles
+            .iter()
+            .filter(|(state_type, _)| *state_type == drag_type)
+            .filter_map(|(_, style)| GroupHitboxes::get(&style.group, cx));
+        own.into_iter()
+            .chain(groups)
+            .map(|id| (id, id.is_hovered(window)))
+            .collect()
+    }
+
     fn paint_mouse_listeners(
         &mut self,
         hitbox: &Hitbox,
@@ -3302,9 +3329,13 @@ impl Interactivity {
             })
         }
 
+        // Drag-over styles resolve against hover as this element paints. Keep the
+        // hover they saw, so the view repaints when the pointer crosses those
+        // hitboxes even while a drag only repaints its preview.
+        let drag_over_hover = self.drag_over_hover(hitbox, window, cx);
         if self.hover_style.is_some()
             || self.base_style.mouse_cursor.is_some()
-            || cx.active_drag.is_some() && self.has_drag_over_styles()
+            || !drag_over_hover.is_empty()
         {
             let hitbox = hitbox.clone();
             let hover_state = self.hover_style.as_ref().and_then(|_| {
@@ -3316,15 +3347,22 @@ impl Interactivity {
             let current_view = window.current_view();
 
             window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
-                let hovered = hitbox.is_hovered(window);
-                let was_hovered = hover_state
-                    .as_ref()
-                    .is_some_and(|state| state.borrow().element);
-                if phase == DispatchPhase::Capture && hovered != was_hovered {
-                    if let Some(hover_state) = &hover_state {
-                        hover_state.borrow_mut().element = hovered;
-                        cx.notify(current_view);
+                if phase != DispatchPhase::Capture {
+                    return;
+                }
+                let mut changed = drag_over_hover
+                    .iter()
+                    .any(|&(id, was_hovered)| id.is_hovered(window) != was_hovered);
+                if let Some(hover_state) = &hover_state {
+                    let hovered = hitbox.is_hovered(window);
+                    let mut hover_state = hover_state.borrow_mut();
+                    if hover_state.element != hovered {
+                        hover_state.element = hovered;
+                        changed = true;
                     }
+                }
+                if changed {
+                    cx.notify(current_view);
                 }
             });
         }

@@ -2702,20 +2702,21 @@ impl ClipboardItem {
         }
 
         if answer.is_empty() {
-            for entry in self.entries.iter() {
-                // `Files` and `ExternalPaths` both describe pathnames, and text
-                // consumers must not be able to tell them apart: platforms pick
-                // between the two based on what the source application offered.
-                let paths = match entry {
-                    ClipboardEntry::ExternalPaths(paths) => &paths.0,
-                    ClipboardEntry::Files(files) => &files.paths.0,
-                    _ => continue,
-                };
-                for path in paths {
-                    use std::fmt::Write as _;
-                    _ = write!(answer, "{}", path.display());
-                }
-            }
+            // `Files` and `ExternalPaths` both describe pathnames, and text
+            // consumers must not be able to tell them apart: platforms pick
+            // between the two based on what the source application offered.
+            // Each path goes on its own line, as file managers paste them.
+            answer = self
+                .entries
+                .iter()
+                .flat_map(|entry| match entry {
+                    ClipboardEntry::ExternalPaths(paths) => paths.paths(),
+                    ClipboardEntry::Files(files) => files.paths.paths(),
+                    _ => &[],
+                })
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
         }
 
         if !answer.is_empty() {

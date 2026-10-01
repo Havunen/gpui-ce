@@ -48,8 +48,10 @@ pub(crate) struct TestWindowState {
     visible: bool,
     is_fullscreen: bool,
     appearance: WindowAppearance,
-    external_drag_files: Vec<(PathBuf, bool)>,
+    external_drags: Vec<crate::FileDragPaths>,
     start_external_drag_result: bool,
+    can_start_external_drag: bool,
+    modifiers: crate::Modifiers,
 }
 
 #[derive(Clone)]
@@ -113,8 +115,10 @@ impl TestWindow {
             visible: params.show,
             is_fullscreen: false,
             appearance: WindowAppearance::Light,
-            external_drag_files: Vec::new(),
+            external_drags: Vec::new(),
             start_external_drag_result: false,
+            can_start_external_drag: true,
+            modifiers: crate::Modifiers::default(),
         })))
     }
     pub fn simulate_scheduled_frame(&self) -> bool {
@@ -239,12 +243,31 @@ impl TestWindow {
         self.0.lock().request_frame_callback = Some(callback);
     }
 
+    /// The paths of every native drag the window was asked to start.
     pub fn external_drag_files(&self) -> Vec<(PathBuf, bool)> {
-        self.0.lock().external_drag_files.clone()
+        self.external_drags()
+            .iter()
+            .flat_map(|drag| drag.entries().iter().cloned())
+            .collect()
+    }
+
+    /// Every native file drag payload the window was asked to start.
+    pub fn external_drags(&self) -> Vec<crate::FileDragPaths> {
+        self.0.lock().external_drags.clone()
     }
 
     pub fn set_start_external_drag_result(&self, result: bool) {
         self.0.lock().start_external_drag_result = result;
+    }
+
+    /// Whether the window offers native drags at all.
+    pub fn set_can_start_external_drag(&self, can_start: bool) {
+        self.0.lock().can_start_external_drag = can_start;
+    }
+
+    /// The modifiers the platform reports as held.
+    pub fn set_modifiers(&self, modifiers: crate::Modifiers) {
+        self.0.lock().modifiers = modifiers;
     }
 }
 
@@ -287,7 +310,7 @@ impl PlatformWindow for TestWindow {
     }
 
     fn modifiers(&self) -> crate::Modifiers {
-        crate::Modifiers::default()
+        self.0.lock().modifiers
     }
 
     fn capslock(&self) -> crate::Capslock {
@@ -493,16 +516,13 @@ impl PlatformWindow for TestWindow {
     }
 
     fn can_start_external_drag(&self) -> bool {
-        true
+        self.0.lock().can_start_external_drag
     }
 
     fn start_external_drag(&self, payload: &crate::ExternalDragPayload) -> bool {
         let mut state = self.0.lock();
-        match payload {
-            crate::ExternalDragPayload::Files(paths) => {
-                state.external_drag_files.extend_from_slice(paths.entries());
-            }
-        }
+        let crate::ExternalDragPayload::Files(paths) = payload;
+        state.external_drags.push(paths.clone());
         state.start_external_drag_result
     }
 

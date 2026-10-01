@@ -3118,8 +3118,9 @@ pub enum DragMoveRefresh {
     /// Refresh the whole window, including cached views (the default).
     #[default]
     Window,
-    /// Invalidate only the preview. Drag handlers must notify views whose
-    /// appearance changes, including custom drop targets and drag-over styles.
+    /// Invalidate only the preview, and the views of elements whose drag-over
+    /// styles change as the pointer crosses them. Drag handlers must notify any
+    /// other views whose appearance follows the drag, such as custom drop targets.
     Preview,
 }
 
