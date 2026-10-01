@@ -55,6 +55,7 @@ ctor = "1.0"
 unicode-bidi = { version = "0.3", default-features = false, features = [
     "hardcoded-data",
 ] }
+derive_setters = "0.1.9"
 derive_more = { version = "2.1", features = [
   "add",
   "add_assign",

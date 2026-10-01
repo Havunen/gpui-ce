@@ -779,7 +779,10 @@ impl PlatformWindow for WindowsWindow {
         Some(done_rx)
     }
 
-    fn activate(&self) {
+    fn activate(&self, token: Option<&str>) -> bool {
+        if token.is_some() {
+            return false;
+        }
         let hwnd = self.0.hwnd;
         let this = self.0.clone();
         self.0
@@ -831,6 +834,7 @@ impl PlatformWindow for WindowsWindow {
                 unsafe { SetForegroundWindow(hwnd).as_bool() };
             })
             .detach();
+        true
     }
 
     fn request_attention(&self) {

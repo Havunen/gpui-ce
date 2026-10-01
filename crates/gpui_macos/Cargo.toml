@@ -15,7 +15,11 @@ path = "src/gpui_macos.rs"
 [features]
 default = ["gpui/default"]
 bench-support = ["gpui/bench-support", "gpui_apple/bench-support"]
-test-support = ["gpui/test-support", "gpui_apple/test-support"]
+test-support = [
+  "gpui/test-support",
+  "gpui_apple/test-support",
+  "gpui_wgpu?/test-support",
+]
 font-kit = ["dep:font-kit"]
 screen-capture = [
   "gpui/screen-capture",
@@ -23,6 +27,10 @@ screen-capture = [
   "dep:objc2-core-media",
   "dep:objc2-screen-capture-kit",
 ]
+# Draw windows with the WGPU renderer instead of Metal, so applications can
+# share its device and composite their own WGPU textures (with gpui's
+# `custom-gpu` feature).
+wgpu = ["dep:gpui_wgpu"]
 
 [dependencies]
 gpui.workspace = true
@@ -48,6 +56,7 @@ foreign-types.workspace = true
 futures.workspace = true
 gpui_apple.workspace = true
 gpui_util.workspace = true
+gpui_wgpu = { workspace = true, optional = true }
 image.workspace = true
 itertools.workspace = true
 libc.workspace = true
