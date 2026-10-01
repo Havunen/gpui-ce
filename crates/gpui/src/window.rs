@@ -1262,6 +1262,7 @@ pub struct Window {
     pub(crate) focus_lost_listeners: SubscriberSet<(), AnyObserver>,
     focus_lost_path: SmallVec<[FocusId; 8]>,
     default_prevented: bool,
+    incoming_file_drop: Option<crate::FileDropTransfer>,
     mouse_position: Point<Pixels>,
     mouse_hit_test: HitTest,
     modifiers: Modifiers,
@@ -1371,6 +1372,12 @@ struct PendingInput {
     focus: Option<FocusId>,
     timer: Option<Task<()>>,
     needs_timeout: bool,
+}
+
+/// Reports a native payload whose drag never started, so its source snapshot is released.
+fn report_external_drag_cancelled(payload: crate::ExternalDragPayload) {
+    let crate::ExternalDragPayload::Files(files) = payload;
+    crate::FileTransferCompletion::cancelled(files.transfer()).report();
 }
 
 pub(crate) struct ElementStateBox {
@@ -2007,6 +2014,7 @@ impl Window {
             focus_lost_listeners: SubscriberSet::new(),
             focus_lost_path: SmallVec::new(),
             default_prevented: true,
+            incoming_file_drop: None,
             mouse_position,
             mouse_hit_test: HitTest::default(),
             modifiers,
@@ -5562,6 +5570,16 @@ impl Window {
         // Handlers may set this to true by calling `prevent_default`.
         self.default_prevented = false;
 
+        let event = if let PlatformInput::FileDrop(FileDropEvent::SubmitWithTransfer {
+            position,
+            transfer,
+        }) = event
+        {
+            self.incoming_file_drop = Some(transfer);
+            PlatformInput::FileDrop(FileDropEvent::Submit { position })
+        } else {
+            event
+        };
         let event = match event {
             // Track the mouse position with our own state, since accessing the platform
             // API for the mouse position can only occur on the main thread.
@@ -5590,6 +5608,8 @@ impl Window {
             PlatformInput::ModifiersChanged(modifiers_changed) => {
                 self.modifiers = modifiers_changed.modifiers;
                 self.capslock = modifiers_changed.capslock;
+                // A drag preview may show modifier feedback, such as a copy badge.
+                self.refresh_active_drag(cx);
                 PlatformInput::ModifiersChanged(modifiers_changed)
             }
             PlatformInput::ScrollWheel(scroll_wheel) => {
@@ -5605,39 +5625,35 @@ impl Window {
             // Translate dragging and dropping of external files from the operating system
             // to internal drag and drop events.
             PlatformInput::FileDrop(file_drop) => match file_drop {
+                FileDropEvent::SubmitWithTransfer { .. } => unreachable!("normalized above"),
                 FileDropEvent::Entered { position, paths } => {
-                    self.mouse_position = position;
-                    let source_window = self.handle.window_id();
-                    if !cx.restore_platform_drag(source_window) && cx.active_drag.is_none() {
-                        cx.active_drag = Some(AnyDrag {
-                            value: Arc::new(paths.clone()),
-                            view: cx.new(|_| paths).into(),
-                            cursor_offset: position,
-                            cursor_style: None,
-                            external_payload_source: None,
-                        });
+                    if !cx.restore_platform_drag(self.handle.window_id())
+                        && cx.active_drag.is_none()
+                    {
+                        let view = cx.new(|_| paths.clone());
+                        cx.start_drag(AnyDrag::new(paths, view).offset(position));
                     }
+                    // The drag starts or resumes here, so repaint everything once, as
+                    // for a drag started in this window. Cached views then pick up
+                    // their drag-over styles even if moves only repaint the preview.
+                    self.refresh();
                     PlatformInput::MouseMove(MouseMoveEvent {
                         position,
                         pressed_button: Some(MouseButton::Left),
-                        modifiers: Modifiers::default(),
+                        modifiers: self.track_native_drag_pointer(position),
                     })
                 }
-                FileDropEvent::Pending { position } => {
-                    self.mouse_position = position;
-                    PlatformInput::MouseMove(MouseMoveEvent {
-                        position,
-                        pressed_button: Some(MouseButton::Left),
-                        modifiers: Modifiers::default(),
-                    })
-                }
+                FileDropEvent::Pending { position } => PlatformInput::MouseMove(MouseMoveEvent {
+                    position,
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: self.track_native_drag_pointer(position),
+                }),
                 FileDropEvent::Submit { position } => {
                     cx.activate(true);
-                    self.mouse_position = position;
                     PlatformInput::MouseUp(MouseUpEvent {
                         button: MouseButton::Left,
                         position,
-                        modifiers: Modifiers::default(),
+                        modifiers: self.track_native_drag_pointer(position),
                         click_count: 1,
                     })
                 }
@@ -5647,6 +5663,12 @@ impl Window {
                     }
                     self.refresh();
                     PlatformInput::FileDrop(FileDropEvent::Exited)
+                }
+                FileDropEvent::Completed(completion) => {
+                    completion.report();
+                    cx.end_platform_drag(self.handle.window_id());
+                    self.refresh();
+                    PlatformInput::FileDrop(FileDropEvent::Ended)
                 }
                 FileDropEvent::Ended => {
                     cx.end_platform_drag(self.handle.window_id());
@@ -5703,9 +5725,46 @@ impl Window {
         #[cfg(feature = "profiler")]
         self.window_profiler.end_input(caused_invalidation);
 
+        // Unclaimed native drops are rejected; a handler can take the lease
+        // during on_drop and complete it from asynchronous filesystem work.
+        self.incoming_file_drop.take();
         DispatchEventResult {
             propagate: cx.propagate_event,
             default_prevented: self.default_prevented,
+        }
+    }
+
+    /// Claim the native completion lease during a file-drop handler.
+    pub fn take_file_drop(&mut self) -> Option<crate::FileDropTransfer> {
+        self.incoming_file_drop.take()
+    }
+
+    /// Cancel the current in-application drag. A native payload still being
+    /// prepared for it is released instead of started.
+    pub fn cancel_drag(&mut self, cx: &mut App) {
+        cx.stop_active_drag(self);
+        self.incoming_file_drop.take();
+    }
+
+    /// Native drag events carry no modifiers, so read the platform's while
+    /// following the pointer.
+    fn track_native_drag_pointer(&mut self, position: Point<Pixels>) -> Modifiers {
+        self.mouse_position = position;
+        self.modifiers = self.platform_window.modifiers();
+        self.modifiers
+    }
+
+    /// Repaints an active drag after the pointer or the modifiers change.
+    fn refresh_active_drag(&mut self, cx: &mut App) {
+        let Some(drag) = &cx.active_drag else {
+            return;
+        };
+        match drag.move_refresh {
+            crate::DragMoveRefresh::Window => self.refresh(),
+            crate::DragMoveRefresh::Preview => {
+                let preview = drag.view.entity_id();
+                self.invalidator.invalidate_view(preview, cx);
+            }
         }
     }
 
@@ -5729,14 +5788,55 @@ impl Window {
         else {
             return;
         };
-        let Some(payload) = payload_source(self, cx) else {
-            return;
-        };
-        if self.platform_window.start_external_drag(&payload)
-            && cx.hand_active_drag_to_platform(self.handle.window_id())
-        {
-            self.refresh();
+        // The gesture is identified by its generation rather than by the dragged value: a
+        // listener may hand every gesture the same value allocation, which would let a
+        // cancelled gesture's payload promote whichever drag is active when it is ready.
+        let gesture = cx.drag_generation;
+        match payload_source(self, cx) {
+            crate::ExternalDragPayloadResolution::Ready(Some(payload)) => {
+                self.start_prepared_external_drag(payload, gesture, cx)
+            }
+            crate::ExternalDragPayloadResolution::Ready(None) => {}
+            crate::ExternalDragPayloadResolution::Pending(task) => {
+                let handle = self.handle;
+                cx.spawn(async move |cx| {
+                    let Some(payload) = task.await else {
+                        return;
+                    };
+                    let mut payload = Some(payload);
+                    handle
+                        .update(cx, |_, window, cx| {
+                            if let Some(payload) = payload.take() {
+                                window.start_prepared_external_drag(payload, gesture, cx);
+                            }
+                        })
+                        .ok();
+                    // The window closed before the payload was ready.
+                    if let Some(payload) = payload {
+                        report_external_drag_cancelled(payload);
+                    }
+                })
+                .detach();
+            }
         }
+    }
+
+    /// Hands the drag of `gesture` to a native session for `payload`. If that
+    /// drag has ended or the platform declines, the payload is released instead.
+    /// No session starts without a drag to suspend, so each payload reports once.
+    fn start_prepared_external_drag(
+        &mut self,
+        payload: crate::ExternalDragPayload,
+        gesture: u64,
+        cx: &mut App,
+    ) {
+        let gesture_active = cx.active_drag.is_some() && cx.drag_generation == gesture;
+        if gesture_active && self.platform_window.start_external_drag(&payload) {
+            cx.hand_active_drag_to_platform(self.handle.window_id());
+        } else {
+            report_external_drag_cancelled(payload);
+        }
+        self.refresh();
     }
 
     /// Whether recognized touch pans may use the platform's predicted touch
@@ -5922,9 +6022,9 @@ impl Window {
 
         if cx.has_active_drag() {
             if event.is::<MouseMoveEvent>() {
-                // If this was a mouse move event, redraw the window so that the
-                // active drag can follow the mouse cursor.
-                self.refresh();
+                // If this was a mouse move event, redraw so that the active drag
+                // can follow the mouse cursor.
+                self.refresh_active_drag(cx);
             } else if event.is::<MouseUpEvent>() {
                 // If this was a mouse up event, cancel the active drag and redraw
                 // the window.
@@ -7736,10 +7836,11 @@ mod tests {
         FileDropEvent, FocusHandle, ImageSource, InputEvent as _, InteractiveElement as _,
         IntoElement, LongPressEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement,
         Pixels, Point, Render, RenderImage, RequestFrameOptions, ShaderBool,
-        StatefulInteractiveElement as _, Styled, TestAppContext, TouchDragEvent, TouchEvent,
+        StatefulInteractiveElement as _, Styled, Task, TestAppContext, TouchDragEvent, TouchEvent,
         TouchId, TouchPhase, Window, WindowAppearance, WindowHandle, WindowOptions, canvas, div,
         hsla, img, linear_color_stop, linear_gradient, point, px, size, white,
     };
+    use futures::channel::oneshot;
     use image::{Frame as ImageFrame, ImageBuffer, Rgba};
     use smallvec::smallvec;
 
@@ -8423,141 +8524,1338 @@ mod tests {
         assert_eq!(child_bounds.get().size, size(px(300.), px(200.)));
     }
 
+    /// Presses the left button where a drag gesture begins.
+    fn press_pointer(position: Point<Pixels>, window: &mut Window, cx: &mut crate::App) {
+        window.dispatch_event(
+            MouseDownEvent {
+                position,
+                button: MouseButton::Left,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            }
+            .to_platform_input(),
+            cx,
+        );
+    }
+
+    /// Moves the pointer with the left button held.
+    fn drag_pointer(position: Point<Pixels>, window: &mut Window, cx: &mut crate::App) {
+        window.dispatch_event(
+            MouseMoveEvent {
+                position,
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Default::default(),
+            }
+            .to_platform_input(),
+            cx,
+        );
+    }
+
+    /// Releases the left button.
+    fn release_pointer(position: Point<Pixels>, window: &mut Window, cx: &mut crate::App) {
+        window.dispatch_event(
+            crate::MouseUpEvent {
+                position,
+                button: MouseButton::Left,
+                modifiers: Default::default(),
+                click_count: 1,
+            }
+            .to_platform_input(),
+            cx,
+        );
+    }
+
+    /// A pointer position just left of every test window.
+    fn outside() -> Point<Pixels> {
+        point(px(-1.), px(20.))
+    }
+
+    /// Takes the transfer results reported for drags of `path` alone, leaving
+    /// other tests' results queued.
+    fn take_completions_for(path: &std::path::Path) -> Vec<crate::FileTransferCompletion> {
+        crate::file_transfer::take_completions_where(
+            |completion| matches!(completion.files.paths.paths(), [only] if only == path),
+        )
+    }
+
+    /// Asserts that exactly one result was reported for `path`: a release of
+    /// the payload without any transfer.
+    fn assert_released_once(path: &std::path::Path) {
+        let completions = take_completions_for(path);
+        assert_eq!(
+            completions.len(),
+            1,
+            "results for {path:?}: {completions:?}"
+        );
+        assert_eq!(completions[0].operation, None);
+        assert!(!completions[0].source_removed);
+    }
+
+    fn drag_over_highlight() -> crate::Hsla {
+        hsla(0.3, 0.9, 0.5, 1.)
+    }
+
+    /// Whether the last frame painted a quad filled with `color`.
+    fn painted(window: &Window, color: crate::Hsla) -> bool {
+        window
+            .rendered_frame
+            .scene
+            .quads
+            .iter()
+            .any(|quad| quad.background.as_solid() == Some(color))
+    }
+
+    struct DragRenderCounter(Rc<Cell<usize>>);
+
+    impl Render for DragRenderCounter {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.0.set(self.0.get() + 1);
+            div().size_full()
+        }
+    }
+
+    struct DragRefreshRoot {
+        content: crate::AnyView,
+        preview_renders: Rc<Cell<usize>>,
+        refresh: crate::DragMoveRefresh,
+        /// Whether the drag offers a native payload when it leaves the window.
+        native: bool,
+    }
+
+    impl Render for DragRefreshRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let preview_renders = self.preview_renders.clone();
+            let root = div()
+                .id("drag-refresh-root")
+                .size_full()
+                .child(
+                    self.content
+                        .clone()
+                        .cached(crate::StyleRefinement::default().size_full()),
+                )
+                .on_drag((), move |_, _, _, cx| {
+                    cx.new(|_| DragRenderCounter(preview_renders.clone()))
+                })
+                .drag_move_refresh(self.refresh);
+            if self.native {
+                root.external_drag_payload(|_: &(), _, _| {
+                    Some(ExternalDragPayload::Files(FileDragPaths::new([(
+                        PathBuf::from("/tmp/refresh-drag"),
+                        false,
+                    )])))
+                })
+            } else {
+                root
+            }
+        }
+    }
+
+    /// Opens a window whose cached `content` lies under a `()` drag source,
+    /// starts a drag that refreshes as `refresh` says, and draws. Returns the
+    /// window and a count of preview renders.
+    fn start_refresh_drag(
+        cx: &mut TestAppContext,
+        refresh: crate::DragMoveRefresh,
+        native: bool,
+        content: impl FnOnce(&mut crate::App) -> crate::AnyView + 'static,
+    ) -> (AnyWindowHandle, Rc<Cell<usize>>) {
+        let preview_renders = Rc::new(Cell::new(0));
+        let window: AnyWindowHandle = cx
+            .add_window({
+                let preview_renders = preview_renders.clone();
+                move |_, cx| DragRefreshRoot {
+                    content: content(cx),
+                    preview_renders,
+                    refresh,
+                    native,
+                }
+            })
+            .into();
+        cx.test_window(window).set_start_external_drag_result(true);
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            press_pointer(point(px(10.), px(10.)), window, cx);
+            drag_pointer(point(px(20.), px(20.)), window, cx);
+            assert_eq!(cx.active_drag.as_ref().unwrap().move_refresh, refresh);
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        (window, preview_renders)
+    }
+
+    #[gpui::test]
+    fn drag_move_refresh_preserves_caches_only_when_opted_in(cx: &mut TestAppContext) {
+        for refresh in [
+            crate::DragMoveRefresh::Window,
+            crate::DragMoveRefresh::Preview,
+        ] {
+            let content_renders = Rc::new(Cell::new(0));
+            let (window, preview_renders) = start_refresh_drag(cx, refresh, false, {
+                let content_renders = content_renders.clone();
+                move |cx| cx.new(|_| DragRenderCounter(content_renders)).into()
+            });
+            cx.update_window(window, |root, window, cx| {
+                let move_pointer = |x, window: &mut Window, cx: &mut crate::App| {
+                    drag_pointer(point(px(x), px(20.)), window, cx)
+                };
+                let before = content_renders.get();
+                let previews_before = preview_renders.get();
+                for x in [30., 40., 50., 60.] {
+                    move_pointer(x, window, cx);
+                    assert!(window.invalidator.is_dirty());
+                    window.draw(cx).clear(cx);
+                }
+                assert_eq!(preview_renders.get(), previews_before + 4);
+                assert_eq!(
+                    content_renders.get(),
+                    before
+                        + if refresh == crate::DragMoveRefresh::Window {
+                            4
+                        } else {
+                            0
+                        }
+                );
+
+                // Explicit view changes and previously requested full refreshes
+                // must still reach the screen during a preview-only drag.
+                let content = root
+                    .downcast::<DragRefreshRoot>()
+                    .unwrap()
+                    .read(cx)
+                    .content
+                    .clone();
+                window.invalidator.invalidate_view(content.entity_id(), cx);
+                let before = content_renders.get();
+                move_pointer(70., window, cx);
+                window.draw(cx).clear(cx);
+                assert_eq!(content_renders.get(), before + 1);
+                window.refresh();
+                move_pointer(80., window, cx);
+                window.draw(cx).clear(cx);
+                assert_eq!(content_renders.get(), before + 2);
+
+                let before = preview_renders.get();
+                window.dispatch_event(
+                    crate::ModifiersChangedEvent {
+                        modifiers: crate::Modifiers {
+                            control: true,
+                            ..Default::default()
+                        },
+                        capslock: Default::default(),
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                assert!(
+                    preview_renders.get() > before,
+                    "stationary modifiers must repaint the preview"
+                );
+                assert!(cx.stop_active_drag(window));
+                window.draw(cx).clear(cx);
+                assert!(!cx.has_active_drag());
+            })
+            .unwrap();
+        }
+    }
+
+    /// Cached content with a target at x 100..150 that highlights while a `()`
+    /// drag is over it.
+    struct DropTargetContent(Rc<Cell<usize>>);
+
+    impl Render for DropTargetContent {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.0.set(self.0.get() + 1);
+            div().size_full().child(
+                div()
+                    .absolute()
+                    .left(px(100.))
+                    .size(px(50.))
+                    .on_drag_over::<()>(|style, _, _, _| style.bg(drag_over_highlight())),
+            )
+        }
+    }
+
+    /// Cached content whose small target highlights while a `()` drag is
+    /// anywhere over the target's group, at x 100..200.
+    struct GroupDropTargetContent(Rc<Cell<usize>>);
+
+    impl Render for GroupDropTargetContent {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.0.set(self.0.get() + 1);
+            div().size_full().child(
+                div()
+                    .absolute()
+                    .left(px(100.))
+                    .size(px(100.))
+                    .group("drop-group")
+                    .child(
+                        div()
+                            .size(px(20.))
+                            .on_drop(|_: &(), _, _| {})
+                            .group_drag_over::<()>("drop-group", |style| {
+                                style.bg(drag_over_highlight())
+                            }),
+                    ),
+            )
+        }
+    }
+
+    /// Starts a preview-only drag over cached content built by `content`, then
+    /// moves the pointer through `steps`. Each step gives an x position, the
+    /// content renders expected since the drag started, and whether the
+    /// highlight shows.
+    fn check_cached_drop_target(
+        cx: &mut TestAppContext,
+        content: impl FnOnce(Rc<Cell<usize>>, &mut crate::App) -> crate::AnyView + 'static,
+        steps: &[(f32, usize, bool)],
+    ) {
+        let content_renders = Rc::new(Cell::new(0));
+        let (window, _) = start_refresh_drag(cx, crate::DragMoveRefresh::Preview, false, {
+            let content_renders = content_renders.clone();
+            move |cx| content(content_renders, cx)
+        });
+        cx.update_window(window, |_, window, cx| {
+            let before = content_renders.get();
+            for &(x, renders, highlighted) in steps {
+                drag_pointer(point(px(x), px(20.)), window, cx);
+                window.draw(cx).clear(cx);
+                assert_eq!(
+                    (
+                        content_renders.get() - before,
+                        painted(window, drag_over_highlight())
+                    ),
+                    (renders, highlighted),
+                    "after moving to x {x}"
+                );
+            }
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn preview_drag_repaints_cached_drop_targets_when_their_hover_changes(cx: &mut TestAppContext) {
+        check_cached_drop_target(
+            cx,
+            |renders, cx| cx.new(|_| DropTargetContent(renders)).into(),
+            &[
+                (40., 0, false),
+                (120., 1, true),
+                (130., 1, true),
+                (200., 2, false),
+            ],
+        );
+    }
+
+    #[gpui::test]
+    fn preview_drag_repaints_cached_group_drop_targets(cx: &mut TestAppContext) {
+        check_cached_drop_target(
+            cx,
+            |renders, cx| cx.new(|_| GroupDropTargetContent(renders)).into(),
+            &[
+                (40., 0, false),
+                // Over the group but away from the target itself.
+                (150., 1, true),
+                (160., 1, true),
+                (250., 2, false),
+            ],
+        );
+    }
+
+    #[gpui::test]
+    fn restored_drag_repaints_cached_drop_targets(cx: &mut TestAppContext) {
+        let content_renders = Rc::new(Cell::new(0));
+        let (window, _) = start_refresh_drag(cx, crate::DragMoveRefresh::Preview, true, {
+            let content_renders = content_renders.clone();
+            move |cx| cx.new(|_| DropTargetContent(content_renders)).into()
+        });
+        cx.update_window(window, |_, window, cx| {
+            drag_pointer(outside(), window, cx);
+            assert!(cx.active_drag.is_none(), "the platform owns the drag");
+            window.draw(cx).clear(cx);
+
+            window.dispatch_event(
+                FileDropEvent::Entered {
+                    position: point(px(40.), px(20.)),
+                    paths: ExternalPaths(smallvec![PathBuf::from("/tmp/refresh-drag")]),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(cx.active_drag.is_some(), "the drag is restored");
+            window.draw(cx).clear(cx);
+            let before = content_renders.get();
+            window.dispatch_event(
+                FileDropEvent::Pending {
+                    position: point(px(120.), px(20.)),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.draw(cx).clear(cx);
+            assert_eq!(content_renders.get(), before + 1);
+            assert!(painted(window, drag_over_highlight()));
+        })
+        .unwrap();
+    }
+
+    /// How a drop target treats the lease of a native file drop.
+    #[derive(Clone, Copy)]
+    enum LeaseHandling {
+        /// Leaves the lease, so the drop is released when its dispatch ends.
+        Ignore,
+        /// Claims the lease to complete the transfer later.
+        Claim,
+        /// Cancels the drag, then looks for the lease.
+        CancelDrag,
+    }
+
+    #[derive(Default)]
+    struct FileDropLog {
+        drops: RefCell<Vec<(ExternalPaths, crate::Modifiers)>>,
+        leases: RefCell<Vec<crate::FileDropTransfer>>,
+    }
+
+    /// Accepts files dropped from other applications.
+    struct FileDropTarget {
+        handling: LeaseHandling,
+        log: Rc<FileDropLog>,
+    }
+
+    impl Render for FileDropTarget {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let (handling, log) = (self.handling, self.log.clone());
+            div()
+                .size_full()
+                .on_drop(move |paths: &ExternalPaths, window, cx| {
+                    log.drops
+                        .borrow_mut()
+                        .push((paths.clone(), window.modifiers()));
+                    if let LeaseHandling::CancelDrag = handling {
+                        window.cancel_drag(cx);
+                    }
+                    if !matches!(handling, LeaseHandling::Ignore) {
+                        log.leases.borrow_mut().extend(window.take_file_drop());
+                    }
+                })
+        }
+    }
+
+    /// Opens and draws a window that accepts dropped files as `handling` says.
+    fn open_file_drop_target(
+        cx: &mut TestAppContext,
+        handling: LeaseHandling,
+    ) -> (AnyWindowHandle, Rc<FileDropLog>) {
+        let log = Rc::new(FileDropLog::default());
+        let window: AnyWindowHandle = cx
+            .add_window({
+                let log = log.clone();
+                move |_, _| FileDropTarget { handling, log }
+            })
+            .into();
+        cx.update_window(window, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        (window, log)
+    }
+
+    fn dropped_paths() -> ExternalPaths {
+        ExternalPaths(smallvec![PathBuf::from("/tmp/dropped")])
+    }
+
+    /// A move lease whose outcomes are recorded.
+    fn recorded_lease() -> (
+        crate::FileDropTransfer,
+        Rc<RefCell<Vec<Option<crate::FileTransferOperation>>>>,
+    ) {
+        let outcomes = Rc::new(RefCell::new(Vec::new()));
+        let lease = crate::FileDropTransfer {
+            operation: crate::FileTransferOperation::Move,
+            source_owns_move: false,
+            completion: crate::FilePaste::new({
+                let outcomes = outcomes.clone();
+                move |operation| outcomes.borrow_mut().push(operation)
+            }),
+        };
+        (lease, outcomes)
+    }
+
+    /// Drags `dropped_paths()` into `window` from another application and
+    /// drops them with a lease. Returns the lease's recorded outcomes.
+    fn drop_files_with_lease(
+        window: AnyWindowHandle,
+        cx: &mut TestAppContext,
+    ) -> Rc<RefCell<Vec<Option<crate::FileTransferOperation>>>> {
+        let (transfer, outcomes) = recorded_lease();
+        cx.update_window(window, |_, window, cx| {
+            let position = point(px(10.), px(10.));
+            window.dispatch_event(
+                FileDropEvent::Entered {
+                    position,
+                    paths: dropped_paths(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                FileDropEvent::SubmitWithTransfer { position, transfer }.to_platform_input(),
+                cx,
+            );
+            assert!(cx.active_drag.is_none());
+        })
+        .unwrap();
+        outcomes
+    }
+
+    #[gpui::test]
+    fn files_from_another_application_reach_drop_targets(cx: &mut TestAppContext) {
+        let (window, log) = open_file_drop_target(cx, LeaseHandling::Claim);
+        cx.update_window(window, |_, window, cx| {
+            let gesture = cx.drag_generation;
+            window.dispatch_event(
+                FileDropEvent::Entered {
+                    position: point(px(10.), px(10.)),
+                    paths: dropped_paths(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert_eq!(
+                cx.active_drag
+                    .as_ref()
+                    .and_then(|drag| drag.value.downcast_ref::<ExternalPaths>()),
+                Some(&dropped_paths())
+            );
+            assert_eq!(
+                cx.drag_generation,
+                gesture.wrapping_add(1),
+                "an arriving drag is a new gesture"
+            );
+            let position = point(px(30.), px(30.));
+            window.dispatch_event(FileDropEvent::Pending { position }.to_platform_input(), cx);
+            assert_eq!(window.mouse_position(), position);
+            window.dispatch_event(FileDropEvent::Submit { position }.to_platform_input(), cx);
+            assert!(cx.active_drag.is_none());
+        })
+        .unwrap();
+        assert_eq!(log.drops.borrow().len(), 1);
+        assert_eq!(log.drops.borrow()[0].0, dropped_paths());
+        assert!(
+            log.leases.borrow().is_empty(),
+            "a drop without a lease offers none"
+        );
+    }
+
+    #[gpui::test]
+    fn files_dragged_back_out_drop_nothing(cx: &mut TestAppContext) {
+        let (window, log) = open_file_drop_target(cx, LeaseHandling::Ignore);
+        cx.update_window(window, |_, window, cx| {
+            window.dispatch_event(
+                FileDropEvent::Entered {
+                    position: point(px(10.), px(10.)),
+                    paths: dropped_paths(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(FileDropEvent::Exited.to_platform_input(), cx);
+            assert!(cx.active_drag.is_none());
+        })
+        .unwrap();
+        assert!(log.drops.borrow().is_empty());
+    }
+
+    #[gpui::test]
+    fn unclaimed_drop_lease_is_released_when_its_drop_ends(cx: &mut TestAppContext) {
+        let (window, log) = open_file_drop_target(cx, LeaseHandling::Ignore);
+        let outcomes = drop_files_with_lease(window, cx);
+        assert_eq!(log.drops.borrow().len(), 1);
+        assert_eq!(*outcomes.borrow(), [None]);
+        cx.update_window(window, |_, window, _| {
+            assert!(window.take_file_drop().is_none())
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn claimed_drop_lease_completes_when_the_receiver_finishes(cx: &mut TestAppContext) {
+        let (window, log) = open_file_drop_target(cx, LeaseHandling::Claim);
+        let outcomes = drop_files_with_lease(window, cx);
+        assert!(
+            outcomes.borrow().is_empty(),
+            "the source waits for the receiver"
+        );
+        let lease = log
+            .leases
+            .borrow_mut()
+            .pop()
+            .expect("the target claimed the lease");
+        assert_eq!(lease.operation, crate::FileTransferOperation::Move);
+        assert!(!lease.source_owns_move);
+        lease
+            .completion
+            .complete(Some(crate::FileTransferOperation::Move));
+        assert_eq!(
+            *outcomes.borrow(),
+            [Some(crate::FileTransferOperation::Move)]
+        );
+    }
+
+    #[gpui::test]
+    fn cancelling_the_drag_releases_its_drop_lease(cx: &mut TestAppContext) {
+        let (window, log) = open_file_drop_target(cx, LeaseHandling::CancelDrag);
+        let outcomes = drop_files_with_lease(window, cx);
+        assert_eq!(log.drops.borrow().len(), 1);
+        assert!(
+            log.leases.borrow().is_empty(),
+            "a cancelled drag offers no lease"
+        );
+        assert_eq!(*outcomes.borrow(), [None]);
+    }
+
+    #[gpui::test]
+    fn drop_leases_are_only_offered_during_their_drop(cx: &mut TestAppContext) {
+        let (window, log) = open_file_drop_target(cx, LeaseHandling::Claim);
+        let (transfer, outcomes) = recorded_lease();
+        cx.update_window(window, |_, window, cx| {
+            assert!(window.take_file_drop().is_none());
+            // Without a drag there is nothing to drop the files on.
+            window.dispatch_event(
+                FileDropEvent::SubmitWithTransfer {
+                    position: point(px(10.), px(10.)),
+                    transfer,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(window.take_file_drop().is_none());
+        })
+        .unwrap();
+        assert!(log.drops.borrow().is_empty());
+        assert_eq!(*outcomes.borrow(), [None]);
+    }
+
+    #[gpui::test]
+    fn native_drag_events_use_platform_modifiers(cx: &mut TestAppContext) {
+        let (window, log) = open_file_drop_target(cx, LeaseHandling::Ignore);
+        let held = crate::Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        cx.test_window(window).set_modifiers(held);
+        cx.update_window(window, |_, window, cx| {
+            let position = point(px(10.), px(10.));
+            for event in [
+                FileDropEvent::Entered {
+                    position,
+                    paths: dropped_paths(),
+                },
+                FileDropEvent::Pending { position },
+                FileDropEvent::Submit { position },
+            ] {
+                // Native drags deliver no modifier changes, so the window's
+                // last known modifiers are stale.
+                window.dispatch_event(
+                    crate::ModifiersChangedEvent {
+                        modifiers: crate::Modifiers {
+                            control: true,
+                            ..Default::default()
+                        },
+                        capslock: Default::default(),
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                window.dispatch_event(event.to_platform_input(), cx);
+                assert_eq!(window.modifiers(), held);
+            }
+        })
+        .unwrap();
+        assert_eq!(log.drops.borrow()[0], (dropped_paths(), held));
+    }
+
+    #[derive(Default)]
+    struct FileDragLog {
+        moves: RefCell<Vec<Point<Pixels>>>,
+        drops: RefCell<Vec<PathBuf>>,
+        /// File drop events that reach mouse listeners: exits and ends.
+        file_drop_events: RefCell<Vec<FileDropEvent>>,
+    }
+
+    /// Drags `path` and offers it to other applications once the drag leaves
+    /// the window.
     struct FileDragView {
         path: PathBuf,
-        observed_drag_moves: Rc<RefCell<Vec<Point<Pixels>>>>,
-        observed_drops: Rc<RefCell<Vec<PathBuf>>>,
+        /// The operation and ownership token of the native payload, or `None`
+        /// to offer no payload.
+        offer: Option<(crate::FileTransferOperation, u64)>,
+        log: Rc<FileDragLog>,
     }
 
     impl Render for FileDragView {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let offer = self.offer;
+            let log = self.log.clone();
             div()
                 .id("file-drag")
                 .size_full()
                 .on_drag(self.path.clone(), |_, _, _, cx| cx.new(|_| Empty))
-                .external_drag_payload(|path: &PathBuf, _, _| {
-                    Some(ExternalDragPayload::Files(FileDragPaths::new([(
-                        path.clone(),
-                        true,
-                    )])))
+                .drag_move_refresh(crate::DragMoveRefresh::Preview)
+                .external_drag_payload(move |path: &PathBuf, _, _| {
+                    let (operation, ownership) = offer?;
+                    Some(ExternalDragPayload::Files(
+                        FileDragPaths::new([(path.clone(), true)])
+                            .with_transfer(operation, ownership),
+                    ))
                 })
                 .on_drag_move({
-                    let observed_drag_moves = self.observed_drag_moves.clone();
+                    let log = log.clone();
                     move |event: &DragMoveEvent<PathBuf>, _, _| {
-                        observed_drag_moves.borrow_mut().push(event.event.position);
+                        log.moves.borrow_mut().push(event.event.position);
                     }
                 })
                 .on_drop({
-                    let observed_drops = self.observed_drops.clone();
-                    move |path: &PathBuf, _, _| observed_drops.borrow_mut().push(path.clone())
+                    let log = log.clone();
+                    move |path: &PathBuf, _, _| log.drops.borrow_mut().push(path.clone())
+                })
+                .child(
+                    canvas(
+                        |_, _, _| {},
+                        move |_, _, window, _| {
+                            window.on_mouse_event(move |event: &FileDropEvent, phase, _, _| {
+                                if phase == DispatchPhase::Bubble {
+                                    log.file_drop_events.borrow_mut().push(event.clone());
+                                }
+                            });
+                        },
+                    )
+                    .size_full(),
+                )
+        }
+    }
+
+    const UNTAGGED_COPY: Option<(crate::FileTransferOperation, u64)> =
+        Some((crate::FileTransferOperation::Copy, 0));
+
+    /// A window whose `FileDragView` started an in-app drag.
+    struct FileDrag {
+        window: AnyWindowHandle,
+        log: Rc<FileDragLog>,
+    }
+
+    /// Opens a `FileDragView` window and starts dragging `path` inside it. The
+    /// platform agrees to start native sessions when `platform_starts` is true.
+    fn start_file_drag(
+        cx: &mut TestAppContext,
+        path: &std::path::Path,
+        offer: Option<(crate::FileTransferOperation, u64)>,
+        platform_starts: bool,
+    ) -> FileDrag {
+        let log = Rc::new(FileDragLog::default());
+        let window: AnyWindowHandle = cx
+            .add_window({
+                let (path, log) = (path.to_path_buf(), log.clone());
+                move |_, _| FileDragView { path, offer, log }
+            })
+            .into();
+        cx.test_window(window)
+            .set_start_external_drag_result(platform_starts);
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            press_pointer(point(px(10.), px(10.)), window, cx);
+            drag_pointer(point(px(20.), px(20.)), window, cx);
+            assert!(cx.active_drag.is_some());
+        })
+        .unwrap();
+        assert!(cx.test_window(window).external_drag_files().is_empty());
+        FileDrag { window, log }
+    }
+
+    #[gpui::test]
+    fn promotion_hands_the_offered_transfer_to_the_platform(cx: &mut TestAppContext) {
+        let path = PathBuf::from("/tmp/offered-move");
+        let drag = start_file_drag(
+            cx,
+            &path,
+            Some((crate::FileTransferOperation::Move, 42)),
+            true,
+        );
+        cx.update_window(drag.window, |_, window, cx| {
+            drag_pointer(outside(), window, cx)
+        })
+        .unwrap();
+        let drags = cx.test_window(drag.window).external_drags();
+        assert_eq!(drags.len(), 1);
+        assert_eq!(drags[0].entries(), [(path.clone(), true)]);
+        assert_eq!(drags[0].operation, crate::FileTransferOperation::Move);
+        assert_eq!(drags[0].ownership, 42);
+        assert!(
+            take_completions_for(&path).is_empty(),
+            "a started session reports its result when it ends"
+        );
+    }
+
+    #[gpui::test]
+    fn declined_payload_keeps_the_drag_in_the_application(cx: &mut TestAppContext) {
+        let path = PathBuf::from("/tmp/declined-drag");
+        let drag = start_file_drag(cx, &path, None, true);
+        cx.update_window(drag.window, |_, window, cx| {
+            drag_pointer(outside(), window, cx);
+            drag_pointer(point(px(-2.), px(20.)), window, cx);
+            assert!(cx.active_drag.is_some());
+            let inside = point(px(30.), px(30.));
+            drag_pointer(inside, window, cx);
+            release_pointer(inside, window, cx);
+            assert!(cx.active_drag.is_none());
+        })
+        .unwrap();
+        assert!(cx.test_window(drag.window).external_drags().is_empty());
+        assert!(take_completions_for(&path).is_empty());
+        assert_eq!(*drag.log.drops.borrow(), [path]);
+    }
+
+    #[gpui::test]
+    fn promotion_needs_a_left_button_drag_out_of_a_window_that_offers_native_drags(
+        cx: &mut TestAppContext,
+    ) {
+        let path = PathBuf::from("/tmp/gated-drag");
+        let drag = start_file_drag(cx, &path, UNTAGGED_COPY, true);
+        let test_window = cx.test_window(drag.window);
+        cx.update_window(drag.window, |_, window, cx| {
+            let pointer_move = |position, pressed_button, window: &mut Window, cx: &mut _| {
+                window.dispatch_event(
+                    MouseMoveEvent {
+                        position,
+                        pressed_button,
+                        modifiers: Default::default(),
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            };
+            // The window's edge still lies inside it.
+            pointer_move(point(px(0.), px(20.)), Some(MouseButton::Left), window, cx);
+            pointer_move(outside(), None, window, cx);
+            pointer_move(outside(), Some(MouseButton::Right), window, cx);
+            test_window.set_can_start_external_drag(false);
+            pointer_move(outside(), Some(MouseButton::Left), window, cx);
+            assert!(cx.active_drag.is_some());
+            assert!(test_window.external_drags().is_empty());
+
+            test_window.set_can_start_external_drag(true);
+            let right_of_window = point(window.viewport_size().width, px(20.));
+            pointer_move(right_of_window, Some(MouseButton::Left), window, cx);
+            assert!(cx.active_drag.is_none());
+        })
+        .unwrap();
+        assert_eq!(test_window.external_drag_files(), [(path, true)]);
+    }
+
+    #[gpui::test]
+    fn completed_event_reports_its_result_and_ends_the_platform_drag(cx: &mut TestAppContext) {
+        let path = PathBuf::from("/tmp/completed-drag");
+        let drag = start_file_drag(
+            cx,
+            &path,
+            Some((crate::FileTransferOperation::Move, 5)),
+            true,
+        );
+        let files = FileDragPaths::new([(path.clone(), true)])
+            .with_transfer(crate::FileTransferOperation::Move, 5)
+            .transfer();
+        cx.update_window(drag.window, |_, window, cx| {
+            drag_pointer(outside(), window, cx);
+            window.dispatch_event(
+                FileDropEvent::Completed(crate::FileTransferCompletion {
+                    files: files.clone(),
+                    operation: Some(crate::FileTransferOperation::Move),
+                    source_removed: true,
+                })
+                .to_platform_input(),
+                cx,
+            );
+            assert!(cx.active_drag.is_none());
+        })
+        .unwrap();
+        let completions = take_completions_for(&path);
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].files, files);
+        assert_eq!(
+            completions[0].operation,
+            Some(crate::FileTransferOperation::Move)
+        );
+        assert!(completions[0].source_removed);
+        assert!(
+            !cx.update(|cx| cx.end_platform_drag(drag.window.window_id())),
+            "the platform drag already ended"
+        );
+        assert!(
+            matches!(
+                drag.log.file_drop_events.borrow().as_slice(),
+                [FileDropEvent::Ended]
+            ),
+            "listeners learn that the drag ended"
+        );
+    }
+
+    #[gpui::test]
+    fn ended_event_ends_the_platform_drag_without_a_result(cx: &mut TestAppContext) {
+        let path = PathBuf::from("/tmp/ended-drag");
+        let drag = start_file_drag(cx, &path, UNTAGGED_COPY, true);
+        cx.update_window(drag.window, |_, window, cx| {
+            drag_pointer(outside(), window, cx);
+            window.dispatch_event(FileDropEvent::Ended.to_platform_input(), cx);
+            assert!(cx.active_drag.is_none());
+        })
+        .unwrap();
+        assert!(take_completions_for(&path).is_empty());
+        assert!(!cx.update(|cx| cx.end_platform_drag(drag.window.window_id())));
+        assert!(matches!(
+            drag.log.file_drop_events.borrow().as_slice(),
+            [FileDropEvent::Ended]
+        ));
+    }
+
+    #[gpui::test]
+    fn delayed_drag_completion_preserves_a_newer_gesture(cx: &mut TestAppContext) {
+        let path = PathBuf::from("/tmp/delayed-completion");
+        let drag = start_file_drag(cx, &path, UNTAGGED_COPY, true);
+        cx.update_window(drag.window, |_, window, cx| {
+            drag_pointer(outside(), window, cx);
+            window.dispatch_event(FileDropEvent::Ended.to_platform_input(), cx);
+
+            // Another drag begins in the same source window while the receiver
+            // is still processing the previous drop.
+            let position = point(px(30.), px(30.));
+            press_pointer(position, window, cx);
+            drag_pointer(position + point(px(20.), px(0.)), window, cx);
+            assert!(cx.active_drag.is_some());
+            let generation = cx.drag_generation;
+            crate::FileTransferCompletion::receiver_performed(
+                FileDragPaths::new([(path.clone(), true)]).transfer(),
+                Some(crate::FileTransferOperation::Copy),
+            )
+            .report();
+            assert!(cx.active_drag.is_some());
+            assert_eq!(cx.drag_generation, generation);
+            drag_pointer(outside(), window, cx);
+            assert!(cx.end_platform_drag(drag.window.window_id()));
+        })
+        .unwrap();
+        assert_eq!(take_completions_for(&path).len(), 1);
+    }
+
+    #[gpui::test]
+    fn restoring_a_drag_resumes_its_gesture(cx: &mut TestAppContext) {
+        let path = PathBuf::from("/tmp/restored-drag");
+        let drag = start_file_drag(cx, &path, UNTAGGED_COPY, true);
+        let gesture = cx.update(|cx| cx.drag_generation);
+        let entered = || {
+            FileDropEvent::Entered {
+                position: point(px(30.), px(30.)),
+                paths: ExternalPaths(smallvec![path.clone()]),
+            }
+            .to_platform_input()
+        };
+        cx.update_window(drag.window, |_, window, cx| {
+            drag_pointer(outside(), window, cx);
+            window.dispatch_event(entered(), cx);
+            assert!(
+                cx.active_drag
+                    .as_ref()
+                    .is_some_and(|drag| drag.value.downcast_ref::<PathBuf>() == Some(&path))
+            );
+            assert_eq!(
+                cx.drag_generation, gesture,
+                "the restored drag keeps its gesture"
+            );
+            window.dispatch_event(FileDropEvent::Exited.to_platform_input(), cx);
+        })
+        .unwrap();
+
+        let other: AnyWindowHandle = cx.add_window(|_, _| EmptyView).into();
+        cx.update_window(other, |_, window, cx| {
+            window.dispatch_event(entered(), cx);
+            assert_eq!(
+                cx.drag_generation,
+                gesture.wrapping_add(1),
+                "another window starts a gesture of its own"
+            );
+            window.dispatch_event(FileDropEvent::Exited.to_platform_input(), cx);
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn cancelling_a_restored_drag_forgets_the_platform_drag(cx: &mut TestAppContext) {
+        let path = PathBuf::from("/tmp/cancelled-restored-drag");
+        let drag = start_file_drag(cx, &path, UNTAGGED_COPY, true);
+        cx.update_window(drag.window, |_, window, cx| {
+            drag_pointer(outside(), window, cx);
+            window.dispatch_event(
+                FileDropEvent::Entered {
+                    position: point(px(30.), px(30.)),
+                    paths: ExternalPaths(smallvec![path.clone()]),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(cx.active_drag.is_some());
+            window.cancel_drag(cx);
+            assert!(cx.active_drag.is_none());
+        })
+        .unwrap();
+        assert!(!cx.update(|cx| cx.end_platform_drag(drag.window.window_id())));
+    }
+
+    /// Starts every gesture with the same dragged value allocation, as a custom drag listener
+    /// may, and prepares its native payload only once a signal arrives.
+    struct SharedValueDragView {
+        value: Arc<PathBuf>,
+        prepared: Rc<RefCell<Option<oneshot::Receiver<()>>>>,
+    }
+
+    impl Render for SharedValueDragView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let value = self.value.clone();
+            let prepared = self.prepared.clone();
+            let mut element = div().id("shared-value-drag").size_full();
+            element
+                .interactivity()
+                .on_drag_alt(move |cursor_offset, cursor_style, _, cx| {
+                    let path = value.as_ref().clone();
+                    let prepared = prepared.clone();
+                    crate::AnyDrag {
+                        view: cx.new(|_| Empty).into(),
+                        value: value.clone(),
+                        cursor_offset,
+                        move_refresh: crate::DragMoveRefresh::default(),
+                        cursor_style,
+                        external_payload_source: None,
+                    }
+                    .external_payload_async(move |_, cx| {
+                        let Some(ready) = prepared.borrow_mut().take() else {
+                            return Task::ready(None);
+                        };
+                        cx.background_spawn(async move {
+                            ready.await.ok()?;
+                            Some(ExternalDragPayload::Files(FileDragPaths::new([(
+                                path, false,
+                            )])))
+                        })
+                    })
+                });
+            element
+        }
+    }
+
+    /// Opens a `SharedValueDragView` window and drags `path` out of it. Its
+    /// native payload is then prepared until the returned sender signals it
+    /// ready. Dropping the sender declines the payload instead.
+    fn start_async_promotion(
+        cx: &mut TestAppContext,
+        path: &std::path::Path,
+    ) -> (AnyWindowHandle, oneshot::Sender<()>) {
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let window: AnyWindowHandle = cx
+            .add_window({
+                let path = path.to_path_buf();
+                move |_, _| SharedValueDragView {
+                    value: Arc::new(path),
+                    prepared: Rc::new(RefCell::new(Some(ready_rx))),
+                }
+            })
+            .into();
+        cx.test_window(window).set_start_external_drag_result(true);
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            press_pointer(point(px(10.), px(10.)), window, cx);
+            drag_pointer(point(px(20.), px(20.)), window, cx);
+            drag_pointer(outside(), window, cx);
+            assert!(
+                cx.active_drag.is_some(),
+                "the drag stays in the application while its payload is prepared"
+            );
+        })
+        .unwrap();
+        (window, ready_tx)
+    }
+
+    #[gpui::test]
+    fn prepared_payload_starts_a_native_session_for_its_gesture(cx: &mut TestAppContext) {
+        let path = PathBuf::from("/tmp/prepared-drag");
+        let (window, ready) = start_async_promotion(cx, &path);
+        ready.send(()).unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            cx.test_window(window).external_drag_files(),
+            [(path.clone(), false)]
+        );
+        cx.update_window(window, |_, _, cx| {
+            assert!(cx.active_drag.is_none(), "the platform owns the drag")
+        })
+        .unwrap();
+        assert!(take_completions_for(&path).is_empty());
+        assert!(cx.update(|cx| cx.end_platform_drag(window.window_id())));
+    }
+
+    #[gpui::test]
+    fn declined_async_payload_keeps_the_drag_in_the_application(cx: &mut TestAppContext) {
+        let path = PathBuf::from("/tmp/declined-async-drag");
+        let (window, ready) = start_async_promotion(cx, &path);
+        drop(ready);
+        cx.run_until_parked();
+        assert!(cx.test_window(window).external_drags().is_empty());
+        cx.update_window(window, |_, _, cx| assert!(cx.active_drag.is_some()))
+            .unwrap();
+        assert!(take_completions_for(&path).is_empty());
+    }
+
+    #[gpui::test]
+    fn releasing_the_pointer_releases_a_pending_payload(cx: &mut TestAppContext) {
+        let path = PathBuf::from("/tmp/released-async-drag");
+        let (window, ready) = start_async_promotion(cx, &path);
+        cx.update_window(window, |_, window, cx| {
+            release_pointer(outside(), window, cx);
+            assert!(cx.active_drag.is_none());
+        })
+        .unwrap();
+        ready.send(()).unwrap();
+        cx.run_until_parked();
+        assert!(cx.test_window(window).external_drags().is_empty());
+        assert_released_once(&path);
+    }
+
+    #[gpui::test]
+    fn closing_the_window_releases_a_pending_payload(cx: &mut TestAppContext) {
+        let path = PathBuf::from("/tmp/closed-async-drag");
+        let (window, ready) = start_async_promotion(cx, &path);
+        cx.update_window(window, |_, window, _| window.remove_window())
+            .unwrap();
+        ready.send(()).unwrap();
+        cx.run_until_parked();
+        assert_released_once(&path);
+    }
+
+    #[gpui::test]
+    fn refused_session_releases_a_prepared_payload(cx: &mut TestAppContext) {
+        let path = PathBuf::from("/tmp/refused-async-drag");
+        let (window, ready) = start_async_promotion(cx, &path);
+        cx.test_window(window).set_start_external_drag_result(false);
+        ready.send(()).unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            cx.test_window(window).external_drag_files(),
+            [(path.clone(), false)],
+            "the platform was asked"
+        );
+        cx.update_window(window, |_, _, cx| assert!(cx.active_drag.is_some()))
+            .unwrap();
+        assert_released_once(&path);
+    }
+
+    #[gpui::test]
+    fn cancelled_async_preparation_does_not_promote_a_later_gesture(cx: &mut TestAppContext) {
+        let path = PathBuf::from("/tmp/shared-value-drag");
+        let (window, ready) = start_async_promotion(cx, &path);
+        cx.update_window(window, |_, window, cx| {
+            window.cancel_drag(cx);
+            assert!(cx.active_drag.is_none());
+
+            // The next gesture shares the first one's value allocation.
+            window.draw(cx).clear(cx);
+            press_pointer(point(px(10.), px(10.)), window, cx);
+            drag_pointer(point(px(20.), px(20.)), window, cx);
+            assert!(cx.active_drag.is_some());
+        })
+        .unwrap();
+
+        ready.send(()).unwrap();
+        cx.run_until_parked();
+
+        assert!(
+            cx.test_window(window).external_drag_files().is_empty(),
+            "a cancelled gesture's payload must not start a native drag for a later one"
+        );
+        cx.update_window(window, |_, _, cx| assert!(cx.active_drag.is_some()))
+            .unwrap();
+        assert_released_once(&path);
+    }
+
+    /// Prepares its native payload on a background task through the element API.
+    struct BackgroundPayloadDragView(PathBuf);
+
+    impl Render for BackgroundPayloadDragView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .id("background-payload-drag")
+                .size_full()
+                .on_drag(self.0.clone(), |_, _, _, cx| cx.new(|_| Empty))
+                .external_drag_payload_async(|path: &PathBuf, _, cx| {
+                    let path = path.clone();
+                    cx.background_spawn(async move {
+                        Some(ExternalDragPayload::Files(FileDragPaths::new([(
+                            path, false,
+                        )])))
+                    })
                 })
         }
     }
 
     #[gpui::test]
-    fn file_drag_is_promoted_once_and_restored_in_source_window(cx: &mut TestAppContext) {
-        struct Drag {
-            window: AnyWindowHandle,
-            observed_drag_moves: Rc<RefCell<Vec<Point<Pixels>>>>,
-            observed_drops: Rc<RefCell<Vec<PathBuf>>>,
-        }
-
-        fn start_drag(cx: &mut TestAppContext, path: PathBuf, platform_result: bool) -> Drag {
-            let observed_drag_moves = Rc::new(RefCell::new(Vec::new()));
-            let observed_drops = Rc::new(RefCell::new(Vec::new()));
-            let window: AnyWindowHandle = cx
-                .add_window({
-                    let observed_drag_moves = observed_drag_moves.clone();
-                    let observed_drops = observed_drops.clone();
-                    move |_, _| FileDragView {
-                        path,
-                        observed_drag_moves,
-                        observed_drops,
-                    }
-                })
-                .into();
-            cx.test_window(window)
-                .set_start_external_drag_result(platform_result);
-
-            let update_result = cx.update_window(window, |_, window, cx| {
-                window.draw(cx).clear(cx);
-                window.dispatch_event(
-                    MouseDownEvent {
-                        position: point(px(10.), px(10.)),
-                        button: MouseButton::Left,
-                        modifiers: Default::default(),
-                        click_count: 1,
-                        first_mouse: false,
-                    }
-                    .to_platform_input(),
-                    cx,
-                );
-                window.dispatch_event(
-                    MouseMoveEvent {
-                        position: point(px(20.), px(20.)),
-                        pressed_button: Some(MouseButton::Left),
-                        modifiers: Default::default(),
-                    }
-                    .to_platform_input(),
-                    cx,
-                );
-                assert!(cx.active_drag.is_some());
-            });
+    fn element_payload_prepared_in_the_background_promotes_the_drag(cx: &mut TestAppContext) {
+        let path = PathBuf::from("/tmp/background-payload-drag");
+        let window: AnyWindowHandle = cx
+            .add_window({
+                let path = path.clone();
+                move |_, _| BackgroundPayloadDragView(path)
+            })
+            .into();
+        cx.test_window(window).set_start_external_drag_result(true);
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            press_pointer(point(px(10.), px(10.)), window, cx);
+            drag_pointer(point(px(20.), px(20.)), window, cx);
+            drag_pointer(outside(), window, cx);
             assert!(
-                update_result.is_ok(),
-                "failed to start drag: {update_result:?}"
+                cx.active_drag.is_some(),
+                "the payload is still being prepared"
             );
-
-            assert!(cx.test_window(window).external_drag_files().is_empty());
-            Drag {
-                window,
-                observed_drag_moves,
-                observed_drops,
-            }
-        }
-
-        let successful_path = PathBuf::from("/tmp/successful-drag");
-        let successful = start_drag(cx, successful_path.clone(), true);
-        let outside_position = point(px(-1.), px(20.));
-        let update_result = cx.update_window(successful.window, |_, window, cx| {
-            window.dispatch_event(
-                MouseMoveEvent {
-                    position: outside_position,
-                    pressed_button: Some(MouseButton::Left),
-                    modifiers: Default::default(),
-                }
-                .to_platform_input(),
-                cx,
-            );
-            assert!(cx.active_drag.is_none());
-        });
-        assert!(
-            update_result.is_ok(),
-            "failed to promote drag: {update_result:?}"
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            cx.test_window(window).external_drag_files(),
+            [(path, false)]
         );
+        cx.update_window(window, |_, _, cx| assert!(cx.active_drag.is_none()))
+            .unwrap();
+    }
+
+    /// Its synchronous native payload resolver ends the drag it is promoting.
+    struct SelfCancellingDragView(PathBuf);
+
+    impl Render for SelfCancellingDragView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .id("self-cancelling-drag")
+                .size_full()
+                .on_drag(self.0.clone(), |_, _, _, cx| cx.new(|_| Empty))
+                .external_drag_payload(|path: &PathBuf, window, cx| {
+                    cx.stop_active_drag(window);
+                    Some(ExternalDragPayload::Files(FileDragPaths::new([(
+                        path.clone(),
+                        false,
+                    )])))
+                })
+        }
+    }
+
+    #[gpui::test]
+    fn payload_for_an_ended_drag_starts_no_native_session(cx: &mut TestAppContext) {
+        let path = PathBuf::from("/tmp/self-cancelling-drag");
+        let window: AnyWindowHandle = cx
+            .add_window({
+                let path = path.clone();
+                move |_, _| SelfCancellingDragView(path)
+            })
+            .into();
+        cx.test_window(window).set_start_external_drag_result(true);
+        cx.update_window(window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            press_pointer(point(px(10.), px(10.)), window, cx);
+            drag_pointer(point(px(20.), px(20.)), window, cx);
+            drag_pointer(outside(), window, cx);
+            assert!(cx.active_drag.is_none());
+        })
+        .unwrap();
+
+        assert!(
+            cx.test_window(window).external_drag_files().is_empty(),
+            "no native session starts once the drag is gone"
+        );
+        assert_released_once(&path);
+    }
+
+    #[gpui::test]
+    fn any_drag_builders_configure_the_drag(cx: &mut TestAppContext) {
+        let window: AnyWindowHandle = cx.add_window(|_, _| EmptyView).into();
+        cx.update_window(window, |_, window, cx| {
+            let view = cx.new(|_| Empty);
+            let drag = crate::AnyDrag::new(7_u32, view.clone());
+            assert_eq!(drag.value.downcast_ref::<u32>(), Some(&7));
+            assert_eq!(drag.cursor_offset, Point::default());
+            assert_eq!(drag.move_refresh, crate::DragMoveRefresh::Window);
+            assert_eq!(drag.cursor_style, None);
+            assert!(drag.external_payload_source.is_none());
+
+            let payload = || {
+                Some(ExternalDragPayload::Files(FileDragPaths::new([(
+                    PathBuf::from("/tmp/built-drag"),
+                    false,
+                )])))
+            };
+            let mut drag = crate::AnyDrag::new(7_u32, view.clone())
+                .offset(point(px(3.), px(4.)))
+                .move_refresh(crate::DragMoveRefresh::Preview)
+                .cursor_style(Some(crate::CursorStyle::DragCopy))
+                .external_payload(move |_, _| payload());
+            assert_eq!(drag.cursor_offset, point(px(3.), px(4.)));
+            assert_eq!(drag.move_refresh, crate::DragMoveRefresh::Preview);
+            assert_eq!(drag.cursor_style, Some(crate::CursorStyle::DragCopy));
+            let resolve = drag.external_payload_source.take().unwrap();
+            assert!(matches!(
+                resolve(window, cx),
+                crate::ExternalDragPayloadResolution::Ready(Some(_))
+            ));
+
+            let mut drag = crate::AnyDrag::new(7_u32, view)
+                .external_payload_async(move |_, _| Task::ready(payload()));
+            let resolve = drag.external_payload_source.take().unwrap();
+            assert!(matches!(
+                resolve(window, cx),
+                crate::ExternalDragPayloadResolution::Pending(_)
+            ));
+        })
+        .unwrap();
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "drag_move_refresh must be called after on_drag")]
+    fn drag_move_refresh_requires_on_drag_first() {
+        let _ = div()
+            .id("misordered-drag")
+            .drag_move_refresh(crate::DragMoveRefresh::Preview);
+    }
+
+    #[gpui::test]
+    fn file_drag_is_promoted_once_and_restored_in_source_window(cx: &mut TestAppContext) {
+        let successful_path = PathBuf::from("/tmp/successful-drag");
+        let successful = start_file_drag(cx, &successful_path, UNTAGGED_COPY, true);
+        cx.update_window(successful.window, |_, window, cx| {
+            drag_pointer(outside(), window, cx);
+            assert!(cx.active_drag.is_none());
+        })
+        .unwrap();
         assert_eq!(
             cx.test_window(successful.window).external_drag_files(),
             [(successful_path.clone(), true)]
         );
         // Views must still see the move that leaves the window, otherwise they never learn to tear
         // down the drag state they built up while the pointer was inside.
-        assert_eq!(
-            successful.observed_drag_moves.borrow().last(),
-            Some(&outside_position)
-        );
+        assert_eq!(successful.log.moves.borrow().last(), Some(&outside()));
 
         let destination: AnyWindowHandle = cx.add_window(|_, _| EmptyView).into();
         let reentry_position = point(px(30.), px(30.));
-        let external_paths = || ExternalPaths([successful_path.clone()].into_iter().collect());
-        let update_result = cx.update_window(destination, |_, window, cx| {
-            window.dispatch_event(
-                FileDropEvent::Entered {
-                    position: reentry_position,
-                    paths: external_paths(),
-                }
-                .to_platform_input(),
-                cx,
-            );
+        let entered = |path: &PathBuf| {
+            FileDropEvent::Entered {
+                position: reentry_position,
+                paths: ExternalPaths(smallvec![path.clone()]),
+            }
+            .to_platform_input()
+        };
+        cx.update_window(destination, |_, window, cx| {
+            window.dispatch_event(entered(&successful_path), cx);
             assert!(
                 cx.active_drag
                     .as_ref()
@@ -8565,42 +9863,25 @@ mod tests {
             );
             window.dispatch_event(FileDropEvent::Exited.to_platform_input(), cx);
             assert!(cx.active_drag.is_none());
-        });
-        assert!(
-            update_result.is_ok(),
-            "failed to handle drag in destination window: {update_result:?}"
-        );
+        })
+        .unwrap();
 
-        let update_result = cx.update_window(successful.window, |_, window, cx| {
-            window.dispatch_event(
-                FileDropEvent::Entered {
-                    position: reentry_position,
-                    paths: external_paths(),
-                }
-                .to_platform_input(),
-                cx,
-            );
+        cx.update_window(successful.window, |_, window, cx| {
+            window.dispatch_event(entered(&successful_path), cx);
             assert!(
                 cx.active_drag
                     .as_ref()
                     .is_some_and(|drag| drag.value.downcast_ref::<PathBuf>().is_some())
             );
             assert_eq!(
-                successful.observed_drag_moves.borrow().last(),
+                successful.log.moves.borrow().last(),
                 Some(&reentry_position)
             );
 
             window.dispatch_event(FileDropEvent::Exited.to_platform_input(), cx);
             assert!(cx.active_drag.is_none());
 
-            window.dispatch_event(
-                FileDropEvent::Entered {
-                    position: reentry_position,
-                    paths: external_paths(),
-                }
-                .to_platform_input(),
-                cx,
-            );
+            window.dispatch_event(entered(&successful_path), cx);
             assert!(
                 cx.active_drag
                     .as_ref()
@@ -8615,7 +9896,7 @@ mod tests {
                 cx,
             );
             assert_eq!(
-                successful.observed_drops.borrow().as_slice(),
+                successful.log.drops.borrow().as_slice(),
                 std::slice::from_ref(&successful_path)
             );
             assert!(cx.active_drag.is_none());
@@ -8625,48 +9906,23 @@ mod tests {
             window.dispatch_event(FileDropEvent::Ended.to_platform_input(), cx);
             assert!(cx.active_drag.is_none());
 
-            window.dispatch_event(
-                FileDropEvent::Entered {
-                    position: reentry_position,
-                    paths: external_paths(),
-                }
-                .to_platform_input(),
-                cx,
-            );
+            window.dispatch_event(entered(&successful_path), cx);
             assert!(
                 cx.active_drag
                     .as_ref()
                     .is_some_and(|drag| drag.value.downcast_ref::<ExternalPaths>().is_some())
             );
             window.dispatch_event(FileDropEvent::Exited.to_platform_input(), cx);
-        });
-        assert!(
-            update_result.is_ok(),
-            "failed to restore drag in source window: {update_result:?}"
-        );
+        })
+        .unwrap();
 
         let cancelled_path = PathBuf::from("/tmp/cancelled-drag");
-        let cancelled = start_drag(cx, cancelled_path.clone(), true);
-        let update_result = cx.update_window(cancelled.window, |_, window, cx| {
-            window.dispatch_event(
-                MouseMoveEvent {
-                    position: outside_position,
-                    pressed_button: Some(MouseButton::Left),
-                    modifiers: Default::default(),
-                }
-                .to_platform_input(),
-                cx,
-            );
+        let cancelled = start_file_drag(cx, &cancelled_path, UNTAGGED_COPY, true);
+        cx.update_window(cancelled.window, |_, window, cx| {
+            drag_pointer(outside(), window, cx);
             assert!(cx.active_drag.is_none());
 
-            window.dispatch_event(
-                FileDropEvent::Entered {
-                    position: reentry_position,
-                    paths: ExternalPaths([cancelled_path].into_iter().collect()),
-                }
-                .to_platform_input(),
-                cx,
-            );
+            window.dispatch_event(entered(&cancelled_path), cx);
             assert!(
                 cx.active_drag
                     .as_ref()
@@ -8674,59 +9930,48 @@ mod tests {
             );
             assert!(cx.stop_active_drag(window));
             assert!(cx.active_drag.is_none());
-        });
-        assert!(
-            update_result.is_ok(),
-            "failed to cancel restored drag: {update_result:?}"
-        );
+        })
+        .unwrap();
         assert!(!cx.update(|cx| cx.end_platform_drag(cancelled.window.window_id())));
 
         let removed_path = PathBuf::from("/tmp/removed-window-drag");
-        let removed = start_drag(cx, removed_path, true);
+        let removed = start_file_drag(cx, &removed_path, UNTAGGED_COPY, true);
         let removed_window_id = removed.window.window_id();
-        let update_result = cx.update_window(removed.window, |_, window, cx| {
-            window.dispatch_event(
-                MouseMoveEvent {
-                    position: outside_position,
-                    pressed_button: Some(MouseButton::Left),
-                    modifiers: Default::default(),
-                }
-                .to_platform_input(),
-                cx,
-            );
+        cx.update_window(removed.window, |_, window, cx| {
+            drag_pointer(outside(), window, cx);
             assert!(cx.active_drag.is_none());
             window.remove_window();
-        });
-        assert!(
-            update_result.is_ok(),
-            "failed to remove drag source window: {update_result:?}"
-        );
+        })
+        .unwrap();
         assert!(!cx.update(|cx| cx.end_platform_drag(removed_window_id)));
 
         let failed_path = PathBuf::from("/tmp/failed-drag");
-        let failed = start_drag(cx, failed_path.clone(), false);
-        let update_result = cx.update_window(failed.window, |_, window, cx| {
+        let failed = start_file_drag(
+            cx,
+            &failed_path,
+            Some((crate::FileTransferOperation::Move, 9)),
+            false,
+        );
+        cx.update_window(failed.window, |_, window, cx| {
             for x_position in [-1., -2.] {
-                window.dispatch_event(
-                    MouseMoveEvent {
-                        position: point(px(x_position), px(20.)),
-                        pressed_button: Some(MouseButton::Left),
-                        modifiers: Default::default(),
-                    }
-                    .to_platform_input(),
-                    cx,
-                );
+                drag_pointer(point(px(x_position), px(20.)), window, cx);
             }
             assert!(cx.active_drag.is_some());
-        });
-        assert!(
-            update_result.is_ok(),
-            "failed to retain drag after platform failure: {update_result:?}"
-        );
+        })
+        .unwrap();
         assert_eq!(
             cx.test_window(failed.window).external_drag_files(),
-            [(failed_path, true)]
+            [(failed_path.clone(), true)]
         );
+        // The refused payload is released once, keeping what it offered.
+        let completions = take_completions_for(&failed_path);
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].operation, None);
+        assert_eq!(
+            completions[0].files.operation,
+            crate::FileTransferOperation::Move
+        );
+        assert_eq!(completions[0].files.ownership, 9);
     }
 
     struct FocusForwarder {

@@ -832,6 +832,7 @@ struct MacWindowState {
     appearance_changed_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
     last_key_equivalent: Option<KeyDownEvent>,
+    outbound_drag: OutboundFileDrag,
     last_left_mouse_down_event: Option<Retained<Objc2Object>>,
     synthetic_drag_counter: usize,
     traffic_light_position: Option<Point<Pixels>>,
@@ -1273,6 +1274,7 @@ impl MacWindow {
                 input_handler: None,
                 last_key_equivalent: None,
                 last_left_mouse_down_event: None,
+                outbound_drag: OutboundFileDrag::default(),
                 synthetic_drag_counter: 0,
                 traffic_light_position: titlebar
                     .as_ref()
@@ -2389,6 +2391,8 @@ impl PlatformWindow for MacWindow {
                 return false;
             }
 
+            // The source operation mask is asked for while the session starts.
+            self.0.lock().outbound_drag.begin(paths.transfer());
             let session: ObjcId = msg_send![
                 native_view,
                 beginDraggingSessionWithItems: dragging_items,
@@ -2397,9 +2401,13 @@ impl PlatformWindow for MacWindow {
             ];
 
             let started = !session.is_null();
+            let mut state = self.0.lock();
             if started {
-                self.0.lock().synthetic_drag_counter += 1;
+                state.synthetic_drag_counter += 1;
+            } else {
+                state.outbound_drag.abort();
             }
+            drop(state);
             log::debug!(
                 "start_external_drag completed: started={}, item_count={}",
                 started,
@@ -3636,10 +3644,16 @@ unsafe extern "C" fn perform_drag_operation(
 ) -> Bool {
     let window_state = unsafe { get_window_state(this) };
     let position = drag_event_position(&window_state, dragging_info);
-    Bool::new(send_file_drop_event(
-        window_state,
-        FileDropEvent::Submit { position },
-    ))
+    let accepted = send_file_drop_event(window_state.clone(), FileDropEvent::Submit { position });
+    // A drop back on the source window lands on its restored in-app drag, so no
+    // application received the files, whatever operation the session ends with.
+    if is_drag_from_this_window(this, dragging_info) {
+        let completion = window_state.lock().outbound_drag.dropped_on_source();
+        if let Some(completion) = completion {
+            completion.report();
+        }
+    }
+    Bool::new(accepted)
 }
 
 fn external_paths_from_event(dragging_info: *mut Objc2Object) -> Option<ExternalPaths> {
@@ -3668,16 +3682,13 @@ unsafe extern "C" fn conclude_drag_operation(this: &Objc2Object, _: Sel, _: Objc
 }
 
 unsafe extern "C" fn dragging_session_source_operation_mask(
-    _: &Objc2Object,
+    this: &Objc2Object,
     _: Sel,
     _: ObjcId,
     context: NSInteger,
 ) -> NSDragOperation {
-    let operation = match context {
-        NSDRAGGING_CONTEXT_OUTSIDE_APPLICATION => NSDragOperationCopy,
-        NSDRAGGING_CONTEXT_WITHIN_APPLICATION => NSDragOperationCopy | NSDragOperationMove,
-        _ => NSDragOperationCopy | NSDragOperationMove,
-    };
+    let state = unsafe { get_window_state(this) };
+    let operation = state.lock().outbound_drag.operation_mask(context);
     log::debug!(
         "dragging_session_source_operation_mask: context={}, operation={}",
         context,
@@ -3697,12 +3708,81 @@ unsafe extern "C" fn dragging_session_ended(
     // SAFETY: AppKit invokes this selector on the GPUIWindow instance registered in build_classes,
     // which always has WINDOW_STATE_IVAR initialized to the owning MacWindowState.
     let window_state = unsafe { get_window_state(this) };
-    {
+    let completion = {
         let mut lock = window_state.lock();
         lock.synthetic_drag_counter += 1;
         lock.last_left_mouse_down_event = None;
+        lock.outbound_drag.ended(operation)
+    };
+    // Reported here rather than through the window, so the result is kept even
+    // when the window cannot take the event.
+    if let Some(completion) = completion {
+        completion.report();
     }
     send_file_drop_event(window_state, FileDropEvent::Ended);
+}
+
+/// The files of a native drag session this window started. They are kept until
+/// the drop lands, which decides the transfer result. AppKit calls stay in the
+/// callbacks, so this bookkeeping can be tested on its own.
+#[derive(Default)]
+struct OutboundFileDrag(Option<gpui::FileTransfer>);
+
+impl OutboundFileDrag {
+    /// Records the files before AppKit begins the session, because it asks for
+    /// the operation mask while doing so.
+    fn begin(&mut self, files: gpui::FileTransfer) {
+        self.0 = Some(files);
+    }
+
+    /// AppKit declined to begin the session, so no end will ever be reported.
+    fn abort(&mut self) {
+        self.0 = None;
+    }
+
+    /// The operations offered to a drop target in `context`.
+    fn operation_mask(&self, context: NSInteger) -> NSDragOperation {
+        let offers_move = match context {
+            // Other applications may move the files only when the drag asked to.
+            NSDRAGGING_CONTEXT_OUTSIDE_APPLICATION => self
+                .0
+                .as_ref()
+                .is_some_and(|files| files.operation == gpui::FileTransferOperation::Move),
+            NSDRAGGING_CONTEXT_WITHIN_APPLICATION => true,
+            _ => true,
+        };
+        if offers_move {
+            NSDragOperationCopy | NSDragOperationMove
+        } else {
+            NSDragOperationCopy
+        }
+    }
+
+    /// The source window took the drop through its restored in-app drag, so no
+    /// application received the files, whatever operation the session ends with.
+    fn dropped_on_source(&mut self) -> Option<gpui::FileTransferCompletion> {
+        self.0.take().map(gpui::FileTransferCompletion::cancelled)
+    }
+
+    /// The result of a session that ended with `operation`, unless the drop was
+    /// already reported.
+    fn ended(&mut self, operation: NSDragOperation) -> Option<gpui::FileTransferCompletion> {
+        let files = self.0.take()?;
+        let operation = if operation & NSDragOperationMove != 0 {
+            Some(gpui::FileTransferOperation::Move)
+        } else if operation & NSDragOperationCopy != 0 {
+            Some(gpui::FileTransferOperation::Copy)
+        } else {
+            None
+        };
+        Some(gpui::FileTransferCompletion {
+            files,
+            operation,
+            // Finder moves dragged file URLs itself, so after a move the
+            // originals are already gone from where they were.
+            source_removed: operation == Some(gpui::FileTransferOperation::Move),
+        })
+    }
 }
 
 async fn synthetic_drag(
@@ -3955,5 +4035,105 @@ mod tests {
     #[test]
     fn display_id_for_screen_returns_none_for_null_screen() {
         assert_eq!(display_id_for_screen(NIL), None);
+    }
+
+    use gpui::FileTransferOperation as Operation;
+
+    fn outbound_files(operation: Operation) -> gpui::FileTransfer {
+        gpui::FileTransfer {
+            paths: gpui::ExternalPaths([PathBuf::from("/tmp/dragged")].into_iter().collect()),
+            operation,
+            ownership: 7,
+        }
+    }
+
+    fn started(operation: Operation) -> OutboundFileDrag {
+        let mut drag = OutboundFileDrag::default();
+        drag.begin(outbound_files(operation));
+        drag
+    }
+
+    #[test]
+    fn only_move_drags_offer_other_applications_a_move() {
+        let copy_or_move = NSDragOperationCopy | NSDragOperationMove;
+        for (drag, outside) in [
+            (OutboundFileDrag::default(), NSDragOperationCopy),
+            (started(Operation::Copy), NSDragOperationCopy),
+            (started(Operation::Move), copy_or_move),
+        ] {
+            assert_eq!(
+                drag.operation_mask(NSDRAGGING_CONTEXT_OUTSIDE_APPLICATION),
+                outside
+            );
+            // The application's own windows choose between copying and moving.
+            assert_eq!(
+                drag.operation_mask(NSDRAGGING_CONTEXT_WITHIN_APPLICATION),
+                copy_or_move
+            );
+        }
+    }
+
+    #[test]
+    fn session_end_reports_the_operation_performed() {
+        for (performed, operation, source_removed) in [
+            (NSDragOperationMove, Some(Operation::Move), true),
+            (NSDragOperationCopy, Some(Operation::Copy), false),
+            (NSDragOperationNone, None, false),
+        ] {
+            let completion = started(Operation::Move)
+                .ended(performed)
+                .expect("a started session reports its end");
+            assert_eq!(completion.files, outbound_files(Operation::Move));
+            assert_eq!(completion.operation, operation, "performed {performed}");
+            assert_eq!(
+                completion.source_removed, source_removed,
+                "performed {performed}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_end_is_reported_once() {
+        let mut drag = started(Operation::Copy);
+        assert!(drag.ended(NSDragOperationCopy).is_some());
+        assert!(drag.ended(NSDragOperationCopy).is_none());
+        assert!(drag.dropped_on_source().is_none());
+    }
+
+    #[test]
+    fn drop_on_the_source_window_reports_no_transfer() {
+        let mut drag = started(Operation::Move);
+        let completion = drag
+            .dropped_on_source()
+            .expect("the session's files are released");
+        assert_eq!(completion.files, outbound_files(Operation::Move));
+        assert_eq!(completion.operation, None);
+        assert!(!completion.source_removed);
+        // The source window accepted its own drop as a move. That must not
+        // later read as another application having moved the files.
+        assert!(drag.ended(NSDragOperationMove).is_none());
+    }
+
+    #[test]
+    fn declined_session_reports_nothing() {
+        let mut drag = started(Operation::Move);
+        drag.abort();
+        assert_eq!(
+            drag.operation_mask(NSDRAGGING_CONTEXT_OUTSIDE_APPLICATION),
+            NSDragOperationCopy
+        );
+        assert!(drag.dropped_on_source().is_none());
+        assert!(drag.ended(NSDragOperationMove).is_none());
+    }
+
+    #[test]
+    fn a_new_session_reports_its_own_files() {
+        let mut drag = started(Operation::Copy);
+        drag.begin(outbound_files(Operation::Move));
+        assert_eq!(
+            drag.ended(NSDragOperationMove)
+                .map(|completion| completion.files),
+            Some(outbound_files(Operation::Move))
+        );
     }
 }

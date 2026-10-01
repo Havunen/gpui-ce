@@ -1,26 +1,30 @@
 //! Corner smoothing
 //!
-//! Adjust a rounded rectangle's smoothing, radius, width, and height.
+//! Adjust a rounded rectangle's smoothing, radius, border, width, and height.
+//!
+//! The fill and the border are drawn as separate primitives, so they must agree on the smoothed
+//! contour. Large corners at mid smoothing show any disagreement as a dark seam between them.
 
 #[path = "../shared/prelude.rs"]
 mod example_prelude;
 
 use gpui::{
     App, Bounds, Context, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, rgb,
-    rgba, size,
+    size,
 };
-use palette::WithAlpha;
 use slider::Slider;
 
 actions!(app, [Quit]);
 
-const INITIAL_SIZE: f32 = 200.;
+const INITIAL_SIZE: f32 = 440.;
 const MIN_SIZE: f32 = 20.;
-const MAX_SIZE: f32 = 280.;
+const MAX_SIZE: f32 = 440.;
+const MAX_BORDER_WIDTH: f32 = 8.;
 
 struct CornerSmoothingExample {
     corner_smoothing: f32,
     corner_radius: f32,
+    border_width: f32,
     width: f32,
     height: f32,
 }
@@ -48,14 +52,32 @@ impl Render for CornerSmoothingExample {
                     .justify_center()
                     .pb(px(200.))
                     .child(
-                        div().flex().flex_col().items_center().gap(px(28.)).child(
-                            div()
-                                .w(px(self.width))
-                                .h(px(self.height))
-                                .rounded(px(self.corner_radius))
-                                .rounded_smoothing(self.corner_smoothing)
-                                .bg(rgba(0x663399b8).with_alpha(0.5)),
-                        ),
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(px(20.))
+                            .child(
+                                div()
+                                    .w(px(self.width))
+                                    .h(px(self.height))
+                                    .rounded(px(self.corner_radius))
+                                    .rounded_smoothing(self.corner_smoothing)
+                                    .bg(rgb(0x663399))
+                                    .border(px(self.border_width))
+                                    .border_color(rgb(0xffffff)),
+                            )
+                            .child(
+                                div()
+                                    .max_w(px(380.))
+                                    .text_sm()
+                                    .text_center()
+                                    .text_color(rgb(0xa9a1b3))
+                                    .child(
+                                        "The border traces the exact smoothed contour, so the \
+                                         fill should meet it all the way around each corner.",
+                                    ),
+                            ),
                     ),
             )
             .child(
@@ -106,6 +128,22 @@ impl Render for CornerSmoothingExample {
                                                 cx.notify();
                                             }),
                                         ),
+                                    )
+                                    .child(
+                                        Slider::new(
+                                            "border-slider",
+                                            "Border",
+                                            self.border_width,
+                                            0.,
+                                            MAX_BORDER_WIDTH,
+                                        )
+                                        .display_value(format!("{:.1}px", self.border_width))
+                                        .on_change(
+                                            cx.processor(|this, border_width, _window, cx| {
+                                                this.border_width = border_width;
+                                                cx.notify();
+                                            }),
+                                        ),
                                     ),
                             )
                             .child(
@@ -152,7 +190,7 @@ impl Render for CornerSmoothingExample {
 
 fn main() {
     gpui_platform::application().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(500.), px(650.)), cx);
+        let bounds = Bounds::centered(None, size(px(680.), px(800.)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -160,8 +198,9 @@ fn main() {
             },
             |_, cx| {
                 cx.new(|_| CornerSmoothingExample {
-                    corner_smoothing: 1.,
-                    corner_radius: 40.,
+                    corner_smoothing: 0.45,
+                    corner_radius: 150.,
+                    border_width: 1.,
                     width: INITIAL_SIZE,
                     height: INITIAL_SIZE,
                 })

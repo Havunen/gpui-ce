@@ -829,6 +829,10 @@ impl Platform for WindowsPlatform {
         write_to_clipboard(item);
     }
 
+    fn capture_file_paste(&self, files: &gpui::FileTransfer) -> Option<gpui::FilePaste> {
+        crate::file_transfer::capture_paste(files)
+    }
+
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
         read_from_clipboard()
     }
@@ -1191,6 +1195,13 @@ impl Drop for WindowsPlatform {
             DestroyWindow(self.handle)
                 .ok()
                 .context("Destroying platform window")
+                .log_err();
+            // A data object placed with OleSetClipboard lives in this process.
+            // Rendering it now keeps copied files pasteable after exit, as
+            // text written with SetClipboardData already is.
+            OleFlushClipboard()
+                .ok()
+                .context("Flushing the OLE clipboard")
                 .log_err();
             OleUninitialize();
         }

@@ -1,4 +1,4 @@
-use std::{sync::LazyLock, time::Duration};
+use std::{ffi::OsString, os::windows::ffi::OsStringExt, sync::LazyLock, time::Duration};
 
 use crate::bindings::Windows::Win32::GlobalFree;
 use crate::bindings::Windows::Win32::{
@@ -29,6 +29,11 @@ static CLIPBOARD_GIF_FORMAT: LazyLock<u32> =
     LazyLock::new(|| register_clipboard_format(windows_core::w!("GIF")));
 static CLIPBOARD_PNG_FORMAT: LazyLock<u32> =
     LazyLock::new(|| register_clipboard_format(windows_core::w!("PNG")));
+static FILE_TRANSFER_FORMAT: LazyLock<u32> = LazyLock::new(|| {
+    register_clipboard_format(windows_core::w!("application/x-gpui-file-transfer"))
+});
+static PREFERRED_DROP_EFFECT: LazyLock<u32> =
+    LazyLock::new(|| register_clipboard_format(windows_core::w!("Preferred DropEffect")));
 static CLIPBOARD_JPG_FORMAT: LazyLock<u32> =
     LazyLock::new(|| register_clipboard_format(windows_core::w!("JFIF")));
 
@@ -66,6 +71,14 @@ fn get_clipboard_data(format: u32) -> Option<LockedGlobal> {
 }
 
 pub(crate) fn write_to_clipboard(item: ClipboardItem) {
+    if let Some(files) = item.file_transfer() {
+        // The Shell data object carries the files for Explorer; the text is
+        // what terminals and editors paste, as on the other platforms.
+        if let Err(error) = crate::file_transfer::write_files(files, item.text()) {
+            log::error!("Could not write native files to clipboard: {error}");
+        }
+        return;
+    }
     let Some(_clip) = ClipboardGuard::open() else {
         return;
     };
@@ -76,7 +89,8 @@ pub(crate) fn write_to_clipboard(item: ClipboardItem) {
             match entry {
                 ClipboardEntry::String(string) => write_string(string)?,
                 ClipboardEntry::Image(image) => write_image(image)?,
-                ClipboardEntry::ExternalPaths(_) => {}
+                // Items with files took the data-object path above.
+                ClipboardEntry::ExternalPaths(_) | ClipboardEntry::Files(_) => {}
             }
         }
         Ok(())
@@ -89,6 +103,38 @@ pub(crate) fn write_to_clipboard(item: ClipboardItem) {
 
 pub(crate) fn read_from_clipboard() -> Option<ClipboardItem> {
     let _clip = ClipboardGuard::open()?;
+    // CF_HDROP preserves native UTF-16 names, including names that cannot be
+    // encoded as a Unicode URL. Private metadata carries only operation/token.
+    if let Some(ClipboardEntry::ExternalPaths(paths)) = read_files() {
+        let operation = if get_clipboard_data(*PREFERRED_DROP_EFFECT).is_some_and(|data| {
+            data.as_bytes()
+                .get(..4)
+                .is_some_and(|bytes| bytes == 2u32.to_le_bytes())
+        }) {
+            gpui::FileTransferOperation::Move
+        } else {
+            gpui::FileTransferOperation::Copy
+        };
+        let ownership = get_clipboard_data(*FILE_TRANSFER_FORMAT)
+            .and_then(|data| {
+                std::str::from_utf8(data.as_bytes())
+                    .ok()?
+                    .lines()
+                    .nth(1)?
+                    .parse()
+                    .ok()
+            })
+            .unwrap_or(0);
+        let mut entries = vec![ClipboardEntry::Files(gpui::FileTransfer {
+            paths,
+            operation,
+            ownership,
+        })];
+        // Files written by this crate carry their text too; keep it so text
+        // consumers paste what was copied rather than a rendering of the paths.
+        entries.extend(read_string());
+        return Some(ClipboardItem { entries });
+    }
 
     let mut entries = Vec::new();
     let mut have_text = false;
@@ -127,7 +173,7 @@ pub(crate) fn read_from_clipboard() -> Option<ClipboardItem> {
 
 pub(crate) fn with_file_names<F>(hdrop: HDROP, mut f: F)
 where
-    F: FnMut(String),
+    F: FnMut(OsString),
 {
     let file_count = unsafe { DragQueryFileW(hdrop, DRAGDROP_GET_FILES_COUNT, None, 0) };
     for file_index in 0..file_count {
@@ -145,10 +191,7 @@ where
             log::error!("unable to read file name of dragged file");
             continue;
         }
-        match String::from_utf16(&buffer[0..filename_length]) {
-            Ok(file_name) => f(file_name),
-            Err(e) => log::error!("dragged file name is not UTF-16: {}", e),
-        }
+        f(OsString::from_wide(&buffer[..filename_length]));
     }
 }
 

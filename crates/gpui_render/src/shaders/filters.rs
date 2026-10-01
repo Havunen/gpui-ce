@@ -255,6 +255,9 @@ pub mod blur {
         #[location(5)]
         #[interpolate(flat)]
         pub superellipse_power: f32,
+        #[location(6)]
+        #[interpolate(flat)]
+        pub superellipse_error: f32,
     }
 
     #[vertex]
@@ -276,6 +279,7 @@ pub mod blur {
             clip_distances: vertex.clip_distances,
             smoothing_factors: prepared.smoothing_factors,
             superellipse_power: prepared.superellipse_power,
+            superellipse_error: prepared.superellipse_error,
         }
     }
 
@@ -296,6 +300,7 @@ pub mod blur {
                     vertical_reaches: input.vertical_corner_reaches,
                     smoothing_factors: input.smoothing_factors,
                     superellipse_power: input.superellipse_power,
+                    superellipse_error: input.superellipse_error,
                 },
             )),
             get!(BLUR_LOCALS).composite_clip == BlurCompositeClip::RoundedBounds,

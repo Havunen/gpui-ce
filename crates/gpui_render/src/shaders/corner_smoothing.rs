@@ -11,6 +11,12 @@ mod source {
     pub const FIGMA_SEGMENT_SECOND_CUBIC: u32 = 3u32;
     pub const FIGMA_NO_CORNER: u32 = 4u32;
     pub const FIGMA_EPSILON: f32 = 0.000001;
+    /// Largest error, in pixels, the superellipse shortcut's distance may carry before pixels near
+    /// the edge switch to the exact Figma distance.
+    pub const SUPERELLIPSE_MAX_DISTANCE_ERROR: f32 = 0.125;
+    /// Near the edge, the first-order superellipse distance strays from the true distance to its
+    /// own curve by at most this divided by the corner radius, as tighter corners curve faster.
+    pub const SUPERELLIPSE_ESTIMATE_ERROR_TIMES_RADIUS: f32 = 0.2;
 
     pub fn corner_values(corner_radii: Corners) -> Vec4f {
         vec4f(
@@ -30,6 +36,37 @@ mod source {
     pub fn normalized_superellipse_reaches(corner_radii: Corners, corner_smoothing: f32) -> Vec4f {
         max(corner_values(corner_radii), vec4f(0.0, 0.0, 0.0, 0.0))
             * (1.0 + clamp(corner_smoothing, 0.0, 1.0))
+    }
+
+    /// Upper bound on how far the superellipse strays from the Figma contour, per pixel of corner
+    /// radius. Both shapes scale with the radius; the measured ratio peaks at 0.0179 near
+    /// smoothing 0.45 and falls to 0.003 at 1.0, which this bound stays above everywhere.
+    pub fn normalized_superellipse_contour_error(corner_smoothing: f32) -> f32 {
+        let smoothing = clamp(corner_smoothing, 0.0, 1.0);
+        smoothing * (0.08 * (1.0 - smoothing) + 0.0032)
+    }
+
+    /// Bounds how far the shortcut's distance strays from the Figma distance near the edge, in
+    /// pixels: the contours part as corners grow, and the estimate bends as they shrink.
+    pub fn normalized_superellipse_distance_error(
+        corner_radii: Corners,
+        corner_smoothing: f32,
+    ) -> f32 {
+        let radii = corner_values(corner_radii);
+        let largest = max(max(radii.x, radii.y), max(radii.z, radii.w));
+        let smallest = min(
+            min(
+                select(largest, radii.x, radii.x > 0.0),
+                select(largest, radii.y, radii.y > 0.0),
+            ),
+            min(
+                select(largest, radii.z, radii.z > 0.0),
+                select(largest, radii.w, radii.w > 0.0),
+            ),
+        );
+
+        largest * normalized_superellipse_contour_error(corner_smoothing)
+            + SUPERELLIPSE_ESTIMATE_ERROR_TIMES_RADIUS / max(smallest, FIGMA_EPSILON)
     }
 
     pub fn can_use_normalized_superellipse(
@@ -65,8 +102,11 @@ mod source {
         let normalized = corner_center_to_point / extent;
         let powered = pow(normalized, vec2f(power, power));
         let gradient = power * length(pow(normalized, vec2f(power - 1.0, power - 1.0)));
+        let estimate = extent * (powered.x + powered.y - 1.0) / max(gradient, FIGMA_EPSILON);
 
-        extent * (powered.x + powered.y - 1.0) / max(gradient, FIGMA_EPSILON)
+        // The gradient vanishes toward the corner center, inflating the estimate's depth, but the
+        // contour never lies farther away than the straight edges around it.
+        max(estimate, max(corner_to_point.x, corner_to_point.y))
     }
 
     pub fn can_use_compact_corner_selection(size: Vec2f, reaches: Vec4f) -> bool {
@@ -333,6 +373,9 @@ mod source {
         pub vertical_reaches: Vec4f,
         pub smoothing_factors: Vec4f,
         pub superellipse_power: f32,
+        /// How far the superellipse shortcut's distance may stray near the edge, in pixels;
+        /// zero without the shortcut.
+        pub superellipse_error: f32,
     }
 
     pub fn figma_smoothing_factors(corner_smoothing: f32) -> Vec4f {
@@ -465,17 +508,23 @@ mod source {
             vertical_reaches: radius_values,
             smoothing_factors: vec4f(0.0, 1.0, 0.0, 0.0),
             superellipse_power: 0.0,
+            superellipse_error: 0.0,
         };
 
         if smoothing <= 0.0 {
             return prepared;
         }
 
+        prepared.smoothing_factors = figma_smoothing_factors(smoothing);
+
+        // When the shortcut applies, no corners overlap, so the Figma reaches match these and the
+        // exact contour can still refine pixels near the edge.
         if allow_superellipse && can_use_normalized_superellipse(size, radii, smoothing) {
             let reaches = normalized_superellipse_reaches(radii, smoothing);
             prepared.horizontal_reaches = reaches;
             prepared.vertical_reaches = reaches;
             prepared.superellipse_power = normalized_superellipse_power(smoothing);
+            prepared.superellipse_error = normalized_superellipse_distance_error(radii, smoothing);
             return prepared;
         }
 
@@ -489,7 +538,6 @@ mod source {
 
         prepared.horizontal_reaches = extents.horizontal;
         prepared.vertical_reaches = extents.vertical;
-        prepared.smoothing_factors = figma_smoothing_factors(smoothing);
         prepared
     }
 
@@ -989,6 +1037,8 @@ mod source {
         result
     }
 
+    /// With the superellipse shortcut prepared, distances away from the edge are only estimates, so
+    /// such callers may use the result for coverage alone, never offset it.
     pub fn prepared_corner_signed_distance(
         point: Vec2f,
         bounds: Bounds,
@@ -997,7 +1047,7 @@ mod source {
         prepared: PreparedCorners,
     ) -> f32 {
         if prepared.superellipse_power > 0.0 {
-            return normalized_superellipse_signed_distance(
+            let estimate = normalized_superellipse_signed_distance(
                 point,
                 bounds,
                 corner_radii,
@@ -1005,9 +1055,15 @@ mod source {
                 prepared.horizontal_reaches,
                 prepared.superellipse_power,
             );
-        }
 
-        if prepared.smoothing_factors.x <= 0.0 {
+            // Beyond the error from the edge, both distances leave a pixel fully in or out.
+            let error = prepared.superellipse_error;
+            if error <= SUPERELLIPSE_MAX_DISTANCE_ERROR
+                || abs(estimate) >= PIXEL_ANTIALIAS_RADIUS + error
+            {
+                return estimate;
+            }
+        } else if prepared.smoothing_factors.x <= 0.0 {
             return rounded_rectangle_signed_distance(point, bounds, corner_radii);
         }
 
@@ -1185,8 +1241,14 @@ mod tests {
                     smoothing,
                     prepared.superellipse_power,
                 );
-                let actual =
-                    prepared_corner_signed_distance(point, bounds, radii, smoothing, prepared);
+                let actual = normalized_superellipse_signed_distance(
+                    point,
+                    bounds,
+                    radii,
+                    smoothing,
+                    prepared.horizontal_reaches,
+                    prepared.superellipse_power,
+                );
                 assert_eq!(actual, expected, "compact distance at {point:?}");
             }
         }
@@ -1220,12 +1282,319 @@ mod tests {
             smoothing,
             prepared.superellipse_power,
         );
-        let actual = prepared_corner_signed_distance(shoulder, bounds, radii, smoothing, prepared);
+        let estimate = |point| {
+            normalized_superellipse_signed_distance(
+                point,
+                bounds,
+                radii,
+                smoothing,
+                prepared.horizontal_reaches,
+                prepared.superellipse_power,
+            )
+        };
+        let actual = estimate(shoulder);
         assert!((actual - expected).abs() < 0.0001);
         assert!(actual > 0.0);
 
-        let deep_interior =
-            prepared_corner_signed_distance(vec2f(65.0, 65.0), bounds, radii, smoothing, prepared);
+        let deep_interior = estimate(vec2f(65.0, 65.0));
         assert!((deep_interior + 15.0).abs() < 0.0001);
+    }
+
+    const SMOOTHING_SAMPLES: [f32; 6] = [0.1, 0.3, 0.45, 0.6, 0.8, 1.0];
+
+    fn uniform_corners(radius: f32) -> Corners {
+        Corners {
+            top_left: radius,
+            top_right: radius,
+            bottom_right: radius,
+            bottom_left: radius,
+        }
+    }
+
+    fn sized_bounds(width: f32, height: f32) -> Bounds {
+        Bounds {
+            origin: vec2f(0.0, 0.0),
+            size: vec2f(width, height),
+        }
+    }
+
+    /// Samples the top-left corner's zero contour from its left-edge reach to its top-edge reach
+    /// by bisecting along rays from the point where the two reach lines cross.
+    fn top_left_contour(
+        bounds: Bounds,
+        radii: Corners,
+        smoothing: f32,
+        prepared: PreparedCorners,
+        samples: usize,
+    ) -> Vec<(f32, f32)> {
+        let reach = (prepared.horizontal_reaches.x, prepared.vertical_reaches.x);
+        (0..=samples)
+            .map(|index| {
+                let angle = index as f32 / samples as f32 * std::f32::consts::FRAC_PI_2;
+                let direction = (-angle.cos(), -angle.sin());
+                let along = |length: f32| {
+                    (
+                        reach.0 + direction.0 * length,
+                        reach.1 + direction.1 * length,
+                    )
+                };
+                let (mut inside, mut outside) = (0.0, 2.0 * reach.0.max(reach.1));
+                for _ in 0..48 {
+                    let middle = 0.5 * (inside + outside);
+                    let (x, y) = along(middle);
+                    let distance = prepared_corner_signed_distance(
+                        vec2f(x, y),
+                        bounds,
+                        radii,
+                        smoothing,
+                        prepared,
+                    );
+                    if distance < 0.0 {
+                        inside = middle;
+                    } else {
+                        outside = middle;
+                    }
+                }
+                along(inside)
+            })
+            .collect()
+    }
+
+    /// Mirrors the top-left contour into a closed outline, which only holds for uniform radii.
+    fn closed_contour(
+        bounds: Bounds,
+        radii: Corners,
+        smoothing: f32,
+        prepared: PreparedCorners,
+        samples: usize,
+    ) -> Vec<(f32, f32)> {
+        let top_left = top_left_contour(bounds, radii, smoothing, prepared, samples);
+        let (width, height) = (bounds.size.x, bounds.size.y);
+        let mut contour = top_left.clone();
+        contour.extend(top_left.iter().rev().map(|&(x, y)| (width - x, y)));
+        contour.extend(top_left.iter().map(|&(x, y)| (width - x, height - y)));
+        contour.extend(top_left.iter().rev().map(|&(x, y)| (x, height - y)));
+        contour.push(top_left[0]);
+        contour
+    }
+
+    fn polyline_distance(point: (f32, f32), polyline: &[(f32, f32)]) -> f32 {
+        polyline
+            .windows(2)
+            .map(|segment| {
+                let (start, end) = (segment[0], segment[1]);
+                let edge = (end.0 - start.0, end.1 - start.1);
+                let offset = (point.0 - start.0, point.1 - start.1);
+                let t = ((offset.0 * edge.0 + offset.1 * edge.1)
+                    / (edge.0 * edge.0 + edge.1 * edge.1).max(f32::EPSILON))
+                .clamp(0.0, 1.0);
+                (offset.0 - edge.0 * t).hypot(offset.1 - edge.1 * t)
+            })
+            .fold(f32::MAX, f32::min)
+    }
+
+    fn polyline_length(polyline: &[(f32, f32)]) -> f32 {
+        polyline
+            .windows(2)
+            .map(|segment| (segment[1].0 - segment[0].0).hypot(segment[1].1 - segment[0].1))
+            .sum()
+    }
+
+    /// Returns the largest gap between the prepared signed distance and the Euclidean distance to
+    /// the sampled contour, over points whose Euclidean distance is at most `band`.
+    fn max_distance_error(
+        bounds: Bounds,
+        radii: Corners,
+        smoothing: f32,
+        prepared: PreparedCorners,
+        band: f32,
+    ) -> f32 {
+        let reach = (prepared.horizontal_reaches.x, prepared.vertical_reaches.x);
+        let contour = closed_contour(bounds, radii, smoothing, prepared, 600);
+
+        let mut max_error: f32 = 0.0;
+        for row in 0..=64 {
+            for column in 0..=64 {
+                let point = (
+                    -band + (reach.0 + 2.0 * band) * column as f32 / 64.0,
+                    -band + (reach.1 + 2.0 * band) * row as f32 / 64.0,
+                );
+                let actual = prepared_corner_signed_distance(
+                    vec2f(point.0, point.1),
+                    bounds,
+                    radii,
+                    smoothing,
+                    prepared,
+                );
+                let expected = polyline_distance(point, &contour).copysign(actual);
+                if expected.abs() <= band {
+                    max_error = max_error.max((actual - expected).abs());
+                }
+            }
+        }
+        max_error
+    }
+
+    #[test]
+    fn figma_distance_is_euclidean_through_thick_borders() {
+        // Borders offset this distance inward, so it must stay exact beyond the antialiasing band.
+        let border_band = 8.0;
+        let bounds = sized_bounds(1000.0, 1000.0);
+
+        for radius in [6.0, 20.0, 60.0] {
+            for smoothing in SMOOTHING_SAMPLES {
+                let radii = uniform_corners(radius);
+                let prepared = prepare_corners(bounds.size, radii, smoothing, false);
+                let error = max_distance_error(bounds, radii, smoothing, prepared, border_band);
+                assert!(
+                    error < 0.02,
+                    "radius {radius}, smoothing {smoothing}: distance off by {error}"
+                );
+            }
+        }
+
+        // Adjacent corners that overlap shorten their reaches.
+        let bounds = sized_bounds(70.0, 52.0);
+        let radii = uniform_corners(18.0);
+        let prepared = prepare_corners(bounds.size, radii, 1.0, false);
+        assert!(prepared.horizontal_reaches.x < 36.0);
+        let error = max_distance_error(bounds, radii, 1.0, prepared, border_band);
+        assert!(error < 0.02, "overlapping corners: distance off by {error}");
+    }
+
+    #[test]
+    fn superellipse_contour_error_bounds_its_distance_from_the_figma_contour() {
+        let bounds = sized_bounds(1000.0, 1000.0);
+
+        for step in 1..=20 {
+            let smoothing = step as f32 * 0.05;
+            let radius = 100.0;
+            let radii = uniform_corners(radius);
+            let superellipse = prepare_corners(bounds.size, radii, smoothing, true);
+            let figma = prepare_corners(bounds.size, radii, smoothing, false);
+            assert!(superellipse.superellipse_power > 0.0);
+            assert_eq!(superellipse.horizontal_reaches, figma.horizontal_reaches);
+            assert_eq!(superellipse.vertical_reaches, figma.vertical_reaches);
+
+            let separation = top_left_contour(bounds, radii, smoothing, figma, 600)
+                .into_iter()
+                .map(|(x, y)| {
+                    normalized_superellipse_signed_distance(
+                        vec2f(x, y),
+                        bounds,
+                        radii,
+                        smoothing,
+                        superellipse.horizontal_reaches,
+                        superellipse.superellipse_power,
+                    )
+                    .abs()
+                })
+                .fold(0.0, f32::max);
+            let bound = radius * normalized_superellipse_contour_error(smoothing);
+            assert!(
+                separation <= bound,
+                "smoothing {smoothing}: contours {separation}px apart, bound {bound}px"
+            );
+        }
+    }
+
+    #[test]
+    fn superellipse_shortcut_coverage_follows_the_figma_contour() {
+        // Borders and shadows always trace the Figma contour, so fills and images that take the
+        // shortcut must produce exactly its coverage, or they separate from their own border.
+        let bounds = sized_bounds(1000.0, 1000.0);
+        let offsets = (-32..=32).map(|step| step as f32 / 8.0);
+
+        for radius in [0.25, 0.5, 1.0, 2.0, 6.0, 16.0, 40.0, 100.0, 200.0] {
+            for step in 1..=10 {
+                let smoothing = step as f32 * 0.1;
+                let radii = uniform_corners(radius);
+                let superellipse = prepare_corners(bounds.size, radii, smoothing, true);
+                let figma = prepare_corners(bounds.size, radii, smoothing, false);
+                assert!(superellipse.superellipse_power > 0.0);
+                // The error depends on the shape alone, so it is prepared once per primitive.
+                assert_eq!(
+                    superellipse.superellipse_error,
+                    normalized_superellipse_distance_error(radii, smoothing)
+                );
+                assert_eq!(figma.superellipse_error, 0.0);
+                // Only shapes whose estimate stays close skip the exact distance near the edge.
+                let tolerance = if normalized_superellipse_distance_error(radii, smoothing)
+                    <= SUPERELLIPSE_MAX_DISTANCE_ERROR
+                {
+                    SUPERELLIPSE_MAX_DISTANCE_ERROR
+                } else {
+                    0.0
+                };
+
+                let reach = figma.horizontal_reaches.x;
+                let contour = top_left_contour(bounds, radii, smoothing, figma, 120);
+                for (index, &edge) in contour.iter().enumerate() {
+                    let angle = index as f32 / 120.0 * std::f32::consts::FRAC_PI_2;
+                    let direction = (-angle.cos(), -angle.sin());
+                    let edge_length = (edge.0 - reach).hypot(edge.1 - reach);
+
+                    for offset in offsets.clone() {
+                        let length = edge_length + offset;
+                        let point =
+                            vec2f(reach + direction.0 * length, reach + direction.1 * length);
+                        let coverage = |prepared| {
+                            antialiased_coverage(prepared_corner_signed_distance(
+                                point, bounds, radii, smoothing, prepared,
+                            ))
+                        };
+                        let difference = (coverage(superellipse) - coverage(figma)).abs();
+                        assert!(
+                            difference <= tolerance,
+                            "radius {radius}, smoothing {smoothing}, at {point:?}: coverage \
+                             off by {difference}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dash_progress_follows_the_smoothed_contour_length() {
+        for (width, height, radius) in [(1000.0, 1000.0, 24.0), (70.0, 52.0, 18.0)] {
+            for smoothing in SMOOTHING_SAMPLES {
+                let bounds = sized_bounds(width, height);
+                let radii = uniform_corners(radius);
+                let prepared = prepare_corners(bounds.size, radii, smoothing, false);
+                let params = figma_corner_params(
+                    radius,
+                    prepared.horizontal_reaches.x,
+                    prepared.vertical_reaches.x,
+                    prepared.smoothing_factors,
+                );
+                let contour = top_left_contour(bounds, radii, smoothing, prepared, 2000);
+                let contour_length = polyline_length(&contour);
+                let corner_length = figma_corner_length(params);
+                assert!(
+                    (corner_length - contour_length).abs() < 0.002 * contour_length,
+                    "{width}x{height}, smoothing {smoothing}: corner length {corner_length}, \
+                     contour length {contour_length}"
+                );
+
+                // Progress runs from the top-edge reach back to the left-edge reach.
+                let mut remaining = contour_length;
+                for (index, &(x, y)) in contour.iter().enumerate().skip(1) {
+                    let previous = contour[index - 1];
+                    remaining -= (x - previous.0).hypot(y - previous.1);
+                    if index % 50 != 0 || index == contour.len() - 1 {
+                        continue;
+                    }
+
+                    let sample = figma_corner_signed_distance(vec2f(-x, -y), params);
+                    let progress = figma_corner_progress(params, sample, corner_length);
+                    assert!(
+                        (progress - remaining).abs() < 0.01 * contour_length,
+                        "{width}x{height}, smoothing {smoothing}: progress {progress} at \
+                         ({x}, {y}), expected {remaining}"
+                    );
+                }
+            }
+        }
     }
 }

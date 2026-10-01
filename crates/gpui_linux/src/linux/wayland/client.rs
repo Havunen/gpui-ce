@@ -18,7 +18,6 @@ use calloop::{
 use calloop_wayland_source::WaylandSource;
 use filedescriptor::Pipe;
 use gpui_util::ResultExt as _;
-use smallvec::SmallVec;
 use url::Url;
 use wayland_backend::client::ObjectId;
 use wayland_backend::protocol::WEnum;
@@ -440,6 +439,10 @@ pub struct DragState {
     data_offer: Option<wl_data_offer::WlDataOffer>,
     window: Option<WaylandWindowStatePtr>,
     position: Point<Pixels>,
+    action: Option<gpui::FileTransferOperation>,
+    generation: u64,
+    ready: bool,
+    drop_requested: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -449,6 +452,8 @@ pub(crate) enum DataSourceKind {
 }
 
 pub(crate) struct ExternalDrag {
+    files: gpui::FileTransfer,
+    action: Option<gpui::FileTransferOperation>,
     source: wl_data_source::WlDataSource,
     bytes: Vec<u8>,
     window: WaylandWindowStatePtr,
@@ -590,10 +595,16 @@ impl WaylandClientStatePtr {
         let source =
             data_device_manager.create_data_source(&state.globals.qh, DataSourceKind::Drag);
         source.offer(FILE_LIST_MIME_TYPE.to_string());
-        source.set_actions(DndAction::Copy | DndAction::Move);
+        source.set_actions(if paths.operation == gpui::FileTransferOperation::Move {
+            DndAction::Copy | DndAction::Move
+        } else {
+            DndAction::Copy
+        });
         data_device.start_drag(Some(&source), surface, None, serial.as_raw());
 
         state.external_drag = Some(ExternalDrag {
+            files: paths.transfer(),
+            action: None,
             source,
             bytes: uri_list.into_bytes(),
             window,
@@ -1015,6 +1026,10 @@ impl WaylandClient {
                 data_offer: None,
                 window: None,
                 position: Point::default(),
+                action: None,
+                generation: 0,
+                ready: false,
+                drop_requested: false,
             },
             external_drag: None,
             click: ClickState {
@@ -1309,6 +1324,8 @@ impl LinuxClient for WaylandClient {
                 return;
             };
             let data_source = primary_selection_manager.create_source(&state.globals.qh, ());
+            // The primary selection carries text only - `send_primary` never
+            // encodes a file format - so it always advertises the text types.
             for mime_type in TEXT_MIME_TYPES {
                 data_source.offer(mime_type.to_string());
             }
@@ -1335,6 +1352,9 @@ impl LinuxClient for WaylandClient {
             };
             let data_source = data_device_manager
                 .create_data_source(&state.globals.qh, DataSourceKind::Clipboard);
+            for mime in state.clipboard.file_mime_types() {
+                data_source.offer((*mime).to_string());
+            }
             for mime_type in TEXT_MIME_TYPES {
                 data_source.offer(mime_type.to_string());
             }
@@ -1951,6 +1971,9 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 let capslock = capslock_from_xkb(keymap_state);
                 state.modifiers = modifiers;
                 state.capslock = capslock;
+                if let Some(offer) = &state.drag.data_offer {
+                    offer_drag_actions(offer, modifiers.shift);
+                }
 
                 let input = PlatformInput::ModifiersChanged(ModifiersChangedEvent {
                     modifiers: state.modifiers,
@@ -2788,8 +2811,30 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
                         return;
                     };
 
-                    const ACTIONS: DndAction = DndAction::Copy;
-                    data_offer.set_actions(ACTIONS, ACTIONS);
+                    let supported = state.data_offers.iter().any(|offer| {
+                        offer.inner.id() == data_offer.id()
+                            && offer.has_mime_type(FILE_LIST_MIME_TYPE)
+                    });
+                    // A drag the compositor never left behind is over now.
+                    if let Some(offer) = release_drag_offer(&mut state) {
+                        offer.destroy();
+                    }
+                    state.drag.generation = state.drag.generation.wrapping_add(1);
+                    let generation = state.drag.generation;
+                    state.drag.action = None;
+                    state.drag.ready = false;
+                    state.drag.drop_requested = false;
+                    state.drag.position = Point::new(x.into(), y.into());
+                    // Every offer is ours to destroy at leave, read from or not.
+                    state.drag.data_offer = Some(data_offer.clone());
+                    if !supported {
+                        state.drag.window = None;
+                        data_offer.accept(serial, None);
+                        return;
+                    }
+                    state.drag.window = Some(drag_window.clone());
+                    data_offer.accept(serial, Some(FILE_LIST_MIME_TYPE.to_string()));
+                    offer_drag_actions(&data_offer, state.modifiers.shift);
 
                     let pipe = Pipe::new().unwrap();
                     data_offer.receive(FILE_LIST_MIME_TYPE.to_string(), unsafe {
@@ -2809,46 +2854,42 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
                         .common
                         .foreground_executor
                         .spawn(async move {
-                            let file_list = match read_task.await {
-                                Ok(list) => list,
-                                Err(err) => {
-                                    log::error!("error reading drag and drop pipe: {err:?}");
-                                    return;
-                                }
-                            };
-
-                            let paths: SmallVec<[_; 2]> = file_list
-                                .lines()
-                                .filter_map(|path| Url::parse(path).log_err())
-                                .filter_map(|url| match url.to_file_path() {
-                                    Ok(url) => Some(url),
-                                    Err(()) => {
-                                        log::error!("Failed turn {url:?} into a file path");
-                                        None
-                                    }
-                                })
-                                .collect();
-                            let position = Point::new(x.into(), y.into());
-
-                            // Prevent dropping text from other programs.
-                            if paths.is_empty() {
-                                data_offer.destroy();
-                                return;
-                            }
-
-                            let input = PlatformInput::FileDrop(FileDropEvent::Entered {
-                                position,
-                                paths: gpui::ExternalPaths(paths),
-                            });
-
+                            let result = read_task.await;
                             let client = this.get_client();
                             let mut state = client.borrow_mut();
-                            state.drag.data_offer = Some(data_offer);
-                            state.drag.window = Some(drag_window.clone());
-                            state.drag.position = position;
-
+                            if state.drag.generation != generation {
+                                return;
+                            }
+                            let files = result.ok().and_then(|file_list| {
+                                gpui::FileTransfer::decode(
+                                    file_list.as_bytes(),
+                                    gpui::URI_LIST_MIME,
+                                )
+                            });
+                            let Some(files) = files else {
+                                state.drag.window = None;
+                                state.drag.drop_requested = false;
+                                state.drag.ready = false;
+                                if let Some(offer) = release_drag_offer(&mut state) {
+                                    offer.destroy();
+                                }
+                                drop(state);
+                                drag_window.handle_input(PlatformInput::FileDrop(
+                                    FileDropEvent::Exited {},
+                                ));
+                                return;
+                            };
+                            state.drag.ready = true;
+                            let pending = state.drag.drop_requested;
+                            let input = PlatformInput::FileDrop(FileDropEvent::Entered {
+                                position: state.drag.position,
+                                paths: files.paths,
+                            });
                             drop(state);
                             drag_window.handle_input(input);
+                            if pending {
+                                finish_native_file_drop(&client);
+                            }
                         })
                         .detach();
                 }
@@ -2859,41 +2900,47 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
                 };
                 let position = Point::new(x.into(), y.into());
                 state.drag.position = position;
+                if let Some(offer) = &state.drag.data_offer {
+                    offer_drag_actions(offer, state.modifiers.shift);
+                }
 
                 let input = PlatformInput::FileDrop(FileDropEvent::Pending { position });
                 drop(state);
                 drag_window.handle_input(input);
             }
             wl_data_device::Event::Leave => {
-                let Some(drag_window) = state.drag.window.clone() else {
+                if state.drag.drop_requested {
+                    // The files are still being read; the drop releases the offer.
+                    return;
+                }
+                state.drag.generation = state.drag.generation.wrapping_add(1);
+                state.drag.ready = false;
+                if let Some(offer) = release_drag_offer(&mut state) {
+                    offer.destroy();
+                }
+                let Some(drag_window) = state.drag.window.take() else {
                     return;
                 };
-                let data_offer = state.drag.data_offer.clone().unwrap();
-                data_offer.destroy();
-
-                state.drag.data_offer = None;
-                state.drag.window = None;
 
                 let input = PlatformInput::FileDrop(FileDropEvent::Exited {});
                 drop(state);
                 drag_window.handle_input(input);
             }
             wl_data_device::Event::Drop => {
-                let Some(drag_window) = state.drag.window.clone() else {
+                if state.drag.window.is_none() {
+                    // Nothing was accepted from this offer, so the source sees
+                    // the drop cancelled once the offer goes away.
+                    if let Some(offer) = release_drag_offer(&mut state) {
+                        offer.destroy();
+                    }
                     return;
-                };
-                let data_offer = state.drag.data_offer.clone().unwrap();
-                data_offer.finish();
-                data_offer.destroy();
-
-                state.drag.data_offer = None;
-                state.drag.window = None;
-
-                let input = PlatformInput::FileDrop(FileDropEvent::Submit {
-                    position: state.drag.position,
-                });
+                }
+                state.drag.drop_requested = true;
+                let ready = state.drag.ready;
                 drop(state);
-                drag_window.handle_input(input);
+                if ready {
+                    finish_native_file_drop(&client);
+                }
             }
             _ => {}
         }
@@ -2902,6 +2949,81 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
     event_created_child!(WaylandClientStatePtr, wl_data_device::WlDataDevice, [
         wl_data_device::EVT_DATA_OFFER_OPCODE => (wl_data_offer::WlDataOffer, ()),
     ]);
+}
+
+fn finish_native_file_drop(client: &Rc<RefCell<WaylandClientState>>) {
+    let mut state = client.borrow_mut();
+    let Some(window) = state.drag.window.take() else {
+        return;
+    };
+    let Some(offer) = release_drag_offer(&mut state) else {
+        return;
+    };
+    let action = state.drag.action;
+    let position = state.drag.position;
+    state.drag.generation = state.drag.generation.wrapping_add(1);
+    state.drag.drop_requested = false;
+    state.drag.ready = false;
+    drop(state);
+    window.handle_input(PlatformInput::FileDrop(FileDropEvent::SubmitWithTransfer {
+        position,
+        transfer: gpui::FileDropTransfer {
+            operation: drop_operation(action),
+            // The receiver moves local URI-list files. wl_data_offer.finish
+            // acknowledges the transfer; Nautilus does not remove the originals.
+            source_owns_move: false,
+            completion: gpui::FilePaste::new(move |completed| {
+                if drop_is_finished(action, completed) {
+                    offer.finish();
+                }
+                offer.destroy();
+            }),
+        },
+    }));
+}
+
+/// The operation the receiver performs for the compositor's announced action.
+/// Without an announcement, or with one this window never offered, the files
+/// are copied: that is what the offer preferred.
+fn drop_operation(action: Option<gpui::FileTransferOperation>) -> gpui::FileTransferOperation {
+    action.unwrap_or(gpui::FileTransferOperation::Copy)
+}
+
+/// Whether the receiver's completion lets the source consider the drop done:
+/// it performed the operation it was handed by [`drop_operation`].
+fn drop_is_finished(
+    action: Option<gpui::FileTransferOperation>,
+    completed: Option<gpui::FileTransferOperation>,
+) -> bool {
+    completed == Some(drop_operation(action))
+}
+
+/// Tells the source which actions this window takes; Shift asks for a move.
+fn offer_drag_actions(offer: &wl_data_offer::WlDataOffer, shift: bool) {
+    if shift {
+        offer.set_actions(DndAction::Copy | DndAction::Move, DndAction::Move);
+    } else {
+        offer.set_actions(DndAction::Copy, DndAction::Copy);
+    }
+}
+
+/// The operation a compositor's action event stands for.
+fn dnd_operation(action: WEnum<DndAction>) -> Option<gpui::FileTransferOperation> {
+    match action {
+        WEnum::Value(DndAction::Move) => Some(gpui::FileTransferOperation::Move),
+        WEnum::Value(DndAction::Copy) => Some(gpui::FileTransferOperation::Copy),
+        _ => None,
+    }
+}
+
+/// Forgets the current drag's offer, which the protocol has this window
+/// destroy at leave or once the drop is complete.
+fn release_drag_offer(state: &mut WaylandClientState) -> Option<wl_data_offer::WlDataOffer> {
+    let offer = state.drag.data_offer.take()?;
+    state
+        .data_offers
+        .retain(|wrapper| wrapper.inner.id() != offer.id());
+    Some(offer)
 }
 
 impl Dispatch<wl_data_offer::WlDataOffer, ()> for WaylandClientStatePtr {
@@ -2916,14 +3038,17 @@ impl Dispatch<wl_data_offer::WlDataOffer, ()> for WaylandClientStatePtr {
         let client = this.get_client();
         let mut state = client.borrow_mut();
 
-        if let wl_data_offer::Event::Offer { mime_type } = event {
-            // Drag and drop
-            if mime_type == FILE_LIST_MIME_TYPE {
-                let serial = state.serial_tracker.get(SerialKind::DataDevice);
-                let mime_type = mime_type.clone();
-                data_offer.accept(serial.as_raw(), Some(mime_type));
+        if let wl_data_offer::Event::Action { dnd_action } = &event {
+            if state
+                .drag
+                .data_offer
+                .as_ref()
+                .is_some_and(|offer| offer.id() == data_offer.id())
+            {
+                state.drag.action = dnd_operation(*dnd_action);
             }
-
+        }
+        if let wl_data_offer::Event::Offer { mime_type } = event {
             // Clipboard
             if let Some(offer) = state
                 .data_offers
@@ -2962,16 +3087,30 @@ impl Dispatch<wl_data_source::WlDataSource, DataSourceKind> for WaylandClientSta
                 let bytes = external_drag.bytes.clone();
                 state.clipboard.send_bytes(fd, bytes);
             }
+            (DataSourceKind::Drag, wl_data_source::Event::Action { dnd_action }) => {
+                if let Some(drag) = state.external_drag.as_mut() {
+                    drag.action = dnd_operation(dnd_action);
+                }
+            }
             (
                 DataSourceKind::Drag,
-                wl_data_source::Event::DndFinished | wl_data_source::Event::Cancelled,
+                event @ (wl_data_source::Event::DndFinished | wl_data_source::Event::Cancelled),
             ) => {
                 let Some(external_drag) = state.external_drag.take() else {
                     return;
                 };
                 external_drag.source.destroy();
-
-                let input = PlatformInput::FileDrop(FileDropEvent::Ended);
+                let operation = if matches!(event, wl_data_source::Event::DndFinished) {
+                    external_drag.action
+                } else {
+                    None
+                };
+                let input = PlatformInput::FileDrop(FileDropEvent::Completed(
+                    gpui::FileTransferCompletion::receiver_performed(
+                        external_drag.files,
+                        operation,
+                    ),
+                ));
                 drop(state);
                 external_drag.window.handle_input(input);
             }
@@ -3351,5 +3490,21 @@ mod tests {
     #[test]
     fn activation_requester_is_none_without_focus() {
         assert_eq!(activation_requester::<&str>(None, None), None);
+    }
+
+    #[test]
+    fn a_drop_without_an_announced_action_finishes_as_the_copy_it_was_handed() {
+        use gpui::FileTransferOperation::{Copy, Move};
+        // Some compositors never send wl_data_offer.action, or send one this
+        // window did not offer. The receiver is told to copy, so copying must
+        // finish the drop rather than leave the source seeing it cancelled.
+        assert_eq!(drop_operation(None), Copy);
+        assert!(drop_is_finished(None, Some(Copy)));
+        assert!(drop_is_finished(Some(Move), Some(Move)));
+        assert!(drop_is_finished(Some(Copy), Some(Copy)));
+        // Doing something other than what was negotiated, or nothing, does not.
+        assert!(!drop_is_finished(Some(Move), Some(Copy)));
+        assert!(!drop_is_finished(None, Some(Move)));
+        assert!(!drop_is_finished(None, None));
     }
 }

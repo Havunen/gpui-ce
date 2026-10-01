@@ -78,7 +78,10 @@ x11rb::atom_manager! {
         TEXT_MIME_UNKNOWN: b"text/plain",
 
         // HTML: b"text/html",
-        // URI_LIST: b"text/uri-list",
+        URI_LIST: b"text/uri-list",
+        COPIED_FILES: b"x-special/gnome-copied-files",
+        FILE_TRANSFER: b"application/x-gpui-file-transfer",
+        KDE_CUT: b"application/x-kde-cutselection",
 
         PNG__MIME: ImageFormat::mime_type(ImageFormat::Png ).as_bytes(),
         JPEG_MIME: ImageFormat::mime_type(ImageFormat::Jpeg).as_bytes(),
@@ -127,6 +130,8 @@ struct Inner {
     /// The context for the thread which serves clipboard read
     /// requests coming to us.
     server: XContext,
+    /// The display every connection of this clipboard uses; `None` is `$DISPLAY`.
+    display: Option<String>,
     atoms: Atoms,
 
     clipboard: Selection,
@@ -140,10 +145,10 @@ struct Inner {
 }
 
 impl XContext {
-    fn new() -> Result<Self> {
+    fn new(display: Option<&str>) -> Result<Self> {
         // create a new connection to an X11 server
         let (conn, screen_num): (RustConnection, _) =
-            RustConnection::connect(None).map_err(|_| {
+            RustConnection::connect(display).map_err(|_| {
                 Error::unknown("X11 server connection timed out because it was unreachable")
             })?;
         let screen = conn
@@ -208,8 +213,8 @@ enum ReadSelNotifyResult {
 }
 
 impl Inner {
-    fn new() -> Result<Self> {
-        let server = XContext::new()?;
+    fn new(display: Option<&str>) -> Result<Self> {
+        let server = XContext::new(display)?;
         let atoms = Atoms::new(&server.conn)
             .map_err(into_unknown)?
             .reply()
@@ -217,6 +222,7 @@ impl Inner {
 
         Ok(Self {
             server,
+            display: display.map(str::to_owned),
             atoms,
             clipboard: Selection::default(),
             primary: Selection::default(),
@@ -297,7 +303,7 @@ impl Inner {
             }
             return Err(Error::ContentNotAvailable);
         }
-        let reader = XContext::new()?;
+        let reader = XContext::new(self.display.as_deref())?;
 
         let highest_precedence_format =
             match self.read_single(&reader, selection, self.atoms.TARGETS) {
@@ -958,7 +964,24 @@ impl Clipboard {
             });
         }
         // At this point we know that the clipboard does not exist.
-        let ctx = Arc::new(Inner::new()?);
+        let (ctx, join_handle) = Self::serve(None)?;
+        *global_cb = Some(GlobalClipboard {
+            inner: Arc::clone(&ctx),
+            server_handle: join_handle,
+        });
+        Ok(Self { inner: ctx })
+    }
+
+    /// A clipboard owned by this value alone, on the given display.
+    #[cfg(test)]
+    fn connect(display: &str) -> Result<Self> {
+        let (inner, _) = Self::serve(Some(display))?;
+        Ok(Self { inner })
+    }
+
+    /// Connects to the display and starts serving selection requests.
+    fn serve(display: Option<&str>) -> Result<(Arc<Inner>, JoinHandle<()>)> {
+        let ctx = Arc::new(Inner::new(display)?);
         let join_handle = std::thread::Builder::new()
             .name("Clipboard".to_owned())
             .spawn({
@@ -970,11 +993,7 @@ impl Clipboard {
                 }
             })
             .unwrap();
-        *global_cb = Some(GlobalClipboard {
-            inner: Arc::clone(&ctx),
-            server_handle: join_handle,
-        });
-        Ok(Self { inner: ctx })
+        Ok((ctx, join_handle))
     }
 
     pub(crate) fn set_text(
@@ -988,6 +1007,41 @@ impl Clipboard {
             format: self.inner.atoms.UTF8_STRING,
         }];
         self.inner.write(data, selection, wait)
+    }
+
+    /// Writes native files together with `text`, the representation plain-text
+    /// consumers paste. File managers read the file formats; terminals and
+    /// editors read the text, as they do from the Wayland and macOS clipboards.
+    pub(crate) fn set_files(
+        &self,
+        files: &gpui::FileTransfer,
+        text: &str,
+        selection: ClipboardKind,
+        wait: WaitConfig,
+    ) -> Result<()> {
+        let data = self
+            .file_list_formats()
+            .into_iter()
+            .chain([(self.inner.atoms.KDE_CUT, gpui::KDE_CUT_MIME)])
+            .map(|(format, mime)| ClipboardData {
+                format,
+                bytes: files.encode(mime).unwrap(),
+            })
+            .chain([ClipboardData {
+                format: self.inner.atoms.UTF8_STRING,
+                bytes: text.as_bytes().to_vec(),
+            }])
+            .collect();
+        self.inner.write(data, selection, wait)
+    }
+
+    /// Native formats carrying a file list, most specific first.
+    fn file_list_formats(&self) -> [(Atom, &'static str); 3] {
+        [
+            (self.inner.atoms.FILE_TRANSFER, gpui::FILE_TRANSFER_MIME),
+            (self.inner.atoms.COPIED_FILES, gpui::COPIED_FILES_MIME),
+            (self.inner.atoms.URI_LIST, gpui::URI_LIST_MIME),
+        ]
     }
 
     fn image_format_atom(&self, format: ImageFormat) -> Atom {
@@ -1033,13 +1087,48 @@ impl Clipboard {
             self.inner.atoms.TEXT_MIME_UNKNOWN,
         ];
 
-        // image formats first, as they are more specific, and read will return the first
-        // format that the contents can be converted to
-        let mut format_atoms = Vec::with_capacity(image_entries.len() + text_format_atoms.len());
+        let file_formats = self.file_list_formats();
+
+        // file formats first, then image formats, as they are more specific, and
+        // read will return the first format that the contents can be converted to
+        let mut format_atoms =
+            Vec::with_capacity(file_formats.len() + image_entries.len() + text_format_atoms.len());
+        format_atoms.extend(file_formats.iter().map(|(atom, _)| *atom));
         format_atoms.extend(image_entries.iter().map(|(atom, _)| *atom));
         format_atoms.extend_from_slice(text_format_atoms);
 
-        let result = self.inner.read(&format_atoms, selection)?;
+        let mut result = self.inner.read(&format_atoms, selection)?;
+
+        if let Some((_, mime)) = file_formats
+            .iter()
+            .find(|(format, _)| *format == result.format)
+        {
+            let kde_cut = *mime == gpui::URI_LIST_MIME
+                && self
+                    .inner
+                    .read(&[self.inner.atoms.KDE_CUT], selection)
+                    .is_ok_and(|data| data.bytes == b"1");
+            if let Some(files) = decode_file_clipboard(&result.bytes, mime, kde_cut) {
+                // File managers often advertise labels or newline-separated paths
+                // explicitly. Preserve that representation for text consumers.
+                let mut item = self
+                    .inner
+                    .read(text_format_atoms, selection)
+                    .and_then(|data| self.decode_text(data))
+                    .unwrap_or_else(|_| ClipboardItem {
+                        entries: Vec::new(),
+                    });
+                item.entries.push(gpui::ClipboardEntry::Files(files));
+                return Ok(item);
+            }
+            // An owner advertising `text/uri-list` has not necessarily put
+            // *files* on the clipboard - browsers use it for ordinary links.
+            // That is not a clipboard failure, so read the selection again
+            // ignoring the file formats rather than failing the whole paste.
+            result = self
+                .inner
+                .read(&format_atoms[file_formats.len()..], selection)?;
+        }
 
         log::trace!(
             "read clipboard as format {:?}",
@@ -1058,6 +1147,10 @@ impl Clipboard {
             }
         }
 
+        self.decode_text(result)
+    }
+
+    fn decode_text(&self, result: ClipboardData) -> Result<ClipboardItem> {
         let text = if result.format == self.inner.atoms.STRING {
             // ISO Latin-1
             // See: https://stackoverflow.com/questions/28169745/what-are-the-options-to-convert-iso-8859-1-latin-1-to-a-string-utf-8
@@ -1251,5 +1344,132 @@ impl Error {
         Error::Unknown {
             description: message.into(),
         }
+    }
+}
+
+/// Decode a selection payload as local files.
+///
+/// Returns `None` when the payload is a perfectly valid document of that MIME
+/// type that simply does not describe local files - a browser advertises
+/// `text/uri-list` for ordinary links. That is not a clipboard failure, so
+/// callers fall back to reading the selection as text or an image.
+fn decode_file_clipboard(bytes: &[u8], mime: &str, kde_cut: bool) -> Option<gpui::FileTransfer> {
+    let mut files = gpui::FileTransfer::decode(bytes, mime)?;
+    if mime == gpui::URI_LIST_MIME && kde_cut {
+        files.operation = gpui::FileTransferOperation::Move;
+    }
+    Some(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::linux::x11::test_display::Xvfb;
+    use gpui::{FileTransfer, FileTransferOperation};
+    use std::path::PathBuf;
+
+    #[test]
+    fn file_clipboard_preserves_its_advertised_text() {
+        let Some(server) = Xvfb::start() else {
+            eprintln!("Xvfb is not available; skipping");
+            return;
+        };
+        let owner = Clipboard::connect(&server.display).unwrap();
+        let reader = Clipboard::connect(&server.display).unwrap();
+        let files = FileTransfer {
+            paths: gpui::ExternalPaths([PathBuf::from("/tmp/a b.txt")].into_iter().collect()),
+            operation: FileTransferOperation::Move,
+            ownership: 5,
+        };
+        owner
+            .set_files(
+                &files,
+                "First label\nSecond label",
+                ClipboardKind::Clipboard,
+                WaitConfig::None,
+            )
+            .unwrap();
+
+        // A text editor asks for UTF8_STRING and nothing else.
+        let text = reader
+            .inner
+            .read(&[reader.inner.atoms.UTF8_STRING], ClipboardKind::Clipboard)
+            .expect("text consumers must be able to paste the file clipboard");
+        assert_eq!(text.bytes, b"First label\nSecond label");
+
+        // A file manager, or another GPUI application, still gets the files.
+        let item = reader.get_any(ClipboardKind::Clipboard).unwrap();
+        assert_eq!(item.file_transfer(), Some(files));
+        assert_eq!(item.text().as_deref(), Some("First label\nSecond label"));
+    }
+
+    #[test]
+    fn files_survive_missing_or_invalid_text_and_decode_latin1() {
+        let Some(server) = Xvfb::start() else {
+            eprintln!("Xvfb is not available; skipping");
+            return;
+        };
+        let owner = Clipboard::connect(&server.display).unwrap();
+        let reader = Clipboard::connect(&server.display).unwrap();
+        for (text, expected) in [
+            (None, "/tmp/a\n/tmp/b"),
+            (
+                Some((owner.inner.atoms.UTF8_STRING, &b"\xff"[..])),
+                "/tmp/a\n/tmp/b",
+            ),
+            (
+                Some((owner.inner.atoms.STRING, &b"caf\xe9"[..])),
+                "caf\u{e9}",
+            ),
+        ] {
+            let mut data = vec![ClipboardData {
+                format: owner.inner.atoms.URI_LIST,
+                bytes: b"file:///tmp/a\r\nfile:///tmp/b\r\n".to_vec(),
+            }];
+            if let Some((format, bytes)) = text {
+                data.push(ClipboardData {
+                    format,
+                    bytes: bytes.to_vec(),
+                });
+            }
+            owner
+                .inner
+                .write(data, ClipboardKind::Clipboard, WaitConfig::None)
+                .unwrap();
+            let item = reader.get_any(ClipboardKind::Clipboard).unwrap();
+            assert_eq!(item.file_transfer().unwrap().paths.paths().len(), 2);
+            assert_eq!(item.text().as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn link_uri_lists_are_not_files() {
+        // A browser owning the selection offers text/uri-list for a link. The
+        // X11 backend must fall through to text rather than failing the read.
+        for payload in [
+            b"https://example.com/page".as_slice(),
+            b"file:///tmp/ok\r\nhttps://example.com/mixed".as_slice(),
+        ] {
+            assert!(
+                decode_file_clipboard(payload, gpui::URI_LIST_MIME, false).is_none(),
+                "{:?} should not decode as files",
+                std::str::from_utf8(payload),
+            );
+        }
+    }
+
+    #[test]
+    fn kde_cut_selection_upgrades_a_uri_list_to_a_move() {
+        let copied = decode_file_clipboard(b"file:///tmp/a", gpui::URI_LIST_MIME, false).unwrap();
+        assert_eq!(copied.operation, FileTransferOperation::Copy);
+
+        let cut = decode_file_clipboard(b"file:///tmp/a", gpui::URI_LIST_MIME, true).unwrap();
+        assert_eq!(cut.operation, FileTransferOperation::Move);
+
+        // The KDE hint only qualifies a bare uri-list; gnome-copied-files and
+        // our own format carry the operation in the payload itself.
+        let gnome =
+            decode_file_clipboard(b"copy\nfile:///tmp/a", gpui::COPIED_FILES_MIME, true).unwrap();
+        assert_eq!(gnome.operation, FileTransferOperation::Copy);
     }
 }

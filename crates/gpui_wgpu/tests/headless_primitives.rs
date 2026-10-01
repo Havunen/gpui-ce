@@ -506,3 +506,63 @@ fn smoothed_primitives_share_one_contour() {
             .expect("save diagnostic image");
     }
 }
+
+#[test]
+fn smoothed_fill_and_border_trace_the_same_contour() {
+    // Fills may take the superellipse shortcut while bordered quads always trace the Figma
+    // contour. Both must land on one edge, or a fill pulls away from its own border.
+    let mut renderer = WgpuHeadlessRenderer::new().expect("headless renderer");
+    let target = Size {
+        width: DevicePixels(320),
+        height: DevicePixels(320),
+    };
+    let content_mask = mask(320.0, 320.0);
+    let white: Hsla = gpui::rgb_to_hsla(gpui::rgb(0xffffff));
+    let element = bounds(10.0, 10.0, 300.0, 300.0);
+    let center = 160.0;
+
+    let mut edge_distances = |border_widths: Edges<ScaledPixels>| -> Vec<f32> {
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            bounds: element,
+            content_mask,
+            background: solid_background(white),
+            border_color: white.into(),
+            border_widths,
+            corner_radii: Corners::all(ScaledPixels(100.0)),
+            corner_smoothing: 0.45,
+            ..Default::default()
+        });
+        scene.finish();
+        let image = renderer
+            .render_scene_to_image(&scene, target)
+            .expect("render must succeed");
+
+        // Coverage summed along a ray from the center locates the edge on that ray.
+        (0..=90)
+            .map(|degrees| {
+                let angle = (180.0 + degrees as f32).to_radians();
+                let start = 140.0;
+                start
+                    + (0..40 * 16)
+                        .map(|step| {
+                            let distance = start + step as f32 / 16.0;
+                            let x = center + angle.cos() * distance;
+                            let y = center + angle.sin() * distance;
+                            image.get_pixel(x as u32, y as u32).0[3] as f32 / 255.0 / 16.0
+                        })
+                        .sum::<f32>()
+            })
+            .collect()
+    };
+
+    let fill = edge_distances(Edges::default());
+    let bordered = edge_distances(Edges::all(ScaledPixels(1.0)));
+    for (degrees, (fill, bordered)) in fill.iter().zip(&bordered).enumerate() {
+        assert!(
+            (fill - bordered).abs() <= 0.35,
+            "{degrees} degrees past the left edge, the fill edge is {:.2}px inside the border",
+            bordered - fill
+        );
+    }
+}

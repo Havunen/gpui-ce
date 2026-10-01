@@ -328,6 +328,12 @@ pub trait Platform: 'static {
     fn should_auto_hide_scrollbars(&self) -> bool;
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem>;
+
+    /// Capture native paste ownership before a filesystem transfer begins.
+    fn capture_file_paste(&self, _files: &crate::FileTransfer) -> Option<crate::FilePaste> {
+        None
+    }
+
     fn write_to_clipboard(&self, item: ClipboardItem);
 
     /// Reads the clipboard, resolving once its contents are available.
@@ -2646,6 +2652,8 @@ pub enum ClipboardEntry {
     Image(Image),
     /// A file entry
     ExternalPaths(crate::ExternalPaths),
+    /// File paths with native copy/move intent and clipboard ownership.
+    Files(crate::FileTransfer),
 }
 
 impl ClipboardItem {
@@ -2694,14 +2702,21 @@ impl ClipboardItem {
         }
 
         if answer.is_empty() {
-            for entry in self.entries.iter() {
-                if let ClipboardEntry::ExternalPaths(paths) = entry {
-                    for path in &paths.0 {
-                        use std::fmt::Write as _;
-                        _ = write!(answer, "{}", path.display());
-                    }
-                }
-            }
+            // `Files` and `ExternalPaths` both describe pathnames, and text
+            // consumers must not be able to tell them apart: platforms pick
+            // between the two based on what the source application offered.
+            // Each path goes on its own line, as file managers paste them.
+            answer = self
+                .entries
+                .iter()
+                .flat_map(|entry| match entry {
+                    ClipboardEntry::ExternalPaths(paths) => paths.paths(),
+                    ClipboardEntry::Files(files) => files.paths.paths(),
+                    _ => &[],
+                })
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
         }
 
         if !answer.is_empty() {
