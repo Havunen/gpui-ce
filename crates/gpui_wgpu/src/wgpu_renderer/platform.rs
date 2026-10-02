@@ -15,6 +15,10 @@ use super::{WgpuRenderer, WgpuSurfaceConfig};
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "surface_tests.rs"]
+mod tests;
+
 impl WgpuRenderer {
     /// Creates a renderer whose surface and GPU context follow the native window lifetime.
     #[cfg(not(target_family = "wasm"))]
@@ -156,6 +160,13 @@ impl WgpuRenderer {
         let rendered = self.render_to_view(scene, &view);
         if rendered {
             frame.present();
+        } else {
+            // Vulkan's native swapchain cannot release an acquired image just
+            // by dropping it. Repeated failed frames would exhaust its images
+            // and make subsequent acquisitions time out until a resize.
+            drop(view);
+            drop(frame);
+            self.reconfigure_surface();
         }
         rendered
     }
@@ -477,7 +488,10 @@ mod tests {
         let mut scene = Scene::default();
         scene.insert_primitive(Quad {
             bounds,
-            content_mask: gpui::ContentMask { bounds },
+            content_mask: gpui::ContentMask {
+                bounds,
+                ..Default::default()
+            },
             background: gpui::solid_background(gpui::red()),
             ..Default::default()
         });

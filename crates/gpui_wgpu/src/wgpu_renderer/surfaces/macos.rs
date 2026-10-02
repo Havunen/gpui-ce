@@ -337,6 +337,7 @@ mod tests {
                 bounds: bounds(2.0),
                 content_mask: ContentMask {
                     bounds: bounds(4.0),
+                    ..Default::default()
                 },
                 source,
             });

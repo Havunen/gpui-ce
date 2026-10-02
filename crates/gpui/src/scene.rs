@@ -1328,6 +1328,7 @@ mod tests {
     fn scaled_mask(ix: usize) -> ContentMask<ScaledPixels> {
         ContentMask {
             bounds: scaled_bounds(ix),
+            ..Default::default()
         }
     }
 
@@ -1337,6 +1338,7 @@ mod tests {
                 point(px(-10_000.0), px(-10_000.0)),
                 size(px(20_000.0), px(20_000.0)),
             ),
+            ..Default::default()
         }
     }
 
@@ -1358,6 +1360,7 @@ mod tests {
     fn mask() -> ContentMask<ScaledPixels> {
         ContentMask {
             bounds: full_bounds(),
+            ..Default::default()
         }
     }
 
@@ -1638,7 +1641,10 @@ mod tests {
         };
         Quad {
             bounds,
-            content_mask: ContentMask { bounds },
+            content_mask: ContentMask {
+                bounds,
+                ..Default::default()
+            },
             ..Default::default()
         }
     }

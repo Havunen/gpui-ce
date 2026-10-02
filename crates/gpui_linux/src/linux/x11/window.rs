@@ -294,7 +294,7 @@ pub struct X11WindowState {
 
 impl X11WindowState {
     fn is_transparent(&self) -> bool {
-        self.background_appearance != WindowBackgroundAppearance::Opaque
+        self.background_appearance.is_transparent()
     }
 }
 
