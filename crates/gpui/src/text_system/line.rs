@@ -731,9 +731,10 @@ impl AlignedLines<'_> {
                 .width()
     }
 
-    /// The area the lines cover: `line_height` per line, from the leftmost line
-    /// start to the rightmost line end, which lies past the box when a line is
-    /// wider than it or hangs whitespace over its edge.
+    /// Conservative paint-layer bounds, retaining the unwrapped layout's width
+    /// at the original position and at each aligned line start. Wrapped advance
+    /// widths do not include glyph ink overhangs, so tightening the layer to those
+    /// widths can let later primitives draw underneath an overhanging glyph.
     fn bounds(&self, line_height: Pixels) -> Bounds<Pixels> {
         let line_count = self.wrap_boundaries.len() + 1;
         let height = line_height * line_count as f32;
@@ -743,11 +744,11 @@ impl AlignedLines<'_> {
         if self.align == TextAlign::Left {
             return Bounds::new(self.origin, size(self.layout.width, height));
         }
-        let (mut left, mut right) = (Pixels::MAX, Pixels::MIN);
+        let (mut left, mut right) = (px(0.), self.layout.width);
         for extent in self.layout.wrapped_line_extents(self.wrap_boundaries) {
             let offset = extent.alignment_offset(self.align, self.align_width);
             left = left.min(offset);
-            right = right.max(offset + extent.width());
+            right = right.max(offset + self.layout.width);
         }
         Bounds::from_corners(
             point(self.origin.x + left, self.origin.y),
@@ -759,7 +760,10 @@ impl AlignedLines<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FontId, GlyphId, ShapedGlyph, ShapedRun};
+    use crate::{
+        AtlasTextureId, AtlasTextureKind, AtlasTile, ContentMask, FontId, GlyphId,
+        MonochromeSprite, Quad, Scene, ShapedGlyph, ShapedRun, TileId,
+    };
 
     /// Helper: build a ShapedLine from glyph descriptors without the platform text system.
     /// Each glyph is described as (byte_index, x_position).
@@ -832,15 +836,16 @@ mod tests {
         assert_eq!(lines(TextAlign::Left).bounds(px(20.)), bounds(100., 200.));
 
         // Centred lines start at 15, 15 and 20; the first two hang a space
-        // past their aligned end.
+        // past their aligned end. Retain the unwrapped width at each start
+        // rather than tightening the layer to glyph advances.
         assert_eq!(lines(TextAlign::Center).start_x(0), px(115.));
         assert_eq!(lines(TextAlign::Center).end_x(0), px(155.));
-        assert_eq!(lines(TextAlign::Center).bounds(px(20.)), bounds(115., 155.));
+        assert_eq!(lines(TextAlign::Center).bounds(px(20.)), bounds(100., 220.));
 
         // Right-aligned lines start at 30, 30 and 40 and hang over the box.
         assert_eq!(lines(TextAlign::Right).start_x(2), px(140.));
         assert_eq!(lines(TextAlign::Right).end_x(2), px(160.));
-        assert_eq!(lines(TextAlign::Right).bounds(px(20.)), bounds(130., 170.));
+        assert_eq!(lines(TextAlign::Right).bounds(px(20.)), bounds(100., 240.));
 
         // Lines wider than a 20px box overhang it on both sides.
         let overflowing = AlignedLines {
@@ -848,7 +853,7 @@ mod tests {
             ..lines(TextAlign::Center)
         };
         assert_eq!(overflowing.start_x(0), px(95.));
-        assert_eq!(overflowing.bounds(px(20.)), bounds(95., 135.));
+        assert_eq!(overflowing.bounds(px(20.)), bounds(95., 200.));
 
         // An unwrapped line covers exactly its width and height.
         let unwrapped = AlignedLines {
@@ -860,6 +865,95 @@ mod tests {
             unwrapped.bounds(px(20.)),
             Bounds::from_corners(point(px(100.), px(50.)), point(px(200.), px(70.)))
         );
+    }
+
+    fn assert_wrapped_glyph_overhang_stays_below_later_quad(align: TextAlign, align_width: Pixels) {
+        // Two 40px lines in an alignment box. The last glyph on the first line has
+        // a 10px advance but 15px of ink, like an italic f. Use explicit ink
+        // bounds so this exercises scene ordering without platform fonts.
+        let glyphs: Vec<_> = (0..8).map(|ix| (ix, ix as f32 * 10.)).collect();
+        let line = make_shaped_line("ffffffff", &glyphs, 80., &[]);
+        let wrap_boundaries = [WrapBoundary {
+            run_ix: 0,
+            glyph_ix: 4,
+            trailing_whitespace_x: px(40.),
+        }];
+        let line_height = px(20.);
+        let lines = AlignedLines {
+            origin: Point::default(),
+            layout: &line.layout,
+            wrap_boundaries: &wrap_boundaries,
+            align,
+            align_width,
+        };
+        let glyph_bounds = Bounds::new(
+            point(lines.start_x(0) + px(30.), px(0.)),
+            size(px(15.), line_height),
+        );
+        // In a 60px box, right alignment puts this at x=61..65: outside the
+        // advances, but overlapping the glyph's ink. Center alignment has
+        // the same issue at x=51..55.
+        let overlay_bounds = Bounds::new(
+            point(lines.end_x(0) + px(1.), px(0.)),
+            size(px(4.), line_height),
+        );
+        assert!(glyph_bounds.intersects(&overlay_bounds));
+        let content_mask = ContentMask {
+            bounds: Bounds::new(Point::default(), size(px(200.), px(200.))).scale(1.),
+            ..Default::default()
+        };
+
+        let mut scene = Scene::default();
+        scene.push_layer(lines.bounds(line_height).scale(1.));
+        scene.insert_primitive(MonochromeSprite {
+            order: 0,
+            padding: 0,
+            bounds: glyph_bounds.scale(1.),
+            content_mask,
+            color: black().into(),
+            tile: AtlasTile {
+                texture_id: AtlasTextureId {
+                    index: 0,
+                    kind: AtlasTextureKind::Monochrome,
+                },
+                tile_id: TileId(0),
+                padding: 0,
+                bounds: Bounds::new(Point::default(), size(DevicePixels(15), DevicePixels(20))),
+            },
+            transformation: Default::default(),
+        });
+        scene.pop_layer();
+        scene.insert_primitive(Quad {
+            bounds: overlay_bounds.scale(1.),
+            content_mask,
+            background: crate::white().into(),
+            ..Default::default()
+        });
+        scene.finish();
+
+        let glyph_order = scene.monochrome_sprites[0].order;
+        let overlay_order = scene.quads[0].order;
+        assert!(
+            overlay_order > glyph_order,
+            "{align:?} in {align_width:?}: the later quad (order {overlay_order}) must paint above the \
+             overlapping glyph (order {glyph_order})"
+        );
+    }
+
+    #[test]
+    fn center_aligned_wrapped_glyph_overhang_stays_below_later_quad() {
+        // Also cover a box wider than the unwrapped layout, where retaining
+        // only the original, unshifted layer bounds would not cover the ink.
+        for align_width in [px(60.), px(120.)] {
+            assert_wrapped_glyph_overhang_stays_below_later_quad(TextAlign::Center, align_width);
+        }
+    }
+
+    #[test]
+    fn right_aligned_wrapped_glyph_overhang_stays_below_later_quad() {
+        for align_width in [px(60.), px(120.)] {
+            assert_wrapped_glyph_overhang_stays_below_later_quad(TextAlign::Right, align_width);
+        }
     }
 
     #[test]
