@@ -2,8 +2,9 @@ use crate::{
     ActiveTooltip, AnyView, App, AppContext, Bounds, DispatchPhase, Element, ElementId,
     GlobalElementId, HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
     LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size,
-    TextOverflow, TextRun, TextStyle, TextTransform, TooltipId, TruncateFrom, WhiteSpace, Window,
-    WrappedLine, WrappedLineLayout, register_tooltip_mouse_handlers, set_tooltip_on_window,
+    TextAlign, TextOverflow, TextRun, TextStyle, TextTransform, TooltipId, TruncateFrom,
+    WhiteSpace, Window, WrappedLine, WrappedLineLayout, register_tooltip_mouse_handlers,
+    set_tooltip_on_window,
 };
 use anyhow::Context as _;
 use gpui_util::ResultExt;
@@ -622,6 +623,9 @@ struct TextLayoutInner {
     truncate_width: Option<Pixels>,
     size: Option<Size<Pixels>>,
     bounds: Option<Bounds<Pixels>>,
+    /// The alignment the lines were last painted with, so hit-testing
+    /// resolves positions against the glyphs as painted.
+    text_align: TextAlign,
 }
 
 fn apply_text_transform_preserving_byte_len(
@@ -974,6 +978,7 @@ impl TextLayout {
                         truncate_width,
                         size: Some(Size::default()),
                         bounds: None,
+                        text_align: TextAlign::Left,
                     });
                     return Size::default();
                 };
@@ -993,6 +998,7 @@ impl TextLayout {
                     truncate_width,
                     size: Some(size),
                     bounds: None,
+                    text_align: TextAlign::Left,
                 });
 
                 size
@@ -1010,9 +1016,9 @@ impl TextLayout {
     }
 
     fn paint(&self, text: &str, window: &mut Window, cx: &mut App) {
-        let element_state = self.0.borrow();
+        let mut element_state = self.0.borrow_mut();
         let element_state = element_state
-            .as_ref()
+            .as_mut()
             .with_context(|| format!("measurement has not been performed on {text}"))
             .unwrap();
         let bounds = element_state
@@ -1020,14 +1026,20 @@ impl TextLayout {
             .with_context(|| format!("prepaint has not been performed on {text}"))
             .unwrap();
 
+        // The alignment is read here rather than at prepaint: a `Div` applies
+        // its drag-over style only once it has a hitbox, and its hover style
+        // from the live hitbox, so the style stack can differ between the two
+        // phases. Hit-testing then uses what was actually painted.
+        let text_align = window.text_align();
+        element_state.text_align = text_align;
+
         let line_height = element_state.line_height;
         let mut line_origin = bounds.origin;
-        let text_style = window.text_style();
         for line in &element_state.lines {
             line.paint_background(
                 line_origin,
                 line_height,
-                text_style.text_align,
+                text_align,
                 Some(bounds),
                 window,
                 cx,
@@ -1036,7 +1048,7 @@ impl TextLayout {
             line.paint(
                 line_origin,
                 line_height,
-                text_style.text_align,
+                text_align,
                 Some(bounds),
                 window,
                 cx,
@@ -1070,7 +1082,12 @@ impl TextLayout {
                 line_start_ix += line.len() + 1;
             } else {
                 let position_within_line = position - line_origin;
-                match line.index_for_position(position_within_line, line_height) {
+                match line.index_for_position_aligned(
+                    position_within_line,
+                    line_height,
+                    element_state.text_align,
+                    bounds.size.width,
+                ) {
                     Ok(index_within_line) => return Ok(line_start_ix + index_within_line),
                     Err(index_within_line) => return Err(line_start_ix + index_within_line),
                 }
@@ -1104,7 +1121,15 @@ impl TextLayout {
                 continue;
             } else {
                 let ix_within_line = index - line_start_ix;
-                return Some(line_origin + line.position_for_index(ix_within_line, line_height)?);
+                return Some(
+                    line_origin
+                        + line.position_for_index_aligned(
+                            ix_within_line,
+                            line_height,
+                            element_state.text_align,
+                            bounds.size.width,
+                        )?,
+                );
             }
         }
 
@@ -1149,6 +1174,11 @@ impl TextLayout {
     /// The bounds of this layout.
     pub fn bounds(&self) -> Bounds<Pixels> {
         self.0.borrow().as_ref().unwrap().bounds.unwrap()
+    }
+
+    /// The alignment the text was last painted with; `Left` before its first paint.
+    pub fn text_align(&self) -> TextAlign {
+        self.0.borrow().as_ref().unwrap().text_align
     }
 
     /// The line height for this layout.
@@ -1355,6 +1385,11 @@ impl Element for InteractiveText {
             global_id.unwrap(),
             |interactive_state, window| {
                 let mut interactive_state = interactive_state.unwrap_or_default();
+                // Painting records the alignment the layout hit-tests with, so
+                // it comes before the mouse position is resolved against it.
+                self.text
+                    .paint(None, inspector_id, bounds, &mut (), &mut (), window, cx);
+
                 if let Some(click_listener) = self.click_listener.take() {
                     let mouse_position = window.mouse_position();
                     if let Ok(ix) = text_layout.index_for_position(mouse_position)
@@ -1480,9 +1515,6 @@ impl Element for InteractiveText {
                     );
                 }
 
-                self.text
-                    .paint(None, inspector_id, bounds, &mut (), &mut (), window, cx);
-
                 ((), interactive_state)
             },
         );
@@ -1529,5 +1561,436 @@ mod tests {
             make_text_unstable_id(false).id,
             make_text_unstable_id(true).id
         );
+    }
+
+    use gpui_macros::perf;
+
+    use crate::{
+        AnyWindowHandle, Context, Empty, Hsla, InputEvent as _, InteractiveElement as _, Modifiers,
+        MouseButton, ParentElement as _, Render, ScaledPixels, SceneHsla,
+        StatefulInteractiveElement as _, StrikethroughStyle, Styled as _, TestAppContext,
+        UnderlineStyle, WindowHandle, div, hsla, point, px,
+    };
+    use std::{cell::Cell, cell::RefCell, rc::Rc};
+
+    /// 15 glyphs, 6px each with the test text system at 10px, wrapping in a
+    /// 60px column after "abcdefgh ": lines 54 and 36px wide, the first of
+    /// which aligns as 48px since the space it wraps at hangs.
+    const WRAPPED: &str = "abcdefgh abcdef";
+
+    /// `text` in a 60px column, underlined, struck through and highlighted
+    /// from end to end; `clickable` ranges report clicks. A handle above the
+    /// text starts drags of a [`DragHandle`], and `drag_over_align`, if set,
+    /// realigns the text while one hovers it.
+    struct AlignedText {
+        text: &'static str,
+        align: TextAlign,
+        drag_over_align: Option<TextAlign>,
+        layout: Rc<RefCell<Option<TextLayout>>>,
+        clickable: Vec<Range<usize>>,
+        clicked: Rc<Cell<Option<usize>>>,
+    }
+
+    /// What dragging [`AlignedText`]'s handle carries.
+    struct DragHandle;
+
+    impl AlignedText {
+        fn new(text: &'static str, align: TextAlign) -> Self {
+            Self {
+                text,
+                align,
+                drag_over_align: None,
+                layout: Rc::default(),
+                clickable: Vec::new(),
+                clicked: Rc::default(),
+            }
+        }
+    }
+
+    fn underline_color() -> Hsla {
+        hsla(0.6, 1., 0.5, 1.)
+    }
+
+    fn strikethrough_color() -> Hsla {
+        hsla(0.3, 1., 0.5, 1.)
+    }
+
+    fn highlight_color() -> Hsla {
+        hsla(0., 1., 0.5, 1.)
+    }
+
+    impl Render for AlignedText {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let decorated = HighlightStyle {
+                underline: Some(UnderlineStyle {
+                    thickness: px(1.),
+                    color: Some(underline_color()),
+                    wavy: false,
+                }),
+                strikethrough: Some(StrikethroughStyle {
+                    thickness: px(1.),
+                    color: Some(strikethrough_color()),
+                }),
+                background_color: Some(highlight_color()),
+                ..HighlightStyle::default()
+            };
+            let text =
+                StyledText::new(self.text).with_highlights([(0..self.text.len(), decorated)]);
+            *self.layout.borrow_mut() = Some(text.layout().clone());
+            let clicked = self.clicked.clone();
+            let mut column = div().id("column").w_full().text_align(self.align);
+            if let Some(align) = self.drag_over_align {
+                column = column
+                    .drag_over::<DragHandle>(move |style, _, _, _| style.text_align(align))
+                    .on_drop::<DragHandle>(|_, _, _| {});
+            }
+            // The text sits under a centred parent, so the nearest alignment
+            // has to win.
+            div()
+                .flex()
+                .flex_col()
+                .w(px(60.))
+                .text_size(px(10.))
+                .text_align(TextAlign::Center)
+                .child(
+                    div()
+                        .id("handle")
+                        .w_full()
+                        .h(px(20.))
+                        .on_drag(DragHandle, |_, _, _, cx| cx.new(|_| Empty)),
+                )
+                .child(
+                    column.child(
+                        InteractiveText::new("aligned", text)
+                            .on_click(self.clickable.clone(), move |ix, _, _| {
+                                clicked.set(Some(ix))
+                            }),
+                    ),
+                )
+        }
+    }
+
+    /// Renders `view` in a new window, returning the window and the text's layout.
+    fn render(
+        cx: &mut TestAppContext,
+        view: AlignedText,
+    ) -> (WindowHandle<AlignedText>, TextLayout) {
+        let layout = view.layout.clone();
+        let window = cx.add_window(|_, _| view);
+        let layout = layout.borrow().clone().expect("rendered");
+        (window, layout)
+    }
+
+    /// Each decoration painted for a text, as `(left, right)` in logical
+    /// pixels from the text's left edge, top line first.
+    struct PaintedDecorations {
+        underlines: Vec<(f32, f32)>,
+        strikethroughs: Vec<(f32, f32)>,
+        backgrounds: Vec<(f32, f32)>,
+    }
+
+    fn painted_decorations(window: &Window, layout: &TextLayout) -> PaintedDecorations {
+        let underlines = window.painted_underlines();
+        let quads = window.painted_quads();
+        let scale = window.scale_factor();
+        let left = layout.bounds().left().0;
+        let spans = |bounds: Vec<Bounds<ScaledPixels>>| {
+            let mut spans: Vec<_> = bounds
+                .into_iter()
+                .map(|bounds| {
+                    (
+                        bounds.left().0 / scale - left,
+                        bounds.right().0 / scale - left,
+                        bounds.top().0,
+                    )
+                })
+                .collect();
+            spans.sort_by(|a, b| a.2.total_cmp(&b.2).then(a.0.total_cmp(&b.0)));
+            spans.into_iter().map(|(l, r, _)| (l, r)).collect()
+        };
+        let underlines_in = |color: Hsla| {
+            let color = SceneHsla::from(color);
+            spans(
+                underlines
+                    .iter()
+                    .filter(|underline| underline.color == color)
+                    .map(|underline| underline.bounds)
+                    .collect(),
+            )
+        };
+        PaintedDecorations {
+            underlines: underlines_in(underline_color()),
+            strikethroughs: underlines_in(strikethrough_color()),
+            backgrounds: spans(
+                quads
+                    .iter()
+                    .filter(|quad| quad.background.as_solid() == Some(highlight_color()))
+                    .map(|quad| quad.bounds)
+                    .collect(),
+            ),
+        }
+    }
+
+    fn assert_lines(actual: &[(f32, f32)], expected: &[(f32, f32)], what: &str) {
+        assert_eq!(actual.len(), expected.len(), "{what}: {actual:?}");
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!(
+                (actual.0 - expected.0).abs() <= 1. && (actual.1 - expected.1).abs() <= 1.,
+                "{what}: {actual:?} != {expected:?}"
+            );
+        }
+    }
+
+    /// Every decoration of `text` painted with `align` covers `expected`,
+    /// one span per line.
+    fn assert_decorated_lines(
+        cx: &mut TestAppContext,
+        text: &'static str,
+        align: TextAlign,
+        expected: &[(f32, f32)],
+    ) {
+        let (window, layout) = render(cx, AlignedText::new(text, align));
+        let painted = window
+            .update(cx, |_, window, _| painted_decorations(window, &layout))
+            .unwrap();
+        assert_lines(&painted.underlines, expected, "underlines");
+        assert_lines(&painted.strikethroughs, expected, "strikethroughs");
+        assert_lines(&painted.backgrounds, expected, "backgrounds");
+    }
+
+    #[crate::test]
+    fn decorations_follow_each_centred_line(cx: &mut TestAppContext) {
+        // 48px of glyphs and a 36px line centred in 60px start at 6 and 12;
+        // the first line's hanging space runs on to 60.
+        assert_decorated_lines(cx, WRAPPED, TextAlign::Center, &[(6., 60.), (12., 48.)]);
+    }
+
+    #[crate::test]
+    fn decorations_follow_each_right_aligned_line(cx: &mut TestAppContext) {
+        // Both lines' glyphs end flush at 60; the first line's hanging space
+        // runs past it.
+        assert_decorated_lines(cx, WRAPPED, TextAlign::Right, &[(12., 66.), (24., 60.)]);
+    }
+
+    #[crate::test]
+    fn left_aligned_decorations_are_unchanged(cx: &mut TestAppContext) {
+        assert_decorated_lines(cx, WRAPPED, TextAlign::Left, &[(0., 54.), (0., 36.)]);
+    }
+
+    #[crate::test]
+    fn a_centred_single_line_background_ends_with_the_line(cx: &mut TestAppContext) {
+        assert_decorated_lines(cx, "abc", TextAlign::Center, &[(21., 39.)]);
+    }
+
+    #[crate::test]
+    fn an_aligned_layout_hit_tests_where_it_painted(cx: &mut TestAppContext) {
+        let (_, layout) = render(cx, AlignedText::new(WRAPPED, TextAlign::Center));
+        assert_eq!(layout.text_align(), TextAlign::Center);
+        let bounds = layout.bounds();
+        let line_height = layout.line_height();
+
+        // The first line's glyphs start at 6px, and the space it wraps at
+        // follows them up to 60.
+        let first_line = bounds.top() + line_height / 2.;
+        assert_eq!(
+            layout.index_for_position(point(bounds.left() + px(7.), first_line)),
+            Ok(0)
+        );
+        assert_eq!(
+            layout.index_for_position(point(bounds.left() + px(57.), first_line)),
+            Ok(8)
+        );
+        assert_eq!(
+            layout.position_for_index(9),
+            Some(point(bounds.left() + px(60.), bounds.top()))
+        );
+
+        // The second line starts at 12px: its first glyph is index 9.
+        let second_line = bounds.top() + line_height * 1.5;
+        assert_eq!(
+            layout.index_for_position(point(bounds.left() + px(13.), second_line)),
+            Ok(9)
+        );
+        assert_eq!(
+            layout.position_for_index(10),
+            Some(point(bounds.left() + px(18.), bounds.top() + line_height))
+        );
+    }
+
+    #[crate::test]
+    fn a_right_aligned_line_hangs_the_space_it_wraps_at_past_the_edge(cx: &mut TestAppContext) {
+        let (_, layout) = render(cx, AlignedText::new(WRAPPED, TextAlign::Right));
+        let bounds = layout.bounds();
+        let first_line = bounds.top() + layout.line_height() / 2.;
+
+        // The first line's glyphs end flush with the 60px column...
+        assert_eq!(
+            layout.index_for_position(point(bounds.left() + px(59.), first_line)),
+            Ok(7)
+        );
+        assert_eq!(
+            layout.position_for_index(8),
+            Some(point(bounds.left() + px(60.), bounds.top()))
+        );
+        // ...and the space it wraps at hangs past it, where it is painted.
+        assert_eq!(
+            layout.index_for_position(point(bounds.left() + px(63.), first_line)),
+            Ok(8)
+        );
+        assert_eq!(
+            layout.position_for_index(9),
+            Some(point(bounds.left() + px(66.), bounds.top()))
+        );
+    }
+
+    #[crate::test]
+    fn a_drag_over_alignment_is_painted_and_hit_tested(cx: &mut TestAppContext) {
+        let mut view = AlignedText::new(WRAPPED, TextAlign::Left);
+        view.drag_over_align = Some(TextAlign::Right);
+        let latest_layout = view.layout.clone();
+        let (window, layout) = render(cx, view);
+        assert_eq!(layout.text_align(), TextAlign::Left);
+        let bounds = layout.bounds();
+
+        // A div applies its drag-over style only while painting, so the text
+        // has to read its alignment then too, not at prepaint. Drawing renders
+        // the view, so this goes through the window handle that does not
+        // lease it.
+        let handle = point(bounds.center().x, bounds.top() - px(10.));
+        let any_window: AnyWindowHandle = window.into();
+        cx.update_window(any_window, |_, window, cx| {
+            press_pointer(handle, window, cx);
+            drag_pointer(handle + point(px(0.), px(5.)), window, cx);
+            drag_pointer(bounds.center(), window, cx);
+            assert!(cx.active_drag.is_some(), "the handle starts a drag");
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+
+        // Every render lays the text out afresh, so read the layout just painted.
+        let layout = latest_layout.borrow().clone().expect("rendered");
+        assert_eq!(layout.text_align(), TextAlign::Right);
+        let painted = window
+            .update(cx, |_, window, _| painted_decorations(window, &layout))
+            .unwrap();
+        assert_lines(
+            &painted.backgrounds,
+            &[(12., 66.), (24., 60.)],
+            "backgrounds",
+        );
+        let first_line = bounds.top() + layout.line_height() / 2.;
+        assert_eq!(
+            layout.index_for_position(point(bounds.left() + px(59.), first_line)),
+            Ok(7)
+        );
+    }
+
+    /// A 300px column of text, underlined and highlighted end to end so every
+    /// soft wrap continues a decoration too.
+    struct Paragraph {
+        text: SharedString,
+        align: TextAlign,
+    }
+
+    impl Render for Paragraph {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let decorated = HighlightStyle {
+                underline: Some(UnderlineStyle {
+                    thickness: px(1.),
+                    color: None,
+                    wavy: false,
+                }),
+                background_color: Some(highlight_color()),
+                ..HighlightStyle::default()
+            };
+            div()
+                .w(px(300.))
+                .text_size(px(10.))
+                .text_align(self.align)
+                .child(
+                    StyledText::new(self.text.clone())
+                        .with_highlights([(0..self.text.len(), decorated)]),
+                )
+        }
+    }
+
+    /// Paints a paragraph of about 130 wrapped lines, decorated end to end, for
+    /// `frames` frames per alignment. The wrapped layout is cached across frames,
+    /// so this times prepaint and paint.
+    fn paint_paragraph(cx: &mut TestAppContext, aligns: &[TextAlign], frames: usize) {
+        let text = SharedString::from("lorem ipsum dolor sit amet ".repeat(240));
+        for &align in aligns {
+            let text = text.clone();
+            let window: AnyWindowHandle =
+                cx.add_window(move |_, _| Paragraph { text, align }).into();
+            cx.update_window(window, |_, window, cx| {
+                for _ in 0..frames {
+                    window.draw(cx).clear(cx);
+                }
+            })
+            .unwrap();
+        }
+    }
+
+    /// Left-aligned text is the common case and never shifts a line.
+    #[perf(iterations = 1, important)]
+    #[crate::test]
+    fn perf_paint_long_wrapped_paragraph(cx: &mut TestAppContext) {
+        paint_paragraph(cx, &[TextAlign::Left], 300);
+    }
+
+    /// Centred and right-aligned text places every line by its own width.
+    #[perf(iterations = 1, important)]
+    #[crate::test]
+    fn perf_paint_long_wrapped_aligned_paragraph(cx: &mut TestAppContext) {
+        paint_paragraph(cx, &[TextAlign::Center, TextAlign::Right], 150);
+    }
+
+    /// Presses the left button at `position`.
+    fn press_pointer(position: Point<Pixels>, window: &mut Window, cx: &mut App) {
+        window.dispatch_event(
+            MouseDownEvent {
+                position,
+                button: MouseButton::Left,
+                modifiers: Modifiers::none(),
+                click_count: 1,
+                first_mouse: false,
+            }
+            .to_platform_input(),
+            cx,
+        );
+    }
+
+    /// Moves the pointer to `position` with the left button held.
+    fn drag_pointer(position: Point<Pixels>, window: &mut Window, cx: &mut App) {
+        window.dispatch_event(
+            MouseMoveEvent {
+                position,
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Modifiers::none(),
+            }
+            .to_platform_input(),
+            cx,
+        );
+    }
+
+    #[crate::test]
+    fn a_click_on_a_centred_word_reaches_its_range(cx: &mut TestAppContext) {
+        let mut view = AlignedText::new(WRAPPED, TextAlign::Center);
+        view.clickable = vec![9..10];
+        let layout = view.layout.clone();
+        let clicked = view.clicked.clone();
+        let (_, cx) = cx.add_window_view(|_, _| view);
+        let layout = layout.borrow().clone().expect("rendered");
+        let bounds = layout.bounds();
+
+        cx.simulate_click(
+            point(
+                bounds.left() + px(13.),
+                bounds.top() + layout.line_height() * 1.5,
+            ),
+            Modifiers::none(),
+        );
+        assert_eq!(clicked.get(), Some(0));
     }
 }

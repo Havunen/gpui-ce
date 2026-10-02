@@ -19,7 +19,7 @@ use crate::{
     Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
     ScaledFilter, ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style,
     SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
-    TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration, TextInputStateChange,
+    TabStopMap, TaffyLayoutEngine, Task, TextAlign, TextInputConfiguration, TextInputStateChange,
     TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
     Transition, TransitionState, Underline, UnderlineStyle, WindowAppearance,
     WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
@@ -2361,6 +2361,16 @@ impl Window {
         style
     }
 
+    /// The text alignment [`Self::text_style`] would report, read straight off the style stack
+    /// rather than refining a whole [`TextStyle`] for one field.
+    pub(crate) fn text_align(&self) -> TextAlign {
+        self.text_style_stack
+            .iter()
+            .rev()
+            .find_map(|refinement| refinement.text_align)
+            .unwrap_or_default()
+    }
+
     /// Check if the platform window is maximized.
     ///
     /// On some platforms (namely Windows) this is different than the bounds being the size of the display
@@ -2749,6 +2759,14 @@ impl Window {
     #[cfg(any(test, feature = "test-support"))]
     pub fn painted_quads(&self) -> Vec<Quad> {
         self.rendered_frame.scene.quads.clone()
+    }
+
+    /// Returns the underlines in the most recently rendered frame's scene, strikethroughs
+    /// included (they are painted as underlines), for tests to assert on text decorations. Bounds
+    /// are in scaled pixels, as with [`Self::painted_quads`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn painted_underlines(&self) -> Vec<Underline> {
+        self.rendered_frame.scene.underlines.clone()
     }
 
     /// Set the content size of the window.

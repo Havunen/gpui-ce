@@ -1,4 +1,6 @@
-use crate::{FontId, GlyphId, Pixels, PlatformTextSystem, Point, SharedString, Size, point, px};
+use crate::{
+    FontId, GlyphId, Pixels, PlatformTextSystem, Point, SharedString, Size, TextAlign, point, px,
+};
 use collections::FxHashMap;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use smallvec::SmallVec;
@@ -197,10 +199,8 @@ impl LineLayout {
         let mut first_non_whitespace_ix = None;
         let mut last_candidate_ix = None;
         let mut last_candidate_x = px(0.);
-        let mut last_boundary = WrapBoundary {
-            run_ix: 0,
-            glyph_ix: 0,
-        };
+        // Glyphs are addressed as `(run_ix, glyph_ix)`, which orders them as the text does.
+        let mut last_boundary = (0, 0);
         let mut last_boundary_x = px(0.);
         let mut prev_ch = '\0';
         let mut glyphs = self
@@ -210,16 +210,12 @@ impl LineLayout {
             .flat_map(move |(run_ix, run)| {
                 run.glyphs.iter().enumerate().map(move |(glyph_ix, glyph)| {
                     let character = text[glyph.index..].chars().next().unwrap();
-                    (
-                        WrapBoundary { run_ix, glyph_ix },
-                        character,
-                        glyph.position.x,
-                    )
+                    ((run_ix, glyph_ix), character, glyph.position.x)
                 })
             })
             .peekable();
 
-        while let Some((boundary, ch, x)) = glyphs.next() {
+        while let Some((glyph, ch, x)) = glyphs.next() {
             if ch == '\n' {
                 continue;
             }
@@ -228,24 +224,24 @@ impl LineLayout {
             // but there are some differences, so we have to duplicate the code here.
             if LineWrapper::is_word_char(ch) {
                 if prev_ch == ' ' && ch != ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = Some(boundary);
+                    last_candidate_ix = Some(glyph);
                     last_candidate_x = x;
                 }
             } else {
                 if ch != ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = Some(boundary);
+                    last_candidate_ix = Some(glyph);
                     last_candidate_x = x;
                 }
             }
 
             if ch != ' ' && first_non_whitespace_ix.is_none() {
-                first_non_whitespace_ix = Some(boundary);
+                first_non_whitespace_ix = Some(glyph);
             }
 
             let next_x = glyphs.peek().map_or(self.width, |(_, _, x)| *x);
             let width = next_x - last_boundary_x;
 
-            if width > wrap_width && boundary > last_boundary {
+            if width > wrap_width && glyph > last_boundary {
                 // When used line_clamp, we should limit the number of lines.
                 if let Some(max_lines) = max_lines
                     && boundaries.len() >= max_lines.saturating_sub(1)
@@ -253,19 +249,169 @@ impl LineLayout {
                     break;
                 }
 
-                if let Some(last_candidate_ix) = last_candidate_ix.take() {
-                    last_boundary = last_candidate_ix;
-                    last_boundary_x = last_candidate_x;
-                } else {
-                    last_boundary = boundary;
-                    last_boundary_x = x;
-                }
-                boundaries.push(last_boundary);
+                let line_start = last_boundary;
+                (last_boundary, last_boundary_x) = last_candidate_ix
+                    .take()
+                    .map_or((glyph, x), |candidate| (candidate, last_candidate_x));
+                let (run_ix, glyph_ix) = last_boundary;
+                boundaries.push(WrapBoundary {
+                    run_ix,
+                    glyph_ix,
+                    trailing_whitespace_x: self.trailing_whitespace_x(
+                        text,
+                        line_start,
+                        last_boundary,
+                    ),
+                });
             }
             prev_ch = ch;
         }
 
         boundaries
+    }
+
+    /// Where the spaces a line was wrapped at begin: the x of the first of the `' '` glyphs
+    /// running up to the glyph at `boundary`, or that glyph's own x when the line does not end
+    /// in a space. The spaces are only followed back to the glyph at `line_start`, so a line of
+    /// nothing but spaces hangs whole.
+    fn trailing_whitespace_x(
+        &self,
+        text: &str,
+        line_start: (usize, usize),
+        boundary: (usize, usize),
+    ) -> Pixels {
+        let (run_ix, glyph_ix) = boundary;
+        self.runs[..=run_ix]
+            .iter()
+            .enumerate()
+            .rev()
+            .flat_map(|(ix, run)| {
+                let end = if ix == run_ix {
+                    glyph_ix
+                } else {
+                    run.glyphs.len()
+                };
+                run.glyphs[..end]
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .map(move |(glyph_ix, glyph)| ((ix, glyph_ix), glyph))
+            })
+            .take_while(|(ix, glyph)| *ix >= line_start && text[glyph.index..].starts_with(' '))
+            .last()
+            .map_or_else(
+                || self.runs[run_ix].glyphs[glyph_ix].position.x,
+                |(_, glyph)| glyph.position.x,
+            )
+    }
+
+    /// The glyph that starts the line after `boundary`.
+    pub(crate) fn glyph_at(&self, boundary: &WrapBoundary) -> &ShapedGlyph {
+        &self.runs[boundary.run_ix].glyphs[boundary.glyph_ix]
+    }
+
+    /// Where the line before `boundary` ends, as `(visible_end, end)`; the last line, which no
+    /// boundary follows, ends with the layout.
+    fn wrapped_line_end(&self, boundary: Option<&WrapBoundary>) -> (Pixels, Pixels) {
+        match boundary {
+            Some(boundary) => (
+                boundary.trailing_whitespace_x,
+                self.glyph_at(boundary).position.x,
+            ),
+            None => (self.width, self.width),
+        }
+    }
+
+    /// Where visual line `line_ix` of this layout lies once it is wrapped at `wrap_boundaries`.
+    /// `line_ix` is at most `wrap_boundaries.len()`, the index of the last line.
+    pub(crate) fn wrapped_line_extent(
+        &self,
+        wrap_boundaries: &[WrapBoundary],
+        line_ix: usize,
+    ) -> WrappedLineExtent {
+        debug_assert!(line_ix <= wrap_boundaries.len(), "no line {line_ix}");
+        let start = match line_ix.checked_sub(1) {
+            Some(previous) => self.glyph_at(&wrap_boundaries[previous]).position.x,
+            None => Pixels::ZERO,
+        };
+        let (visible_end, end) = self.wrapped_line_end(wrap_boundaries.get(line_ix));
+        WrappedLineExtent {
+            start,
+            visible_end,
+            end,
+        }
+    }
+
+    /// The extents of every visual line of this layout wrapped at `wrap_boundaries`, first line
+    /// first. Each line starts where the one before it ended, so every boundary is looked up once.
+    pub(crate) fn wrapped_line_extents<'a>(
+        &'a self,
+        wrap_boundaries: &'a [WrapBoundary],
+    ) -> impl Iterator<Item = WrappedLineExtent> + 'a {
+        let mut start = Pixels::ZERO;
+        wrap_boundaries
+            .iter()
+            .map(Some)
+            .chain([None])
+            .map(move |boundary| {
+                let (visible_end, end) = self.wrapped_line_end(boundary);
+                let extent = WrappedLineExtent {
+                    start,
+                    visible_end,
+                    end,
+                };
+                start = end;
+                extent
+            })
+    }
+
+    /// How far `align` shifts visual line `line_ix` right of this layout's origin when it is
+    /// painted in a box `align_width` wide, wrapped at `wrap_boundaries`. Painting and hit
+    /// testing share it, so a position resolves to the glyph painted there. A line the layout
+    /// does not have is not shifted.
+    pub(crate) fn wrapped_line_offset(
+        &self,
+        wrap_boundaries: &[WrapBoundary],
+        line_ix: usize,
+        align: TextAlign,
+        align_width: Pixels,
+    ) -> Pixels {
+        // Left-aligned text, by far the common case, never shifts: painting calls
+        // this once per soft wrap every frame, so skip the extent lookups for it.
+        if align == TextAlign::Left || line_ix > wrap_boundaries.len() {
+            return Pixels::ZERO;
+        }
+        self.wrapped_line_extent(wrap_boundaries, line_ix)
+            .alignment_offset(align, align_width)
+    }
+}
+
+/// Where one visual line of a wrapped layout lies within the unwrapped layout.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct WrappedLineExtent {
+    /// The x of the glyph that starts the line.
+    pub(crate) start: Pixels,
+    /// Where alignment measures the line to: the whitespace it was wrapped at hangs past this.
+    pub(crate) visible_end: Pixels,
+    /// The x of the glyph that starts the next line, or the layout's width for the last line.
+    pub(crate) end: Pixels,
+}
+
+impl WrappedLineExtent {
+    /// The line's width, the whitespace it was wrapped at included.
+    pub(crate) fn width(&self) -> Pixels {
+        self.end - self.start
+    }
+
+    /// How far `align` shifts the line right of the layout's origin in a box `align_width`
+    /// wide. A line wider than the box shifts left, past the box's edge.
+    pub(crate) fn alignment_offset(&self, align: TextAlign, align_width: Pixels) -> Pixels {
+        let visible_width = self.visible_end - self.start;
+        match align {
+            TextAlign::Left => Pixels::ZERO,
+            TextAlign::Center => (align_width - visible_width) / 2.,
+            TextAlign::Right => align_width - visible_width,
+        }
     }
 }
 
@@ -289,6 +435,18 @@ pub struct WrapBoundary {
     pub run_ix: usize,
     /// The index of the glyph just before the line was wrapped
     pub glyph_ix: usize,
+    /// Where the spaces the line was wrapped at begin, in the unwrapped layout: the glyph's own
+    /// x when the line does not end in a space. Alignment measures the line to here, so those
+    /// spaces hang past its aligned edge instead of pushing its text away from it. Whitespace at
+    /// the end of the text is not wrapped at and so aligns like any other glyph.
+    pub trailing_whitespace_x: Pixels,
+}
+
+impl WrapBoundary {
+    /// Whether the line after this boundary starts with glyph `glyph_ix` of run `run_ix`.
+    pub(crate) fn is_at(&self, run_ix: usize, glyph_ix: usize) -> bool {
+        (self.run_ix, self.glyph_ix) == (run_ix, glyph_ix)
+    }
 }
 
 impl WrappedLineLayout {
@@ -339,6 +497,24 @@ impl WrappedLineLayout {
         &self.unwrapped_layout.runs
     }
 
+    /// How far `align` moves visual line `wrapped_line_ix` right of the layout's origin when it
+    /// is painted in a box `align_width` wide: the shift painting applies, so callers can place
+    /// things on aligned text. The whitespace a line was wrapped at hangs past its aligned edge
+    /// rather than counting toward its width. A line past the last is not moved.
+    pub fn wrapped_line_offset(
+        &self,
+        wrapped_line_ix: usize,
+        align: TextAlign,
+        align_width: Pixels,
+    ) -> Pixels {
+        self.unwrapped_layout.wrapped_line_offset(
+            &self.wrap_boundaries,
+            wrapped_line_ix,
+            align,
+            align_width,
+        )
+    }
+
     /// The index corresponding to a given position in this layout for the given line height.
     ///
     /// See also [`Self::closest_index_for_position`].
@@ -347,7 +523,19 @@ impl WrappedLineLayout {
         position: Point<Pixels>,
         line_height: Pixels,
     ) -> Result<usize, usize> {
-        self._index_for_position(position, line_height, false)
+        self._index_for_position(position, line_height, false, TextAlign::Left, Pixels::ZERO)
+    }
+
+    /// [`Self::index_for_position`] for text painted with `align` in a box
+    /// `align_width` wide.
+    pub fn index_for_position_aligned(
+        &self,
+        position: Point<Pixels>,
+        line_height: Pixels,
+        align: TextAlign,
+        align_width: Pixels,
+    ) -> Result<usize, usize> {
+        self._index_for_position(position, line_height, false, align, align_width)
     }
 
     /// The closest index to a given position in this layout for the given line height.
@@ -360,7 +548,19 @@ impl WrappedLineLayout {
         position: Point<Pixels>,
         line_height: Pixels,
     ) -> Result<usize, usize> {
-        self._index_for_position(position, line_height, true)
+        self._index_for_position(position, line_height, true, TextAlign::Left, Pixels::ZERO)
+    }
+
+    /// [`Self::closest_index_for_position`] for text painted with `align` in
+    /// a box `align_width` wide.
+    pub fn closest_index_for_position_aligned(
+        &self,
+        position: Point<Pixels>,
+        line_height: Pixels,
+        align: TextAlign,
+        align_width: Pixels,
+    ) -> Result<usize, usize> {
+        self._index_for_position(position, line_height, true, align, align_width)
     }
 
     fn _index_for_position(
@@ -368,6 +568,8 @@ impl WrappedLineLayout {
         mut position: Point<Pixels>,
         line_height: Pixels,
         closest: bool,
+        align: TextAlign,
+        align_width: Pixels,
     ) -> Result<usize, usize> {
         let wrapped_line_ix = (position.y / line_height) as usize;
 
@@ -377,8 +579,7 @@ impl WrappedLineLayout {
             let Some(line_start_boundary) = self.wrap_boundaries.get(wrapped_line_ix - 1) else {
                 return Err(0);
             };
-            let run = &self.unwrapped_layout.runs[line_start_boundary.run_ix];
-            let glyph = &run.glyphs[line_start_boundary.glyph_ix];
+            let glyph = self.unwrapped_layout.glyph_at(line_start_boundary);
             wrapped_line_start_index = glyph.index;
             wrapped_line_start_x = glyph.position.x;
         } else {
@@ -390,9 +591,8 @@ impl WrappedLineLayout {
         let wrapped_line_end_x;
         if wrapped_line_ix < self.wrap_boundaries.len() {
             let next_wrap_boundary_ix = wrapped_line_ix;
-            let next_wrap_boundary = self.wrap_boundaries[next_wrap_boundary_ix];
-            let run = &self.unwrapped_layout.runs[next_wrap_boundary.run_ix];
-            let glyph = &run.glyphs[next_wrap_boundary.glyph_ix];
+            let next_wrap_boundary = &self.wrap_boundaries[next_wrap_boundary_ix];
+            let glyph = self.unwrapped_layout.glyph_at(next_wrap_boundary);
             wrapped_line_end_index = glyph.index;
             wrapped_line_end_x = glyph.position.x;
         } else {
@@ -400,6 +600,7 @@ impl WrappedLineLayout {
             wrapped_line_end_x = self.unwrapped_layout.width;
         };
 
+        position.x -= self.wrapped_line_offset(wrapped_line_ix, align, align_width);
         let mut position_in_unwrapped_line = position;
         position_in_unwrapped_line.x += wrapped_line_start_x;
         if position_in_unwrapped_line.x < wrapped_line_start_x {
@@ -422,15 +623,24 @@ impl WrappedLineLayout {
 
     /// Returns the pixel position for the given byte index.
     pub fn position_for_index(&self, index: usize, line_height: Pixels) -> Option<Point<Pixels>> {
+        self.position_for_index_aligned(index, line_height, TextAlign::Left, Pixels::ZERO)
+    }
+
+    /// [`Self::position_for_index`] for text painted with `align` in a box
+    /// `align_width` wide. An index on a wrap boundary stays at the end of
+    /// the line above, as it does unaligned.
+    pub fn position_for_index_aligned(
+        &self,
+        index: usize,
+        line_height: Pixels,
+        align: TextAlign,
+        align_width: Pixels,
+    ) -> Option<Point<Pixels>> {
         let mut line_start_ix = 0;
         let mut line_end_indices = self
             .wrap_boundaries
             .iter()
-            .map(|wrap_boundary| {
-                let run = &self.unwrapped_layout.runs[wrap_boundary.run_ix];
-                let glyph = &run.glyphs[wrap_boundary.glyph_ix];
-                glyph.index
-            })
+            .map(|wrap_boundary| self.unwrapped_layout.glyph_at(wrap_boundary).index)
             .chain([self.len()])
             .enumerate();
         for (ix, line_end_ix) in line_end_indices {
@@ -442,7 +652,8 @@ impl WrappedLineLayout {
                 continue;
             } else {
                 let line_start_x = self.unwrapped_layout.x_for_index(line_start_ix);
-                let x = self.unwrapped_layout.x_for_index(index) - line_start_x;
+                let x = self.unwrapped_layout.x_for_index(index) - line_start_x
+                    + self.wrapped_line_offset(ix, align, align_width);
                 return Some(point(x, line_y));
             }
         }
@@ -1058,6 +1269,239 @@ mod tests {
         }
     }
 
+    /// Ten 10px glyphs, "abc efg ij", wrapped at its two spaces: lines of 40,
+    /// 40 and 20px, which alignment measures as 30, 30 and 20px since the
+    /// spaces the first two lines were wrapped at hang.
+    fn wrapped_ten_glyphs() -> WrappedLineLayout {
+        let mut layout = make_layout((0..10).map(|ix| glyph_at(ix as f32 * 10., ix)).collect());
+        layout.len = 10;
+        WrappedLineLayout {
+            unwrapped_layout: Arc::new(layout),
+            wrap_boundaries: SmallVec::from_slice(&[
+                WrapBoundary {
+                    run_ix: 0,
+                    glyph_ix: 4,
+                    trailing_whitespace_x: px(30.),
+                },
+                WrapBoundary {
+                    run_ix: 0,
+                    glyph_ix: 8,
+                    trailing_whitespace_x: px(70.),
+                },
+            ]),
+            wrap_width: Some(px(60.)),
+        }
+    }
+
+    /// `text` in 10px glyphs, wrapped to `wrap_width`.
+    fn wrapped(text: &str, wrap_width: f32) -> WrappedLineLayout {
+        let glyphs = text
+            .char_indices()
+            .map(|(ix, _)| glyph_at(ix as f32 * 10., ix))
+            .collect();
+        let mut layout = make_layout(glyphs);
+        layout.width = px(text.len() as f32 * 10.);
+        layout.len = text.len();
+        let wrap_boundaries = layout.compute_wrap_boundaries(text, px(wrap_width), None);
+        WrappedLineLayout {
+            unwrapped_layout: Arc::new(layout),
+            wrap_boundaries,
+            wrap_width: Some(px(wrap_width)),
+        }
+    }
+
+    #[test]
+    fn wrap_boundaries_record_where_the_spaces_wrapped_at_begin() {
+        let boundary = |glyph_ix, trailing_whitespace_x| WrapBoundary {
+            run_ix: 0,
+            glyph_ix,
+            trailing_whitespace_x: px(trailing_whitespace_x),
+        };
+        // Breaking before "def" and "gh" leaves the space before each at the end of its line.
+        assert_eq!(
+            wrapped("abc def gh", 45.).wrap_boundaries.as_slice(),
+            &[boundary(4, 30.), boundary(8, 70.)]
+        );
+        // A line broken inside a word ends where the next line starts.
+        assert_eq!(
+            wrapped("abcdefgh", 35.).wrap_boundaries.as_slice(),
+            &[boundary(3, 30.), boundary(6, 60.)]
+        );
+        // Spaces hang back no further than the start of their own line.
+        assert_eq!(
+            wrapped("a      b", 35.).wrap_boundaries.as_slice(),
+            &[boundary(3, 10.), boundary(6, 30.)]
+        );
+    }
+
+    #[test]
+    fn trailing_spaces_are_followed_back_across_shaped_runs() {
+        // "ab  cd" with a run break between the two spaces: the first space
+        // ends run 0, the second starts run 1 along with "cd".
+        let text = "ab  cd";
+        let glyphs: Vec<_> = text
+            .char_indices()
+            .map(|(ix, _)| glyph_at(ix as f32 * 10., ix))
+            .collect();
+        let (first_run, second_run) = glyphs.split_at(3);
+        let layout = LineLayout {
+            font_size: px(16.),
+            width: px(60.),
+            ascent: px(12.),
+            descent: px(4.),
+            runs: vec![
+                ShapedRun {
+                    font_id: FontId(0),
+                    glyphs: first_run.to_vec(),
+                },
+                ShapedRun {
+                    font_id: FontId(1),
+                    glyphs: second_run.to_vec(),
+                },
+            ],
+            len: text.len(),
+        };
+        assert_eq!(
+            layout
+                .compute_wrap_boundaries(text, px(45.), None)
+                .as_slice(),
+            &[WrapBoundary {
+                run_ix: 1,
+                glyph_ix: 1,
+                trailing_whitespace_x: px(20.),
+            }]
+        );
+    }
+
+    #[test]
+    fn line_extents_iterate_as_they_index() {
+        let layout = wrapped_ten_glyphs();
+        let by_index: Vec<_> = (0..3)
+            .map(|line_ix| {
+                layout
+                    .unwrapped_layout
+                    .wrapped_line_extent(&layout.wrap_boundaries, line_ix)
+            })
+            .collect();
+        let iterated: Vec<_> = layout
+            .unwrapped_layout
+            .wrapped_line_extents(&layout.wrap_boundaries)
+            .collect();
+        assert_eq!(iterated, by_index);
+        assert_eq!(
+            iterated[1],
+            WrappedLineExtent {
+                start: px(40.),
+                visible_end: px(70.),
+                end: px(80.),
+            }
+        );
+    }
+
+    #[test]
+    fn wrapped_line_offsets_follow_the_alignment() {
+        let layout = wrapped_ten_glyphs();
+        let offsets = |align, width| {
+            (0..4)
+                .map(|line| layout.wrapped_line_offset(line, align, px(width)))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(offsets(TextAlign::Left, 60.), vec![px(0.); 4]);
+        // The first two lines align as 30px: the spaces they wrap at hang.
+        assert_eq!(
+            offsets(TextAlign::Center, 60.),
+            vec![px(15.), px(15.), px(20.), px(0.)]
+        );
+        assert_eq!(
+            offsets(TextAlign::Right, 60.),
+            vec![px(30.), px(30.), px(40.), px(0.)]
+        );
+        // A line wider than its box overhangs it on both sides.
+        assert_eq!(
+            layout.wrapped_line_offset(0, TextAlign::Center, px(20.)),
+            px(-5.)
+        );
+    }
+
+    #[test]
+    fn aligned_hit_testing_finds_the_glyph_painted_there() {
+        let layout = wrapped_ten_glyphs();
+        let line_height = px(20.);
+        for align in [TextAlign::Left, TextAlign::Center, TextAlign::Right] {
+            for index in 0..=10 {
+                let position = layout
+                    .position_for_index_aligned(index, line_height, align, px(60.))
+                    .expect("every index has a position");
+                let hit = layout.index_for_position_aligned(
+                    point(position.x, position.y + line_height / 2.),
+                    line_height,
+                    align,
+                    px(60.),
+                );
+                assert_eq!(
+                    hit.unwrap_or_else(|clamped| clamped),
+                    index,
+                    "{align:?}: index {index} at {position:?} resolves to {hit:?}"
+                );
+            }
+        }
+
+        // The second glyph of the centred middle line is painted at its
+        // offset plus one glyph.
+        assert_eq!(
+            layout.position_for_index_aligned(5, line_height, TextAlign::Center, px(60.)),
+            Some(point(px(25.), px(20.)))
+        );
+        assert_eq!(
+            layout.index_for_position_aligned(
+                point(px(30.), px(30.)),
+                line_height,
+                TextAlign::Center,
+                px(60.)
+            ),
+            Ok(5)
+        );
+        // The closest boundary to a position can be the glyph after it.
+        assert_eq!(
+            layout.closest_index_for_position_aligned(
+                point(px(32.), px(30.)),
+                line_height,
+                TextAlign::Center,
+                px(60.)
+            ),
+            Ok(6)
+        );
+        // A wrap boundary stays at the end of the line above, past the space
+        // that line hangs.
+        assert_eq!(
+            layout.position_for_index_aligned(4, line_height, TextAlign::Center, px(60.)),
+            Some(point(px(55.), px(0.)))
+        );
+    }
+
+    #[test]
+    fn clicks_beside_an_aligned_line_clamp_to_its_ends() {
+        let layout = wrapped_ten_glyphs();
+        let hit = |x: f32, y: f32| {
+            layout.index_for_position_aligned(
+                point(px(x), px(y)),
+                px(20.),
+                TextAlign::Center,
+                px(60.),
+            )
+        };
+        // The middle line is painted from 15 to 55, its hanging space included.
+        assert_eq!(hit(10., 30.), Err(4));
+        assert_eq!(hit(50., 30.), Ok(7));
+        assert_eq!(hit(56., 30.), Err(8));
+        assert_eq!(hit(200., 200.), Err(0));
+        // Unaligned hit-testing is unchanged.
+        assert_eq!(
+            layout.index_for_position(point(px(5.), px(30.)), px(20.)),
+            Ok(4)
+        );
+    }
+
     fn make_layout(glyphs: Vec<ShapedGlyph>) -> LineLayout {
         LineLayout {
             font_size: px(16.),
@@ -1115,6 +1559,26 @@ mod tests {
             .collect()
     }
 
+    /// Lays out and wraps 1024 distinct lines of about 230 glyphs into 200px,
+    /// so every line is a cache miss that computes its wrap boundaries.
+    #[perf(important)]
+    fn perf_wrap_many_distinct_lines() {
+        const LINE_COUNT: usize = 1_024;
+        let cache = LineLayoutCache::new(Arc::new(NoopTextSystem::new()));
+        let mut total_boundaries = 0;
+        for ix in 0..LINE_COUNT {
+            let text = format!("line {ix:04} {}", "lorem ipsum dolor sit amet ".repeat(8));
+            let runs = [FontRun {
+                len: text.len(),
+                font_id: FontId(0),
+                letter_spacing: None,
+            }];
+            let layout = cache.layout_wrapped_line(text, px(16.), &runs, Some(px(200.)), None);
+            total_boundaries += layout.wrap_boundaries.len();
+        }
+        black_box(total_boundaries);
+    }
+
     #[perf(important)]
     fn perf_wrapped_line_position_for_index_many_soft_wraps() {
         const LINE_LEN: usize = 8_192;
@@ -1128,6 +1592,7 @@ mod tests {
             .map(|glyph_ix| WrapBoundary {
                 run_ix: 0,
                 glyph_ix,
+                trailing_whitespace_x: px(glyph_ix as f32),
             })
             .collect();
         let layout = WrappedLineLayout {
