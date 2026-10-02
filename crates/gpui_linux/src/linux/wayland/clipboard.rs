@@ -98,13 +98,13 @@ impl<T: ReceiveData> DataOffer<T> {
         }
     }
 
-    fn read_text(&self, connection: &Connection) -> Option<ClipboardItem> {
+    fn read_text(&self, read: &mut impl FnMut(&str) -> Option<Vec<u8>>) -> Option<ClipboardItem> {
         let mime_type = self.mime_types.iter().find(|&mime_type| {
             ALLOWED_TEXT_MIME_TYPES
                 .iter()
                 .any(|&allowed| allowed == mime_type)
         })?;
-        let bytes = self.read_bytes(connection, mime_type)?;
+        let bytes = read(mime_type)?;
         let text_content = match String::from_utf8(bytes) {
             Ok(content) => content,
             Err(e) => {
@@ -120,14 +120,14 @@ impl<T: ReceiveData> DataOffer<T> {
         Some(ClipboardItem::new_string(result))
     }
 
-    fn read_image(&self, connection: &Connection) -> Option<ClipboardItem> {
+    fn read_image(&self, read: &mut impl FnMut(&str) -> Option<Vec<u8>>) -> Option<ClipboardItem> {
         for format in ImageFormat::iter() {
             let mime_type = format.mime_type();
             if !self.has_mime_type(mime_type) {
                 continue;
             }
 
-            if let Some(bytes) = self.read_bytes(connection, mime_type) {
+            if let Some(bytes) = read(mime_type) {
                 let id = hash(&bytes);
                 return Some(ClipboardItem {
                     entries: vec![ClipboardEntry::Image(Image { format, bytes, id })],
@@ -135,6 +135,41 @@ impl<T: ReceiveData> DataOffer<T> {
             }
         }
         None
+    }
+
+    fn read_clipboard(
+        &self,
+        read: &mut impl FnMut(&str) -> Option<Vec<u8>>,
+    ) -> Option<ClipboardItem> {
+        let files = [
+            gpui::FILE_TRANSFER_MIME,
+            gpui::COPIED_FILES_MIME,
+            gpui::URI_LIST_MIME,
+        ]
+        .into_iter()
+        .find_map(|mime| {
+            if !self.has_mime_type(mime) {
+                return None;
+            }
+            let mut files = gpui::FileTransfer::decode(&read(mime)?, mime)?;
+            if mime == gpui::URI_LIST_MIME
+                && self.has_mime_type(gpui::KDE_CUT_MIME)
+                && read(gpui::KDE_CUT_MIME).is_some_and(|b| b == b"1")
+            {
+                files.operation = gpui::FileTransferOperation::Move;
+            }
+            Some(files)
+        });
+        let text = self.read_text(read);
+        if let Some(files) = files {
+            let mut item = text.unwrap_or_else(|| ClipboardItem {
+                entries: Vec::new(),
+            });
+            item.entries.push(ClipboardEntry::Files(files));
+            Some(item)
+        } else {
+            text.or_else(|| self.read_image(read))
+        }
     }
 }
 
@@ -215,35 +250,7 @@ impl Clipboard {
             return self.contents.clone();
         }
 
-        let files = [
-            gpui::FILE_TRANSFER_MIME,
-            gpui::COPIED_FILES_MIME,
-            gpui::URI_LIST_MIME,
-        ]
-        .into_iter()
-        .find_map(|mime| {
-            if !offer.has_mime_type(mime) {
-                return None;
-            }
-            let mut files =
-                gpui::FileTransfer::decode(&offer.read_bytes(&self.connection, mime)?, mime)?;
-            if mime == gpui::URI_LIST_MIME
-                && offer.has_mime_type(gpui::KDE_CUT_MIME)
-                && offer
-                    .read_bytes(&self.connection, gpui::KDE_CUT_MIME)
-                    .is_some_and(|b| b == b"1")
-            {
-                files.operation = gpui::FileTransferOperation::Move;
-            }
-            Some(ClipboardItem {
-                entries: vec![ClipboardEntry::Files(files)],
-            })
-        });
-        let item = files.or_else(|| {
-            offer
-                .read_text(&self.connection)
-                .or_else(|| offer.read_image(&self.connection))
-        })?;
+        let item = offer.read_clipboard(&mut |mime| offer.read_bytes(&self.connection, mime))?;
 
         self.cached_read = Some(item.clone());
         Some(item)
@@ -259,9 +266,10 @@ impl Clipboard {
             return self.primary_contents.clone();
         }
 
+        let mut read = |mime: &str| offer.read_bytes(&self.connection, mime);
         let item = offer
-            .read_text(&self.connection)
-            .or_else(|| offer.read_image(&self.connection))?;
+            .read_text(&mut read)
+            .or_else(|| offer.read_image(&mut read))?;
 
         self.cached_primary_read = Some(item.clone());
         Some(item)
@@ -315,5 +323,70 @@ impl Clipboard {
         } else {
             &[]
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Offer;
+    impl ReceiveData for Offer {
+        fn receive_data(&self, _: String, _: BorrowedFd<'_>) {
+            unreachable!("tests supply the offered bytes directly")
+        }
+    }
+
+    fn read(formats: &[(&str, &[u8])]) -> ClipboardItem {
+        let mut offer = DataOffer::new(Offer);
+        for (mime, _) in formats {
+            offer.add_mime_type((*mime).into());
+        }
+        offer
+            .read_clipboard(&mut |mime| {
+                formats
+                    .iter()
+                    .find(|(offered, _)| *offered == mime)
+                    .map(|(_, bytes)| bytes.to_vec())
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn file_offers_keep_their_explicit_text() {
+        for mime in ALLOWED_TEXT_MIME_TYPES {
+            let item = read(&[
+                (gpui::URI_LIST_MIME, b"file:///tmp/a\r\nfile:///tmp/b\r\n"),
+                (gpui::KDE_CUT_MIME, b"1"),
+                (mime, b"First file\r\nSecond file"),
+            ]);
+            let files = item.file_transfer().unwrap();
+            assert_eq!(files.paths.paths().len(), 2);
+            assert_eq!(files.operation, gpui::FileTransferOperation::Move);
+            assert_eq!(item.text().as_deref(), Some("First file\nSecond file"));
+        }
+    }
+
+    #[test]
+    fn missing_or_invalid_text_does_not_discard_files() {
+        for text in [None, Some(&b"\xff"[..])] {
+            let mut formats = vec![(gpui::URI_LIST_MIME, &b"file:///tmp/a\r\nfile:///tmp/b"[..])];
+            if let Some(text) = text {
+                formats.push((ALLOWED_TEXT_MIME_TYPES[0], text));
+            }
+            let item = read(&formats);
+            assert!(item.file_transfer().is_some());
+            assert_eq!(item.text().as_deref(), Some("/tmp/a\n/tmp/b"));
+        }
+    }
+
+    #[test]
+    fn non_file_uri_lists_still_paste_as_text() {
+        let item = read(&[
+            (gpui::URI_LIST_MIME, b"https://example.com"),
+            (ALLOWED_TEXT_MIME_TYPES[0], b"Link label"),
+        ]);
+        assert!(item.file_transfer().is_none());
+        assert_eq!(item.text().as_deref(), Some("Link label"));
     }
 }

@@ -1849,7 +1849,7 @@ impl MetalRenderer {
 
             let surface_uniforms = SurfaceUniforms {
                 bounds: surface.bounds.into(),
-                content_mask: surface.content_mask.bounds.into(),
+                content_mask: surface.content_mask.into(),
                 color_format: SurfaceColorFormat::Yuv,
                 opacity: opacities.get(index).copied().unwrap_or(1.0),
                 padding0: 0,
@@ -2154,7 +2154,10 @@ mod tests {
         let mut filtered_scene = Scene::default();
         filtered_scene.insert_primitive(BackdropFilter {
             bounds,
-            content_mask: ContentMask { bounds },
+            content_mask: ContentMask {
+                bounds,
+                ..Default::default()
+            },
             filters: smallvec::smallvec![ScaledFilter::Blur(ScaledPixels(1.0))],
             opacity: 1.0,
             ..Default::default()
@@ -2200,7 +2203,10 @@ mod tests {
             order: 0,
             padding: 0,
             bounds,
-            content_mask: ContentMask { bounds },
+            content_mask: ContentMask {
+                bounds,
+                ..Default::default()
+            },
             color: white().into(),
             tile,
             transformation: TransformationMatrix::unit(),
@@ -2307,7 +2313,10 @@ mod tests {
         ] {
             quads.insert_primitive(Quad {
                 bounds,
-                content_mask: ContentMask { bounds },
+                content_mask: ContentMask {
+                    bounds,
+                    ..Default::default()
+                },
                 background,
                 ..Default::default()
             });
@@ -2418,6 +2427,7 @@ mod tests {
             bounds: underline_frame,
             content_mask: ContentMask {
                 bounds: underline_frame,
+                ..Default::default()
             },
             background: solid_background(hsla(0.0, 0.0, 0.1, 1.0)),
             ..Default::default()
@@ -2428,6 +2438,7 @@ mod tests {
             bounds: underline_bounds,
             content_mask: ContentMask {
                 bounds: underline_bounds,
+                ..Default::default()
             },
             color: hsla(0.6, 0.8, 0.6, 0.65).into(),
             thickness: ScaledPixels(1.0),
@@ -2456,6 +2467,7 @@ mod tests {
             bounds: underline_bounds,
             content_mask: ContentMask {
                 bounds: underline_bounds,
+                ..Default::default()
             },
             color: hsla(0.1, 0.9, 0.55, 1.0).into(),
             thickness: ScaledPixels(1.0),
@@ -2516,7 +2528,10 @@ mod tests {
         let mut border = Scene::default();
         border.insert_primitive(Quad {
             bounds: box_bounds,
-            content_mask: ContentMask { bounds: full },
+            content_mask: ContentMask {
+                bounds: full,
+                ..Default::default()
+            },
             background: solid_background(hsla(0.05, 0.8, 0.45, 1.0)),
             border_style: BorderStyle::Dashed,
             border_color: hsla(0.6, 0.9, 0.7, 1.0).into(),
@@ -2560,7 +2575,10 @@ mod tests {
         let mut custom_border = Scene::default();
         custom_border.insert_primitive(Quad {
             bounds: box_bounds,
-            content_mask: ContentMask { bounds: full },
+            content_mask: ContentMask {
+                bounds: full,
+                ..Default::default()
+            },
             background: solid_background(hsla(0.05, 0.8, 0.45, 1.0)),
             border_style: BorderStyle::Dashed,
             border_dashed_length: 4.0,
@@ -2612,7 +2630,10 @@ mod tests {
             order: 0,
             blur_radius: ScaledPixels(2.0),
             bounds: box_bounds,
-            content_mask: ContentMask { bounds: full },
+            content_mask: ContentMask {
+                bounds: full,
+                ..Default::default()
+            },
             corner_radii: Corners::all(ScaledPixels(2.0)),
             color: hsla(0.7, 0.8, 0.3, 0.7).into(),
             element_bounds: box_bounds,
@@ -2670,13 +2691,19 @@ mod tests {
         let mut filter = Scene::default();
         filter.insert_primitive(Quad {
             bounds: full,
-            content_mask: ContentMask { bounds: full },
+            content_mask: ContentMask {
+                bounds: full,
+                ..Default::default()
+            },
             background: checkerboard(hsla(0.2, 0.7, 0.5, 1.0), 2.0),
             ..Default::default()
         });
         filter.insert_primitive(BackdropFilter {
             bounds: box_bounds,
-            content_mask: ContentMask { bounds: full },
+            content_mask: ContentMask {
+                bounds: full,
+                ..Default::default()
+            },
             corner_radii: Corners::all(ScaledPixels(2.0)),
             filters: smallvec::smallvec![ScaledFilter::Blur(ScaledPixels(1.0))],
             opacity: 0.8,
@@ -2754,6 +2781,7 @@ mod tests {
             bounds: sprite_bounds,
             content_mask: ContentMask {
                 bounds: sprite_bounds,
+                ..Default::default()
             },
             corner_radii: Corners::all(ScaledPixels(1.0)),
             tile,
@@ -2838,6 +2866,7 @@ mod tests {
                     height: px(8.0),
                 },
             },
+            ..Default::default()
         };
         path.color = solid_background(hsla(0.45, 0.9, 0.45, 1.0));
         let mut path_scene = Scene::default();

@@ -294,7 +294,7 @@ pub struct X11WindowState {
 
 impl X11WindowState {
     fn is_transparent(&self) -> bool {
-        self.background_appearance != WindowBackgroundAppearance::Opaque
+        self.background_appearance.is_transparent()
     }
 }
 
@@ -1393,10 +1393,26 @@ impl PlatformWindow for X11Window {
             .borrow()
             .executor
             .spawn(async move {
-                let completion = smol::unblock(move || super::outbound_drag::run(files)).await;
-                window.handle_input(PlatformInput::FileDrop(gpui::FileDropEvent::Completed(
-                    completion,
-                )));
+                let (ended, gesture) = futures::channel::oneshot::channel();
+                let (acknowledge, acknowledged) = std::sync::mpsc::channel();
+                let transfer = smol::unblock(move || {
+                    super::outbound_drag::run(files, || {
+                        if ended.send(()).is_ok() {
+                            let _ = acknowledged.recv();
+                        }
+                    })
+                });
+                let (_, completion) = futures::join!(
+                    async {
+                        let _ = gesture.await;
+                        window.handle_input(PlatformInput::FileDrop(gpui::FileDropEvent::Ended));
+                        let _ = acknowledge.send(());
+                    },
+                    transfer
+                );
+                // XdndFinished may arrive during a later drag in this window.
+                // Reporting filesystem completion must not end that gesture.
+                completion.report();
             })
             .detach();
         true

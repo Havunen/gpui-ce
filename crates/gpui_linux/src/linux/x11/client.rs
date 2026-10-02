@@ -1095,19 +1095,11 @@ impl X11Client {
                 // The owner reports a conversion it cannot perform with no property.
                 let reply = (event.property == state.atoms.XDND_DATA)
                     .then(|| {
-                        state
-                            .xcb_connection
-                            .get_property(
-                                true,
-                                event.requestor,
-                                state.atoms.XDND_DATA,
-                                AtomEnum::ANY,
-                                0,
-                                16 * 1024 * 1024,
-                            )
-                            .ok()?
-                            .reply()
-                            .ok()
+                        read_xdnd_property(
+                            &state.xcb_connection,
+                            event.requestor,
+                            state.atoms.XDND_DATA,
+                        )
                     })
                     .flatten();
                 let Some(reply) = reply else {
@@ -1118,11 +1110,8 @@ impl X11Client {
                 if reply.type_ == state.atoms.INCR {
                     state.xdnd_state.incremental = true;
                     state.xdnd_state.bytes.clear();
-                    state
-                        .xcb_connection
-                        .delete_property(event.requestor, state.atoms.XDND_DATA)
-                        .log_err();
-                    state.xcb_connection.flush().log_err();
+                    // Reading the entire INCR header already acknowledges it.
+                    // Another deletion could discard the owner's first chunk.
                 } else {
                     drop(state);
                     if reply.bytes_after == 0 {
@@ -1154,23 +1143,13 @@ impl X11Client {
                 let mut state = self.0.borrow_mut();
                 if event.atom == state.atoms.XDND_DATA && state.xdnd_state.incremental {
                     if event.state == xproto::Property::NEW_VALUE {
-                        let reply = state
-                            .xcb_connection
-                            .get_property(
-                                true,
-                                event.window,
-                                event.atom,
-                                AtomEnum::ANY,
-                                0,
-                                16 * 1024 * 1024,
-                            )
-                            .ok()
-                            .and_then(|cookie| cookie.reply().ok())
-                            .filter(|reply| {
-                                reply.bytes_after == 0
-                                    && state.xdnd_state.bytes.len() + reply.value.len()
-                                        <= 64 * 1024 * 1024
-                            });
+                        let reply =
+                            read_xdnd_property(&state.xcb_connection, event.window, event.atom)
+                                .filter(|reply| {
+                                    reply.bytes_after == 0
+                                        && state.xdnd_state.bytes.len() + reply.value.len()
+                                            <= 64 * 1024 * 1024
+                                });
                         let Some(reply) = reply else {
                             drop(state);
                             self.fail_xdnd_transfer();
@@ -3047,9 +3026,132 @@ fn xkb_state_for_key_event(xkb: &xkbc::State, event_state: xproto::KeyButMask) -
     key_event_state
 }
 
+/// Reading and acknowledging a selection property is one atomic X request,
+/// for both the INCR header and every subsequent chunk.
+fn read_xdnd_property(
+    connection: &impl Connection,
+    window: u32,
+    property: u32,
+) -> Option<xproto::GetPropertyReply> {
+    connection
+        .get_property(true, window, property, AtomEnum::ANY, 0, 16 * 1024 * 1024)
+        .ok()?
+        .reply()
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incremental_selection_keeps_every_chunk_from_a_fast_owner() {
+        use xproto::{CreateWindowAux, PropMode, Property, WindowClass};
+        let Some(server) = super::super::test_display::Xvfb::start() else {
+            eprintln!("Xvfb is not available; skipping");
+            return;
+        };
+        let (receiver, screen) = x11rb::connect(Some(&server.display)).unwrap();
+        let (owner, _) = x11rb::connect(Some(&server.display)).unwrap();
+        let window = receiver.generate_id().unwrap();
+        let property = receiver
+            .intern_atom(false, b"XDND_DATA")
+            .unwrap()
+            .reply()
+            .unwrap()
+            .atom;
+        let incr = receiver
+            .intern_atom(false, b"INCR")
+            .unwrap()
+            .reply()
+            .unwrap()
+            .atom;
+        receiver
+            .create_window(
+                0,
+                window,
+                receiver.setup().roots[screen].root,
+                0,
+                0,
+                1,
+                1,
+                0,
+                WindowClass::INPUT_ONLY,
+                0,
+                &CreateWindowAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        owner
+            .change_window_attributes(
+                window,
+                &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        let bytes = b"file:///tmp/large-file-list\r\n".repeat(10_000);
+        owner
+            .change_property32(
+                PropMode::REPLACE,
+                window,
+                property,
+                incr,
+                &[bytes.len() as u32],
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+
+        let wait_for_property = move |connection: &x11rb::rust_connection::RustConnection,
+                                      change| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                if let Some(Event::PropertyNotify(event)) = connection.poll_for_event().unwrap()
+                    && event.window == window
+                    && event.atom == property
+                    && event.state == change
+                {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            panic!("selection transfer stopped responding");
+        };
+        // Consume the header's NewValue before waiting for chunk notifications.
+        wait_for_property(&receiver, Property::NEW_VALUE);
+        let chunks = bytes.clone();
+        let producer = std::thread::spawn(move || {
+            for chunk in chunks.chunks(4096).chain(std::iter::once(&[][..])) {
+                wait_for_property(&owner, Property::DELETE);
+                owner
+                    .change_property8(PropMode::REPLACE, window, property, AtomEnum::STRING, chunk)
+                    .unwrap()
+                    .check()
+                    .unwrap();
+            }
+            wait_for_property(&owner, Property::DELETE);
+        });
+        assert_eq!(
+            read_xdnd_property(&receiver, window, property)
+                .unwrap()
+                .type_,
+            incr
+        );
+        let mut received = Vec::new();
+        loop {
+            wait_for_property(&receiver, Property::NEW_VALUE);
+            let reply = read_xdnd_property(&receiver, window, property).unwrap();
+            assert_eq!(reply.type_, u32::from(AtomEnum::STRING));
+            if reply.value.is_empty() {
+                break;
+            }
+            received.extend(reply.value);
+        }
+        producer.join().unwrap();
+        assert_eq!(received, bytes);
+    }
 
     fn xdnd_reading_files() -> Xdnd {
         Xdnd {

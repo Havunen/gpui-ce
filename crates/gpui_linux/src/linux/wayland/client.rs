@@ -3106,11 +3106,10 @@ impl Dispatch<wl_data_source::WlDataSource, DataSourceKind> for WaylandClientSta
                     None
                 };
                 let input = PlatformInput::FileDrop(FileDropEvent::Completed(
-                    gpui::FileTransferCompletion {
-                        files: external_drag.files,
+                    gpui::FileTransferCompletion::receiver_performed(
+                        external_drag.files,
                         operation,
-                        source_removed: false,
-                    },
+                    ),
                 ));
                 drop(state);
                 external_drag.window.handle_input(input);

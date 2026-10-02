@@ -1,7 +1,7 @@
 //! Shell data object wrapper retaining transfer-result formats for the caller.
 use crate::bindings::Windows::Win32::*;
 use gpui::{FileTransfer, FileTransferCompletion, FileTransferOperation};
-use std::{cell::RefCell, os::windows::ffi::OsStrExt, rc::Rc, sync::LazyLock};
+use std::{cell::RefCell, os::windows::ffi::OsStrExt, path::Path, rc::Rc, sync::LazyLock};
 use windows_core::{BOOL, Error, GUID, HRESULT, Interface, PCWSTR, Ref, Result, implement};
 
 const EFFECT_COPY: u32 = DROPEFFECT_COPY as u32;
@@ -65,7 +65,17 @@ struct TransferResult {
     recycle_bin: bool,
 }
 
-#[implement(IDataObject, IDataObjectAsyncCapability)]
+impl TransferResult {
+    fn reset(&mut self) {
+        *self = Self {
+            async_mode: self.async_mode,
+            ..Default::default()
+        };
+    }
+}
+
+// Both the shared result and the wrapped Shell object belong to the UI apartment.
+#[implement(IDataObject, IDataObjectAsyncCapability, Agile = false)]
 struct FileDataObject {
     inner: IDataObject,
     files: FileTransfer,
@@ -154,6 +164,16 @@ impl IDataObject_Impl for FileDataObject_Impl {
         }
         if let Some(value) = value {
             let mut state = self.result.borrow_mut();
+            if self.clipboard
+                && state.reported
+                && !state.in_operation
+                && [*PERFORMED, *LOGICAL, *TARGET_CLSID].contains(&format)
+            {
+                // Synchronous pastes have no StartOperation. Their first result
+                // metadata begins a fresh attempt after the previous PasteSucceeded.
+                // Repeated PasteSucceeded notifications still finish only once.
+                state.reset();
+            }
             state.recycle_bin |= recycle_bin;
             if format == *PERFORMED {
                 state.performed = Some(value);
@@ -200,8 +220,14 @@ impl IDataObjectAsyncCapability_Impl for FileDataObject_Impl {
         Ok(self.result.borrow().async_mode.into())
     }
     fn StartOperation(&self, _: Ref<IBindCtx>) -> Result<()> {
-        self.result.borrow_mut().in_operation = true;
-        self.files.set_active(true);
+        let mut state = self.result.borrow_mut();
+        if !state.in_operation {
+            if self.clipboard {
+                state.reset();
+            }
+            state.in_operation = true;
+            self.files.set_active(true);
+        }
         Ok(())
     }
     fn InOperation(&self) -> Result<BOOL> {
@@ -291,11 +317,7 @@ fn data_object(
     }
     let mut lists = IdLists(Vec::new());
     for path in files.paths.paths() {
-        let mut native: Vec<u16> = path.as_os_str().encode_wide().collect();
-        if native.contains(&0) {
-            return Err(E_INVALIDARG.into());
-        }
-        native.push(0);
+        let native = shell_path(path)?;
         let mut pidl = std::ptr::null_mut();
         unsafe {
             SHParseDisplayName(
@@ -335,6 +357,35 @@ fn data_object(
     }
     .into();
     Ok((object, result))
+}
+
+/// Shell parsing names use backslashes and DOS/UNC prefixes, even when a
+/// filesystem path came from `canonicalize`. Work in UTF-16 to retain native names.
+fn shell_path(path: &Path) -> Result<Vec<u16>> {
+    let mut native: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .map(|c| if c == b'/' as u16 { b'\\' as u16 } else { c })
+        .collect();
+    if native.contains(&0) {
+        return Err(E_INVALIDARG.into());
+    }
+    match native.as_slice() {
+        // \\?\UNC\server\share -> \\server\share
+        [92, 92, 63, 92, 85, 78, 67, 92, ..] => {
+            native.drain(2..8);
+        }
+        // \\?\C:\path -> C:\path; other device namespaces stay intact.
+        [92, 92, 63, 92, drive, 58, 92, ..]
+            if (b'A' as u16..=b'Z' as u16).contains(drive)
+                || (b'a' as u16..=b'z' as u16).contains(drive) =>
+        {
+            native.drain(..4);
+        }
+        _ => {}
+    }
+    native.push(0);
+    Ok(native)
 }
 
 /// Places the files on the clipboard, with `text` for plain-text consumers.
@@ -453,5 +504,170 @@ pub(crate) fn capture_drop(
                 }
             }
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt, path::PathBuf};
+
+    struct Apartment;
+
+    impl Apartment {
+        fn new() -> Self {
+            unsafe { OleInitialize(std::ptr::null()).ok().unwrap() };
+            Self
+        }
+    }
+
+    impl Drop for Apartment {
+        fn drop(&mut self) {
+            unsafe { OleUninitialize() };
+        }
+    }
+
+    fn files(path: PathBuf, ownership: u64) -> FileTransfer {
+        FileTransfer {
+            paths: gpui::ExternalPaths([path].into_iter().collect()),
+            operation: FileTransferOperation::Move,
+            ownership,
+        }
+    }
+
+    #[test]
+    fn shell_accepts_forward_slashes_and_canonicalized_paths() {
+        let _apartment = Apartment::new();
+        let executable = std::env::current_exe().unwrap();
+        for path in [
+            executable.clone(),
+            PathBuf::from(executable.to_str().unwrap().replace('\\', "/")),
+            std::fs::canonicalize(&executable).unwrap(),
+        ] {
+            assert!(
+                data_object(files(path.clone(), 0), false).is_ok(),
+                "{path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_paths_preserve_native_names_and_unc_shares() {
+        for (input, expected) in [
+            (r"C:/dir/file", r"C:\dir\file"),
+            (r"\\?\C:\dir\file", r"C:\dir\file"),
+            (r"\\?\UNC\server\share\file", r"\\server\share\file"),
+            (r"\\server/share/file", r"\\server\share\file"),
+        ] {
+            let mut input: Vec<u16> = input.encode_utf16().collect();
+            let mut expected: Vec<u16> = expected.encode_utf16().collect();
+            // NTFS filenames can contain an unpaired UTF-16 surrogate.
+            input.push(0xd800);
+            expected.extend([0xd800, 0]);
+            assert_eq!(
+                shell_path(Path::new(&OsString::from_wide(&input))).unwrap(),
+                expected
+            );
+        }
+        assert!(shell_path(Path::new(&OsString::from_wide(&[65, 0, 66]))).is_err());
+    }
+
+    #[test]
+    fn data_object_uses_apartment_marshaling() {
+        let _apartment = Apartment::new();
+        let (object, _) = data_object(files(std::env::current_exe().unwrap(), 0), false).unwrap();
+        // Neither IAgileObject nor the free-threaded IMarshal may be exposed.
+        for iid in [
+            GUID::from_u128(0x94ea2b94_e9cc_49e0_c0ff_ee64ca8f5b90),
+            GUID::from_u128(0x00000003_0000_0000_c000_000000000046),
+        ] {
+            let mut interface = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { object.query(&iid, &mut interface) },
+                HRESULT(0x80004002u32 as i32)
+            );
+            assert!(interface.is_null());
+        }
+    }
+
+    #[gpui::test]
+    fn clipboard_reports_each_paste_with_fresh_effects(cx: &mut gpui::TestAppContext) {
+        let _apartment = Apartment::new();
+        let files = files(std::env::current_exe().unwrap(), 0x7e57_1001);
+        let (object, state) = data_object(files.clone(), true).unwrap();
+        let asynchronous = object.cast::<IDataObjectAsyncCapability>().unwrap();
+        let expect = |operation, source_removed| {
+            let completions = cx
+                .update(|cx| cx.take_file_transfer_completions())
+                .into_iter()
+                .filter(|completion| completion.files == files)
+                .collect::<Vec<_>>();
+            assert_eq!(completions.len(), 1);
+            assert_eq!(completions[0].operation, operation);
+            assert_eq!(completions[0].source_removed, source_removed);
+        };
+        for (result, effect, pasted, operation, removed) in [
+            (
+                S_OK,
+                EFFECT_COPY,
+                Some(EFFECT_COPY),
+                Some(FileTransferOperation::Copy),
+                true,
+            ),
+            (E_ABORT, EFFECT_MOVE, Some(EFFECT_MOVE), None, false),
+            (
+                S_OK,
+                EFFECT_MOVE,
+                Some(EFFECT_MOVE),
+                Some(FileTransferOperation::Move),
+                false,
+            ),
+            (
+                S_OK,
+                0,
+                Some(EFFECT_MOVE),
+                Some(FileTransferOperation::Move),
+                true,
+            ),
+            // No PasteSucceeded in this attempt: the previous move must not leak.
+            (S_OK, EFFECT_MOVE, None, None, false),
+        ] {
+            unsafe { asynchronous.StartOperation(None::<&IBindCtx>).ok().unwrap() };
+            assert!(state.borrow().performed.is_none());
+            assert!(state.borrow().pasted.is_none());
+            assert!(!state.borrow().recycle_bin);
+            // A repeated StartOperation must not count another extraction.
+            unsafe { asynchronous.StartOperation(None::<&IBindCtx>).ok().unwrap() };
+            set_bytes(&object, *PERFORMED, &effect.to_le_bytes()).unwrap();
+            if let Some(pasted) = pasted {
+                set_bytes(&object, *PASTED, &pasted.to_le_bytes()).unwrap();
+            }
+            unsafe {
+                asynchronous
+                    .EndOperation(result, None::<&IBindCtx>, effect)
+                    .ok()
+                    .unwrap();
+                asynchronous
+                    .EndOperation(result, None::<&IBindCtx>, effect)
+                    .ok()
+                    .unwrap();
+                assert!(asynchronous.GetAsyncMode().unwrap().as_bool());
+            }
+            expect(operation, removed);
+        }
+        assert!(!cx.update(|cx| cx.file_transfer_is_active(files.ownership)));
+
+        // Synchronous targets report through SetData without StartOperation.
+        for (effect, pasted) in [
+            (EFFECT_COPY, EFFECT_COPY),
+            (EFFECT_MOVE, 0),
+            (EFFECT_MOVE, EFFECT_MOVE),
+            (0, EFFECT_MOVE),
+        ] {
+            set_bytes(&object, *PERFORMED, &effect.to_le_bytes()).unwrap();
+            set_bytes(&object, *PASTED, &pasted.to_le_bytes()).unwrap();
+            set_bytes(&object, *PASTED, &pasted.to_le_bytes()).unwrap();
+            expect(transfer_operation(pasted), effect != EFFECT_MOVE);
+        }
     }
 }

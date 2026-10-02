@@ -179,13 +179,21 @@ impl FileTransfer {
     }
 }
 impl FileTransferCompletion {
-    /// A transfer that was cancelled, rejected, or never started.
-    pub fn cancelled(files: FileTransfer) -> Self {
+    /// A native file transfer whose receiver performs any source removal.
+    pub fn receiver_performed(
+        files: FileTransfer,
+        operation: Option<FileTransferOperation>,
+    ) -> Self {
         Self {
             files,
-            operation: None,
-            source_removed: false,
+            operation,
+            source_removed: operation == Some(FileTransferOperation::Move),
         }
+    }
+
+    /// A transfer that was cancelled, rejected, or never started.
+    pub fn cancelled(files: FileTransfer) -> Self {
+        Self::receiver_performed(files, None)
     }
 
     /// Native adapters report completion after their protocol's final event.
@@ -624,6 +632,24 @@ mod tests {
         assert_eq!(completion.files, files);
         assert_eq!(completion.operation, None);
         assert!(!completion.source_removed);
+    }
+
+    #[test]
+    fn receiver_owned_moves_never_request_source_cleanup() {
+        for operation in [
+            None,
+            Some(FileTransferOperation::Copy),
+            Some(FileTransferOperation::Move),
+        ] {
+            let files = transfer("receiver-owned", 12);
+            let completion = FileTransferCompletion::receiver_performed(files.clone(), operation);
+            assert_eq!(completion.files, files);
+            assert_eq!(completion.operation, operation);
+            assert_eq!(
+                completion.source_removed,
+                operation == Some(FileTransferOperation::Move)
+            );
+        }
     }
 
     #[test]

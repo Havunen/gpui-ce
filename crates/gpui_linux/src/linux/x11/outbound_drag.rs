@@ -32,32 +32,42 @@ struct Increment {
     offset: usize,
 }
 
-pub(super) fn run(files: FileTransfer) -> FileTransferCompletion {
-    run_on(files, None, FINISHED_TIMEOUT)
+pub(super) fn run(files: FileTransfer, on_ended: impl FnOnce()) -> FileTransferCompletion {
+    run_on(files, None, FINISHED_TIMEOUT, on_ended)
 }
 
 fn run_on(
     files: FileTransfer,
     display: Option<&str>,
     finished_timeout: Duration,
+    on_ended: impl FnOnce(),
 ) -> FileTransferCompletion {
-    let result =
-        Session::start(display).and_then(|mut session| session.run(&files, finished_timeout));
+    files.set_active(true);
+    let mut on_ended = Some(on_ended);
+    let result = Session::start(display)
+        .and_then(|mut session| session.run(&files, finished_timeout, &mut on_ended));
+    // Cancellation and connection errors must also end the pointer gesture.
+    if let Some(on_ended) = on_ended.take() {
+        on_ended();
+    }
+    files.set_active(false);
     if let Err(error) = &result {
         log::warn!("Native X11 drag stopped: {error}");
     }
-    FileTransferCompletion {
-        files,
-        operation: result.ok().flatten(),
-        source_removed: false,
-    }
+    FileTransferCompletion::receiver_performed(files, result.ok().flatten())
 }
 
-fn send(connection: &RustConnection, target: u32, kind: u32, data: [u32; 5]) -> anyhow::Result<()> {
+fn send(
+    connection: &RustConnection,
+    target: u32,
+    destination: u32,
+    kind: u32,
+    data: [u32; 5],
+) -> anyhow::Result<()> {
     connection
         .send_event(
             false,
-            target,
+            destination,
             EventMask::NO_EVENT,
             ClientMessageEvent::new(32, target, kind, data),
         )?
@@ -101,6 +111,8 @@ struct Session {
     source: u32,
     /// The aware window under the pointer, and the protocol version shared with it.
     target: u32,
+    /// Event delivery may go through a proxy; message identity remains `target`.
+    target_destination: u32,
     target_version: u32,
     /// The action the target accepted in its latest XdndStatus.
     accepted: Option<u32>,
@@ -165,6 +177,7 @@ impl Session {
             root,
             source,
             target: NONE,
+            target_destination: NONE,
             target_version: VERSION,
             accepted: None,
             dropped: false,
@@ -175,24 +188,35 @@ impl Session {
         &mut self,
         files: &FileTransfer,
         finished_timeout: Duration,
+        on_ended: &mut Option<impl FnOnce()>,
     ) -> anyhow::Result<Option<FileTransferOperation>> {
-        let result = self.drive(files, finished_timeout);
+        let result = self.drive(files, finished_timeout, on_ended);
         // A target that was entered but not dropped onto must learn the drag
         // is over, however the session ended, or it keeps its drop state.
         if !self.dropped && self.target != NONE {
-            let _ = self.send(self.target, self.atoms.XdndLeave);
+            let _ = self.send(self.atoms.XdndLeave, [self.source, 0, 0, 0, 0]);
+        }
+        if let Some(on_ended) = on_ended.take() {
+            on_ended();
         }
         result
     }
 
-    fn send(&self, target: u32, kind: u32) -> anyhow::Result<()> {
-        send(&self.connection, target, kind, [self.source, 0, 0, 0, 0])
+    fn send(&self, kind: u32, data: [u32; 5]) -> anyhow::Result<()> {
+        send(
+            &self.connection,
+            self.target,
+            self.target_destination,
+            kind,
+            data,
+        )
     }
 
     fn drive(
         &mut self,
         files: &FileTransfer,
         finished_timeout: Duration,
+        on_ended: &mut Option<impl FnOnce()>,
     ) -> anyhow::Result<Option<FileTransferOperation>> {
         let bytes = files.uri_list();
         anyhow::ensure!(!bytes.is_empty(), "No local file URLs");
@@ -216,34 +240,33 @@ impl Session {
                     }
                     let released_at = *released.get_or_insert(now);
                     if self.accepted.is_some() {
-                        send(
-                            &self.connection,
-                            self.target,
-                            self.atoms.XdndDrop,
-                            [self.source, 0, time, 0, 0],
-                        )?;
+                        self.send(self.atoms.XdndDrop, [self.source, 0, time, 0, 0])?;
+                        self.dropped = true;
+                        // Let the UI end this gesture before another press can
+                        // reach it. Selection ownership continues until Finished.
+                        if let Some(on_ended) = on_ended.take() {
+                            on_ended();
+                        }
                         self.connection.ungrab_pointer(CURRENT_TIME)?;
                         self.connection.ungrab_keyboard(CURRENT_TIME)?;
                         self.connection.flush()?;
-                        self.dropped = true;
                         finished_deadline = Some(now + finished_timeout);
                     } else if released_at.elapsed() > STATUS_GRACE {
                         return Ok(None);
                     }
                 } else {
-                    let (next_target, version) = self.target_under_pointer()?;
-                    if next_target != self.target {
+                    let (next_target, destination, version) = self.target_under_pointer()?;
+                    if (next_target, destination) != (self.target, self.target_destination) {
                         if self.target != NONE {
-                            self.send(self.target, self.atoms.XdndLeave)?;
+                            self.send(self.atoms.XdndLeave, [self.source, 0, 0, 0, 0])?;
                         }
                         self.target = next_target;
+                        self.target_destination = destination;
                         self.target_version = version.min(VERSION);
                         self.accepted = None;
                         last_position = None;
                         if self.target != NONE {
-                            send(
-                                &self.connection,
-                                self.target,
+                            self.send(
                                 self.atoms.XdndEnter,
                                 [self.source, self.target_version << 24, self.atoms.URI, 0, 0],
                             )?;
@@ -260,9 +283,7 @@ impl Session {
                         ((pointer.root_x as u16 as u32) << 16) | pointer.root_y as u16 as u32;
                     if self.target != NONE && last_position != Some((coordinates, requested_action))
                     {
-                        send(
-                            &self.connection,
-                            self.target,
+                        self.send(
                             self.atoms.XdndPosition,
                             [self.source, 0, coordinates, time, requested_action],
                         )?;
@@ -433,17 +454,25 @@ impl Session {
 
     /// The deepest Xdnd-aware window under the pointer, honouring XdndProxy,
     /// and the protocol version it announces.
-    fn target_under_pointer(&self) -> anyhow::Result<(u32, u32)> {
+    fn target_under_pointer(&self) -> anyhow::Result<(u32, u32, u32)> {
         let mut current = self.root;
         let mut target = NONE;
+        let mut destination = NONE;
         let mut version = 0;
         // Walk through window-manager frames to the deepest aware client window.
         for _ in 0..64 {
-            if current != self.source
-                && let Some(announced) = self.window_property(current, self.atoms.XdndAware)?
-            {
-                target = current;
-                version = announced;
+            if current != self.source {
+                let mut receiver = current;
+                if let Some(proxy) = self.window_property(current, self.atoms.XdndProxy)?
+                    && self.window_property(proxy, self.atoms.XdndProxy)? == Some(proxy)
+                {
+                    receiver = proxy;
+                }
+                if let Some(announced) = self.window_property(receiver, self.atoms.XdndAware)? {
+                    target = current;
+                    destination = receiver;
+                    version = announced;
+                }
             }
             // A window destroyed during the walk simply has no children.
             let Some(pointer) = self.connection.query_pointer(current)?.reply().ok() else {
@@ -454,16 +483,7 @@ impl Session {
             }
             current = pointer.child;
         }
-        if target != NONE
-            && let Some(proxy) = self.window_property(target, self.atoms.XdndProxy)?
-            && self.window_property(proxy, self.atoms.XdndProxy)? == Some(proxy)
-        {
-            target = proxy;
-            if let Some(announced) = self.window_property(proxy, self.atoms.XdndAware)? {
-                version = announced;
-            }
-        }
-        Ok((target, version))
+        Ok((target, destination, version))
     }
 
     /// The first 32-bit value of `property` on `window`, or `None` when the
@@ -621,24 +641,38 @@ mod tests {
         }
 
         fn drag(&self, finished_timeout: Duration) -> JoinHandle<FileTransferCompletion> {
+            self.drag_with(FileTransferOperation::Copy, finished_timeout, || {})
+        }
+
+        fn drag_with(
+            &self,
+            operation: FileTransferOperation,
+            finished_timeout: Duration,
+            on_ended: impl FnOnce() + Send + 'static,
+        ) -> JoinHandle<FileTransferCompletion> {
             let display = self.server.display.clone();
             let files = FileTransfer {
                 paths: gpui::ExternalPaths([PathBuf::from("/tmp/dragged")].into_iter().collect()),
-                operation: FileTransferOperation::Copy,
+                operation,
                 ownership: 11,
             };
-            std::thread::spawn(move || run_on(files, Some(&display), finished_timeout))
+            std::thread::spawn(move || run_on(files, Some(&display), finished_timeout, on_ended))
         }
 
         /// The next Xdnd message of the given kind, panicking if another kind
         /// arrives first or nothing arrives in time.
         fn expect(&self, kind: u32) -> [u32; 5] {
+            self.expect_on(&self.connection, kind)
+        }
+
+        fn expect_on(&self, connection: &RustConnection, kind: u32) -> [u32; 5] {
             let deadline = Instant::now() + Duration::from_secs(10);
             while Instant::now() < deadline {
-                if let Some(Event::ClientMessage(message)) =
-                    self.connection.poll_for_event().unwrap()
-                    && message.window == self.window
-                {
+                if let Some(Event::ClientMessage(message)) = connection.poll_for_event().unwrap() {
+                    assert_eq!(
+                        message.window, self.window,
+                        "messages identify the logical target"
+                    );
                     assert_eq!(message.type_, kind, "unexpected Xdnd message");
                     return message.data.as_data32();
                 }
@@ -648,7 +682,7 @@ mod tests {
         }
 
         fn reply(&self, source: u32, kind: u32, data: [u32; 5]) {
-            send(&self.connection, source, kind, data).unwrap();
+            send(&self.connection, source, source, kind, data).unwrap();
         }
     }
 
@@ -726,5 +760,114 @@ mod tests {
         target.expect(target.atoms.XdndEnter);
         target.button(BUTTON_RELEASE_EVENT);
         assert_eq!(session.join().unwrap().operation, None);
+    }
+
+    #[test]
+    fn proxy_delivery_retains_the_target_identity() {
+        let target = target_or_skip!(5);
+        // A different client owns the proxy, so delivery to the wrong window
+        // cannot accidentally satisfy the assertions on ClientMessage.window.
+        let (proxy, _) = x11rb::connect(Some(&target.server.display)).unwrap();
+        let proxy_window = proxy.generate_id().unwrap();
+        proxy
+            .create_window(
+                0,
+                proxy_window,
+                target.root,
+                -10,
+                -10,
+                1,
+                1,
+                0,
+                WindowClass::INPUT_ONLY,
+                0,
+                &CreateWindowAux::new(),
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        proxy
+            .change_property32(
+                PropMode::REPLACE,
+                proxy_window,
+                target.atoms.XdndProxy,
+                AtomEnum::WINDOW,
+                &[proxy_window],
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        proxy
+            .change_property32(
+                PropMode::REPLACE,
+                proxy_window,
+                target.atoms.XdndAware,
+                AtomEnum::ATOM,
+                &[4],
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        target.set_proxy(proxy_window);
+        // Only the proxy needs to advertise XdndAware.
+        target
+            .connection
+            .delete_property(target.window, target.atoms.XdndAware)
+            .unwrap()
+            .check()
+            .unwrap();
+
+        let session = target.drag(FINISHED_TIMEOUT);
+        let [source, flags, ..] = target.expect_on(&proxy, target.atoms.XdndEnter);
+        assert_eq!(flags >> 24, 4, "use the proxy's protocol version");
+        target.expect_on(&proxy, target.atoms.XdndPosition);
+        target.reply(
+            source,
+            target.atoms.XdndStatus,
+            [target.window, 1, 0, 0, target.atoms.XdndActionCopy],
+        );
+        target.button(BUTTON_RELEASE_EVENT);
+        target.expect_on(&proxy, target.atoms.XdndDrop);
+        target.reply(
+            source,
+            target.atoms.XdndFinished,
+            [target.window, 0, 0, 0, 0],
+        );
+        assert_eq!(
+            session.join().unwrap().operation,
+            Some(FileTransferOperation::Copy)
+        );
+    }
+
+    #[test]
+    fn gesture_ends_before_receiver_owned_move_finishes() {
+        let target = target_or_skip!(5);
+        let (ended, gesture) = std::sync::mpsc::channel();
+        let session = target.drag_with(FileTransferOperation::Move, FINISHED_TIMEOUT, move || {
+            ended.send(()).unwrap();
+        });
+        let [source, ..] = target.expect(target.atoms.XdndEnter);
+        target.expect(target.atoms.XdndPosition);
+        target.reply(
+            source,
+            target.atoms.XdndStatus,
+            [target.window, 1, 0, 0, target.atoms.XdndActionMove],
+        );
+        target.button(BUTTON_RELEASE_EVENT);
+        target.expect(target.atoms.XdndDrop);
+        gesture.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(
+            !session.is_finished(),
+            "filesystem completion is still pending"
+        );
+        target.reply(
+            source,
+            target.atoms.XdndFinished,
+            [target.window, 1, target.atoms.XdndActionMove, 0, 0],
+        );
+        let completion = session.join().unwrap();
+        assert_eq!(completion.operation, Some(FileTransferOperation::Move));
+        assert!(completion.source_removed);
+        assert!(gesture.try_recv().is_err(), "the gesture ends exactly once");
     }
 }

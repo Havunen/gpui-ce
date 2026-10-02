@@ -1331,6 +1331,13 @@ impl App {
         self.platform.active_window()
     }
 
+    /// Returns the id of the window currently being updated (drawn or
+    /// dispatching an event), if any. `None` outside any window update, e.g.
+    /// in app-level callbacks or when effects are flushed.
+    pub fn current_window_id(&self) -> Option<WindowId> {
+        self.window_update_stack.last().copied()
+    }
+
     /// Opens a new window with the given option and the root view returned by the given function.
     /// The function is invoked with a `Window`, which can be used to interact with window-specific
     /// functionality.
@@ -3331,6 +3338,29 @@ mod test {
         cx.to_async().refresh();
 
         assert_eq!(render_count.get(), render_count_before_refresh + 1);
+    }
+
+    #[gpui::test]
+    fn current_window_id_is_the_window_being_updated(cx: &mut TestAppContext) {
+        let render_count = Rc::new(Cell::new(0));
+        let first = cx.add_window({
+            let render_count = render_count.clone();
+            move |_, _| RenderCounter(render_count)
+        });
+        let second = cx.add_window(move |_, _| RenderCounter(render_count));
+
+        cx.update(|cx| assert_eq!(cx.current_window_id(), None));
+        first
+            .update(cx, |_, _, cx| {
+                assert_eq!(cx.current_window_id(), Some(first.window_id()));
+                second
+                    .update(cx, |_, _, cx| {
+                        assert_eq!(cx.current_window_id(), Some(second.window_id()));
+                    })
+                    .unwrap();
+                assert_eq!(cx.current_window_id(), Some(first.window_id()));
+            })
+            .unwrap();
     }
 
     #[test]
