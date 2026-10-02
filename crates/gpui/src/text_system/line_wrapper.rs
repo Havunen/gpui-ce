@@ -1360,22 +1360,16 @@ mod tests {
                 )
                 .unwrap();
 
+            // Each line breaks after a space, which hangs: the boundary records
+            // where that space begins.
+            let boundary = |glyph_ix: usize| WrapBoundary {
+                run_ix: 0,
+                glyph_ix,
+                trailing_whitespace_x: lines[0].layout.runs()[0].glyphs[glyph_ix - 1].position.x,
+            };
             assert_eq!(
                 lines[0].layout.wrap_boundaries(),
-                &[
-                    WrapBoundary {
-                        run_ix: 0,
-                        glyph_ix: 7
-                    },
-                    WrapBoundary {
-                        run_ix: 0,
-                        glyph_ix: 12
-                    },
-                    WrapBoundary {
-                        run_ix: 0,
-                        glyph_ix: 18
-                    }
-                ],
+                &[boundary(7), boundary(12), boundary(18)],
             );
         });
     }

@@ -352,14 +352,14 @@ fn paint_line(
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
-    let line_bounds = Bounds::new(
+    let lines = AlignedLines {
         origin,
-        size(
-            layout.width,
-            line_height * (wrap_boundaries.len() as f32 + 1.),
-        ),
-    );
-    window.paint_layer(line_bounds, |window| {
+        layout,
+        wrap_boundaries,
+        align,
+        align_width: align_width.unwrap_or(layout.width),
+    };
+    window.paint_layer(lines.bounds(line_height), |window| {
         let padding_top = (line_height - layout.ascent - layout.descent) / 2.;
         let baseline_offset = point(px(0.), padding_top + layout.ascent);
         let mut decoration_runs = decoration_runs.iter();
@@ -369,31 +369,24 @@ fn paint_line(
         let mut current_underline: Option<(Point<Pixels>, UnderlineStyle)> = None;
         let mut current_strikethrough: Option<(Point<Pixels>, StrikethroughStyle)> = None;
         let text_system = cx.text_system().clone();
-        let mut glyph_origin = point(
-            aligned_origin_x(
-                origin,
-                align_width.unwrap_or(layout.width),
-                px(0.0),
-                &align,
-                layout,
-                wraps.peek(),
-            ),
-            origin.y,
-        );
+        let mut line_ix = 0;
+        let mut glyph_origin = point(lines.start_x(0), origin.y);
         let mut prev_glyph_position = Point::default();
         let mut max_glyph_size = size(px(0.), px(0.));
-        let mut first_glyph_x = origin.x;
         for (run_ix, run) in layout.runs.iter().enumerate() {
             max_glyph_size = text_system.bounding_box(run.font_id, layout.font_size).size;
 
             for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
                 glyph_origin.x += glyph.position.x - prev_glyph_position.x;
-                if glyph_ix == 0 && run_ix == 0 {
-                    first_glyph_x = glyph_origin.x;
-                }
 
-                if wraps.peek() == Some(&&WrapBoundary { run_ix, glyph_ix }) {
-                    wraps.next();
+                if wraps
+                    .next_if(|boundary| boundary.is_at(run_ix, glyph_ix))
+                    .is_some()
+                {
+                    // A decoration that runs on continues where alignment
+                    // puts the next line, not at the origin.
+                    line_ix += 1;
+                    let next_line_x = lines.start_x(line_ix);
                     if let Some((underline_origin, underline_style)) = current_underline.as_mut() {
                         if glyph_origin.x == underline_origin.x {
                             underline_origin.x -= max_glyph_size.width.half();
@@ -404,7 +397,7 @@ fn paint_line(
                             underline_style,
                         );
                         if glyph.index < run_end {
-                            underline_origin.x = origin.x;
+                            underline_origin.x = next_line_x;
                             underline_origin.y += line_height;
                         } else {
                             current_underline = None;
@@ -422,21 +415,14 @@ fn paint_line(
                             strikethrough_style,
                         );
                         if glyph.index < run_end {
-                            strikethrough_origin.x = origin.x;
+                            strikethrough_origin.x = next_line_x;
                             strikethrough_origin.y += line_height;
                         } else {
                             current_strikethrough = None;
                         }
                     }
 
-                    glyph_origin.x = aligned_origin_x(
-                        origin,
-                        align_width.unwrap_or(layout.width),
-                        glyph.position.x,
-                        &align,
-                        layout,
-                        wraps.peek(),
-                    );
+                    glyph_origin.x = next_line_x;
                     glyph_origin.y += line_height;
                 }
                 prev_glyph_position = glyph.position;
@@ -554,12 +540,7 @@ fn paint_line(
             }
         }
 
-        let mut last_line_end_x = first_glyph_x + layout.width;
-        if let Some(boundary) = wrap_boundaries.last() {
-            let run = &layout.runs[boundary.run_ix];
-            let glyph = &run.glyphs[boundary.glyph_ix];
-            last_line_end_x -= glyph.position.x;
-        }
+        let last_line_end_x = lines.end_x(wrap_boundaries.len());
 
         if let Some((mut underline_start, underline_style)) = current_underline.take() {
             if last_line_end_x == underline_start.x {
@@ -598,30 +579,21 @@ fn paint_line_background(
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
-    let line_bounds = Bounds::new(
+    let lines = AlignedLines {
         origin,
-        size(
-            layout.width,
-            line_height * (wrap_boundaries.len() as f32 + 1.),
-        ),
-    );
-    window.paint_layer(line_bounds, |window| {
+        layout,
+        wrap_boundaries,
+        align,
+        align_width: align_width.unwrap_or(layout.width),
+    };
+    window.paint_layer(lines.bounds(line_height), |window| {
         let mut decoration_runs = decoration_runs.iter();
         let mut wraps = wrap_boundaries.iter().peekable();
         let mut run_end = 0;
         let mut current_background: Option<(Point<Pixels>, Hsla)> = None;
         let text_system = cx.text_system().clone();
-        let mut glyph_origin = point(
-            aligned_origin_x(
-                origin,
-                align_width.unwrap_or(layout.width),
-                px(0.0),
-                &align,
-                layout,
-                wraps.peek(),
-            ),
-            origin.y,
-        );
+        let mut line_ix = 0;
+        let mut glyph_origin = point(lines.start_x(0), origin.y);
         let mut prev_glyph_position = Point::default();
         let mut max_glyph_size = size(px(0.), px(0.));
         for (run_ix, run) in layout.runs.iter().enumerate() {
@@ -630,8 +602,12 @@ fn paint_line_background(
             for (glyph_ix, glyph) in run.glyphs.iter().enumerate() {
                 glyph_origin.x += glyph.position.x - prev_glyph_position.x;
 
-                if wraps.peek() == Some(&&WrapBoundary { run_ix, glyph_ix }) {
-                    wraps.next();
+                if wraps
+                    .next_if(|boundary| boundary.is_at(run_ix, glyph_ix))
+                    .is_some()
+                {
+                    line_ix += 1;
+                    let next_line_x = lines.start_x(line_ix);
                     if let Some((background_origin, background_color)) = current_background.as_mut()
                     {
                         if glyph_origin.x == background_origin.x {
@@ -645,21 +621,14 @@ fn paint_line_background(
                             *background_color,
                         ));
                         if glyph.index < run_end {
-                            background_origin.x = origin.x;
+                            background_origin.x = next_line_x;
                             background_origin.y += line_height;
                         } else {
                             current_background = None;
                         }
                     }
 
-                    glyph_origin.x = aligned_origin_x(
-                        origin,
-                        align_width.unwrap_or(layout.width),
-                        glyph.position.x,
-                        &align,
-                        layout,
-                        wraps.peek(),
-                    );
+                    glyph_origin.x = next_line_x;
                     glyph_origin.y += line_height;
                 }
                 prev_glyph_position = glyph.position;
@@ -712,12 +681,7 @@ fn paint_line_background(
             }
         }
 
-        let mut last_line_end_x = origin.x + layout.width;
-        if let Some(boundary) = wrap_boundaries.last() {
-            let run = &layout.runs[boundary.run_ix];
-            let glyph = &run.glyphs[boundary.glyph_ix];
-            last_line_end_x -= glyph.position.x;
-        }
+        let last_line_end_x = lines.end_x(wrap_boundaries.len());
 
         if let Some((mut background_origin, background_color)) = current_background.take() {
             if last_line_end_x == background_origin.x {
@@ -736,26 +700,59 @@ fn paint_line_background(
     })
 }
 
-fn aligned_origin_x(
+/// Where a layout's lines are painted once aligned: visual line `line_ix`
+/// starts at `start_x(line_ix)` and runs its own width from there.
+struct AlignedLines<'a> {
     origin: Point<Pixels>,
+    layout: &'a LineLayout,
+    wrap_boundaries: &'a [WrapBoundary],
+    align: TextAlign,
     align_width: Pixels,
-    last_glyph_x: Pixels,
-    align: &TextAlign,
-    layout: &LineLayout,
-    wrap_boundary: Option<&&WrapBoundary>,
-) -> Pixels {
-    let end_of_line = if let Some(WrapBoundary { run_ix, glyph_ix }) = wrap_boundary {
-        layout.runs[*run_ix].glyphs[*glyph_ix].position.x
-    } else {
-        layout.width
-    };
+}
 
-    let line_width = end_of_line - last_glyph_x;
+impl AlignedLines<'_> {
+    /// Where visual line `line_ix` starts.
+    fn start_x(&self, line_ix: usize) -> Pixels {
+        self.origin.x
+            + self.layout.wrapped_line_offset(
+                self.wrap_boundaries,
+                line_ix,
+                self.align,
+                self.align_width,
+            )
+    }
 
-    match align {
-        TextAlign::Left => origin.x,
-        TextAlign::Center => (origin.x * 2.0 + align_width - line_width) / 2.0,
-        TextAlign::Right => origin.x + align_width - line_width,
+    /// Where visual line `line_ix` ends, the whitespace it was wrapped at included.
+    fn end_x(&self, line_ix: usize) -> Pixels {
+        self.start_x(line_ix)
+            + self
+                .layout
+                .wrapped_line_extent(self.wrap_boundaries, line_ix)
+                .width()
+    }
+
+    /// The area the lines cover: `line_height` per line, from the leftmost line
+    /// start to the rightmost line end, which lies past the box when a line is
+    /// wider than it or hangs whitespace over its edge.
+    fn bounds(&self, line_height: Pixels) -> Bounds<Pixels> {
+        let line_count = self.wrap_boundaries.len() + 1;
+        let height = line_height * line_count as f32;
+        // Left-aligned lines all start at the origin and none is wider than the
+        // unwrapped layout, so that width covers them without a pass over the
+        // lines; the layer is clipped to the content mask anyway.
+        if self.align == TextAlign::Left {
+            return Bounds::new(self.origin, size(self.layout.width, height));
+        }
+        let (mut left, mut right) = (Pixels::MAX, Pixels::MIN);
+        for extent in self.layout.wrapped_line_extents(self.wrap_boundaries) {
+            let offset = extent.alignment_offset(self.align, self.align_width);
+            left = left.min(offset);
+            right = right.max(offset + extent.width());
+        }
+        Bounds::from_corners(
+            point(self.origin.x + left, self.origin.y),
+            point(self.origin.x + right, self.origin.y + height),
+        )
     }
 }
 
@@ -797,6 +794,72 @@ mod tests {
             text: SharedString::new(text),
             decoration_runs: SmallVec::from(decorations.to_vec()),
         }
+    }
+
+    #[test]
+    fn aligned_lines_start_and_end_where_their_glyphs_are_painted() {
+        // "abc efg ij" in 10px glyphs, wrapped at both spaces, painted in a 60px
+        // box: lines of 40, 40 and 20px that align as 30, 30 and 20px.
+        let glyphs: Vec<_> = (0..10).map(|ix| (ix, ix as f32 * 10.)).collect();
+        let line = make_shaped_line("abc efg ij", &glyphs, 100., &[]);
+        let wrap_boundaries = [
+            WrapBoundary {
+                run_ix: 0,
+                glyph_ix: 4,
+                trailing_whitespace_x: px(30.),
+            },
+            WrapBoundary {
+                run_ix: 0,
+                glyph_ix: 8,
+                trailing_whitespace_x: px(70.),
+            },
+        ];
+        let lines = |align| AlignedLines {
+            origin: point(px(100.), px(50.)),
+            layout: &line.layout,
+            wrap_boundaries: &wrap_boundaries,
+            align,
+            align_width: px(60.),
+        };
+        let bounds = |left, right| {
+            Bounds::from_corners(point(px(left), px(50.)), point(px(right), px(110.)))
+        };
+
+        // Left-aligned lines never shift; their layer spans the unwrapped
+        // layout, which no line exceeds.
+        assert_eq!(lines(TextAlign::Left).start_x(2), px(100.));
+        assert_eq!(lines(TextAlign::Left).end_x(2), px(120.));
+        assert_eq!(lines(TextAlign::Left).bounds(px(20.)), bounds(100., 200.));
+
+        // Centred lines start at 15, 15 and 20; the first two hang a space
+        // past their aligned end.
+        assert_eq!(lines(TextAlign::Center).start_x(0), px(115.));
+        assert_eq!(lines(TextAlign::Center).end_x(0), px(155.));
+        assert_eq!(lines(TextAlign::Center).bounds(px(20.)), bounds(115., 155.));
+
+        // Right-aligned lines start at 30, 30 and 40 and hang over the box.
+        assert_eq!(lines(TextAlign::Right).start_x(2), px(140.));
+        assert_eq!(lines(TextAlign::Right).end_x(2), px(160.));
+        assert_eq!(lines(TextAlign::Right).bounds(px(20.)), bounds(130., 170.));
+
+        // Lines wider than a 20px box overhang it on both sides.
+        let overflowing = AlignedLines {
+            align_width: px(20.),
+            ..lines(TextAlign::Center)
+        };
+        assert_eq!(overflowing.start_x(0), px(95.));
+        assert_eq!(overflowing.bounds(px(20.)), bounds(95., 135.));
+
+        // An unwrapped line covers exactly its width and height.
+        let unwrapped = AlignedLines {
+            wrap_boundaries: &[],
+            align_width: px(100.),
+            ..lines(TextAlign::Right)
+        };
+        assert_eq!(
+            unwrapped.bounds(px(20.)),
+            Bounds::from_corners(point(px(100.), px(50.)), point(px(200.), px(70.)))
+        );
     }
 
     #[test]
