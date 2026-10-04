@@ -88,18 +88,25 @@ pub fn scene(frame: usize) -> Scene {
     scene
 }
 
-/// Asserts that every triangle `scene(frame)` draws painted its interior. The
-/// background clears to black (or transparent), and every path color is bright.
+/// Asserts that every triangle `scene(frame)` draws painted its interior, compared
+/// with the cleared background in the corner the scene leaves empty. Backends clear
+/// opaque windows to different colors.
 pub fn assert_paths_painted(rgba: &[u8], width: u32, frame: usize) {
+    let height = (rgba.len() / 4) as u32 / width;
+    let pixel = |x: u32, y: u32| {
+        let offset = (y * width + x) as usize * 4;
+        &rgba[offset..offset + 4]
+    };
+    let background = pixel(width - 1, height - 1);
     for row in 0..4 {
         let (x, y) = triangle_origin(frame, row);
         // The centroid, clear of the row's quad.
         let (x, y) = ((x + 32.75 / 3.) as u32, (y + 33.75 / 3.) as u32);
-        let offset = (y * width + x) as usize * 4;
-        let pixel = &rgba[offset..offset + 4];
+        let painted = pixel(x, y);
         assert!(
-            pixel[..3].iter().any(|channel| *channel >= 32),
-            "frame {frame}: the row {row} path did not paint ({x}, {y}): {pixel:?}"
+            max_difference(&painted[..3], &background[..3]) >= 32,
+            "frame {frame}: the row {row} path did not paint ({x}, {y}): \
+             {painted:?} on {background:?}"
         );
     }
 }
