@@ -5240,6 +5240,36 @@ pub mod Windows {
                     );
                 }
             }
+            pub unsafe fn PSGetShaderResources(
+                &self,
+                startslot: u32,
+                numviews: u32,
+                ppshaderresourceviews: Option<*mut Option<ID3D11ShaderResourceView>>,
+            ) {
+                unsafe {
+                    (windows_core::Interface::vtable(self).PSGetShaderResources)(
+                        windows_core::Interface::as_raw(self),
+                        startslot,
+                        numviews,
+                        ppshaderresourceviews.unwrap_or(core::mem::zeroed()) as _,
+                    );
+                }
+            }
+            pub unsafe fn VSGetShaderResources(
+                &self,
+                startslot: u32,
+                numviews: u32,
+                ppshaderresourceviews: Option<*mut Option<ID3D11ShaderResourceView>>,
+            ) {
+                unsafe {
+                    (windows_core::Interface::vtable(self).VSGetShaderResources)(
+                        windows_core::Interface::as_raw(self),
+                        startslot,
+                        numviews,
+                        ppshaderresourceviews.unwrap_or(core::mem::zeroed()) as _,
+                    );
+                }
+            }
             pub unsafe fn ClearState(&self) {
                 unsafe {
                     (windows_core::Interface::vtable(self).ClearState)(
@@ -5421,7 +5451,12 @@ pub mod Windows {
             CSSetSamplers: usize,
             CSSetConstantBuffers: usize,
             VSGetConstantBuffers: usize,
-            PSGetShaderResources: usize,
+            pub PSGetShaderResources: unsafe extern "system" fn(
+                *mut core::ffi::c_void,
+                u32,
+                u32,
+                *mut *mut core::ffi::c_void,
+            ),
             PSGetShader: usize,
             PSGetSamplers: usize,
             VSGetShader: usize,
@@ -5432,7 +5467,12 @@ pub mod Windows {
             GSGetConstantBuffers: usize,
             GSGetShader: usize,
             IAGetPrimitiveTopology: usize,
-            VSGetShaderResources: usize,
+            pub VSGetShaderResources: unsafe extern "system" fn(
+                *mut core::ffi::c_void,
+                u32,
+                u32,
+                *mut *mut core::ffi::c_void,
+            ),
             VSGetSamplers: usize,
             GetPredication: usize,
             GSGetShaderResources: usize,

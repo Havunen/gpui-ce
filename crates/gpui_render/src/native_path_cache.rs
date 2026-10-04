@@ -11,6 +11,8 @@ pub struct Entry<T> {
     pub resource: T,
     pub bounds: PixelRect,
     _lease: RetentionLease,
+    _window_lease: RetentionLease,
+    _geometry_lease: RetentionLease,
     key: u64,
     vertices: Vec<PathRasterizationVertex>,
 }
@@ -18,6 +20,8 @@ pub struct Entry<T> {
 pub struct PathCache<T> {
     entries: Vec<Arc<Entry<T>>>,
     budget: RetentionBudget,
+    window_budget: RetentionBudget,
+    geometry_budget: RetentionBudget,
     warmed: usize,
     pub hits: u64,
     pub misses: u64,
@@ -88,6 +92,8 @@ impl<T> PathCache<T> {
         Self {
             entries: Vec::new(),
             budget,
+            window_budget: RetentionBudget::new(WINDOW_LAYER_BYTES),
+            geometry_budget: RetentionBudget::new(1024 * 1024),
             warmed: 0,
             hits: 0,
             misses: 0,
@@ -99,7 +105,7 @@ impl<T> PathCache<T> {
         self.misses = 0;
     }
     pub fn bytes(&self) -> u64 {
-        self.entries.iter().map(|entry| entry.bounds.bytes()).sum()
+        self.window_budget.used()
     }
     pub fn clear(&mut self) {
         self.entries.clear();
@@ -149,26 +155,31 @@ impl<T> PathCache<T> {
         }
         while !self.entries.is_empty()
             && (self.bytes().saturating_add(bounds.bytes()) > WINDOW_LAYER_BYTES
-                || self
-                    .entries
-                    .iter()
-                    .map(|e| std::mem::size_of_val(e.vertices.as_slice()))
-                    .sum::<usize>()
-                    .saturating_add(geometry)
-                    > GEOMETRY_BYTES)
+                || self.geometry_budget.used().saturating_add(geometry as u64)
+                    > GEOMETRY_BYTES as u64)
         {
             self.entries.remove(0);
         }
         let Some(lease) = self.budget.try_acquire(bounds.bytes()) else {
             return Ok(None);
         };
+        let Some(window_lease) = self.window_budget.try_acquire(bounds.bytes()) else {
+            return Ok(None);
+        };
+        let Some(geometry_lease) = self.geometry_budget.try_acquire(geometry as u64) else {
+            return Ok(None);
+        };
         let resource = create()?;
+        let mut vertices = Vec::with_capacity(path_types::rasterization_vertex_count(paths));
+        vertices.extend(path_types::rasterization_vertices(paths));
         let entry = Arc::new(Entry {
             resource,
             bounds,
             _lease: lease,
+            _window_lease: window_lease,
+            _geometry_lease: geometry_lease,
             key: path_plan::fingerprint(paths),
-            vertices: path_types::rasterization_vertices(paths).collect(),
+            vertices,
         });
         self.entries.push(entry.clone());
         self.warmed += 1;
@@ -179,6 +190,42 @@ impl<T> PathCache<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn window_limit_includes_evicted_entries_awaiting_gpu_completion() {
+        let budget = RetentionBudget::default();
+        let mut cache = PathCache::new(budget.clone());
+        let bounds = PixelRect {
+            width: 1600,
+            height: 1000,
+            ..Default::default()
+        };
+        let inflight = cache
+            .capture(&[], bounds, || Ok::<_, ()>(1))
+            .unwrap()
+            .unwrap();
+        cache.clear();
+        cache.begin();
+        assert_eq!(cache.bytes(), bounds.bytes());
+        assert!(
+            cache
+                .capture(&[], bounds, || -> Result<i32, ()> {
+                    panic!("window budget exceeded")
+                })
+                .unwrap()
+                .is_none()
+        );
+        drop(inflight);
+        assert_eq!(cache.bytes(), 0);
+        assert!(
+            cache
+                .capture(&[], bounds, || Ok::<_, ()>(2))
+                .unwrap()
+                .is_some()
+        );
+        cache.clear();
+        assert_eq!(budget.used(), 0);
+    }
+
     #[test]
     fn admission_is_bounded_and_inflight_leases_survive_eviction() {
         let budget = RetentionBudget::new(128);

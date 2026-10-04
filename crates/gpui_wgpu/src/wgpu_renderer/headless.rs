@@ -260,6 +260,56 @@ mod path_target_tests {
     }
 
     #[test]
+    fn failed_frames_discard_unsubmitted_path_captures_and_report_failure() {
+        use gpui_render::optimization_fixture as fixture;
+        let context = WgpuContext::new_headless(None).unwrap();
+        for packed in [false, true] {
+            let viewport = fixture::viewport(0);
+            let mut candidate = WgpuRenderer::new_headless(&context, viewport).unwrap();
+            candidate.options.cached_layers = true;
+            candidate.options.batched_paths = packed;
+            let mut failed = fixture::scene(0);
+            let bounds = Bounds::new(
+                point(ScaledPixels(0.), ScaledPixels(0.)),
+                size(ScaledPixels(40.), ScaledPixels(40.)),
+            );
+            failed.insert_primitive(gpui::PaintSurface {
+                order: 1000,
+                bounds,
+                content_mask: gpui::ContentMask {
+                    bounds,
+                    ..Default::default()
+                },
+                source: gpui::SurfaceSource::Unsupported(size(DevicePixels(40), DevicePixels(40))),
+            });
+            failed.surfaces[0].order = 1000; // Fail after paths have encoded their captures.
+            failed.finish();
+            assert!(candidate.render_to_image(&failed).is_err());
+            assert_eq!(candidate.resources().path_cache.borrow().bytes(), 0);
+            if gpui::gpu_profiler::enabled() {
+                let frames = gpui::gpu_profiler::GpuFrameCollector::default().collect_unseen();
+                assert!(frames.iter().any(|f| f.renderer_id == candidate.renderer_id
+                    && matches!(f.status, "render_failed" | "unsupported")
+                    && f.gpu_duration_ns.is_none()));
+            }
+            let mut reference = WgpuRenderer::new_headless(&context, viewport).unwrap();
+            reference.options = Default::default();
+            let scene = fixture::scene(0);
+            let expected = reference.render_to_image(&scene).unwrap();
+            for _ in 0..3 {
+                let actual = candidate.render_to_image(&scene).unwrap();
+                assert!(
+                    actual
+                        .as_raw()
+                        .iter()
+                        .zip(expected.as_raw())
+                        .all(|(a, b)| a.abs_diff(*b) <= 1)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn native_gpu_fixture_covers_cached_packed_and_retained_rendering() {
         use gpui_render::optimization_fixture as fixture;
         let context = WgpuContext::new_headless(None).unwrap();

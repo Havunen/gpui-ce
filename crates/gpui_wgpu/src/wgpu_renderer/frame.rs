@@ -585,23 +585,39 @@ impl<'a> FrameEncoder<'a> {
             }
         }
         if result.is_err() {
+            // Captures were encoded into the discarded command buffer. They must never
+            // become hits on the next frame, even when their geometry is unchanged.
+            self.renderer.resources().path_cache.borrow_mut().clear();
             if let Some(retained) = self.renderer.resources().retained.borrow_mut().as_mut() {
                 retained.snapshot = None;
             }
+        }
+        // Binding caches own texture views too. Remove evicted entries after all
+        // captures, while this frame's command buffer and completion leases own uses.
+        if self.renderer.options.cached_layers {
+            let resources = self.renderer.resources();
+            let mut views = resources.path_cache.borrow().views();
+            views.extend(resources.path_intermediate_view.iter().cloned());
+            resources.instances.retain_path_bindings(&views);
         }
         self.instances.finish(&mut self.encoder);
         self.renderer.resources().finish_frame_uploads();
         if let Some(trace) = &self.renderer.resources().gpu_trace {
             if result.is_ok() {
                 let cache = self.renderer.resources().path_cache.borrow();
-                trace.cache_stats(cache.bytes(), cache.hits, cache.misses);
+                trace.cache_stats(
+                    cache.bytes(),
+                    cache.hits,
+                    cache.misses,
+                    super::shared::retention_budget(&self.renderer.resources().device).used(),
+                );
                 trace.resolve(&mut self.encoder);
             } else {
                 trace.cancel();
             }
         }
         let command_buffer = self.encoder.finish();
-        let used_paths = self
+        let mut used_paths: Vec<_> = self
             .paths
             .into_iter()
             .filter_map(|path| match path {
@@ -609,6 +625,13 @@ impl<'a> FrameEncoder<'a> {
                 _ => None,
             })
             .collect();
+        used_paths.extend(
+            self.renderer
+                .resources()
+                .path_cache
+                .borrow_mut()
+                .take_captures(),
+        );
         result.map(|()| (command_buffer, used_paths))
     }
 

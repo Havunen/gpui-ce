@@ -131,9 +131,10 @@ impl GpuTrace {
         })
     }
 
-    pub(super) fn cache_stats(&self, bytes: u64, hits: u64, misses: u64) {
+    pub(super) fn cache_stats(&self, bytes: u64, hits: u64, misses: u64, retained_bytes: u64) {
         if let Some(frame) = self.active.borrow_mut().as_mut() {
             frame.metrics.memory.cached_bytes = Some(bytes);
+            frame.metrics.memory.device_retention_bytes = Some(retained_bytes);
             frame.metrics.cache_hits = hits;
             frame.metrics.cache_misses = misses;
         }
@@ -168,6 +169,8 @@ impl GpuTrace {
         };
         let busy = self.slots[frame.slot].busy.clone();
         if frame.names.is_empty() {
+            frame.metrics.status = "no_timed_passes";
+            gpu_profiler::record(frame.metrics);
             busy.store(false, Ordering::Release);
             return;
         }
@@ -229,8 +232,16 @@ impl GpuTrace {
     }
 
     pub(super) fn cancel(&self) {
-        if let Some(frame) = self.active.borrow_mut().take() {
+        if let Some(mut frame) = self.active.borrow_mut().take() {
+            frame.metrics.status = "render_failed";
+            gpu_profiler::record(frame.metrics);
             self.slots[frame.slot].busy.store(false, Ordering::Release);
         }
+    }
+}
+
+impl Drop for GpuTrace {
+    fn drop(&mut self) {
+        self.cancel();
     }
 }

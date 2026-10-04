@@ -816,6 +816,22 @@ impl DirectXRenderer {
             trace.begin(scene);
         }
         let result = self.render_inner(scene, background);
+        // D3D11 holds COM references to bound views. Do not let the shared immediate
+        // context retain a closed window's cached texture after its budget lease ends.
+        // https://learn.microsoft.com/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-pssetshaderresources
+        if self.options.cached_layers || self.options.partial_redraw {
+            if let Some(devices) = &self.devices {
+                unsafe {
+                    devices
+                        .device_context
+                        .VSSetShaderResources(PRIMARY_TEXTURE_REGISTER, Some(&[None]));
+                    devices
+                        .device_context
+                        .PSSetShaderResources(PRIMARY_TEXTURE_REGISTER, Some(&[None]));
+                }
+            }
+        }
+
         if let (Some(states), Some(devices)) = (&self.path_scissor_states, &self.devices) {
             unsafe {
                 devices.device_context.RSSetState(&states.0);
@@ -3647,7 +3663,7 @@ mod tests {
     //! batch starts past the beginning of the frame's instance buffer.
 
     // Explicit imports: a glob of `super` would also pull in gpui's `#[test]` proc macro.
-    use super::{DirectXRenderer, report_live_objects};
+    use super::{DirectXRenderer, PRIMARY_TEXTURE_REGISTER, report_live_objects};
     use crate::bindings::Windows::Win32::{CreateWindowExW, DestroyWindow, WS_OVERLAPPED};
     use crate::bindings::Windows::Win32::{HWND, ID3D11Debug};
     use crate::directx_devices::DirectXDevices;
@@ -3719,6 +3735,27 @@ mod tests {
                     candidate.resize(size)?;
                     let expected = full.render_to_image(&scene, background)?;
                     let actual = candidate.render_to_image(&scene, background)?;
+                    if options.cached_layers || options.partial_redraw {
+                        let context = &candidate.devices.as_ref().unwrap().device_context;
+                        let mut bound = [None];
+                        unsafe {
+                            context.PSGetShaderResources(
+                                PRIMARY_TEXTURE_REGISTER,
+                                bound.len() as u32,
+                                Some(bound.as_mut_ptr()),
+                            );
+                        }
+                        assert!(bound[0].is_none(), "pixel stage retained a cached texture");
+                        unsafe {
+                            context.VSGetShaderResources(
+                                PRIMARY_TEXTURE_REGISTER,
+                                bound.len() as u32,
+                                Some(bound.as_mut_ptr()),
+                            );
+                        }
+                        assert!(bound[0].is_none(), "vertex stage retained a cached texture");
+                    }
+
                     let difference = actual
                         .as_raw()
                         .iter()

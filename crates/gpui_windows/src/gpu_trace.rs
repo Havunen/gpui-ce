@@ -163,7 +163,7 @@ impl GpuTrace {
             }
         }
     }
-    fn data<T: Default>(&self, query: &ID3D11Query) -> Option<T> {
+    fn data<T: Default>(&self, query: &ID3D11Query) -> Result<Option<T>, ()> {
         let mut value = T::default();
         let result = unsafe {
             self.context.GetData(
@@ -174,7 +174,11 @@ impl GpuTrace {
             )
         };
         // S_FALSE means pending; HRESULT::is_ok() would incorrectly accept it.
-        (result.0 == 0).then_some(value)
+        if result.is_err() {
+            Err(())
+        } else {
+            Ok((result.0 == 0).then_some(value))
+        }
     }
     fn poll(&self) {
         let mut state = self.state.borrow_mut();
@@ -182,16 +186,29 @@ impl GpuTrace {
             if !slot.pending {
                 continue;
             }
-            let Some(disjoint) = self.data::<D3D11_QUERY_DATA_TIMESTAMP_DISJOINT>(&slot.disjoint)
-            else {
-                continue;
-            };
-            let values: Option<Vec<u64>> = slot.queries[..slot.names.len() * 2]
-                .iter()
-                .map(|query| self.data(query))
-                .collect();
-            let Some(values) = values else {
-                continue;
+            let readback = (|| -> Result<Option<_>, ()> {
+                let Some(disjoint) =
+                    self.data::<D3D11_QUERY_DATA_TIMESTAMP_DISJOINT>(&slot.disjoint)?
+                else {
+                    return Ok(None);
+                };
+                let values: Result<Option<Vec<u64>>, ()> = slot.queries[..slot.names.len() * 2]
+                    .iter()
+                    .map(|query| self.data(query))
+                    .collect();
+                Ok(values?.map(|values| (disjoint, values)))
+            })();
+            let (disjoint, values) = match readback {
+                Ok(Some(ready)) => ready,
+                Ok(None) => continue,
+                Err(()) => {
+                    if let Some(mut metrics) = slot.metrics.take() {
+                        metrics.status = "readback_failed";
+                        gpu_profiler::record(metrics);
+                    }
+                    slot.pending = false;
+                    continue;
+                }
             };
             let Some(mut metrics) = slot.metrics.take() else {
                 continue;
@@ -222,6 +239,18 @@ impl GpuTrace {
             }
             gpu_profiler::record(metrics);
             slot.pending = false;
+        }
+    }
+}
+
+impl Drop for GpuTrace {
+    fn drop(&mut self) {
+        self.poll();
+        for slot in &mut self.state.get_mut().slots {
+            if let Some(mut metrics) = slot.metrics.take() {
+                metrics.status = "renderer_closed";
+                gpu_profiler::record(metrics);
+            }
         }
     }
 }
