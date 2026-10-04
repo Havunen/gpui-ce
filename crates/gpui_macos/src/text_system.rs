@@ -899,6 +899,34 @@ mod tests {
     }
 
     #[test]
+    fn bundled_fonts_load_from_embedded_and_owned_bytes() {
+        use std::borrow::Cow;
+        let fonts = MacTextSystem::new();
+        fonts
+            .add_fonts(vec![
+                // Embedded in the binary: Core Text reads the static bytes in place.
+                Cow::Borrowed(
+                    include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf").as_slice(),
+                ),
+                // Loaded at runtime: the bytes are the font's only source.
+                Cow::Owned(
+                    include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf")
+                        .to_vec(),
+                ),
+            ])
+            .unwrap();
+        let lilex = fonts.font_id(&font("Lilex")).unwrap();
+        let plex = fonts.font_id(&font("IBM Plex Sans")).unwrap();
+        let state = fonts.0.read();
+        let (lilex, plex) = (&state.fonts[lilex.0], &state.fonts[plex.0]);
+        assert_eq!(lilex.postscript_name().unwrap(), "Lilex-Regular");
+        assert_eq!(plex.postscript_name().unwrap(), "IBMPlexSans");
+        assert!(lilex.glyph_for_char('m').is_some() && plex.glyph_for_char('m').is_some());
+        // Core Text keeps the bytes it reads alive; no face holds a second copy.
+        assert!(lilex.copy_font_data().is_none() && plex.copy_font_data().is_none());
+    }
+
+    #[test]
     fn test_layout_line_zwnj_insertion() {
         let fonts = MacTextSystem::new();
         let font_id = fonts.font_id(&font("Helvetica")).unwrap();

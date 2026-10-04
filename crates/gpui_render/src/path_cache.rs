@@ -197,6 +197,128 @@ impl<T> PathCache<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gpu_policy::GpuOptions;
+    use gpui::{Bounds, ContentMask, PathBuilder, Quad, point, px, size};
+
+    /// A scene with path batches at `xs`, separated by quads so each is its own batch.
+    fn scene(xs: &[f32], filtered: bool) -> Scene {
+        let mut scene = Scene::default();
+        for (index, x) in xs.iter().enumerate() {
+            let mut builder = PathBuilder::fill();
+            builder.move_to(point(px(*x), px(10.)));
+            builder.line_to(point(px(*x + 20.), px(10.)));
+            builder.line_to(point(px(*x), px(30.)));
+            builder.close();
+            let mut path = builder.build().unwrap().scale(1.0);
+            path.order = index as u32 * 2 + 1;
+            path.content_mask = ContentMask {
+                bounds: Bounds::new(
+                    point(ScaledPixels(-1000.), ScaledPixels(-1000.)),
+                    size(ScaledPixels(4000.), ScaledPixels(4000.)),
+                ),
+                ..Default::default()
+            };
+            scene.paths.push(path);
+            scene.quads.push(Quad {
+                order: index as u32 * 2 + 2,
+                ..Default::default()
+            });
+        }
+        if filtered {
+            let bounds = Bounds::new(
+                point(ScaledPixels(0.), ScaledPixels(0.)),
+                size(ScaledPixels(50.), ScaledPixels(50.)),
+            );
+            scene.insert_primitive(gpui::BackdropFilter {
+                bounds,
+                content_mask: ContentMask {
+                    bounds,
+                    ..Default::default()
+                },
+                filters: vec![gpui::ScaledFilter::Blur(ScaledPixels(2.))].into(),
+                opacity: 1.,
+                ..Default::default()
+            });
+        }
+        scene.finish();
+        scene
+    }
+
+    /// The path batches of `scene`, in painting order.
+    fn batches(scene: &Scene) -> Vec<&[Path<ScaledPixels>]> {
+        scene
+            .render_commands()
+            .iter()
+            .filter_map(|command| match command {
+                RenderCommand::Batch(PrimitiveBatch::Paths { range, .. }) => {
+                    Some(&scene.paths[range.clone()])
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The plan for each path batch, by kind.
+    fn plan_kinds(scene: &Scene, cache: &mut PathCache<u32>, options: &str) -> Vec<&'static str> {
+        let plan = plan(scene, (200, 100), cache, GpuOptions::parse(options));
+        plan.iter()
+            .zip(scene.render_commands())
+            .filter(|(_, command)| {
+                matches!(command, RenderCommand::Batch(PrimitiveBatch::Paths { .. }))
+            })
+            .map(|(source, _)| match source {
+                Source::Inline => "inline",
+                Source::Invisible => "invisible",
+                Source::Cached(_) => "cached",
+                Source::Packed { .. } => "packed",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn plans_reuse_caches_skip_invisible_batches_and_pack_the_rest() {
+        let scene = scene(&[10., 500., 60., 120.], false);
+        assert_eq!(batches(&scene).len(), 4);
+        let mut cache = PathCache::new(RetentionBudget::default());
+        assert!(plan(&scene, (200, 100), &mut cache, GpuOptions::default()).is_empty());
+        assert_eq!(
+            plan_kinds(&scene, &mut cache, "batched-paths"),
+            ["packed", "invisible", "packed", "packed"]
+        );
+
+        let first = batches(&scene)[0];
+        let bounds = path_plan::visible_rect(first.iter().map(Path::clipped_bounds), (200, 100));
+        cache
+            .capture(first, bounds.unwrap(), || Ok::<_, ()>(1))
+            .unwrap();
+        assert_eq!(
+            plan_kinds(&scene, &mut cache, "cached-layers"),
+            ["cached", "invisible", "inline", "inline"]
+        );
+        assert_eq!(
+            plan_kinds(&scene, &mut cache, "cached-layers,batched-paths"),
+            ["cached", "invisible", "packed", "packed"]
+        );
+        assert_eq!((cache.hits, cache.misses), (2, 4));
+    }
+
+    #[test]
+    fn plans_never_pack_a_lone_batch_or_an_offscreen_scene() {
+        let mut cache = PathCache::<u32>::new(RetentionBudget::default());
+        let lone = scene(&[10., 500.], false);
+        assert_eq!(
+            plan_kinds(&lone, &mut cache, "batched-paths"),
+            ["inline", "invisible"]
+        );
+        // Filters sample the scene as painted so far, so batches must paint in order.
+        let filtered = scene(&[10., 60.], true);
+        assert!(filtered.requires_offscreen_rendering());
+        assert_eq!(
+            plan_kinds(&filtered, &mut cache, "batched-paths"),
+            ["inline", "inline"]
+        );
+    }
+
     #[test]
     fn window_limit_includes_evicted_entries_awaiting_gpu_completion() {
         let budget = RetentionBudget::default();

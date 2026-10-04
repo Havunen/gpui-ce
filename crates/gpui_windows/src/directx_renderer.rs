@@ -3705,12 +3705,9 @@ mod tests {
         }
     }
 
-    /// `GPUI_D3D_DEBUG=off` in a debug build creates devices without the debug
-    /// layer; reporting their live objects after a device loss must not fail.
-
     #[test]
     fn native_gpu_experiments_preserve_pixels_and_bounded_lifetimes() -> Result<()> {
-        use gpui_render::optimization_fixture as fixture;
+        use gpui_render::{gpu_policy, optimization_fixture as fixture};
         let first = HiddenWindow::new()?;
         let second = HiddenWindow::new()?;
         let devices = DirectXDevices::new()?;
@@ -3731,6 +3728,7 @@ mod tests {
                     full.resize(size)?;
                     candidate.resize(size)?;
                     let expected = full.render_to_image(&scene, background)?;
+                    fixture::assert_paths_painted(expected.as_raw(), expected.width(), frame);
                     let actual = candidate.render_to_image(&scene, background)?;
                     if options.cached_layers || options.partial_redraw {
                         let context = &candidate.devices.as_ref().unwrap().device_context;
@@ -3753,38 +3751,29 @@ mod tests {
                         assert!(bound[0].is_none(), "vertex stage retained a cached texture");
                     }
 
-                    let difference = actual
-                        .as_raw()
-                        .iter()
-                        .zip(expected.as_raw())
-                        .map(|(a, b)| a.abs_diff(*b))
-                        .max()
-                        .unwrap();
+                    let difference = fixture::max_difference(actual.as_raw(), expected.as_raw());
                     assert!(
                         difference <= 1,
                         "{options:?}, transparent={transparent}, frame={frame}, difference={difference}"
                     );
-                    if options.cached_layers && !options.partial_redraw && frame == 4 {
-                        assert!(candidate.path_cache.hits >= 4);
+                    if options.cached_layers && !options.partial_redraw {
+                        // Frame 4 repeats every path of frame 3; frame 5 recolors one.
+                        if frame == 4 {
+                            assert!(candidate.path_cache.hits >= 4, "{options:?}");
+                        }
+                        if frame == 5 {
+                            assert!(candidate.path_cache.misses >= 1, "{options:?}");
+                        }
                     }
                     if options.partial_redraw {
                         assert!(candidate.retained.is_some());
                     }
+                    assert!(candidate.path_cache.bytes() <= gpu_policy::WINDOW_LAYER_BYTES);
                     assert!(
-                        candidate.path_cache.bytes() <= gpui_render::gpu_policy::WINDOW_LAYER_BYTES
-                    );
-                    assert!(
-                        candidate.retention.budget().used()
-                            <= gpui_render::gpu_policy::DEVICE_RETENTION_BYTES
+                        candidate.retention.budget().used() <= gpu_policy::DEVICE_RETENTION_BYTES
                     );
                     let repeated = candidate.render_to_image(&scene, background)?;
-                    assert!(
-                        repeated
-                            .as_raw()
-                            .iter()
-                            .zip(expected.as_raw())
-                            .all(|(a, b)| a.abs_diff(*b) <= 1)
-                    );
+                    assert!(fixture::max_difference(repeated.as_raw(), expected.as_raw()) <= 1);
                 }
                 let budget = candidate.retention.budget().clone();
                 drop(candidate);
@@ -3797,6 +3786,7 @@ mod tests {
 
     #[test]
     fn cropped_path_targets_match_full_viewport_pixels() -> Result<()> {
+        use gpui_render::optimization_fixture as fixture;
         let first = HiddenWindow::new()?;
         let second = HiddenWindow::new()?;
         let devices = DirectXDevices::new()?;
@@ -3804,55 +3794,14 @@ mod tests {
         let mut cropped = DirectXRenderer::new(second.0, &devices, true)?;
         full.options.cropped_paths = false;
         cropped.options.cropped_paths = true;
-        for (x, y, width, height) in [
-            (30., 10., 512, 320),
-            (150., 80., 512, 320),
-            (30., 10., 360, 240),
-        ] {
-            let bounds = gpui::Bounds::new(
-                gpui::point(gpui::ScaledPixels(0.), gpui::ScaledPixels(0.)),
-                gpui::size(gpui::ScaledPixels(512.), gpui::ScaledPixels(320.)),
-            );
-            let mask = gpui::ContentMask {
-                bounds,
-                ..Default::default()
-            };
-            let mut scene = gpui::Scene::default();
-            scene.insert_primitive(gpui::Quad {
-                bounds,
-                content_mask: mask,
-                background: gpui::rgba(0x123456ff).into(),
-                ..Default::default()
-            });
-            let mut path = gpui::PathBuilder::stroke(gpui::px(1.6));
-            path.move_to(gpui::point(gpui::px(-5.25), gpui::px(y)));
-            path.cubic_bezier_to(
-                gpui::point(gpui::px(x), gpui::px(y + 50.)),
-                gpui::point(gpui::px(x), gpui::px(y)),
-                gpui::point(gpui::px(x + 10.), gpui::px(y + 30.)),
-            );
-            let mut path = path.build().unwrap().scale(1.0);
-            path.content_mask = mask;
-            path.color = gpui::linear_gradient(
-                90.,
-                gpui::linear_color_stop(gpui::rgb(0xff0000), 0.),
-                gpui::linear_color_stop(gpui::rgb(0x00ff00), 1.),
-            );
-            scene.insert_primitive(path);
-            scene.finish();
-
-            let size = gpui::size(DevicePixels(width), DevicePixels(height));
-            full.resize(size)?;
-            cropped.resize(size)?;
+        for (x, y, viewport) in fixture::CROPPED_PATH_CASES {
+            full.resize(viewport)?;
+            cropped.resize(viewport)?;
+            let scene = fixture::cropped_path_scene(x, y);
             let expected = full.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?;
             let actual = cropped.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?;
-            let difference = actual
-                .as_raw()
-                .iter()
-                .zip(expected.as_raw())
-                .map(|(a, b)| a.abs_diff(*b))
-                .max()
-                .unwrap();
+            fixture::assert_cropped_paths_painted(actual.as_raw(), actual.width(), x, y);
+            let difference = fixture::max_difference(actual.as_raw(), expected.as_raw());
             assert!(
                 difference <= 1,
                 "cropped D3D11 changed pixels by {difference}"
@@ -3860,6 +3809,9 @@ mod tests {
         }
         Ok(())
     }
+
+    /// `GPUI_D3D_DEBUG=off` in a debug build creates devices without the debug
+    /// layer; reporting their live objects after a device loss must not fail.
     #[test]
     fn live_object_reports_skip_devices_without_the_debug_layer() -> Result<()> {
         let devices = DirectXDevices::with_debug_layer(false)?;

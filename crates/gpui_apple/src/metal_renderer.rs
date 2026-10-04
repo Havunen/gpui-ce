@@ -2597,6 +2597,49 @@ mod tests {
     }
 
     #[test]
+    fn msl_sources_compile_with_their_entry_points() {
+        // Compiling MSL is the fallback when a build had no Metal Toolchain or this OS
+        // rejects a precompiled library, so it must keep working where libraries exist.
+        let device = metal::Device::system_default().expect("Metal device");
+        for shader in NATIVE_SHADERS {
+            let library = device
+                .new_library_with_source(shader.msl, &metal::CompileOptions::new())
+                .unwrap_or_else(|error| panic!("{}: {error}", shader.label));
+            for entry in [shader.vertex_entry, shader.fragment_entry] {
+                library
+                    .get_function(entry, None)
+                    .unwrap_or_else(|error| panic!("{} {entry}: {error}", shader.label));
+            }
+        }
+    }
+
+    #[test]
+    fn shared_programs_build_each_pipeline_once_per_device() {
+        let device = metal::Device::system_default().expect("Metal device");
+        let first = Programs::for_device(&device, true);
+        let second = Programs::for_device(&device, true);
+        assert!(Arc::ptr_eq(&first, &second));
+        let quads = first.pipeline("quads", 1, Blend::Alpha);
+        assert_eq!(
+            second.pipeline("quads", 1, Blend::Alpha).as_ptr(),
+            quads.as_ptr()
+        );
+        assert_ne!(
+            first.pipeline("quads", 1, Blend::Premultiplied).as_ptr(),
+            quads.as_ptr(),
+            "blending is part of a pipeline's identity"
+        );
+        assert!(!Arc::ptr_eq(&Programs::for_device(&device, false), &first));
+
+        let weak = Arc::downgrade(&first);
+        drop((first, second));
+        assert!(
+            weak.upgrade().is_none(),
+            "the last renderer releases the device's programs"
+        );
+    }
+
+    #[test]
     fn gpu_timings_report_the_passes_of_completed_frames() {
         use gpui_render::optimization_fixture as fixture;
         let mut renderer =
@@ -2656,15 +2699,13 @@ mod tests {
 
     #[test]
     fn native_gpu_experiments_preserve_pixels_and_bounded_lifetimes() {
-        use gpui_render::optimization_fixture as fixture;
+        use gpui_render::{gpu_policy, optimization_fixture as fixture};
+        let new_renderer =
+            || MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
         for transparent in [false, true] {
             for options in fixture::modes() {
-                let mut full = MetalRenderer::new_headless(Arc::new(Mutex::new(
-                    InstanceBufferPool::default(),
-                )));
-                let mut candidate = MetalRenderer::new_headless(Arc::new(Mutex::new(
-                    InstanceBufferPool::default(),
-                )));
+                let mut full = new_renderer();
+                let mut candidate = new_renderer();
                 full.options = Default::default();
                 candidate.options = options;
                 full.update_transparency(transparent);
@@ -2673,40 +2714,32 @@ mod tests {
                     let scene = fixture::scene(frame);
                     let size = fixture::viewport(frame);
                     let expected = full.render_scene_to_image(&scene, size).unwrap();
+                    fixture::assert_paths_painted(expected.as_raw(), expected.width(), frame);
                     let actual = candidate.render_scene_to_image(&scene, size).unwrap();
-                    let difference = actual
-                        .as_raw()
-                        .iter()
-                        .zip(expected.as_raw())
-                        .map(|(a, b)| a.abs_diff(*b))
-                        .max()
-                        .unwrap();
+                    let difference = fixture::max_difference(actual.as_raw(), expected.as_raw());
                     assert!(
                         difference <= 1,
                         "{options:?}, transparent={transparent}, frame={frame}, difference={difference}"
                     );
-                    if options.cached_layers && !options.partial_redraw && frame == 4 {
-                        assert!(candidate.path_cache.hits >= 4);
+                    if options.cached_layers && !options.partial_redraw {
+                        // Frame 4 repeats every path of frame 3; frame 5 recolors one.
+                        if frame == 4 {
+                            assert!(candidate.path_cache.hits >= 4, "{options:?}");
+                        }
+                        if frame == 5 {
+                            assert!(candidate.path_cache.misses >= 1, "{options:?}");
+                        }
                     }
                     if options.partial_redraw {
                         assert!(candidate.retained.is_some());
                     }
+                    assert!(candidate.path_cache.bytes() <= gpu_policy::WINDOW_LAYER_BYTES);
                     assert!(
-                        candidate.path_cache.bytes() <= gpui_render::gpu_policy::WINDOW_LAYER_BYTES
-                    );
-                    assert!(
-                        candidate.retention.budget().used()
-                            <= gpui_render::gpu_policy::DEVICE_RETENTION_BYTES
+                        candidate.retention.budget().used() <= gpu_policy::DEVICE_RETENTION_BYTES
                     );
                     // Re-present exactly the same scene to exercise retained-frame reuse.
                     let repeated = candidate.render_scene_to_image(&scene, size).unwrap();
-                    assert!(
-                        repeated
-                            .as_raw()
-                            .iter()
-                            .zip(expected.as_raw())
-                            .all(|(a, b)| a.abs_diff(*b) <= 1)
-                    );
+                    assert!(fixture::max_difference(repeated.as_raw(), expected.as_raw()) <= 1);
                 }
                 let budget = candidate.retention.budget().clone();
                 candidate.update_transparency(!transparent);
@@ -2725,64 +2758,26 @@ mod tests {
 
     #[test]
     fn cropped_path_targets_match_full_viewport_pixels() {
+        use gpui_render::optimization_fixture as fixture;
         let mut full =
             MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
         let mut cropped =
             MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
         full.options.cropped_paths = false;
         cropped.options.cropped_paths = true;
-        for (x, y, width, height) in [
-            (30., 10., 512, 320),
-            (150., 80., 512, 320),
-            (30., 10., 360, 240),
-        ] {
-            let bounds = gpui::Bounds::new(
-                gpui::point(gpui::ScaledPixels(0.), gpui::ScaledPixels(0.)),
-                gpui::size(gpui::ScaledPixels(512.), gpui::ScaledPixels(320.)),
-            );
-            let mask = gpui::ContentMask {
-                bounds,
-                ..Default::default()
-            };
-            let mut scene = gpui::Scene::default();
-            scene.insert_primitive(gpui::Quad {
-                bounds,
-                content_mask: mask,
-                background: gpui::rgba(0x123456ff).into(),
-                ..Default::default()
-            });
-            let mut path = gpui::PathBuilder::stroke(gpui::px(1.6));
-            path.move_to(gpui::point(gpui::px(-5.25), gpui::px(y)));
-            path.cubic_bezier_to(
-                gpui::point(gpui::px(x), gpui::px(y + 50.)),
-                gpui::point(gpui::px(x), gpui::px(y)),
-                gpui::point(gpui::px(x + 10.), gpui::px(y + 30.)),
-            );
-            let mut path = path.build().unwrap().scale(1.0);
-            path.content_mask = mask;
-            path.color = gpui::linear_gradient(
-                90.,
-                gpui::linear_color_stop(gpui::rgb(0xff0000), 0.),
-                gpui::linear_color_stop(gpui::rgb(0x00ff00), 1.),
-            );
-            scene.insert_primitive(path);
-            scene.finish();
-
-            let size = gpui::size(DevicePixels(width), DevicePixels(height));
-            let expected = full.render_scene_to_image(&scene, size).unwrap();
-            let actual = cropped.render_scene_to_image(&scene, size).unwrap();
-            let difference = actual
-                .as_raw()
-                .iter()
-                .zip(expected.as_raw())
-                .map(|(a, b)| a.abs_diff(*b))
-                .max()
-                .unwrap();
+        for (x, y, viewport) in fixture::CROPPED_PATH_CASES {
+            let scene = fixture::cropped_path_scene(x, y);
+            let expected = full.render_scene_to_image(&scene, viewport).unwrap();
+            let actual = cropped.render_scene_to_image(&scene, viewport).unwrap();
+            fixture::assert_cropped_paths_painted(actual.as_raw(), actual.width(), x, y);
+            let difference = fixture::max_difference(actual.as_raw(), expected.as_raw());
             assert!(
                 difference <= 1,
                 "cropped Metal changed pixels by {difference}"
             );
-            assert!(cropped.path_intermediate_texture.as_ref().unwrap().width() < width as u64);
+            let target = cropped.path_intermediate_texture.as_ref().unwrap();
+            assert!(target.width() < viewport.width.0 as u64);
+            assert!(target.height() <= viewport.height.0 as u64);
         }
     }
 

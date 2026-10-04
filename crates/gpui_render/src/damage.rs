@@ -141,6 +141,11 @@ mod tests {
     use super::*;
     use gpui::{ContentMask, point, size};
     fn scene(x: f32, colour: u32) -> Scene {
+        let mut scene = unfinished_scene(x, colour);
+        scene.finish();
+        scene
+    }
+    fn unfinished_scene(x: f32, colour: u32) -> Scene {
         let mut scene = Scene::default();
         scene.quads.push(Quad {
             bounds: Bounds::new(
@@ -157,7 +162,6 @@ mod tests {
             background: gpui::rgba(colour).into(),
             ..Default::default()
         });
-        scene.finish();
         scene
     }
     #[test]
@@ -187,5 +191,115 @@ mod tests {
                 .compare(&previous, (200, 100)),
             Damage::Full
         );
+    }
+
+    fn glyph_scene(colour: gpui::Hsla, transformation: gpui::TransformationMatrix) -> Scene {
+        let bounds = Bounds::new(
+            point(ScaledPixels(20.), ScaledPixels(30.)),
+            size(ScaledPixels(8.), ScaledPixels(12.)),
+        );
+        let mut scene = Scene::default();
+        scene.monochrome_sprites.push(MonochromeSprite {
+            order: 0,
+            padding: 0,
+            bounds,
+            content_mask: ContentMask {
+                bounds: Bounds::new(
+                    point(ScaledPixels(0.), ScaledPixels(0.)),
+                    size(ScaledPixels(200.), ScaledPixels(100.)),
+                ),
+                ..Default::default()
+            },
+            color: colour.into(),
+            tile: gpui::AtlasTile {
+                texture_id: gpui::AtlasTextureId {
+                    index: 0,
+                    kind: gpui::AtlasTextureKind::Monochrome,
+                },
+                tile_id: gpui::TileId(1),
+                padding: 0,
+                bounds: Default::default(),
+            },
+            transformation,
+        });
+        scene.finish();
+        scene
+    }
+
+    #[test]
+    fn glyph_recolours_are_bounded_unless_transformed() {
+        let (white, red) = (gpui::white(), gpui::hsla(0., 1., 0.5, 1.));
+        let unit = gpui::TransformationMatrix::default();
+        let previous = Snapshot::capture(&glyph_scene(white, unit), 1).unwrap();
+        assert_eq!(
+            Snapshot::capture(&glyph_scene(red, unit), 1)
+                .unwrap()
+                .compare(&previous, (200, 100)),
+            Damage::Rect(PixelRect {
+                x: 18,
+                y: 28,
+                width: 12,
+                height: 16
+            })
+        );
+        // A transformed glyph may paint outside its bounds.
+        let rotated = gpui::TransformationMatrix::unit().rotate(gpui::radians(0.5));
+        let previous = Snapshot::capture(&glyph_scene(white, rotated), 1).unwrap();
+        assert_eq!(
+            Snapshot::capture(&glyph_scene(red, rotated), 1)
+                .unwrap()
+                .compare(&previous, (200, 100)),
+            Damage::Full
+        );
+    }
+
+    #[test]
+    fn changed_shadows_redraw_everything_and_offscreen_scenes_are_not_tracked() {
+        let previous = Snapshot::capture(&scene(10., 0x000000ff), 1).unwrap();
+        let mut shadowed = unfinished_scene(10., 0x000000ff);
+        let bounds = Bounds::new(
+            point(ScaledPixels(15.), ScaledPixels(40.)),
+            size(ScaledPixels(100.), ScaledPixels(30.)),
+        );
+        shadowed.shadows.push(gpui::Shadow {
+            order: 0,
+            bounds,
+            content_mask: ContentMask {
+                bounds,
+                ..Default::default()
+            },
+            blur_radius: ScaledPixels(6.),
+            color: gpui::rgba(0x00880088).into(),
+            corner_radii: Default::default(),
+            element_bounds: bounds,
+            element_corner_radii: Default::default(),
+            inset: gpui::ShaderBool::Disabled,
+            corner_smoothing: 0.,
+        });
+        shadowed.finish();
+        assert_eq!(
+            Snapshot::capture(&shadowed, 1)
+                .unwrap()
+                .compare(&previous, (200, 100)),
+            Damage::Full
+        );
+
+        let mut filtered = unfinished_scene(10., 0x000000ff);
+        let bounds = Bounds::new(
+            point(ScaledPixels(0.), ScaledPixels(0.)),
+            size(ScaledPixels(50.), ScaledPixels(50.)),
+        );
+        filtered.insert_primitive(gpui::BackdropFilter {
+            bounds,
+            content_mask: ContentMask {
+                bounds,
+                ..Default::default()
+            },
+            filters: vec![gpui::ScaledFilter::Blur(ScaledPixels(2.))].into(),
+            opacity: 1.,
+            ..Default::default()
+        });
+        filtered.finish();
+        assert!(Snapshot::capture(&filtered, 1).is_none());
     }
 }
