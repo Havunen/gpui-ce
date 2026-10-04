@@ -905,6 +905,7 @@ impl DirectXRenderer {
         background_appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
         self.path_cache.begin();
+        self.retention.pool.end_frame();
         let mut path_frame = PathFrame::new(
             self.retention.clone(),
             self.options.cached_layers || self.options.partial_redraw,

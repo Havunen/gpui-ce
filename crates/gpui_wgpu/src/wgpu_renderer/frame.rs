@@ -237,6 +237,7 @@ fn begin_frame(renderer: &mut WgpuRenderer) -> bool {
         {
             let _ = renderer.resources().device.poll(wgpu::PollType::Poll);
         }
+        renderer.resources().retention.pool.end_frame();
         renderer.atlas.before_frame();
         return true;
     };

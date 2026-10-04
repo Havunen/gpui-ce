@@ -1056,6 +1056,7 @@ impl MetalRenderer {
         viewport_size: Size<DevicePixels>,
     ) -> Result<metal::CommandBuffer> {
         let gpu_frame = self.gpu_trace.as_ref().map(|trace| trace.begin(scene));
+        self.retention.pool.end_frame();
         self.prepare_intermediate_textures(scene, viewport_size);
         self.path_cache.begin();
         let mut used_paths = Vec::new();

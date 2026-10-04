@@ -110,6 +110,9 @@ impl RetentionBudget {
     pub fn used(&self) -> u64 {
         self.0.used.load(Ordering::Relaxed)
     }
+    pub fn limit(&self) -> u64 {
+        self.0.limit
+    }
     pub fn try_acquire(&self, bytes: u64) -> Option<RetentionLease> {
         self.0
             .used
