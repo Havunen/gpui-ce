@@ -2220,6 +2220,9 @@ impl MetalRenderer {
 
         command_encoder.set_render_pipeline_state(&self.path_sprites_pipeline_state);
         bind_scene_uniforms(command_encoder, scene_uniforms);
+        // The vertex stage normalizes texture coordinates by the source's size, which
+        // differs from the viewport for cropped targets and cached layers.
+        command_encoder.set_vertex_texture(PRIMARY_TEXTURE_SLOT, Some(intermediate_texture));
         command_encoder.set_fragment_texture(PRIMARY_TEXTURE_SLOT, Some(intermediate_texture));
         command_encoder.set_fragment_sampler_state(SAMPLER_SLOT, Some(&self.sampler));
 
