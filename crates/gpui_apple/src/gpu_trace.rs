@@ -137,11 +137,11 @@ impl Frame {
         mut self,
         command: &metal::CommandBufferRef,
         path_size: (u32, u32),
-        path_bytes: u64,
+        memory: gpu_profiler::GpuMemory,
     ) {
         let mut metrics = self.metrics.take().unwrap();
         metrics.path_target = path_size;
-        metrics.memory.path_bytes = path_bytes;
+        metrics.memory = memory;
         metrics.query_samples_dropped = self.recording.dropped.get();
         let names = self.recording.names.borrow().clone();
         let samples = self.recording.buffer.clone();

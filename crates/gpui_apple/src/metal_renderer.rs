@@ -1295,7 +1295,25 @@ impl MetalRenderer {
                 .filter(|t| t.storage_mode() != metal::MTLStorageMode::Memoryless)
                 .map(|t| t.width() * t.height() * 4 * t.sample_count())
                 .sum();
-            frame.finish(command_buffer, size, bytes);
+            let filter_bytes = self
+                .scene_color_texture
+                .iter()
+                .chain(self.blur_ping_texture.iter())
+                .chain(self.blur_pong_texture.iter())
+                .chain(self.group_textures.iter())
+                .map(|t| t.width() * t.height() * 4 * t.sample_count())
+                .sum();
+            frame.finish(
+                command_buffer,
+                size,
+                gpui::gpu_profiler::GpuMemory {
+                    path_bytes: bytes,
+                    atlas_bytes: Some(self.sprite_atlas.allocated_bytes()),
+                    filter_bytes: Some(filter_bytes),
+                    upload_bytes: Some(instance_buffer.metal_buffer.length()),
+                    ..Default::default()
+                },
+            );
         }
         Ok(command_buffer.to_owned())
     }

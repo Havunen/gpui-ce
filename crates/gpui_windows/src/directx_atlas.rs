@@ -79,6 +79,25 @@ impl DirectXAtlas {
         })
     }
 
+    pub(crate) fn allocated_bytes(&self) -> u64 {
+        let state = self.state.lock();
+        [
+            &state.monochrome_textures,
+            &state.polychrome_textures,
+            &state.subpixel_textures,
+        ]
+        .into_iter()
+        .flat_map(|list| list.textures.iter().flatten())
+        .map(|tile| {
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            unsafe {
+                tile.texture.GetDesc(&mut desc);
+            }
+            u64::from(desc.Width) * u64::from(desc.Height) * u64::from(tile.bytes_per_pixel)
+        })
+        .sum()
+    }
+
     pub(crate) fn get_texture_view(
         &self,
         id: AtlasTextureId,

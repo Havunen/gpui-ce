@@ -196,15 +196,12 @@ impl PathResources {
 /// (indexed by isolation depth), up to [`MAX_FILTER_DEPTH`], so nested content blurs isolate
 /// correctly; deeper nests render inline.
 struct BlurResources {
-    #[expect(dead_code)]
     scene_color: ID3D11Texture2D,
     scene_color_rtv: Option<ID3D11RenderTargetView>,
     scene_color_srv: Option<ID3D11ShaderResourceView>,
-    #[expect(dead_code)]
     ping: ID3D11Texture2D,
     ping_rtv: Option<ID3D11RenderTargetView>,
     ping_srv: Option<ID3D11ShaderResourceView>,
-    #[expect(dead_code)]
     pong: ID3D11Texture2D,
     pong_rtv: Option<ID3D11RenderTargetView>,
     pong_srv: Option<ID3D11ShaderResourceView>,
@@ -605,7 +602,41 @@ impl DirectXRenderer {
             .map(|p| (p.viewport.Width as u32, p.viewport.Height as u32))
             .unwrap_or_default();
         if let Some(trace) = &self.gpu_trace {
-            trace.finish(result.is_ok(), path_size);
+            let bytes = |texture: &ID3D11Texture2D| {
+                let mut desc = D3D11_TEXTURE2D_DESC::default();
+                unsafe {
+                    texture.GetDesc(&mut desc);
+                }
+                u64::from(desc.Width)
+                    * u64::from(desc.Height)
+                    * 4
+                    * u64::from(desc.SampleDesc.Count)
+            };
+            let mut memory = gpui::gpu_profiler::GpuMemory {
+                atlas_bytes: Some(self.atlas.allocated_bytes()),
+                ..Default::default()
+            };
+            if let Some(resources) = &self.resources {
+                memory.path_bytes = resources
+                    .path
+                    .as_ref()
+                    .map(|p| bytes(&p.texture) + bytes(&p.msaa_texture))
+                    .unwrap_or(0);
+                memory.filter_bytes = Some(
+                    resources
+                        .blur
+                        .as_ref()
+                        .map(|b| {
+                            [&b.scene_color, &b.ping, &b.pong]
+                                .into_iter()
+                                .chain(b.groups.iter())
+                                .map(bytes)
+                                .sum()
+                        })
+                        .unwrap_or(0),
+                );
+            }
+            trace.finish(result.is_ok(), path_size, memory);
         }
         result
     }
@@ -704,6 +735,19 @@ impl DirectXRenderer {
             .and_then(|devices| devices.annotation.clone())
             .filter(|annotation| unsafe { annotation.GetStatus().as_bool() });
         for command in scene.render_commands() {
+            let _gpu_span = if matches!(command, RenderCommand::Batch(PrimitiveBatch::Paths { .. }))
+            {
+                None
+            } else {
+                self.gpu_trace.as_ref().map(|trace| {
+                    trace.span(match command {
+                        RenderCommand::Batch(PrimitiveBatch::BackdropFilters(_))
+                        | RenderCommand::BeginFilter { .. }
+                        | RenderCommand::EndFilter { .. } => "filter",
+                        _ => "main",
+                    })
+                })
+            };
             let _annotation = annotation
                 .as_ref()
                 .map(|annotation| Annotation::new(annotation, HSTRING::from(command.label())));

@@ -137,7 +137,12 @@ impl GpuTrace {
             end,
         }
     }
-    pub(crate) fn finish(&self, succeeded: bool, path_size: (u32, u32)) {
+    pub(crate) fn finish(
+        &self,
+        succeeded: bool,
+        path_size: (u32, u32),
+        memory: gpu_profiler::GpuMemory,
+    ) {
         let mut state = self.state.borrow_mut();
         if let Some(index) = state.active.take() {
             let slot = &mut state.slots[index];
@@ -148,7 +153,7 @@ impl GpuTrace {
             slot.pending = true;
             if let Some(metrics) = &mut slot.metrics {
                 metrics.path_target = path_size;
-                metrics.memory.path_bytes = u64::from(path_size.0) * u64::from(path_size.1) * 4 * 5;
+                metrics.memory = memory;
                 if !succeeded {
                     metrics.status = "render_failed";
                 }
