@@ -466,102 +466,123 @@ mod path_target_tests {
     #[test]
     fn retained_colour_damage_matches_full_redraw_and_recovers_after_fallbacks() {
         let _ = env_logger::try_init();
-        let context = WgpuContext::new_headless(None).unwrap();
-        let viewport = size(DevicePixels(512), DevicePixels(320));
-        let mut reference = WgpuRenderer::new_headless(&context, viewport).unwrap();
-        reference.options = Default::default();
-        let mut candidate = WgpuRenderer::new_headless(&context, viewport).unwrap();
-        candidate.options.partial_redraw = true;
-        candidate.options.cached_layers = true;
-        candidate.options.batched_paths = true;
-        candidate.options.cropped_paths = true;
-        let mut observed_rect = false;
-        for frame in 0..16 {
-            let resized = if frame >= 12 {
-                size(DevicePixels(450), DevicePixels(280))
-            } else {
-                viewport
-            };
-            reference.update_drawable_size(resized);
-            candidate.update_drawable_size(resized);
-            let mask = ContentMask {
-                bounds: Bounds::new(
-                    point(ScaledPixels(0.), ScaledPixels(0.)),
-                    size(
-                        ScaledPixels(resized.width.0 as f32),
-                        ScaledPixels(resized.height.0 as f32),
-                    ),
-                ),
-                ..Default::default()
-            };
-            let mut scene = Scene::default();
-            scene.quads.push(Quad {
-                order: 0,
-                bounds: mask.bounds,
-                content_mask: mask,
-                background: gpui::rgba(0x12345688).into(),
-                ..Default::default()
-            });
-            let y = if frame == 7 { 140. } else { 50. };
-            scene.quads.push(Quad {
-                order: 1,
-                bounds: Bounds::new(
-                    point(ScaledPixels(10.), ScaledPixels(y)),
-                    size(ScaledPixels(100.), ScaledPixels(20.)),
-                ),
-                content_mask: mask,
-                background: gpui::rgba(if frame % 2 == 0 {
-                    0xff000088
+        for transparent in [false, true] {
+            let context = WgpuContext::new_headless(None).unwrap();
+            let viewport = size(DevicePixels(512), DevicePixels(320));
+            let mut reference = WgpuRenderer::new_headless(&context, viewport).unwrap();
+            reference.options = Default::default();
+            reference.update_transparency(transparent);
+            let mut candidate = WgpuRenderer::new_headless(&context, viewport).unwrap();
+            candidate.update_transparency(transparent);
+            candidate.options.partial_redraw = true;
+            candidate.options.cached_layers = true;
+            candidate.options.batched_paths = true;
+            candidate.options.cropped_paths = true;
+            let mut observed_rect = false;
+            for frame in 0..16 {
+                let resized = if frame >= 12 {
+                    size(DevicePixels(450), DevicePixels(280))
                 } else {
-                    0x0000ff40
-                })
-                .into(),
-                ..Default::default()
-            });
-            let mut path = triangle(25., 55., 40., mask);
-            path.order = 2;
-            scene.paths.push(path);
-            if frame == 9 {
-                // A popup appears, then disappears.
-                scene.quads.push(Quad {
-                    order: 3,
+                    viewport
+                };
+                reference.update_drawable_size(resized);
+                candidate.update_drawable_size(resized);
+                let mask = ContentMask {
                     bounds: Bounds::new(
-                        point(ScaledPixels(20.), ScaledPixels(60.)),
-                        size(ScaledPixels(100.), ScaledPixels(80.)),
+                        point(ScaledPixels(0.), ScaledPixels(0.)),
+                        size(
+                            ScaledPixels(resized.width.0 as f32),
+                            ScaledPixels(resized.height.0 as f32),
+                        ),
                     ),
+                    ..Default::default()
+                };
+                let mut scene = Scene::default();
+                scene.quads.push(Quad {
+                    order: 0,
+                    bounds: mask.bounds,
                     content_mask: mask,
-                    background: gpui::white().into(),
+                    background: gpui::rgba(0x12345688).into(),
                     ..Default::default()
                 });
-            }
-            scene.finish();
-            if let Some(retained) = candidate.resources().retained.borrow().as_ref() {
-                if let Some(previous) = retained.snapshot.as_ref() {
-                    let snapshot = gpui_render::damage::Snapshot::capture(&scene, 0).unwrap();
-                    observed_rect |= matches!(
-                        snapshot
-                            .compare(previous, (resized.width.0 as u32, resized.height.0 as u32)),
-                        gpui_render::damage::Damage::Rect(_)
-                    );
+                let y = if frame == 7 { 140. } else { 50. };
+                scene.quads.push(Quad {
+                    order: 1,
+                    bounds: Bounds::new(
+                        point(ScaledPixels(10.), ScaledPixels(y)),
+                        size(ScaledPixels(100.), ScaledPixels(20.)),
+                    ),
+                    content_mask: mask,
+                    background: gpui::rgba(if frame % 2 == 0 {
+                        0xff000088
+                    } else {
+                        0x0000ff40
+                    })
+                    .into(),
+                    ..Default::default()
+                });
+                scene.shadows.push(gpui::Shadow {
+                    order: 2,
+                    bounds: Bounds::new(
+                        point(ScaledPixels(15.), ScaledPixels(40.)),
+                        size(ScaledPixels(100.), ScaledPixels(30.)),
+                    ),
+                    content_mask: mask,
+                    blur_radius: ScaledPixels(6.),
+                    color: gpui::rgba(0x00880088).into(),
+                    corner_radii: Default::default(),
+                    element_bounds: mask.bounds,
+                    element_corner_radii: Default::default(),
+                    inset: gpui::ShaderBool::Disabled,
+                    corner_smoothing: 0.,
+                });
+                let mut path = triangle(25., 55., 40., mask);
+                path.order = 2;
+                scene.paths.push(path);
+                if frame == 9 {
+                    // A popup appears, then disappears.
+                    scene.quads.push(Quad {
+                        order: 3,
+                        bounds: Bounds::new(
+                            point(ScaledPixels(20.), ScaledPixels(60.)),
+                            size(ScaledPixels(100.), ScaledPixels(80.)),
+                        ),
+                        content_mask: mask,
+                        background: gpui::white().into(),
+                        ..Default::default()
+                    });
                 }
+                scene.finish();
+                if let Some(retained) = candidate.resources().retained.borrow().as_ref() {
+                    if let Some(previous) = retained.snapshot.as_ref() {
+                        let snapshot = gpui_render::damage::Snapshot::capture(&scene, 0).unwrap();
+                        observed_rect |= matches!(
+                            snapshot.compare(
+                                previous,
+                                (resized.width.0 as u32, resized.height.0 as u32)
+                            ),
+                            gpui_render::damage::Damage::Rect(_)
+                        );
+                    }
+                }
+                let expected = reference.render_to_image(&scene).unwrap();
+                let actual = candidate.render_to_image(&scene).unwrap();
+                let difference = actual
+                    .as_raw()
+                    .iter()
+                    .zip(expected.as_raw())
+                    .map(|(a, b)| a.abs_diff(*b))
+                    .max()
+                    .unwrap();
+                assert!(difference <= 1, "frame={frame} difference={difference}");
             }
-            let expected = reference.render_to_image(&scene).unwrap();
-            let actual = candidate.render_to_image(&scene).unwrap();
-            let difference = actual
-                .as_raw()
-                .iter()
-                .zip(expected.as_raw())
-                .map(|(a, b)| a.abs_diff(*b))
-                .max()
-                .unwrap();
-            assert!(difference <= 1, "frame={frame} difference={difference}");
+            assert!(
+                observed_rect,
+                "must exercise incremental redraws, not just full fallback"
+            );
+            assert!(candidate.resources().retained.borrow().is_some());
+            candidate.update_transparency(!transparent);
+            assert!(candidate.resources().retained.borrow().is_none());
         }
-        assert!(
-            observed_rect,
-            "must exercise incremental redraws, not just full fallback"
-        );
-        assert!(candidate.resources().retained.borrow().is_some());
-        candidate.update_transparency(true);
-        assert!(candidate.resources().retained.borrow().is_none());
     }
 }

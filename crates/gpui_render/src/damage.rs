@@ -1,5 +1,5 @@
 //! Conservative damage for colour-only changes in an otherwise identical scene.
-//! Layout, ordering, filters, surfaces and shadows always require a full redraw.
+//! Layout, ordering, filters, surfaces and changed shadows require a full redraw.
 use crate::{
     path_plan::{PixelRect, visible_rect},
     path_types::{self, PathRasterizationVertex},
@@ -29,13 +29,52 @@ fn append<T: BufferData>(bytes: &mut Vec<u8>, values: &[T]) {
 }
 impl Snapshot {
     pub fn capture(scene: &Scene, atlas_generation: u64) -> Option<Self> {
-        if !scene.shadows.is_empty()
-            || !scene.surfaces.is_empty()
-            || scene.requires_offscreen_rendering()
-        {
+        if !scene.surfaces.is_empty() || scene.requires_offscreen_rendering() {
+            return None;
+        }
+        let bytes = scene
+            .quads
+            .len()
+            .saturating_mul(std::mem::size_of::<Quad>())
+            .saturating_add(
+                scene
+                    .monochrome_sprites
+                    .len()
+                    .saturating_mul(std::mem::size_of::<MonochromeSprite>()),
+            )
+            .saturating_add(
+                path_types::rasterization_vertex_count(&scene.paths)
+                    .saturating_mul(std::mem::size_of::<PathRasterizationVertex>()),
+            )
+            .saturating_add(
+                scene
+                    .shadows
+                    .len()
+                    .saturating_mul(std::mem::size_of::<gpui::Shadow>()),
+            )
+            .saturating_add(
+                scene
+                    .polychrome_sprites
+                    .len()
+                    .saturating_mul(std::mem::size_of::<gpui::PolychromeSprite>()),
+            )
+            .saturating_add(
+                scene
+                    .subpixel_sprites
+                    .len()
+                    .saturating_mul(std::mem::size_of::<gpui::SubpixelSprite>()),
+            )
+            .saturating_add(
+                scene
+                    .underlines
+                    .len()
+                    .saturating_mul(std::mem::size_of::<gpui::Underline>()),
+            );
+        if bytes > 2 * 1024 * 1024 {
             return None;
         }
         let mut fixed = Vec::new();
+        append(&mut fixed, &scene.shadows);
         append(&mut fixed, &scene.subpixel_sprites);
         append(&mut fixed, &scene.polychrome_sprites);
         append(&mut fixed, &scene.underlines);

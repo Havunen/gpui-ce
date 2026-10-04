@@ -297,9 +297,7 @@ impl WgpuRenderer {
         scene: &gpui::Scene,
     ) -> Option<(wgpu::TextureView, gpui_render::damage::Damage)> {
         use gpui::PlatformAtlas;
-        if !self.options.partial_redraw
-            || self.target.alpha_mode() != wgpu::CompositeAlphaMode::Opaque
-        {
+        if !self.options.partial_redraw {
             return None;
         }
         let r = self.resources();

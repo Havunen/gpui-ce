@@ -11,6 +11,7 @@ struct Idle {
 }
 pub(super) struct TexturePool {
     idle: Mutex<Vec<Idle>>,
+    retiring: Mutex<Vec<Arc<Mutex<Option<Idle>>>>>,
     budget: RetentionBudget,
     pending: AtomicU64,
 }
@@ -28,6 +29,7 @@ impl TexturePool {
             }
             let pool = Arc::new(Self {
                 idle: Mutex::new(Vec::new()),
+                retiring: Mutex::new(Vec::new()),
                 budget: super::shared::retention_budget(device),
                 pending: AtomicU64::new(0),
             });
@@ -51,17 +53,29 @@ impl TexturePool {
             return;
         };
         self.pending.fetch_add(bytes, Ordering::Relaxed);
+        let entry = Arc::new(Mutex::new(Some(Idle {
+            texture,
+            _lease: lease,
+        })));
+        let weak_entry = Arc::downgrade(&entry);
+        {
+            let mut retiring = self.retiring.lock().unwrap();
+            retiring.retain(|entry| entry.lock().unwrap().is_some());
+            retiring.push(entry);
+        }
         let pool = Arc::downgrade(self);
+        // Weak references also release resources if the last window closes
+        // before another poll. The GPU itself retains in-flight textures.
         queue.on_submitted_work_done(move || {
-            if let Some(pool) = pool.upgrade() {
-                pool.pending.fetch_sub(bytes, Ordering::Relaxed);
-                pool.idle.lock().unwrap().push(Idle {
-                    texture,
-                    _lease: lease,
-                });
+            if let (Some(pool), Some(entry)) = (pool.upgrade(), weak_entry.upgrade()) {
+                if let Some(entry) = entry.lock().unwrap().take() {
+                    pool.pending.fetch_sub(bytes, Ordering::Relaxed);
+                    pool.idle.lock().unwrap().push(entry);
+                }
             }
         });
     }
+
     pub(super) fn bytes(&self) -> (u64, u64) {
         (
             self.idle
@@ -120,8 +134,16 @@ mod tests {
         );
         assert!(pool.take(&descriptor).is_some());
         assert_eq!(pool.budget.used(), 0);
+        let budget = pool.budget.clone();
+        pool.retire(&context.queue, context.device.create_texture(&descriptor));
+        assert_eq!(budget.used(), 1024);
         let weak = Arc::downgrade(&pool);
         drop(pool);
         assert!(weak.upgrade().is_none());
+        assert_eq!(
+            budget.used(),
+            0,
+            "last-window close must release unpolled retirements"
+        );
     }
 }

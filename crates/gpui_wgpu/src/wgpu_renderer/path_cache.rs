@@ -84,8 +84,25 @@ impl PathCache {
         {
             return;
         }
-        while self.bytes().saturating_add(world_bounds.bytes()) > WINDOW_LAYER_BYTES
-            && !self.entries.is_empty()
+        // A tiny raster may still contain arbitrarily complex tessellation.
+        // Bound copied geometry independently of the GPU texture budget.
+        const GEOMETRY_BYTES: usize = 1024 * 1024;
+        let geometry_bytes = path_types::rasterization_vertex_count(paths)
+            .saturating_mul(std::mem::size_of::<PathRasterizationVertex>());
+        if geometry_bytes > GEOMETRY_BYTES {
+            return;
+        }
+        while !self.entries.is_empty()
+            && (self.bytes().saturating_add(world_bounds.bytes()) > WINDOW_LAYER_BYTES
+                || self
+                    .entries
+                    .iter()
+                    .map(|entry| {
+                        entry.vertices.len() * std::mem::size_of::<PathRasterizationVertex>()
+                    })
+                    .sum::<usize>()
+                    .saturating_add(geometry_bytes)
+                    > GEOMETRY_BYTES)
         {
             self.entries.remove(0);
         }
