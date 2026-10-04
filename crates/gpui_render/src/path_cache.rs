@@ -1,4 +1,5 @@
-//! Bounded native-backend path storage. Backends own textures and completion fences.
+//! Bounded storage for rasterized path batches, reused while their geometry is unchanged.
+//! Backends own the textures and the fences that tell when the GPU is done with them.
 use crate::{
     gpu_policy::{RetentionBudget, RetentionLease, WINDOW_LAYER_BYTES},
     path_plan::{self, PixelRect},
@@ -6,6 +7,10 @@ use crate::{
 };
 use gpui::{Path, PrimitiveBatch, RenderCommand, ScaledPixels, Scene};
 use std::sync::Arc;
+
+/// Cached geometry is compared vertex by vertex on lookup, so bound it independently
+/// of the texture budget: a tiny raster may still hold arbitrarily complex tessellation.
+const GEOMETRY_BYTES: u64 = 1024 * 1024;
 
 pub struct Entry<T> {
     pub resource: T,
@@ -93,7 +98,7 @@ impl<T> PathCache<T> {
             entries: Vec::new(),
             budget,
             window_budget: RetentionBudget::new(WINDOW_LAYER_BYTES),
-            geometry_budget: RetentionBudget::new(1024 * 1024),
+            geometry_budget: RetentionBudget::new(GEOMETRY_BYTES),
             warmed: 0,
             hits: 0,
             misses: 0,
@@ -109,6 +114,10 @@ impl<T> PathCache<T> {
     }
     pub fn clear(&mut self) {
         self.entries.clear();
+    }
+    /// The cached entries, least recently used first.
+    pub fn entries(&self) -> impl Iterator<Item = &Arc<Entry<T>>> {
+        self.entries.iter()
     }
     pub fn get(&mut self, paths: &[Path<ScaledPixels>]) -> Option<Arc<Entry<T>>> {
         let key = path_plan::fingerprint(paths);
@@ -142,9 +151,8 @@ impl<T> PathCache<T> {
         bounds: PixelRect,
         create: impl FnOnce() -> Result<T, E>,
     ) -> Result<Option<Arc<Entry<T>>>, E> {
-        const GEOMETRY_BYTES: usize = 1024 * 1024;
-        let geometry = path_types::rasterization_vertex_count(paths)
-            .saturating_mul(std::mem::size_of::<PathRasterizationVertex>());
+        let geometry = (path_types::rasterization_vertex_count(paths) as u64)
+            .saturating_mul(std::mem::size_of::<PathRasterizationVertex>() as u64);
         if self.warmed >= 2
             || bounds.width == 0
             || bounds.height == 0
@@ -155,8 +163,7 @@ impl<T> PathCache<T> {
         }
         while !self.entries.is_empty()
             && (self.bytes().saturating_add(bounds.bytes()) > WINDOW_LAYER_BYTES
-                || self.geometry_budget.used().saturating_add(geometry as u64)
-                    > GEOMETRY_BYTES as u64)
+                || self.geometry_budget.used().saturating_add(geometry) > GEOMETRY_BYTES)
         {
             self.entries.remove(0);
         }
@@ -166,7 +173,7 @@ impl<T> PathCache<T> {
         let Some(window_lease) = self.window_budget.try_acquire(bounds.bytes()) else {
             return Ok(None);
         };
-        let Some(geometry_lease) = self.geometry_budget.try_acquire(geometry as u64) else {
+        let Some(geometry_lease) = self.geometry_budget.try_acquire(geometry) else {
             return Ok(None);
         };
         let resource = create()?;

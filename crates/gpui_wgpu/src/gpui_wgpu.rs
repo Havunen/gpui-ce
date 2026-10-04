@@ -1,3 +1,7 @@
+// Completion callbacks own wgpu textures, and proving those `Send` walks deeper than
+// the default limit: https://github.com/rust-lang/rust/issues/159228
+#![recursion_limit = "256"]
+
 mod cosmic_text_system;
 mod wgpu_atlas;
 mod wgpu_context;

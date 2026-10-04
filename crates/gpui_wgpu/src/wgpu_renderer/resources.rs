@@ -7,12 +7,12 @@ use std::{
 use collections::FxHashMap;
 
 use crate::WgpuContext;
-use gpui_render::blur::downsampled_dimension;
 use gpui_render::shaders::{
     blur::BlurUniforms,
     common::{FontRasterizationUniforms, GlobalUniforms},
     surface::SurfaceUniforms,
 };
+use gpui_render::{blur::downsampled_dimension, path_cache::PathCache, path_plan::PixelRect};
 
 use super::{
     WgpuRenderer,
@@ -20,6 +20,7 @@ use super::{
     filters::FrameUniformRequirements,
     pipelines::{WgpuBindGroupLayouts, WgpuPipelines},
     settings::RenderingParameters,
+    shared::{DeviceRetention, ScratchPool, scratch_texture},
     surfaces::SurfaceCache,
 };
 
@@ -28,9 +29,9 @@ const INITIAL_SURFACE_UNIFORM_CAPACITY: u64 = 8;
 
 /// Device-owned state that is replaced atomically during GPU recovery.
 pub(super) struct WgpuResources {
-    pub(super) texture_pool: Option<Arc<super::texture_pool::TexturePool>>,
+    pub(super) retention: Arc<DeviceRetention>,
     pub(super) retained: RefCell<Option<RetainedFrame>>,
-    pub(super) path_cache: RefCell<super::path_cache::PathCache>,
+    pub(super) path_cache: RefCell<PathCache<CachedPathTexture>>,
     pub(super) gpu_trace: Option<super::gpu_trace::GpuTrace>,
     pub(super) device: Arc<wgpu::Device>,
     pub(super) queue: Arc<wgpu::Queue>,
@@ -70,6 +71,55 @@ pub(super) struct WgpuResources {
     pub(super) blur_pong_view: Option<wgpu::TextureView>,
     pub(super) filter_group_textures: Vec<wgpu::Texture>,
     pub(super) filter_group_views: Vec<wgpu::TextureView>,
+}
+
+/// A path batch's raster, copied out of the path target for reuse in later frames.
+pub(super) struct CachedPathTexture {
+    _texture: wgpu::Texture,
+    pub(super) view: wgpu::TextureView,
+}
+
+impl CachedPathTexture {
+    /// Encodes a copy of `tile` of `source` into a new texture the size of `bounds`.
+    pub(super) fn copy(
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        source: &wgpu::Texture,
+        tile: PixelRect,
+        bounds: PixelRect,
+    ) -> Self {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gpui_cached_path_batch"),
+            size: wgpu::Extent3d {
+                width: bounds.width,
+                height: bounds.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: source.format(),
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                origin: wgpu::Origin3d {
+                    x: tile.x,
+                    y: tile.y,
+                    z: 0,
+                },
+                ..source.as_image_copy()
+            },
+            texture.as_image_copy(),
+            texture.size(),
+        );
+        let view = texture.create_view(&Default::default());
+        Self {
+            _texture: texture,
+            view,
+        }
+    }
 }
 
 pub(super) struct RetainedFrame {
@@ -180,14 +230,11 @@ impl WgpuResources {
             },
             last_error,
         };
+        let retention = DeviceRetention::for_device(&device);
         let resources = Self {
-            texture_pool: gpui_render::gpu_policy::GpuOptions::from_env()
-                .pooled_targets
-                .then(|| super::texture_pool::TexturePool::for_device(&device)),
+            path_cache: RefCell::new(PathCache::new(retention.budget().clone())),
+            retention,
             retained: RefCell::new(None),
-            path_cache: RefCell::new(super::path_cache::PathCache::new(
-                super::shared::retention_budget(&device),
-            )),
             gpu_trace: gpui::gpu_profiler::enabled()
                 .then(|| super::gpu_trace::GpuTrace::new(&device, &queue)),
             instances: InstanceBufferArena::new(&device, &bind_group_layouts, renderer_tier),
@@ -222,26 +269,27 @@ impl WgpuResources {
         Ok((resources, metadata))
     }
 
-    fn retire_scratch(&mut self) {
-        if let Some(pool) = &self.texture_pool {
-            for texture in [
-                self.path_intermediate_texture.take(),
-                self.path_msaa_texture.take(),
-                self.scene_color_texture.take(),
-                self.blur_ping_texture.take(),
-                self.blur_pong_texture.take(),
-            ]
-            .into_iter()
-            .flatten()
-            .chain(self.filter_group_textures.drain(..))
-            {
-                pool.retire(&self.queue, texture);
+    /// Offers the scratch textures for reuse when `pooled`, otherwise releases them.
+    pub(super) fn retire_scratch(&mut self, pooled: bool) {
+        let textures = [
+            self.path_intermediate_texture.take(),
+            self.path_msaa_texture.take(),
+            self.scene_color_texture.take(),
+            self.blur_ping_texture.take(),
+            self.blur_pong_texture.take(),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(self.filter_group_textures.drain(..));
+        if pooled {
+            for texture in textures {
+                self.retention.retire(&self.queue, texture);
             }
         }
     }
 
-    pub(super) fn invalidate_intermediate_textures(&mut self) {
-        self.retire_scratch();
+    pub(super) fn invalidate_intermediate_textures(&mut self, pooled: bool) {
+        self.retire_scratch(pooled);
         self.retained.get_mut().take();
         self.path_cache.get_mut().clear();
         self.instances.invalidate_texture_bindings();
@@ -311,7 +359,7 @@ impl WgpuRenderer {
         };
         if retained.is_none() {
             let bytes = u64::from(self.target.width()) * u64::from(self.target.height()) * 4;
-            let lease = super::shared::retention_budget(&r.device).try_acquire(bytes)?;
+            let lease = r.retention.budget().try_acquire(bytes)?;
             let (texture, view) = sampled_render_texture(
                 &r.device,
                 None,
@@ -354,43 +402,27 @@ impl WgpuRenderer {
         }
         let format = self.target.format();
         let sample_count = self.rendering_params.path_sample_count;
-        if std::env::var_os("GPUI_PROFILE_PATH_TARGET").is_some() {
-            eprintln!(
-                "GPUI path target {width}x{height}, viewport {}x{}, samples {sample_count}",
-                self.target.width(),
-                self.target.height()
-            );
-        }
+        let pooled = self.options.pooled_targets;
         let resources = self.resources_mut();
         resources.instances.invalidate_texture_bindings();
-        let (texture, view) = sampled_render_texture(
-            &resources.device,
-            resources.texture_pool.as_deref(),
-            format,
-            width,
-            height,
-        );
-        if let Some(pool) = &resources.texture_pool {
-            for texture in [
-                resources.path_intermediate_texture.take(),
-                resources.path_msaa_texture.take(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                pool.retire(&resources.queue, texture);
+        let pool = pooled.then_some(&resources.retention.pool);
+        let (texture, view) =
+            sampled_render_texture(&resources.device, pool, format, width, height);
+        let previous = [
+            resources.path_intermediate_texture.take(),
+            resources.path_msaa_texture.take(),
+        ];
+        if pooled {
+            for texture in previous.into_iter().flatten() {
+                resources.retention.retire(&resources.queue, texture);
             }
         }
         resources.path_intermediate_texture = Some(texture);
         resources.path_intermediate_view = Some(view);
-        if let Some((texture, view)) = msaa_texture(
-            &resources.device,
-            resources.texture_pool.as_deref(),
-            format,
-            width,
-            height,
-            sample_count,
-        ) {
+        let pool = pooled.then_some(&resources.retention.pool);
+        if let Some((texture, view)) =
+            msaa_texture(&resources.device, pool, format, width, height, sample_count)
+        {
             resources.path_msaa_texture = Some(texture);
             resources.path_msaa_view = Some(view);
         }
@@ -402,46 +434,28 @@ impl WgpuRenderer {
         let height = self.target.height();
         let blur_width = downsampled_dimension(width);
         let blur_height = downsampled_dimension(height);
+        let pooled = self.options.pooled_targets;
         let resources = self.resources_mut();
+        let pool = pooled.then_some(&resources.retention.pool);
 
         if resources.scene_color_texture.is_none() {
-            let (texture, view) = sampled_render_texture(
-                &resources.device,
-                resources.texture_pool.as_deref(),
-                format,
-                width,
-                height,
-            );
+            let (texture, view) =
+                sampled_render_texture(&resources.device, pool, format, width, height);
             resources.scene_color_texture = Some(texture);
             resources.scene_color_view = Some(view);
-            let (texture, view) = sampled_render_texture(
-                &resources.device,
-                resources.texture_pool.as_deref(),
-                format,
-                blur_width,
-                blur_height,
-            );
+            let (texture, view) =
+                sampled_render_texture(&resources.device, pool, format, blur_width, blur_height);
             resources.blur_ping_texture = Some(texture);
             resources.blur_ping_view = Some(view);
-            let (texture, view) = sampled_render_texture(
-                &resources.device,
-                resources.texture_pool.as_deref(),
-                format,
-                blur_width,
-                blur_height,
-            );
+            let (texture, view) =
+                sampled_render_texture(&resources.device, pool, format, blur_width, blur_height);
             resources.blur_pong_texture = Some(texture);
             resources.blur_pong_view = Some(view);
         }
 
         while resources.filter_group_views.len() < isolated_target_count {
-            let (texture, view) = sampled_render_texture(
-                &resources.device,
-                resources.texture_pool.as_deref(),
-                format,
-                width,
-                height,
-            );
+            let (texture, view) =
+                sampled_render_texture(&resources.device, pool, format, width, height);
             resources.filter_group_textures.push(texture);
             resources.filter_group_views.push(view);
         }
@@ -489,7 +503,7 @@ impl WgpuRenderer {
 
 fn sampled_render_texture(
     device: &wgpu::Device,
-    pool: Option<&super::texture_pool::TexturePool>,
+    pool: Option<&ScratchPool>,
     format: wgpu::TextureFormat,
     width: u32,
     height: u32,
@@ -510,16 +524,14 @@ fn sampled_render_texture(
             | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     };
-    let texture = pool
-        .and_then(|pool| pool.take(&descriptor))
-        .unwrap_or_else(|| device.create_texture(&descriptor));
+    let texture = scratch_texture(device, pool, &descriptor);
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     (texture, view)
 }
 
 fn msaa_texture(
     device: &wgpu::Device,
-    pool: Option<&super::texture_pool::TexturePool>,
+    pool: Option<&ScratchPool>,
     format: wgpu::TextureFormat,
     width: u32,
     height: u32,
@@ -542,15 +554,7 @@ fn msaa_texture(
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     };
-    let texture = pool
-        .and_then(|pool| pool.take(&descriptor))
-        .unwrap_or_else(|| device.create_texture(&descriptor));
+    let texture = scratch_texture(device, pool, &descriptor);
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     Some((texture, view))
-}
-
-impl Drop for WgpuResources {
-    fn drop(&mut self) {
-        self.retire_scratch();
-    }
 }

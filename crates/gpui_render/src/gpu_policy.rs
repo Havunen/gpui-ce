@@ -113,7 +113,7 @@ impl RetentionBudget {
     pub fn try_acquire(&self, bytes: u64) -> Option<RetentionLease> {
         self.0
             .used
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 used.checked_add(bytes).filter(|next| *next <= self.0.limit)
             })
             .ok()?;

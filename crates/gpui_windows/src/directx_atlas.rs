@@ -2,8 +2,9 @@ use crate::bindings::Windows::Win32::{
     D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, ID3D11Device,
     ID3D11DeviceContext, ID3D11ShaderResourceView, ID3D11Texture2D, *,
 };
-use collections::{FxHashMap, FxHashSet};
+use collections::FxHashMap;
 use etagere::BucketedAtlasAllocator;
+use gpui_render::sharing::{OwnerId, Registry, TileOwners};
 use parking_lot::Mutex;
 use std::sync::Arc;
 
@@ -12,14 +13,18 @@ use gpui::{
     PlatformAtlas, Point, Size,
 };
 
+/// A window's view of an atlas. With shared resources, every window on a device uses
+/// one atlas state, and a tile lives until the last window using it removes it.
 pub(crate) struct DirectXAtlas {
     state: Arc<Mutex<DirectXAtlasState>>,
-    owned: Mutex<(u64, FxHashSet<AtlasKey>)>,
+    owner: OwnerId,
 }
-thread_local! { static SHARED: std::cell::RefCell<Vec<std::sync::Weak<Mutex<DirectXAtlasState>>>> = const { std::cell::RefCell::new(Vec::new()) }; }
+
+thread_local! {
+    static SHARED_ATLASES: Registry<Mutex<DirectXAtlasState>> = const { Registry::new() };
+}
 
 struct DirectXAtlasState {
-    shared: bool,
     device: ID3D11Device,
     device_context: ID3D11DeviceContext,
     monochrome_textures: AtlasTextureList<DirectXAtlasTexture>,
@@ -27,8 +32,7 @@ struct DirectXAtlasState {
     subpixel_textures: AtlasTextureList<DirectXAtlasTexture>,
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
     generation: u64,
-    epoch: u64,
-    owners: FxHashMap<AtlasKey, usize>,
+    owners: TileOwners,
 }
 
 struct DirectXAtlasTexture {
@@ -41,42 +45,26 @@ struct DirectXAtlasTexture {
 }
 
 impl DirectXAtlas {
+    // The state holds COM pointers that are not `Send`; it stays on the window thread.
+    #[allow(clippy::arc_with_non_send_sync)]
     pub(crate) fn new(device: &ID3D11Device, device_context: &ID3D11DeviceContext) -> Self {
-        let make = || Self {
-            state: Arc::new(Mutex::new(DirectXAtlasState {
-                shared: gpui_render::gpu_policy::GpuOptions::from_env().shared_resources,
-                device: device.clone(),
-                device_context: device_context.clone(),
-                monochrome_textures: Default::default(),
-                polychrome_textures: Default::default(),
-                subpixel_textures: Default::default(),
-                tiles_by_key: Default::default(),
-                generation: 0,
-                epoch: 0,
-                owners: FxHashMap::default(),
-            })),
-            owned: Mutex::default(),
+        let shared = gpui_render::gpu_policy::GpuOptions::from_env().shared_resources;
+        let state = if shared {
+            SHARED_ATLASES.with(|atlases| {
+                atlases.get_or_insert_with(
+                    |state| state.lock().device == *device,
+                    || DirectXAtlasState::new(device, device_context, true),
+                )
+            })
+        } else {
+            Arc::new(DirectXAtlasState::new(device, device_context, false))
         };
-        if !gpui_render::gpu_policy::GpuOptions::from_env().shared_resources {
-            return make();
-        }
-        SHARED.with_borrow_mut(|cache| {
-            cache.retain(|s| s.strong_count() > 0);
-            for shared in cache.iter().filter_map(std::sync::Weak::upgrade) {
-                let lock = shared.lock();
-                if lock.device == *device {
-                    let epoch = lock.epoch;
-                    drop(lock);
-                    return Self {
-                        state: shared,
-                        owned: Mutex::new((epoch, FxHashSet::default())),
-                    };
-                }
-            }
-            let atlas = make();
-            cache.push(Arc::downgrade(&atlas.state));
-            atlas
-        })
+        Self::with_state(state)
+    }
+
+    fn with_state(state: Arc<Mutex<DirectXAtlasState>>) -> Self {
+        let owner = state.lock().owners.add_owner();
+        Self { state, owner }
     }
 
     pub(crate) fn allocated_bytes(&self) -> u64 {
@@ -121,8 +109,7 @@ impl DirectXAtlas {
         lock.polychrome_textures = AtlasTextureList::default();
         lock.subpixel_textures = AtlasTextureList::default();
         lock.tiles_by_key.clear();
-        lock.owners.clear();
-        lock.epoch = lock.epoch.wrapping_add(1);
+        lock.owners.reset();
         lock.generation = lock.generation.wrapping_add(1);
     }
 }
@@ -137,7 +124,7 @@ impl PlatformAtlas for DirectXAtlas {
     ) -> anyhow::Result<Option<AtlasTile>> {
         let mut lock = self.state.lock();
         if let Some(tile) = lock.tiles_by_key.get(key).copied() {
-            self.retain_key(&mut lock, key);
+            lock.owners.retain(self.owner, key);
             Ok(Some(tile))
         } else {
             let Some((size, bytes)) = build()? else {
@@ -161,23 +148,16 @@ impl PlatformAtlas for DirectXAtlas {
             })?;
             texture.upload(&lock.device_context, tile.bounds, &bytes);
             lock.tiles_by_key.insert(key.clone(), tile);
-            self.retain_key(&mut lock, key);
+            lock.owners.retain(self.owner, key);
             Ok(Some(tile))
         }
     }
 
     fn remove(&self, key: &AtlasKey) {
         let mut lock = self.state.lock();
-
-        if !lock.shared {
-            lock.release_key(key);
-            return;
+        if lock.owners.release(self.owner, key) {
+            lock.free_tile(key);
         }
-        let mut owned = self.owned.lock();
-        if owned.0 != lock.epoch || !owned.1.remove(key) {
-            return;
-        }
-        lock.release_key(key);
     }
 
     fn generation(&self) -> u64 {
@@ -186,17 +166,24 @@ impl PlatformAtlas for DirectXAtlas {
 }
 
 impl DirectXAtlasState {
-    fn release_key(&mut self, key: &AtlasKey) {
-        if self.shared {
-            let Some(owners) = self.owners.get_mut(key) else {
-                return;
-            };
-            *owners -= 1;
-            if *owners > 0 {
-                return;
-            }
-            self.owners.remove(key);
-        }
+    fn new(
+        device: &ID3D11Device,
+        device_context: &ID3D11DeviceContext,
+        shared: bool,
+    ) -> Mutex<Self> {
+        Mutex::new(Self {
+            device: device.clone(),
+            device_context: device_context.clone(),
+            monochrome_textures: Default::default(),
+            polychrome_textures: Default::default(),
+            subpixel_textures: Default::default(),
+            tiles_by_key: Default::default(),
+            generation: 0,
+            owners: TileOwners::new(shared),
+        })
+    }
+
+    fn free_tile(&mut self, key: &AtlasKey) {
         let Some(tile) = self.tiles_by_key.remove(key) else {
             return;
         };
@@ -500,32 +487,11 @@ mod tests {
     }
 }
 
-impl DirectXAtlas {
-    fn retain_key(&self, lock: &mut DirectXAtlasState, key: &AtlasKey) {
-        if !lock.shared {
-            return;
-        }
-        let mut owned = self.owned.lock();
-        if owned.0 != lock.epoch {
-            owned.0 = lock.epoch;
-            owned.1.clear();
-        }
-        if owned.1.insert(key.clone()) {
-            *lock.owners.entry(key.clone()).or_default() += 1;
-        }
-    }
-}
 impl Drop for DirectXAtlas {
     fn drop(&mut self) {
         let mut state = self.state.lock();
-        if !state.shared {
-            return;
-        }
-        let owned = self.owned.get_mut();
-        if owned.0 == state.epoch {
-            for key in owned.1.drain() {
-                state.release_key(&key);
-            }
+        for key in state.owners.remove_owner(self.owner) {
+            state.free_tile(&key);
         }
     }
 }
@@ -533,16 +499,19 @@ impl Drop for DirectXAtlas {
 #[cfg(test)]
 mod shared_atlas_tests {
     use super::*;
+
     #[test]
     fn shared_atlas_survives_one_window_closing_and_releases_the_final_lease() -> anyhow::Result<()>
     {
         let devices = crate::directx_devices::DirectXDevices::new()?;
-        let first = DirectXAtlas::new(&devices.device, &devices.device_context);
-        first.state.lock().shared = true;
-        let second = DirectXAtlas {
-            state: first.state.clone(),
-            owned: Mutex::default(),
-        };
+        #[allow(clippy::arc_with_non_send_sync)]
+        let state = Arc::new(DirectXAtlasState::new(
+            &devices.device,
+            &devices.device_context,
+            true,
+        ));
+        let first = DirectXAtlas::with_state(state.clone());
+        let second = DirectXAtlas::with_state(state);
         let key = AtlasKey::Image(gpui::RenderImageParams {
             image_id: gpui::ImageId(8),
             frame_index: 0,
@@ -565,10 +534,13 @@ mod shared_atlas_tests {
         );
         first.remove(&key);
         first.remove(&key);
-        assert_eq!(second.state.lock().owners[&key], 1);
+        assert!(second.state.lock().tiles_by_key.contains_key(&key));
         first.get_or_insert_with(&key, &mut build)?;
         drop(first);
-        assert_eq!(second.state.lock().owners[&key], 1);
+        assert!(
+            second.state.lock().tiles_by_key.contains_key(&key),
+            "a closing window keeps tiles another window uses"
+        );
         second.remove(&key);
         assert_eq!(second.allocated_bytes(), 0);
         let weak = Arc::downgrade(&second.state);

@@ -3,17 +3,21 @@ use super::{
     buffers::{InstanceTransport, InstanceUpload},
     filters::{FILTER_UNIFORMS_PER_COMPOSITE, FrameUniformRequirements},
     path_types,
+    resources::CachedPathTexture,
 };
 use gpui::{
-    FilterRenderTarget, MAX_FILTER_GROUP_DEPTH, MonochromeSprite, PolychromeSprite, PrimitiveBatch,
-    Quad, RenderCommand, Scene, Shadow, SubpixelSprite, Underline,
+    FilterRenderTarget, MAX_FILTER_GROUP_DEPTH, MonochromeSprite, Path, PolychromeSprite,
+    PrimitiveBatch, Quad, RenderCommand, ScaledPixels, Scene, Shadow, SubpixelSprite, Underline,
 };
 use gpui_render::blur::{FilterCompositeClip, FilterCompositeParameters};
 use gpui_render::damage::Damage;
+use gpui_render::path_cache::{self, Entry, Source};
+use gpui_render::path_plan::{self, PixelRect};
 use gpui_render::shaders::{
     common::{FontRasterizationUniforms, GlobalUniforms, ShaderBool},
     interface as shader_interface,
 };
+use std::sync::Arc;
 
 pub(super) fn render_to_view(
     renderer: &mut WgpuRenderer,
@@ -57,15 +61,10 @@ pub(super) fn render_to_view(
                 .map(|f| bytes(&f._texture))
                 .unwrap_or(0),
         );
-        let (pooled, pending) = r
-            .texture_pool
-            .as_ref()
-            .map(|p| p.bytes())
-            .unwrap_or_default();
+        let (pooled, pending) = r.retention.pool.bytes();
         metrics.memory.pooled_bytes = Some(pooled);
         metrics.memory.pending_release_bytes = Some(pending);
-        metrics.memory.device_retention_bytes =
-            Some(super::shared::retention_budget(&r.device).used());
+        metrics.memory.device_retention_bytes = Some(r.retention.budget().used());
         metrics.path_target = r
             .path_intermediate_texture
             .as_ref()
@@ -89,16 +88,18 @@ pub(super) fn render_to_view(
         trace.begin(metrics);
     }
     match FrameEncoder::new(renderer, scene, targets).encode(readback) {
-        Ok((command_buffer, mut used_paths)) => {
+        Ok((command_buffer, used_paths)) => {
             let submission = renderer.resources().queue.submit([command_buffer]);
             let resources = renderer.resources();
-            if renderer.options.cached_layers || renderer.options.partial_redraw {
-                used_paths.extend(resources.path_cache.borrow().leases());
-                let retained = resources
-                    .retained
-                    .borrow()
-                    .as_ref()
-                    .map(|frame| frame.lease.clone());
+            // The cached rasters and the retained frame this frame used stay charged to
+            // the device budget until the GPU is done with them, even if they are
+            // evicted or replaced before then.
+            let retained = resources
+                .retained
+                .borrow()
+                .as_ref()
+                .map(|frame| frame.lease.clone());
+            if !used_paths.is_empty() || retained.is_some() {
                 resources
                     .queue
                     .on_submitted_work_done(move || drop((used_paths, retained)));
@@ -250,7 +251,7 @@ fn begin_frame(renderer: &mut WgpuRenderer) -> bool {
     }
     if renderer.faults.consecutive_failed_frames > 5 {
         if let Some(resources) = renderer.resources.as_mut() {
-            resources.invalidate_intermediate_textures();
+            resources.invalidate_intermediate_textures(renderer.options.pooled_targets);
         }
         renderer.atlas.clear();
         renderer.target.request_redraw();
@@ -444,91 +445,24 @@ struct FrameEncoder<'a> {
     offscreen: Option<wgpu::TextureView>,
     presentation: wgpu::TextureView,
     instances: InstanceUpload,
-    paths: Vec<PathSource>,
-}
-
-enum PathSource {
-    Inline,
-    Cached(std::sync::Arc<super::path_cache::CachedPath>),
-    Packed {
-        world: gpui_render::path_plan::PixelRect,
-        tile: gpui_render::path_plan::PixelRect,
-    },
-}
-
-fn plan_paths(renderer: &WgpuRenderer, scene: &Scene) -> Vec<PathSource> {
-    if !renderer.options.cached_layers && !renderer.options.batched_paths {
-        return Vec::new();
-    }
-    use gpui_render::path_plan;
-    let r = renderer.resources();
-    let mut cache = r.path_cache.borrow_mut();
-    cache.begin();
-    let mut plan: Vec<_> = scene
-        .render_commands()
-        .iter()
-        .map(|command| {
-            if renderer.options.cached_layers {
-                if let RenderCommand::Batch(PrimitiveBatch::Paths { range, .. }) = command {
-                    if let Some(cached) = cache.get(&scene.paths[range.clone()]) {
-                        return PathSource::Cached(cached);
-                    }
-                }
-            }
-            PathSource::Inline
-        })
-        .collect();
-    if renderer.options.batched_paths && !scene.requires_offscreen_rendering() {
-        if let Some(target) = &r.path_intermediate_texture {
-            let extent = (target.width(), target.height());
-            let misses: Vec<_> = scene
-                .render_commands()
-                .iter()
-                .enumerate()
-                .filter_map(|(i, command)| {
-                    if matches!(plan[i], PathSource::Cached(_)) {
-                        return None;
-                    }
-                    if let RenderCommand::Batch(PrimitiveBatch::Paths {
-                        range,
-                        rasterization_vertex_count,
-                        ..
-                    }) = command
-                    {
-                        if *rasterization_vertex_count == 0 {
-                            return None;
-                        }
-                        let bounds = path_plan::visible_rect(
-                            scene.paths[range.clone()]
-                                .iter()
-                                .map(gpui::Path::clipped_bounds),
-                            extent,
-                        )?;
-                        Some((i, bounds))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if let Some(tiles) = path_plan::pack(
-                &misses.iter().map(|(_, rect)| *rect).collect::<Vec<_>>(),
-                extent,
-            ) {
-                for ((i, world), tile) in misses.into_iter().zip(tiles) {
-                    plan[i] = PathSource::Packed { world, tile };
-                }
-            }
-        }
-    }
-    let mut active = cache.views();
-    active.extend(r.path_intermediate_view.iter().cloned());
-    r.instances.retain_path_bindings(&active);
-    plan
+    paths: Vec<Source<CachedPathTexture>>,
+    /// Cached path rasters this frame reads or captures.
+    used_paths: Vec<Arc<Entry<CachedPathTexture>>>,
 }
 
 impl<'a> FrameEncoder<'a> {
     fn new(renderer: &'a WgpuRenderer, scene: &'a Scene, targets: PreparedTargets) -> Self {
-        let paths = plan_paths(renderer, scene);
+        let paths = {
+            let resources = renderer.resources();
+            let mut cache = resources.path_cache.borrow_mut();
+            cache.begin();
+            let extent = resources
+                .path_intermediate_texture
+                .as_ref()
+                .map(|target| (target.width(), target.height()))
+                .unwrap_or_default();
+            path_cache::plan(scene, extent, &mut cache, renderer.options)
+        };
         let encoder =
             renderer
                 .resources()
@@ -546,19 +480,14 @@ impl<'a> FrameEncoder<'a> {
             presentation: targets.presentation,
             instances: targets.instances,
             paths,
+            used_paths: Vec::new(),
         }
     }
 
     fn encode(
         mut self,
         readback: Option<ReadbackCopy<'_>>,
-    ) -> Result<
-        (
-            wgpu::CommandBuffer,
-            Vec<std::sync::Arc<super::path_cache::CachedPath>>,
-        ),
-        DrawError,
-    > {
+    ) -> Result<(wgpu::CommandBuffer, Vec<Arc<Entry<CachedPathTexture>>>), DrawError> {
         let result = self.encode_commands();
         if result.is_ok() {
             if let Some(offscreen) = &self.offscreen {
@@ -596,8 +525,13 @@ impl<'a> FrameEncoder<'a> {
         // captures, while this frame's command buffer and completion leases own uses.
         if self.renderer.options.cached_layers {
             let resources = self.renderer.resources();
-            let mut views = resources.path_cache.borrow().views();
-            views.extend(resources.path_intermediate_view.iter().cloned());
+            let views: Vec<_> = resources
+                .path_cache
+                .borrow()
+                .entries()
+                .map(|entry| entry.resource.view.clone())
+                .chain(resources.path_intermediate_view.iter().cloned())
+                .collect();
             resources.instances.retain_path_bindings(&views);
         }
         self.instances.finish(&mut self.encoder);
@@ -609,7 +543,7 @@ impl<'a> FrameEncoder<'a> {
                     cache.bytes(),
                     cache.hits,
                     cache.misses,
-                    super::shared::retention_budget(&self.renderer.resources().device).used(),
+                    self.renderer.resources().retention.budget().used(),
                 );
                 trace.resolve(&mut self.encoder);
             } else {
@@ -617,69 +551,36 @@ impl<'a> FrameEncoder<'a> {
             }
         }
         let command_buffer = self.encoder.finish();
-        let mut used_paths: Vec<_> = self
-            .paths
-            .into_iter()
-            .filter_map(|path| match path {
-                PathSource::Cached(cached) => Some(cached),
-                _ => None,
-            })
-            .collect();
-        used_paths.extend(
-            self.renderer
-                .resources()
-                .path_cache
-                .borrow_mut()
-                .take_captures(),
-        );
-        result.map(|()| (command_buffer, used_paths))
+        result.map(|()| (command_buffer, self.used_paths))
     }
 
     fn encode_commands(&mut self) -> DrawResult {
         if self.damage == Damage::Unchanged {
             return Ok(());
         }
+        let scene = self.scene;
         let packed: Vec<_> = self
-            .scene
-            .render_commands()
+            .paths
             .iter()
-            .enumerate()
-            .filter_map(|(i, command)| {
-                if let (
-                    PathSource::Packed { world, tile },
+            .zip(scene.render_commands())
+            .filter_map(|(source, command)| match (source, command) {
+                (
+                    Source::Packed { world, tile },
                     RenderCommand::Batch(PrimitiveBatch::Paths { range, .. }),
-                ) = (self.paths.get(i).unwrap_or(&PathSource::Inline), command)
-                {
-                    Some((
-                        &self.scene.paths[range.clone()][..],
-                        tile.origin() - world.origin(),
-                        Some(*tile),
-                    ))
-                } else {
-                    None
-                }
+                ) => Some((&scene.paths[range.clone()], *world, *tile)),
+                _ => None,
             })
             .collect();
         if !packed.is_empty() {
             self.renderer.draw_path_batches(
                 &mut self.encoder,
-                packed.into_iter(),
+                packed.iter().map(|&(paths, world, tile)| {
+                    (paths, tile.origin() - world.origin(), Some(tile))
+                }),
                 &mut self.instances,
             )?;
-            for (i, command) in self.scene.render_commands().iter().enumerate() {
-                if let (
-                    PathSource::Packed { world, tile },
-                    RenderCommand::Batch(PrimitiveBatch::Paths { range, .. }),
-                ) = (self.paths.get(i).unwrap_or(&PathSource::Inline), command)
-                {
-                    capture_path(
-                        self.renderer,
-                        &mut self.encoder,
-                        *tile,
-                        *world,
-                        &self.scene.paths[range.clone()],
-                    );
-                }
+            for (paths, world, tile) in packed {
+                self.capture_paths(paths, world, tile);
             }
         }
         let mut pass = begin_scene_render_pass(
@@ -709,19 +610,21 @@ impl<'a> FrameEncoder<'a> {
                         continue;
                     }
                     let paths = &self.scene.paths[range.clone()];
-                    match self.paths.get(command_index).unwrap_or(&PathSource::Inline) {
-                        PathSource::Cached(cached) => {
+                    match self.paths.get(command_index) {
+                        Some(Source::Invisible) => continue,
+                        Some(Source::Cached(cached)) => {
                             self.renderer.draw_paths_from_texture(
                                 paths,
                                 cached.bounds.origin(),
                                 Some(cached.bounds),
-                                &cached.view,
+                                &cached.resource.view,
                                 &mut self.instances,
                                 &mut pass,
                             )?;
+                            self.used_paths.push(cached.clone());
                             continue;
                         }
-                        PathSource::Packed { world, tile } => {
+                        Some(Source::Packed { world, tile }) => {
                             let view = self
                                 .renderer
                                 .resources()
@@ -738,13 +641,11 @@ impl<'a> FrameEncoder<'a> {
                             )?;
                             continue;
                         }
-                        PathSource::Inline => {}
+                        Some(Source::Inline) | None => {}
                     }
-                    if gpui_render::path_plan::visible_rect(
-                        paths.iter().map(gpui::Path::clipped_bounds),
-                        (self.renderer.target.width(), self.renderer.target.height()),
-                    )
-                    .is_none()
+                    let viewport = (self.renderer.target.width(), self.renderer.target.height());
+                    if path_plan::visible_rect(paths.iter().map(Path::clipped_bounds), viewport)
+                        .is_none()
                     {
                         continue;
                     }
@@ -754,23 +655,14 @@ impl<'a> FrameEncoder<'a> {
                         paths,
                         &mut self.instances,
                     );
-                    if rasterized.is_ok() {
-                        if let Some(target) =
-                            self.renderer.resources().path_intermediate_texture.as_ref()
-                        {
-                            if let Some(bounds) = gpui_render::path_plan::visible_rect(
-                                paths.iter().map(gpui::Path::clipped_bounds),
-                                (target.width(), target.height()),
-                            ) {
-                                capture_path(
-                                    self.renderer,
-                                    &mut self.encoder,
-                                    bounds,
-                                    bounds,
-                                    paths,
-                                );
-                            }
-                        }
+                    if rasterized.is_ok()
+                        && let Some(target) = &self.renderer.resources().path_intermediate_texture
+                        && let Some(bounds) = path_plan::visible_rect(
+                            paths.iter().map(Path::clipped_bounds),
+                            (target.width(), target.height()),
+                        )
+                    {
+                        self.capture_paths(paths, bounds, bounds);
                     }
                     pass = begin_scene_render_pass(
                         self.renderer,
@@ -877,23 +769,30 @@ impl<'a> FrameEncoder<'a> {
         self.targets.assert_balanced();
         Ok(())
     }
-}
 
-fn capture_path(
-    renderer: &WgpuRenderer,
-    encoder: &mut wgpu::CommandEncoder,
-    source: gpui_render::path_plan::PixelRect,
-    world: gpui_render::path_plan::PixelRect,
-    paths: &[gpui::Path<gpui::ScaledPixels>],
-) {
-    if !renderer.options.cached_layers {
-        return;
-    }
-    let r = renderer.resources();
-    if let Some(texture) = &r.path_intermediate_texture {
-        r.path_cache
-            .borrow_mut()
-            .capture(&r.device, encoder, texture, source, world, paths);
+    /// Caches the raster of `paths` drawn at `world`, copied from `tile` of the path
+    /// target, for later frames that draw the same geometry.
+    fn capture_paths(&mut self, paths: &[Path<ScaledPixels>], world: PixelRect, tile: PixelRect) {
+        if !self.renderer.options.cached_layers {
+            return;
+        }
+        let resources = self.renderer.resources();
+        let Some(source) = &resources.path_intermediate_texture else {
+            return;
+        };
+        let encoder = &mut self.encoder;
+        let captured = resources.path_cache.borrow_mut().capture(paths, world, || {
+            Ok::<_, std::convert::Infallible>(CachedPathTexture::copy(
+                &resources.device,
+                encoder,
+                source,
+                tile,
+                world,
+            ))
+        });
+        if let Ok(Some(entry)) = captured {
+            self.used_paths.push(entry);
+        }
     }
 }
 

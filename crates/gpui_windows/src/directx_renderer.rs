@@ -15,14 +15,16 @@ use gpui_render::{
     },
     damage::{Damage, Snapshot},
     gpu_policy::{RetentionBudget, RetentionLease},
-    native_path_cache::{self, PathCache, Source},
+    path_cache::{self, PathCache, Source},
     path_plan::{self, PixelRect},
     path_types::{PathRasterizationVertex, PathSprite},
+    scratch_pool::{Pending, Pool},
     shaders::{
         common::{FontRasterizationUniforms, GlobalUniforms, ShaderBool, SurfaceColorFormat},
         interface as shader_interface,
         surface::SurfaceUniforms,
     },
+    sharing::Registry,
 };
 use gpui_util::ResultExt;
 use smallvec::SmallVec;
@@ -55,32 +57,32 @@ pub(crate) struct FontInfo {
     pub is_bgr: bool,
 }
 
+/// Shaders created for one device. With shared resources every renderer on the device
+/// uses one set, so later windows create none of them.
 struct SharedShaders {
     device: ID3D11Device,
     vertices: std::cell::RefCell<Vec<(Vec<u8>, ID3D11VertexShader)>>,
     fragments: std::cell::RefCell<Vec<(Vec<u8>, ID3D11PixelShader)>>,
 }
-thread_local! { static SHARED_SHADERS: std::cell::RefCell<Vec<std::rc::Weak<SharedShaders>>> = const { std::cell::RefCell::new(Vec::new()) }; }
-fn shared_shaders(device: &ID3D11Device) -> Option<std::rc::Rc<SharedShaders>> {
+
+thread_local! {
+    static SHARED_SHADERS: Registry<SharedShaders> = const { Registry::new() };
+    static RETENTION: Registry<DeviceRetention> = const { Registry::new() };
+}
+
+fn shared_shaders(device: &ID3D11Device) -> Option<Arc<SharedShaders>> {
     if !gpui_render::gpu_policy::GpuOptions::from_env().shared_resources {
         return None;
     }
-    Some(SHARED_SHADERS.with_borrow_mut(|cache| {
-        cache.retain(|entry| entry.strong_count() > 0);
-        if let Some(entry) = cache
-            .iter()
-            .filter_map(std::rc::Weak::upgrade)
-            .find(|entry| entry.device == *device)
-        {
-            return entry;
-        }
-        let entry = std::rc::Rc::new(SharedShaders {
-            device: device.clone(),
-            vertices: Default::default(),
-            fragments: Default::default(),
-        });
-        cache.push(std::rc::Rc::downgrade(&entry));
-        entry
+    Some(SHARED_SHADERS.with(|shaders| {
+        shaders.get_or_insert_with(
+            |shaders| shaders.device == *device,
+            || SharedShaders {
+                device: device.clone(),
+                vertices: Default::default(),
+                fragments: Default::default(),
+            },
+        )
     }))
 }
 
@@ -88,14 +90,14 @@ struct CachedPathTexture {
     _texture: ID3D11Texture2D,
     srv: Option<ID3D11ShaderResourceView>,
 }
-type CachedPathEntry = Arc<native_path_cache::Entry<CachedPathTexture>>;
+type CachedPathEntry = Arc<path_cache::Entry<CachedPathTexture>>;
 type ScratchKey = (u8, u32, u32, usize);
 enum Scratch {
     Path(PathResources),
     Blur(BlurResources),
 }
-type ScratchPool = gpui_render::native_pool::Pool<ScratchKey, Scratch>;
-type PendingScratch = std::sync::Weak<gpui_render::native_pool::Pending<ScratchKey, Scratch>>;
+type ScratchPool = Pool<ScratchKey, Scratch>;
+type PendingScratch = std::sync::Weak<Pending<ScratchKey, Scratch>>;
 fn texture_bytes(texture: &ID3D11Texture2D) -> u64 {
     let mut desc = D3D11_TEXTURE2D_DESC::default();
     unsafe {
@@ -103,15 +105,36 @@ fn texture_bytes(texture: &ID3D11Texture2D) -> u64 {
     }
     u64::from(desc.Width) * u64::from(desc.Height) * 4 * u64::from(desc.SampleDesc.Count)
 }
+/// Optional resources retained beyond a frame (path caches, retained frames, pooled
+/// scratch targets), charged to one budget per device rather than per window. D3D11 has
+/// no completion callbacks, so event queries tell when the GPU is done with them.
 struct DeviceRetention {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
-    budget: RetentionBudget,
     pool: ScratchPool,
     pending_pool: std::cell::RefCell<Vec<(ID3D11Query, PendingScratch)>>,
     pending: std::cell::RefCell<Vec<(ID3D11Query, Vec<CachedPathEntry>, Vec<Arc<RetentionLease>>)>>,
 }
 impl DeviceRetention {
+    fn for_device(device: &ID3D11Device, context: &ID3D11DeviceContext) -> Arc<Self> {
+        RETENTION.with(|retention| {
+            retention.get_or_insert_with(
+                |retention| retention.device == *device,
+                || Self {
+                    device: device.clone(),
+                    context: context.clone(),
+                    pool: ScratchPool::new(RetentionBudget::default()),
+                    pending_pool: Default::default(),
+                    pending: Default::default(),
+                },
+            )
+        })
+    }
+
+    fn budget(&self) -> &RetentionBudget {
+        self.pool.budget()
+    }
+
     fn retire(&self, value: Scratch) {
         let (key, bytes) = match &value {
             Scratch::Path(p) => {
@@ -200,43 +223,16 @@ impl DeviceRetention {
         });
     }
 }
-thread_local! { static RETENTION: std::cell::RefCell<Vec<std::rc::Weak<DeviceRetention>>> = const { std::cell::RefCell::new(Vec::new()) }; }
-fn device_retention(
-    device: &ID3D11Device,
-    context: &ID3D11DeviceContext,
-) -> std::rc::Rc<DeviceRetention> {
-    RETENTION.with_borrow_mut(|entries| {
-        entries.retain(|entry| entry.strong_count() > 0);
-        if let Some(entry) = entries
-            .iter()
-            .filter_map(std::rc::Weak::upgrade)
-            .find(|entry| entry.device == *device)
-        {
-            return entry;
-        }
-        let budget = RetentionBudget::default();
-        let entry = std::rc::Rc::new(DeviceRetention {
-            device: device.clone(),
-            context: context.clone(),
-            pool: ScratchPool::new(budget.clone()),
-            pending_pool: Default::default(),
-            budget,
-            pending: Default::default(),
-        });
-        entries.push(std::rc::Rc::downgrade(&entry));
-        entry
-    })
-}
 // Keep evicted entries charged until the immediate context completes their last use.
 // The shared device state survives closing any one window; it has no strong global owner.
 struct PathFrame {
-    device: std::rc::Rc<DeviceRetention>,
+    device: Arc<DeviceRetention>,
     query: Option<ID3D11Query>,
     used: Vec<CachedPathEntry>,
     leases: Vec<Arc<RetentionLease>>,
 }
 impl PathFrame {
-    fn new(device: std::rc::Rc<DeviceRetention>, enabled: bool) -> Self {
+    fn new(device: Arc<DeviceRetention>, enabled: bool) -> Self {
         device.poll();
         let mut query = None;
         if enabled && device.pending.borrow().len() < 4 {
@@ -287,12 +283,12 @@ struct RetainedFrame {
 }
 
 pub(crate) struct DirectXRenderer {
-    retention: std::rc::Rc<DeviceRetention>,
+    retention: Arc<DeviceRetention>,
     retained: Option<RetainedFrame>,
     path_cache: PathCache<CachedPathTexture>,
     path_scissor_states: Option<(ID3D11RasterizerState, ID3D11RasterizerState)>,
     options: gpui_render::gpu_policy::GpuOptions,
-    _shared_shaders: Option<std::rc::Rc<SharedShaders>>,
+    _shared_shaders: Option<Arc<SharedShaders>>,
     gpu_trace: Option<std::rc::Rc<crate::gpu_trace::GpuTrace>>,
     hwnd: HWND,
     atlas: Arc<DirectXAtlas>,
@@ -621,10 +617,10 @@ impl DirectXRenderer {
                     .map_err(|error| log::warn!("GPU timestamps unavailable: {error}"))
                     .ok()
             });
-        let retention = device_retention(&devices.device, &devices.device_context);
+        let retention = DeviceRetention::for_device(&devices.device, &devices.device_context);
         Ok(DirectXRenderer {
             retained: None,
-            path_cache: PathCache::new(retention.budget.clone()),
+            path_cache: PathCache::new(retention.budget().clone()),
             retention,
             path_scissor_states: None,
             options: gpui_render::gpu_policy::GpuOptions::from_env(),
@@ -781,8 +777,8 @@ impl DirectXRenderer {
         self.gpu_trace = gpui::gpu_profiler::enabled()
             .then(|| crate::gpu_trace::GpuTrace::new(&devices.device, &devices.device_context))
             .and_then(Result::ok);
-        self.retention = device_retention(&devices.device, &devices.device_context);
-        self.path_cache = PathCache::new(self.retention.budget.clone());
+        self.retention = DeviceRetention::for_device(&devices.device, &devices.device_context);
+        self.path_cache = PathCache::new(self.retention.budget().clone());
         self.retained = None;
         self.path_scissor_states = None;
         self.devices = Some(devices);
@@ -868,7 +864,7 @@ impl DirectXRenderer {
                 } else {
                     0
                 }),
-                device_retention_bytes: Some(self.retention.budget.used()),
+                device_retention_bytes: Some(self.retention.budget().used()),
                 pooled_bytes: Some(self.retention.pool.bytes().0),
                 pending_release_bytes: Some(self.retention.pool.bytes().1),
                 ..Default::default()
@@ -925,7 +921,7 @@ impl DirectXRenderer {
         if snapshot.is_some() && self.retained.is_none() {
             if let Some(lease) = self
                 .retention
-                .budget
+                .budget()
                 .try_acquire(u64::from(self.width) * u64::from(self.height) * 4 + 4)
             {
                 let devices = self.devices.as_ref().context("devices missing")?;
@@ -1077,7 +1073,7 @@ impl DirectXRenderer {
         let path_plan = if damage == Damage::Unchanged {
             Vec::new()
         } else {
-            native_path_cache::plan(scene, extent, &mut self.path_cache, path_options)
+            path_cache::plan(scene, extent, &mut self.path_cache, path_options)
         };
         let packed: Vec<_> = path_plan
             .iter()
@@ -2302,7 +2298,7 @@ impl DirectXResources {
         device: &ID3D11Device,
         scene: &Scene,
         cropped: bool,
-        retention: Option<&std::rc::Rc<DeviceRetention>>,
+        retention: Option<&Arc<DeviceRetention>>,
     ) -> Result<()> {
         let previous = self
             .path
@@ -3777,7 +3773,7 @@ mod tests {
                         candidate.path_cache.bytes() <= gpui_render::gpu_policy::WINDOW_LAYER_BYTES
                     );
                     assert!(
-                        candidate.retention.budget.used()
+                        candidate.retention.budget().used()
                             <= gpui_render::gpu_policy::DEVICE_RETENTION_BYTES
                     );
                     let repeated = candidate.render_to_image(&scene, background)?;
@@ -3789,7 +3785,7 @@ mod tests {
                             .all(|(a, b)| a.abs_diff(*b) <= 1)
                     );
                 }
-                let budget = candidate.retention.budget.clone();
+                let budget = candidate.retention.budget().clone();
                 drop(candidate);
                 drop(full);
                 assert_eq!(budget.used(), 0);

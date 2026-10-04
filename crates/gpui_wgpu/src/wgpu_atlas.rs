@@ -1,10 +1,11 @@
 use anyhow::{Context as _, Result};
-use collections::{FxHashMap, FxHashSet};
+use collections::FxHashMap;
 use etagere::{BucketedAtlasAllocator, size2};
 use gpui::{
     AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTextureList, AtlasTile, Bounds, DevicePixels,
     PlatformAtlas, Point, Size,
 };
+use gpui_render::sharing::{OwnerId, Registry, TileOwners};
 use parking_lot::Mutex;
 use std::{borrow::Cow, ops, sync::Arc};
 
@@ -21,12 +22,15 @@ fn etagere_point_to_device(point: etagere::Point) -> Point<DevicePixels> {
     }
 }
 
+/// A window's view of an atlas. With shared resources, every window on a device uses
+/// one atlas state, and a tile lives until the last window using it removes it.
 pub struct WgpuAtlas {
     state: Arc<Mutex<WgpuAtlasState>>,
-    owned: Mutex<(u64, FxHashSet<AtlasKey>)>,
+    owner: OwnerId,
 }
+
 thread_local! {
-    static SHARED_ATLASES: std::cell::RefCell<Vec<std::sync::Weak<Mutex<WgpuAtlasState>>>> = const { std::cell::RefCell::new(Vec::new()) };
+    static SHARED_ATLASES: Registry<Mutex<WgpuAtlasState>> = const { Registry::new() };
 }
 
 /// Identity of a backing atlas texture, distinct from its reusable slot ID.
@@ -40,7 +44,6 @@ struct PendingUpload {
 }
 
 struct WgpuAtlasState {
-    shared: bool,
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     max_texture_size: u32,
@@ -50,8 +53,7 @@ struct WgpuAtlasState {
     pending_uploads: Vec<PendingUpload>,
     next_texture_identity: u64,
     generation: u64,
-    epoch: u64,
-    owners: FxHashMap<AtlasKey, usize>,
+    owners: TileOwners,
 }
 
 pub struct WgpuTextureInfo {
@@ -66,56 +68,42 @@ impl WgpuAtlas {
         queue: Arc<wgpu::Queue>,
         color_texture_format: wgpu::TextureFormat,
     ) -> Self {
-        let max_texture_size = device.limits().max_texture_dimension_2d;
-        WgpuAtlas {
-            state: Arc::new(Mutex::new(WgpuAtlasState {
-                shared: gpui_render::gpu_policy::GpuOptions::from_env().shared_resources,
-                device,
-                queue,
-                max_texture_size,
-                color_texture_format,
-                storage: WgpuAtlasStorage::default(),
-                tiles_by_key: Default::default(),
-                pending_uploads: Vec::new(),
-                next_texture_identity: 0,
-                generation: 0,
-                epoch: 0,
-                owners: FxHashMap::default(),
-            })),
-            owned: Mutex::default(),
-        }
+        Self::with_state(Arc::new(WgpuAtlasState::new(
+            device,
+            queue,
+            color_texture_format,
+            false,
+        )))
     }
 
     pub fn from_context(context: &WgpuContext) -> Self {
-        let make = || {
-            Self::new(
+        let format = context.color_texture_format();
+        let state = |shared| {
+            WgpuAtlasState::new(
                 context.device.clone(),
                 context.queue.clone(),
-                context.color_texture_format(),
+                format,
+                shared,
             )
         };
         if !gpui_render::gpu_policy::GpuOptions::from_env().shared_resources {
-            return make();
+            return Self::with_state(Arc::new(state(false)));
         }
-        SHARED_ATLASES.with_borrow_mut(|cache| {
-            cache.retain(|weak| weak.strong_count() > 0);
-            for state in cache.iter().filter_map(std::sync::Weak::upgrade) {
-                let lock = state.lock();
-                if Arc::ptr_eq(&lock.device, &context.device)
-                    && lock.color_texture_format == context.color_texture_format()
-                {
-                    let epoch = lock.epoch;
-                    drop(lock);
-                    return Self {
-                        state,
-                        owned: Mutex::new((epoch, FxHashSet::default())),
-                    };
-                }
-            }
-            let atlas = make();
-            cache.push(Arc::downgrade(&atlas.state));
-            atlas
-        })
+        Self::with_state(SHARED_ATLASES.with(|atlases| {
+            atlases.get_or_insert_with(
+                |shared| {
+                    let shared = shared.lock();
+                    Arc::ptr_eq(&shared.device, &context.device)
+                        && shared.color_texture_format == format
+                },
+                || state(true),
+            )
+        }))
+    }
+
+    fn with_state(state: Arc<Mutex<WgpuAtlasState>>) -> Self {
+        let owner = state.lock().owners.add_owner();
+        Self { state, owner }
     }
 
     pub fn allocated_bytes(&self) -> u64 {
@@ -133,20 +121,6 @@ impl WgpuAtlas {
                 * u64::from(t.bytes_per_pixel())
         })
         .sum()
-    }
-
-    fn retain_key(&self, lock: &mut WgpuAtlasState, key: &AtlasKey) {
-        if !lock.shared {
-            return;
-        }
-        let mut owned = self.owned.lock();
-        if owned.0 != lock.epoch {
-            owned.0 = lock.epoch;
-            owned.1.clear();
-        }
-        if owned.1.insert(key.clone()) {
-            *lock.owners.entry(key.clone()).or_default() += 1;
-        }
     }
 
     pub fn before_frame(&self) {
@@ -169,8 +143,7 @@ impl WgpuAtlas {
         let mut lock = self.state.lock();
         lock.storage = WgpuAtlasStorage::default();
         lock.tiles_by_key.clear();
-        lock.owners.clear();
-        lock.epoch = lock.epoch.wrapping_add(1);
+        lock.owners.reset();
         lock.pending_uploads.clear();
         lock.generation = lock.generation.wrapping_add(1);
     }
@@ -184,8 +157,7 @@ impl WgpuAtlas {
         lock.color_texture_format = context.color_texture_format();
         lock.storage = WgpuAtlasStorage::default();
         lock.tiles_by_key.clear();
-        lock.owners.clear();
-        lock.epoch = lock.epoch.wrapping_add(1);
+        lock.owners.reset();
         lock.pending_uploads.clear();
         lock.generation = lock.generation.wrapping_add(1);
     }
@@ -199,7 +171,7 @@ impl PlatformAtlas for WgpuAtlas {
     ) -> Result<Option<AtlasTile>> {
         let mut lock = self.state.lock();
         if let Some(tile) = lock.tiles_by_key.get(key).copied() {
-            self.retain_key(&mut lock, key);
+            lock.owners.retain(self.owner, key);
             Ok(Some(tile))
         } else {
             profiling::scope!("new tile");
@@ -218,23 +190,16 @@ impl PlatformAtlas for WgpuAtlas {
                 .context("failed to allocate")?;
             lock.upload_texture(tile.texture_id, tile.bounds, &bytes);
             lock.tiles_by_key.insert(key.clone(), tile);
-            self.retain_key(&mut lock, key);
+            lock.owners.retain(self.owner, key);
             Ok(Some(tile))
         }
     }
 
     fn remove(&self, key: &AtlasKey) {
         let mut lock = self.state.lock();
-
-        if !lock.shared {
-            lock.release_key(key);
-            return;
+        if lock.owners.release(self.owner, key) {
+            lock.free_tile(key);
         }
-        let mut owned = self.owned.lock();
-        if owned.0 != lock.epoch || !owned.1.remove(key) {
-            return;
-        }
-        lock.release_key(key);
     }
 
     fn generation(&self) -> u64 {
@@ -243,17 +208,27 @@ impl PlatformAtlas for WgpuAtlas {
 }
 
 impl WgpuAtlasState {
-    fn release_key(&mut self, key: &AtlasKey) {
-        if self.shared {
-            let Some(owners) = self.owners.get_mut(key) else {
-                return;
-            };
-            *owners -= 1;
-            if *owners > 0 {
-                return;
-            }
-            self.owners.remove(key);
-        }
+    fn new(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        color_texture_format: wgpu::TextureFormat,
+        shared: bool,
+    ) -> Mutex<Self> {
+        Mutex::new(Self {
+            max_texture_size: device.limits().max_texture_dimension_2d,
+            device,
+            queue,
+            color_texture_format,
+            storage: WgpuAtlasStorage::default(),
+            tiles_by_key: Default::default(),
+            pending_uploads: Vec::new(),
+            next_texture_identity: 0,
+            generation: 0,
+            owners: TileOwners::new(shared),
+        })
+    }
+
+    fn free_tile(&mut self, key: &AtlasKey) {
         let Some(tile) = self.tiles_by_key.remove(key) else {
             return;
         };
@@ -593,12 +568,14 @@ mod tests {
     #[test]
     fn shared_atlas_keeps_tiles_until_the_last_window_releases_them() -> anyhow::Result<()> {
         let (device, queue) = test_device_and_queue()?;
-        let first = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
-        first.state.lock().shared = true;
-        let second = WgpuAtlas {
-            state: first.state.clone(),
-            owned: Mutex::default(),
-        };
+        let state = Arc::new(WgpuAtlasState::new(
+            device,
+            queue,
+            wgpu::TextureFormat::Bgra8Unorm,
+            true,
+        ));
+        let first = WgpuAtlas::with_state(state.clone());
+        let second = WgpuAtlas::with_state(state);
         let key = AtlasKey::Image(RenderImageParams {
             image_id: ImageId(8),
             frame_index: 0,
@@ -619,7 +596,6 @@ mod tests {
         assert_eq!(tile, reused);
         first.remove(&key);
         assert!(second.state.lock().tiles_by_key.contains_key(&key));
-        assert_eq!(second.state.lock().owners[&key], 1);
         // Repeated removal and a different window's removal do not release a lease twice.
         first.remove(&key);
         second.remove(&key);
@@ -628,10 +604,18 @@ mod tests {
         first.get_or_insert_with(&key, &mut build)?;
         second.get_or_insert_with(&key, &mut build)?;
         drop(first);
-        assert_eq!(second.state.lock().owners[&key], 1);
+        assert!(
+            second.state.lock().tiles_by_key.contains_key(&key),
+            "a closing window keeps tiles another window uses"
+        );
+        // Clearing drops every tile; the rebuilt one belongs to its new user alone.
         second.clear();
         second.get_or_insert_with(&key, &mut build)?;
-        assert_eq!(second.state.lock().owners[&key], 1);
+        second.remove(&key);
+        assert!(second.state.lock().tiles_by_key.is_empty());
+        let weak = Arc::downgrade(&second.state);
+        drop(second);
+        assert!(weak.upgrade().is_none());
         Ok(())
     }
 
@@ -734,14 +718,8 @@ mod tests {
 impl Drop for WgpuAtlas {
     fn drop(&mut self) {
         let mut state = self.state.lock();
-        if !state.shared {
-            return;
-        }
-        let owned = self.owned.get_mut();
-        if owned.0 == state.epoch {
-            for key in owned.1.drain() {
-                state.release_key(&key);
-            }
+        for key in state.owners.remove_owner(self.owner) {
+            state.free_tile(&key);
         }
     }
 }

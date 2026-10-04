@@ -21,7 +21,6 @@ mod frame;
 mod gpu_trace;
 #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
 mod headless;
-mod path_cache;
 mod path_types;
 mod pipelines;
 mod platform;
@@ -30,7 +29,6 @@ mod settings;
 mod shared;
 mod surfaces;
 mod target;
-mod texture_pool;
 
 #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
 pub use headless::WgpuHeadlessRenderer;
@@ -152,7 +150,7 @@ impl WgpuRenderer {
         let Some(resources) = self.resources.as_mut() else {
             return;
         };
-        resources.invalidate_intermediate_textures();
+        resources.invalidate_intermediate_textures(self.options.pooled_targets);
         if let Some(surface) = resources.surface.as_ref() {
             surface.configure(&resources.device, &config);
         }
@@ -199,7 +197,7 @@ impl WgpuRenderer {
             return;
         };
         // Variant pipelines must use the layouts that own the existing bindings.
-        resources.invalidate_intermediate_textures();
+        resources.invalidate_intermediate_textures(self.options.pooled_targets);
         resources.pipelines = if self.options.shared_resources {
             shared::pipelines(
                 &resources.device,
@@ -303,6 +301,16 @@ impl WgpuRenderer {
         readback: frame::ReadbackCopy<'_>,
     ) -> Option<wgpu::SubmissionIndex> {
         frame::render_to_view(self, scene, frame_view, Some(readback))
+    }
+}
+
+impl Drop for WgpuRenderer {
+    fn drop(&mut self) {
+        // Another window on the device may reuse this one's scratch textures.
+        let pooled = self.options.pooled_targets;
+        if let Some(resources) = self.resources.as_mut() {
+            resources.retire_scratch(pooled);
+        }
     }
 }
 

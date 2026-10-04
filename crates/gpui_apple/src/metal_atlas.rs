@@ -1,5 +1,5 @@
 use anyhow::{Context as _, Result};
-use collections::{FxHashMap, FxHashSet};
+use collections::FxHashMap;
 use derive_more::{Deref, DerefMut};
 use etagere::BucketedAtlasAllocator;
 use foreign_types::ForeignTypeRef;
@@ -7,53 +7,42 @@ use gpui::{
     AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTextureList, AtlasTile, Bounds, DevicePixels,
     PlatformAtlas, Point, Size,
 };
+use gpui_render::sharing::{OwnerId, Registry, TileOwners};
 use metal::Device;
 use parking_lot::Mutex;
 use std::borrow::Cow;
 use std::sync::Arc;
 
+/// A window's view of an atlas. With shared resources, every window on a device uses
+/// one atlas state, and a tile lives until the last window using it removes it.
 pub struct MetalAtlas {
     state: Arc<Mutex<MetalAtlasState>>,
-    owned: Mutex<(u64, FxHashSet<AtlasKey>)>,
+    owner: OwnerId,
 }
-thread_local! { static SHARED: std::cell::RefCell<Vec<std::sync::Weak<Mutex<MetalAtlasState>>>> = const { std::cell::RefCell::new(Vec::new()) }; }
+
+thread_local! {
+    static SHARED_ATLASES: Registry<Mutex<MetalAtlasState>> = const { Registry::new() };
+}
 
 impl MetalAtlas {
     pub(crate) fn new(device: Device, is_apple_gpu: bool) -> Self {
-        let make = || Self {
-            state: Arc::new(Mutex::new(MetalAtlasState {
-                shared: gpui_render::gpu_policy::GpuOptions::from_env().shared_resources,
-                device: AssertSend(device.clone()),
-                is_apple_gpu,
-                monochrome_textures: Default::default(),
-                polychrome_textures: Default::default(),
-                tiles_by_key: Default::default(),
-                generation: 0,
-                epoch: 0,
-                owners: FxHashMap::default(),
-            })),
-            owned: Mutex::default(),
+        let shared = gpui_render::gpu_policy::GpuOptions::from_env().shared_resources;
+        let state = if shared {
+            SHARED_ATLASES.with(|atlases| {
+                atlases.get_or_insert_with(
+                    |state| state.lock().device.as_ptr() == device.as_ptr(),
+                    || MetalAtlasState::new(device.clone(), is_apple_gpu, true),
+                )
+            })
+        } else {
+            Arc::new(MetalAtlasState::new(device, is_apple_gpu, false))
         };
-        if !gpui_render::gpu_policy::GpuOptions::from_env().shared_resources {
-            return make();
-        }
-        SHARED.with_borrow_mut(|cache| {
-            cache.retain(|s| s.strong_count() > 0);
-            for shared in cache.iter().filter_map(std::sync::Weak::upgrade) {
-                let lock = shared.lock();
-                if lock.device.as_ptr() == device.as_ptr() {
-                    let epoch = lock.epoch;
-                    drop(lock);
-                    return Self {
-                        state: shared,
-                        owned: Mutex::new((epoch, FxHashSet::default())),
-                    };
-                }
-            }
-            let atlas = make();
-            cache.push(Arc::downgrade(&atlas.state));
-            atlas
-        })
+        Self::with_state(state)
+    }
+
+    fn with_state(state: Arc<Mutex<MetalAtlasState>>) -> Self {
+        let owner = state.lock().owners.add_owner();
+        Self { state, owner }
     }
 
     pub(crate) fn allocated_bytes(&self) -> u64 {
@@ -79,15 +68,13 @@ impl MetalAtlas {
 }
 
 struct MetalAtlasState {
-    shared: bool,
     device: AssertSend<Device>,
     is_apple_gpu: bool,
     monochrome_textures: AtlasTextureList<MetalAtlasTexture>,
     polychrome_textures: AtlasTextureList<MetalAtlasTexture>,
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
     generation: u64,
-    epoch: u64,
-    owners: FxHashMap<AtlasKey, usize>,
+    owners: TileOwners,
 }
 
 impl PlatformAtlas for MetalAtlas {
@@ -97,35 +84,30 @@ impl PlatformAtlas for MetalAtlas {
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>> {
         let mut lock = self.state.lock();
-        if let Some(tile) = lock.tiles_by_key.get(key).copied() {
-            self.retain_key(&mut lock, key);
-            Ok(Some(tile))
-        } else {
-            let Some((size, bytes)) = build()? else {
-                return Ok(None);
-            };
-            let tile = lock
-                .allocate(size, key.texture_kind())
-                .context("failed to allocate")?;
-            let texture = lock.texture(tile.texture_id);
-            texture.upload(tile.bounds, &bytes);
-            lock.tiles_by_key.insert(key.clone(), tile);
-            self.retain_key(&mut lock, key);
-            Ok(Some(tile))
-        }
+        let tile = match lock.tiles_by_key.get(key) {
+            Some(tile) => *tile,
+            None => {
+                let Some((size, bytes)) = build()? else {
+                    return Ok(None);
+                };
+                let tile = lock
+                    .allocate(size, key.texture_kind())
+                    .context("failed to allocate")?;
+                let texture = lock.texture(tile.texture_id);
+                texture.upload(tile.bounds, &bytes);
+                lock.tiles_by_key.insert(key.clone(), tile);
+                tile
+            }
+        };
+        lock.owners.retain(self.owner, key);
+        Ok(Some(tile))
     }
 
     fn remove(&self, key: &AtlasKey) {
         let mut lock = self.state.lock();
-        if !lock.shared {
-            lock.release_key(key);
-            return;
+        if lock.owners.release(self.owner, key) {
+            lock.free_tile(key);
         }
-        let mut owned = self.owned.lock();
-        if owned.0 != lock.epoch || !owned.1.remove(key) {
-            return;
-        }
-        lock.release_key(key);
     }
 
     fn generation(&self) -> u64 {
@@ -134,17 +116,19 @@ impl PlatformAtlas for MetalAtlas {
 }
 
 impl MetalAtlasState {
-    fn release_key(&mut self, key: &AtlasKey) {
-        if self.shared {
-            let Some(owners) = self.owners.get_mut(key) else {
-                return;
-            };
-            *owners -= 1;
-            if *owners > 0 {
-                return;
-            }
-            self.owners.remove(key);
-        }
+    fn new(device: Device, is_apple_gpu: bool, shared: bool) -> Mutex<Self> {
+        Mutex::new(Self {
+            device: AssertSend(device),
+            is_apple_gpu,
+            monochrome_textures: Default::default(),
+            polychrome_textures: Default::default(),
+            tiles_by_key: Default::default(),
+            generation: 0,
+            owners: TileOwners::new(shared),
+        })
+    }
+
+    fn free_tile(&mut self, key: &AtlasKey) {
         let Some(tile) = self.tiles_by_key.remove(key) else {
             return;
         };
@@ -494,32 +478,11 @@ mod tests {
     }
 }
 
-impl MetalAtlas {
-    fn retain_key(&self, lock: &mut MetalAtlasState, key: &AtlasKey) {
-        if !lock.shared {
-            return;
-        }
-        let mut owned = self.owned.lock();
-        if owned.0 != lock.epoch {
-            owned.0 = lock.epoch;
-            owned.1.clear();
-        }
-        if owned.1.insert(key.clone()) {
-            *lock.owners.entry(key.clone()).or_default() += 1;
-        }
-    }
-}
 impl Drop for MetalAtlas {
     fn drop(&mut self) {
         let mut state = self.state.lock();
-        if !state.shared {
-            return;
-        }
-        let owned = self.owned.get_mut();
-        if owned.0 == state.epoch {
-            for key in owned.1.drain() {
-                state.release_key(&key);
-            }
+        for key in state.owners.remove_owner(self.owner) {
+            state.free_tile(&key);
         }
     }
 }
@@ -527,19 +490,15 @@ impl Drop for MetalAtlas {
 #[cfg(test)]
 mod shared_atlas_tests {
     use super::*;
+
     #[test]
     fn shared_atlas_survives_one_window_closing_and_releases_the_final_lease() -> anyhow::Result<()>
     {
         let device = metal::Device::system_default().expect("Metal device required");
-        let first = MetalAtlas::new(
-            device.clone(),
-            device.supports_family(metal::MTLGPUFamily::Apple1),
-        );
-        first.state.lock().shared = true;
-        let second = MetalAtlas {
-            state: first.state.clone(),
-            owned: Mutex::default(),
-        };
+        let is_apple_gpu = device.supports_family(metal::MTLGPUFamily::Apple1);
+        let state = Arc::new(MetalAtlasState::new(device, is_apple_gpu, true));
+        let first = MetalAtlas::with_state(state.clone());
+        let second = MetalAtlas::with_state(state);
         let key = AtlasKey::Image(gpui::RenderImageParams {
             image_id: gpui::ImageId(8),
             frame_index: 0,
@@ -562,10 +521,13 @@ mod shared_atlas_tests {
         );
         first.remove(&key);
         first.remove(&key);
-        assert_eq!(second.state.lock().owners[&key], 1);
+        assert!(second.state.lock().tiles_by_key.contains_key(&key));
         first.get_or_insert_with(&key, &mut build)?;
         drop(first);
-        assert_eq!(second.state.lock().owners[&key], 1);
+        assert!(
+            second.state.lock().tiles_by_key.contains_key(&key),
+            "a closing window keeps tiles another window uses"
+        );
         second.remove(&key);
         assert_eq!(second.allocated_bytes(), 0);
         let weak = Arc::downgrade(&second.state);

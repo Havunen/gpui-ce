@@ -14,14 +14,16 @@ use gpui_render::{
         downsampled_dimension,
     },
     damage::{Damage, Snapshot},
-    gpu_policy::{RetentionBudget, RetentionLease},
-    native_path_cache::{self, PathCache, Source},
+    gpu_policy::{GpuOptions, RetentionBudget, RetentionLease},
+    path_cache::{self, PathCache, Source},
     path_plan::{self, PixelRect},
     path_types::{self, PathRasterizationVertex},
+    scratch_pool::Pool,
     shaders::{
         common::{FontRasterizationUniforms, GlobalUniforms, ShaderBool, SurfaceColorFormat},
         surface::SurfaceUniforms,
     },
+    sharing::Registry,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -235,70 +237,94 @@ impl InstanceBufferPool {
     }
 }
 
-// Weak registry: the last renderer releases compiled programs and their device.
-struct SharedPrograms {
-    device: metal::Device,
-    libraries: std::cell::RefCell<Vec<(&'static str, metal::Library)>>,
-    pipelines: std::cell::RefCell<
-        Vec<(
-            (u8, &'static str, &'static str, &'static str, u64, u32),
-            metal::RenderPipelineState,
-        )>,
-    >,
-}
-thread_local! { static SHARED_PROGRAMS: std::cell::RefCell<Vec<std::rc::Weak<SharedPrograms>>> = const { std::cell::RefCell::new(Vec::new()) }; }
-fn shared_programs(device: &metal::DeviceRef) -> Option<std::rc::Rc<SharedPrograms>> {
-    use foreign_types::ForeignTypeRef;
-    if !gpui_render::gpu_policy::GpuOptions::from_env().shared_resources {
-        return None;
-    }
-    Some(SHARED_PROGRAMS.with_borrow_mut(|cache| {
-        cache.retain(|entry| entry.strong_count() > 0);
-        if let Some(entry) = cache
-            .iter()
-            .filter_map(std::rc::Weak::upgrade)
-            .find(|entry| entry.device.as_ptr() == device.as_ptr())
-        {
-            return entry;
-        }
-        let entry = std::rc::Rc::new(SharedPrograms {
-            device: device.to_owned(),
-            libraries: Default::default(),
-            pipelines: Default::default(),
-        });
-        cache.push(std::rc::Rc::downgrade(&entry));
-        entry
-    }))
-}
-fn cached_pipeline(
-    device: &metal::DeviceRef,
-    shader: &NativeShader,
-    format: metal::MTLPixelFormat,
-    samples: u32,
-    kind: u8,
-    build: impl FnOnce() -> metal::RenderPipelineState,
-) -> metal::RenderPipelineState {
-    let Some(shared) = shared_programs(device) else {
-        return build();
-    };
-    let key = (
-        kind,
-        shader.vertex_entry,
-        shader.fragment_entry,
-        shader.msl,
-        format as u64,
-        samples,
-    );
-    if let Some((_, pipeline)) = shared.pipelines.borrow().iter().find(|(k, _)| *k == key) {
-        return pipeline.clone();
-    }
-    let pipeline = build();
-    shared.pipelines.borrow_mut().push((key, pipeline.clone()));
-    pipeline
+/// How a pipeline blends into its target.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Blend {
+    /// Straight-alpha source over the target.
+    Alpha,
+    /// Premultiplied source over the target: path sprites and blur composites.
+    Premultiplied,
+    /// Premultiplied, with alpha accumulating coverage too: path rasterization.
+    Coverage,
+    /// Overwrites the target: blur downsample and gaussian passes.
+    Replace,
 }
 
-// Device lifetime, not window lifetime, owns the optional retention budget.
+/// Shader libraries and pipeline states built for one device. With shared resources,
+/// every renderer on the device uses one set, so later windows build none of them.
+struct Programs {
+    device: metal::Device,
+    libraries: Mutex<Vec<(&'static str, metal::Library)>>,
+    pipelines: Mutex<Vec<((&'static str, u32, Blend), metal::RenderPipelineState)>>,
+}
+
+thread_local! {
+    static SHARED_PROGRAMS: Registry<Programs> = const { Registry::new() };
+    static RETENTION: Registry<DeviceRetention> = const { Registry::new() };
+}
+
+impl Programs {
+    fn for_device(device: &metal::Device, shared: bool) -> Arc<Self> {
+        let create = || Self {
+            device: device.clone(),
+            libraries: Mutex::default(),
+            pipelines: Mutex::default(),
+        };
+        if !shared {
+            return Arc::new(create());
+        }
+        SHARED_PROGRAMS.with(|programs| {
+            programs.get_or_insert_with(
+                |programs| programs.device.as_ptr() == device.as_ptr(),
+                create,
+            )
+        })
+    }
+
+    /// The library for `shader`'s module, loaded once: precompiled when the build had
+    /// Apple's Metal Toolchain, otherwise (or if this OS rejects the library) compiled
+    /// from MSL by the device's runtime compiler.
+    fn library(&self, shader: &'static NativeShader) -> metal::Library {
+        let mut libraries = self.libraries.lock();
+        if let Some((_, library)) = libraries.iter().find(|(msl, _)| *msl == shader.msl) {
+            return library.clone();
+        }
+        let precompiled = shader.metallib.and_then(|bytes| {
+            self.device
+                .new_library_with_data(bytes)
+                .inspect_err(|error| {
+                    log::warn!(
+                        "precompiled metal library {} failed to load, compiling MSL: {error}",
+                        shader.label
+                    )
+                })
+                .ok()
+        });
+        let library = precompiled.unwrap_or_else(|| {
+            self.device
+                .new_library_with_source(shader.msl, &metal::CompileOptions::new())
+                .unwrap_or_else(|error| panic!("error building metal library: {error}"))
+        });
+        libraries.push((shader.msl, library.clone()));
+        library
+    }
+
+    fn pipeline(&self, label: &str, sample_count: u32, blend: Blend) -> metal::RenderPipelineState {
+        let shader = native_shader(label);
+        let key = (shader.label, sample_count, blend);
+        if let Some((_, pipeline)) = self.pipelines.lock().iter().find(|(k, _)| *k == key) {
+            return pipeline.clone();
+        }
+        let library = self.library(shader);
+        let pipeline = build_pipeline_state(&self.device, &library, shader, sample_count, blend);
+        self.pipelines.lock().push((key, pipeline.clone()));
+        pipeline
+    }
+}
+
 type TextureKey = (u64, u64, u64, u64, u64, u64, u64);
+type ScratchPool = Pool<TextureKey, metal::Texture>;
+
 fn texture_key(texture: &metal::TextureRef) -> TextureKey {
     (
         texture.width(),
@@ -310,31 +336,52 @@ fn texture_key(texture: &metal::TextureRef) -> TextureKey {
         texture.texture_type() as u64,
     )
 }
+
+fn descriptor_key(descriptor: &metal::TextureDescriptorRef) -> TextureKey {
+    (
+        descriptor.width(),
+        descriptor.height(),
+        descriptor.pixel_format() as u64,
+        descriptor.sample_count(),
+        descriptor.storage_mode() as u64,
+        descriptor.usage().bits(),
+        descriptor.texture_type() as u64,
+    )
+}
+
+/// A texture for `descriptor`: an idle one from `pool` when it has one, otherwise new.
+fn scratch_texture(
+    device: &metal::DeviceRef,
+    pool: Option<&ScratchPool>,
+    descriptor: &metal::TextureDescriptorRef,
+) -> metal::Texture {
+    pool.and_then(|pool| pool.take(&descriptor_key(descriptor)))
+        .unwrap_or_else(|| device.new_texture(descriptor))
+}
+
+/// Optional resources retained beyond a frame (path caches, retained frames, pooled
+/// scratch textures), charged to one budget per device rather than per window.
 struct DeviceRetention {
     device: metal::Device,
-    budget: RetentionBudget,
-    pool: gpui_render::native_pool::Pool<TextureKey, metal::Texture>,
+    pool: ScratchPool,
 }
-thread_local! { static RETENTION: std::cell::RefCell<Vec<std::sync::Weak<DeviceRetention>>> = const { std::cell::RefCell::new(Vec::new()) }; }
-fn device_retention(device: &metal::DeviceRef) -> Arc<DeviceRetention> {
-    RETENTION.with_borrow_mut(|entries| {
-        entries.retain(|entry| entry.strong_count() > 0);
-        if let Some(entry) = entries
-            .iter()
-            .filter_map(std::sync::Weak::upgrade)
-            .find(|entry| entry.device.as_ptr() == device.as_ptr())
-        {
-            return entry;
-        }
-        let budget = RetentionBudget::default();
-        let entry = Arc::new(DeviceRetention {
-            device: device.to_owned(),
-            pool: gpui_render::native_pool::Pool::new(budget.clone()),
-            budget,
-        });
-        entries.push(Arc::downgrade(&entry));
-        entry
-    })
+
+impl DeviceRetention {
+    fn for_device(device: &metal::Device) -> Arc<Self> {
+        RETENTION.with(|retention| {
+            retention.get_or_insert_with(
+                |retention| retention.device.as_ptr() == device.as_ptr(),
+                || Self {
+                    device: device.clone(),
+                    pool: Pool::new(RetentionBudget::default()),
+                },
+            )
+        })
+    }
+
+    fn budget(&self) -> &RetentionBudget {
+        self.pool.budget()
+    }
 }
 
 struct RetainedFrame {
@@ -348,8 +395,8 @@ pub struct MetalRenderer {
     retention: Arc<DeviceRetention>,
     retained: Option<RetainedFrame>,
     path_cache: PathCache<metal::Texture>,
-    options: gpui_render::gpu_policy::GpuOptions,
-    _shared_programs: Option<std::rc::Rc<SharedPrograms>>,
+    options: GpuOptions,
+    _programs: Arc<Programs>,
     gpu_trace: Option<crate::gpu_trace::GpuTrace>,
     device: metal::Device,
     layer: Option<metal::MetalLayer>,
@@ -465,171 +512,33 @@ impl MetalRenderer {
         // https://developer.apple.com/documentation/metal/mtlgpufamily
         let is_apple_gpu = device.supports_family(MTLGPUFamily::Apple1);
 
-        // Load each Naga-generated module once: precompiled when the build had Apple's
-        // Metal Toolchain, otherwise (or if this OS rejects the library) compiled from
-        // MSL by the device's runtime compiler. Deduplicated per source, and across
-        // renderers on one device when resources are shared.
-        let shared = shared_programs(&device);
-        let mut libraries: Vec<(&'static str, metal::Library)> = Vec::new();
-        let mut library_for = |shader: &'static NativeShader| -> metal::Library {
-            if let Some(shared) = &shared {
-                if let Some((_, library)) = shared
-                    .libraries
-                    .borrow()
-                    .iter()
-                    .find(|(s, _)| *s == shader.msl)
-                {
-                    return library.clone();
-                }
-            }
-            if let Some((_, library)) = libraries
-                .iter()
-                .find(|(registered, _)| *registered == shader.msl)
-            {
-                return library.clone();
-            }
-            let precompiled = shader.metallib.and_then(|bytes| {
-                device
-                    .new_library_with_data(bytes)
-                    .inspect_err(|error| {
-                        log::warn!(
-                            "precompiled metal library {} failed to load, compiling MSL: {error}",
-                            shader.label
-                        )
-                    })
-                    .ok()
-            });
-            let library = precompiled.unwrap_or_else(|| {
-                device
-                    .new_library_with_source(shader.msl, &metal::CompileOptions::new())
-                    .unwrap_or_else(|error| panic!("error building metal library: {error}"))
-            });
-            if let Some(shared) = &shared {
-                shared
-                    .libraries
-                    .borrow_mut()
-                    .push((shader.msl, library.clone()));
-            }
-            libraries.push((shader.msl, library.clone()));
-            library
-        };
-
-        let mut pipeline = |label: &str| -> (&'static NativeShader, metal::Library) {
-            let shader = native_shader(label);
-            (shader, library_for(shader))
-        };
-
-        let (path_rasterization_shader, path_rasterization_library) =
-            pipeline("path_rasterization");
-        let paths_rasterization_pipeline_state = build_path_rasterization_pipeline_state(
-            &device,
-            &path_rasterization_library,
-            path_rasterization_shader,
-            MTLPixelFormat::BGRA8Unorm,
-            PATH_SAMPLE_COUNT,
-        );
-        let (paths_shader, paths_library) = pipeline("paths");
-        let path_sprites_pipeline_state = build_path_sprite_pipeline_state(
-            &device,
-            &paths_library,
-            paths_shader,
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let (shadows_shader, shadows_library) = pipeline("shadows");
-        let shadows_pipeline_state = build_pipeline_state(
-            &device,
-            &shadows_library,
-            shadows_shader,
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let (smoothed_shadows_shader, smoothed_shadows_library) = pipeline("smoothed_shadows");
-        let smoothed_shadows_pipeline_state = build_pipeline_state(
-            &device,
-            &smoothed_shadows_library,
-            smoothed_shadows_shader,
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let (quads_shader, quads_library) = pipeline("quads");
-        let quads_pipeline_state = build_pipeline_state(
-            &device,
-            &quads_library,
-            quads_shader,
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let (smoothed_quads_shader, smoothed_quads_library) = pipeline("smoothed_quads");
-        let smoothed_quads_pipeline_state = build_pipeline_state(
-            &device,
-            &smoothed_quads_library,
-            smoothed_quads_shader,
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let (underlines_shader, underlines_library) = pipeline("underlines");
-        let underlines_pipeline_state = build_pipeline_state(
-            &device,
-            &underlines_library,
-            underlines_shader,
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let (monochrome_shader, monochrome_library) = pipeline("monochrome_sprites");
-        let monochrome_sprites_pipeline_state = build_pipeline_state(
-            &device,
-            &monochrome_library,
-            monochrome_shader,
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let (polychrome_shader, polychrome_library) = pipeline("polychrome_sprites");
-        let polychrome_sprites_pipeline_state = build_pipeline_state(
-            &device,
-            &polychrome_library,
-            polychrome_shader,
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let (smoothed_polychrome_shader, smoothed_polychrome_library) =
-            pipeline("smoothed_polychrome_sprites");
-        let smoothed_polychrome_sprites_pipeline_state = build_pipeline_state(
-            &device,
-            &smoothed_polychrome_library,
-            smoothed_polychrome_shader,
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let (surfaces_shader, surfaces_library) = pipeline("surfaces");
-        let surfaces_pipeline_state = build_pipeline_state(
-            &device,
-            &surfaces_library,
-            surfaces_shader,
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let (blur_downsample_shader, blur_downsample_library) = pipeline("blur_downsample");
-        let blur_downsample_pipeline_state = build_blur_pipeline_state(
-            &device,
-            &blur_downsample_library,
-            blur_downsample_shader,
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let (blur_shader, blur_library) = pipeline("blur");
-        let blur_pipeline_state = build_blur_pipeline_state(
-            &device,
-            &blur_library,
-            blur_shader,
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        // Premultiplied blend (One / OneMinusSourceAlpha) — the composite outputs a premultiplied
-        // blurred sample; straight-alpha blending would darken the faded edges.
-        let (blur_composite_shader, blur_composite_library) = pipeline("blur_composite");
-        let blur_composite_pipeline_state = build_path_sprite_pipeline_state(
-            &device,
-            &blur_composite_library,
-            blur_composite_shader,
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let (smoothed_blur_composite_shader, smoothed_blur_composite_library) =
-            pipeline("smoothed_blur_composite");
-        let smoothed_blur_composite_pipeline_state = build_path_sprite_pipeline_state(
-            &device,
-            &smoothed_blur_composite_library,
-            smoothed_blur_composite_shader,
-            MTLPixelFormat::BGRA8Unorm,
-        );
+        let options = GpuOptions::from_env();
+        let programs = Programs::for_device(&device, options.shared_resources);
+        let paths_rasterization_pipeline_state =
+            programs.pipeline("path_rasterization", PATH_SAMPLE_COUNT, Blend::Coverage);
+        let path_sprites_pipeline_state = programs.pipeline("paths", 1, Blend::Premultiplied);
+        let shadows_pipeline_state = programs.pipeline("shadows", 1, Blend::Alpha);
+        let smoothed_shadows_pipeline_state =
+            programs.pipeline("smoothed_shadows", 1, Blend::Alpha);
+        let quads_pipeline_state = programs.pipeline("quads", 1, Blend::Alpha);
+        let smoothed_quads_pipeline_state = programs.pipeline("smoothed_quads", 1, Blend::Alpha);
+        let underlines_pipeline_state = programs.pipeline("underlines", 1, Blend::Alpha);
+        let monochrome_sprites_pipeline_state =
+            programs.pipeline("monochrome_sprites", 1, Blend::Alpha);
+        let polychrome_sprites_pipeline_state =
+            programs.pipeline("polychrome_sprites", 1, Blend::Alpha);
+        let smoothed_polychrome_sprites_pipeline_state =
+            programs.pipeline("smoothed_polychrome_sprites", 1, Blend::Alpha);
+        let surfaces_pipeline_state = programs.pipeline("surfaces", 1, Blend::Alpha);
+        let blur_downsample_pipeline_state =
+            programs.pipeline("blur_downsample", 1, Blend::Replace);
+        let blur_pipeline_state = programs.pipeline("blur", 1, Blend::Replace);
+        // The composite outputs a premultiplied blurred sample; straight-alpha blending
+        // would darken the faded edges.
+        let blur_composite_pipeline_state =
+            programs.pipeline("blur_composite", 1, Blend::Premultiplied);
+        let smoothed_blur_composite_pipeline_state =
+            programs.pipeline("smoothed_blur_composite", 1, Blend::Premultiplied);
 
         let sampler_descriptor = SamplerDescriptor::new();
         sampler_descriptor.set_min_filter(metal::MTLSamplerMinMagFilter::Linear);
@@ -641,13 +550,13 @@ impl MetalRenderer {
         let core_video_texture_cache =
             CVMetalTextureCache::new(None, device.clone(), None).unwrap();
 
-        let retention = device_retention(&device);
+        let retention = DeviceRetention::for_device(&device);
         Self {
             retained: None,
-            path_cache: PathCache::new(retention.budget.clone()),
+            path_cache: PathCache::new(retention.budget().clone()),
             retention,
-            options: gpui_render::gpu_policy::GpuOptions::from_env(),
-            _shared_programs: shared,
+            options,
+            _programs: programs,
             gpu_trace: gpui::gpu_profiler::enabled()
                 .then(|| crate::gpu_trace::GpuTrace::new(&device)),
             device,
@@ -734,23 +643,6 @@ impl MetalRenderer {
         self.intermediate_texture_size = (size.width.0 > 0 && size.height.0 > 0).then_some(size);
     }
 
-    fn scratch_texture(&self, descriptor: &metal::TextureDescriptorRef) -> metal::Texture {
-        if self.options.pooled_targets {
-            let key = (
-                descriptor.width(),
-                descriptor.height(),
-                descriptor.pixel_format() as u64,
-                descriptor.sample_count(),
-                descriptor.storage_mode() as u64,
-                descriptor.usage().bits(),
-                descriptor.texture_type() as u64,
-            );
-            if let Some(texture) = self.retention.pool.take(&key) {
-                return texture;
-            }
-        }
-        self.device.new_texture(descriptor)
-    }
     fn retire_textures(&self, textures: Vec<metal::Texture>) {
         if !self.options.pooled_targets {
             return;
@@ -774,7 +666,7 @@ impl MetalRenderer {
         let command = self.command_queue.new_command_buffer();
         let complete = ConcreteBlock::new(move |_: &metal::CommandBufferRef| {
             for entry in &pending {
-                gpui_render::native_pool::Pool::complete(entry);
+                ScratchPool::complete(entry);
             }
         })
         .copy();
@@ -806,7 +698,7 @@ impl MetalRenderer {
 
         let device = self.device.clone();
         let retention = self.retention.clone();
-        let pooled = self.options.pooled_targets;
+        let pool = self.options.pooled_targets.then_some(&retention.pool);
         let make_color_texture = |width: u64, height: u64| {
             let descriptor = metal::TextureDescriptor::new();
             descriptor.set_width(width.max(1));
@@ -816,21 +708,7 @@ impl MetalRenderer {
             descriptor.set_usage(
                 metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
             );
-            if pooled {
-                let key = (
-                    descriptor.width(),
-                    descriptor.height(),
-                    descriptor.pixel_format() as u64,
-                    descriptor.sample_count(),
-                    descriptor.storage_mode() as u64,
-                    descriptor.usage().bits(),
-                    descriptor.texture_type() as u64,
-                );
-                if let Some(texture) = retention.pool.take(&key) {
-                    return texture;
-                }
-            }
-            device.new_texture(&descriptor)
+            scratch_texture(&device, pool, &descriptor)
         };
 
         let previous = self
@@ -860,7 +738,8 @@ impl MetalRenderer {
             texture_descriptor.set_usage(
                 metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
             );
-            self.path_intermediate_texture = Some(self.scratch_texture(&texture_descriptor));
+            self.path_intermediate_texture =
+                Some(scratch_texture(&device, pool, &texture_descriptor));
 
             // Storage mode guidance:
             // https://developer.apple.com/documentation/metal/choosing-a-resource-storage-mode-for-apple-gpus
@@ -1196,7 +1075,7 @@ impl MetalRenderer {
         if snapshot.is_some() && self.retained.is_none() {
             if let Some(lease) = self
                 .retention
-                .budget
+                .budget()
                 .try_acquire(u64::from(frame_extent.0) * u64::from(frame_extent.1) * 4 + 4)
             {
                 let make = |width, height| {
@@ -1270,7 +1149,7 @@ impl MetalRenderer {
         let path_plan = if damage == Damage::Unchanged {
             Vec::new()
         } else {
-            native_path_cache::plan(scene, extent, &mut self.path_cache, self.options)
+            path_cache::plan(scene, extent, &mut self.path_cache, self.options)
         };
         let packed: Vec<_> = path_plan
             .iter()
@@ -1717,7 +1596,7 @@ impl MetalRenderer {
                             .map(|r| r.texture.width() * r.texture.height() * 4 + 4)
                             .unwrap_or(0),
                     ),
-                    device_retention_bytes: Some(self.retention.budget.used()),
+                    device_retention_bytes: Some(self.retention.budget().used()),
                     pooled_bytes: Some(self.retention.pool.bytes().0),
                     pending_release_bytes: Some(self.retention.pool.bytes().1),
                 },
@@ -1924,7 +1803,7 @@ impl MetalRenderer {
         world: PixelRect,
         source: PixelRect,
         command: &metal::CommandBufferRef,
-    ) -> Result<Option<Arc<gpui_render::native_path_cache::Entry<metal::Texture>>>> {
+    ) -> Result<Option<Arc<path_cache::Entry<metal::Texture>>>> {
         let Some(intermediate) = &self.path_intermediate_texture else {
             return Ok(None);
         };
@@ -2553,141 +2432,49 @@ fn build_pipeline_state(
     device: &metal::DeviceRef,
     library: &metal::LibraryRef,
     shader: &NativeShader,
-    pixel_format: metal::MTLPixelFormat,
+    sample_count: u32,
+    blend: Blend,
 ) -> metal::RenderPipelineState {
-    cached_pipeline(device, shader, pixel_format, 1, 0, || {
-        let vertex_fn = library
-            .get_function(shader.vertex_entry, None)
-            .unwrap_or_else(|error| panic!("error locating {}: {error}", shader.vertex_entry));
-        let fragment_fn = library
-            .get_function(shader.fragment_entry, None)
-            .unwrap_or_else(|error| panic!("error locating {}: {error}", shader.fragment_entry));
+    let vertex_fn = library
+        .get_function(shader.vertex_entry, None)
+        .unwrap_or_else(|error| panic!("error locating {}: {error}", shader.vertex_entry));
+    let fragment_fn = library
+        .get_function(shader.fragment_entry, None)
+        .unwrap_or_else(|error| panic!("error locating {}: {error}", shader.fragment_entry));
 
-        let descriptor = metal::RenderPipelineDescriptor::new();
-        descriptor.set_label(shader.label);
-        descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
-        descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
-        let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
-        color_attachment.set_pixel_format(pixel_format);
-        color_attachment.set_blending_enabled(true);
-        color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
-        color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
-        color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
-        color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
-        color_attachment
-            .set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
-        color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::One);
+    let descriptor = metal::RenderPipelineDescriptor::new();
+    descriptor.set_label(shader.label);
+    descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
+    descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
+    if sample_count > 1 {
+        descriptor.set_raster_sample_count(sample_count as _);
+        descriptor.set_alpha_to_coverage_enabled(false);
+    }
+    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
+    color_attachment.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+    let (source_rgb, destination_alpha) = match blend {
+        Blend::Alpha => (
+            metal::MTLBlendFactor::SourceAlpha,
+            metal::MTLBlendFactor::One,
+        ),
+        Blend::Premultiplied => (metal::MTLBlendFactor::One, metal::MTLBlendFactor::One),
+        Blend::Coverage => (
+            metal::MTLBlendFactor::One,
+            metal::MTLBlendFactor::OneMinusSourceAlpha,
+        ),
+        Blend::Replace => (metal::MTLBlendFactor::One, metal::MTLBlendFactor::Zero),
+    };
+    color_attachment.set_blending_enabled(blend != Blend::Replace);
+    color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
+    color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
+    color_attachment.set_source_rgb_blend_factor(source_rgb);
+    color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
+    color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+    color_attachment.set_destination_alpha_blend_factor(destination_alpha);
 
-        device
-            .new_render_pipeline_state(&descriptor)
-            .expect("could not create render pipeline state")
-    })
-}
-
-fn build_path_sprite_pipeline_state(
-    device: &metal::DeviceRef,
-    library: &metal::LibraryRef,
-    shader: &NativeShader,
-    pixel_format: metal::MTLPixelFormat,
-) -> metal::RenderPipelineState {
-    cached_pipeline(device, shader, pixel_format, 1, 1, || {
-        let vertex_fn = library
-            .get_function(shader.vertex_entry, None)
-            .unwrap_or_else(|error| panic!("error locating {}: {error}", shader.vertex_entry));
-        let fragment_fn = library
-            .get_function(shader.fragment_entry, None)
-            .unwrap_or_else(|error| panic!("error locating {}: {error}", shader.fragment_entry));
-
-        let descriptor = metal::RenderPipelineDescriptor::new();
-        descriptor.set_label(shader.label);
-        descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
-        descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
-        let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
-        color_attachment.set_pixel_format(pixel_format);
-        color_attachment.set_blending_enabled(true);
-        color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
-        color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
-        color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::One);
-        color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
-        color_attachment
-            .set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
-        color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::One);
-
-        device
-            .new_render_pipeline_state(&descriptor)
-            .expect("could not create render pipeline state")
-    })
-}
-
-fn build_path_rasterization_pipeline_state(
-    device: &metal::DeviceRef,
-    library: &metal::LibraryRef,
-    shader: &NativeShader,
-    pixel_format: metal::MTLPixelFormat,
-    path_sample_count: u32,
-) -> metal::RenderPipelineState {
-    cached_pipeline(device, shader, pixel_format, path_sample_count, 2, || {
-        let vertex_fn = library
-            .get_function(shader.vertex_entry, None)
-            .unwrap_or_else(|error| panic!("error locating {}: {error}", shader.vertex_entry));
-        let fragment_fn = library
-            .get_function(shader.fragment_entry, None)
-            .unwrap_or_else(|error| panic!("error locating {}: {error}", shader.fragment_entry));
-
-        let descriptor = metal::RenderPipelineDescriptor::new();
-        descriptor.set_label(shader.label);
-        descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
-        descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
-        if path_sample_count > 1 {
-            descriptor.set_raster_sample_count(path_sample_count as _);
-            descriptor.set_alpha_to_coverage_enabled(false);
-        }
-        let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
-        color_attachment.set_pixel_format(pixel_format);
-        color_attachment.set_blending_enabled(true);
-        color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
-        color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
-        color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::One);
-        color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
-        color_attachment
-            .set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
-        color_attachment
-            .set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
-
-        device
-            .new_render_pipeline_state(&descriptor)
-            .expect("could not create render pipeline state")
-    })
-}
-
-// Blur downsample/gaussian passes overwrite their target (no blending). The composite pass
-// uses the normal alpha-blending pipeline (`build_path_sprite_pipeline_state`) instead.
-fn build_blur_pipeline_state(
-    device: &metal::DeviceRef,
-    library: &metal::LibraryRef,
-    shader: &NativeShader,
-    pixel_format: metal::MTLPixelFormat,
-) -> metal::RenderPipelineState {
-    cached_pipeline(device, shader, pixel_format, 1, 3, || {
-        let vertex_fn = library
-            .get_function(shader.vertex_entry, None)
-            .unwrap_or_else(|error| panic!("error locating {}: {error}", shader.vertex_entry));
-        let fragment_fn = library
-            .get_function(shader.fragment_entry, None)
-            .unwrap_or_else(|error| panic!("error locating {}: {error}", shader.fragment_entry));
-
-        let descriptor = metal::RenderPipelineDescriptor::new();
-        descriptor.set_label(shader.label);
-        descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
-        descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
-        let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
-        color_attachment.set_pixel_format(pixel_format);
-        color_attachment.set_blending_enabled(false);
-
-        device
-            .new_render_pipeline_state(&descriptor)
-            .expect("could not create render pipeline state")
-    })
+    device
+        .new_render_pipeline_state(&descriptor)
+        .expect("could not create render pipeline state")
 }
 
 impl Drop for MetalRenderer {
@@ -2907,7 +2694,7 @@ mod tests {
                         candidate.path_cache.bytes() <= gpui_render::gpu_policy::WINDOW_LAYER_BYTES
                     );
                     assert!(
-                        candidate.retention.budget.used()
+                        candidate.retention.budget().used()
                             <= gpui_render::gpu_policy::DEVICE_RETENTION_BYTES
                     );
                     // Re-present exactly the same scene to exercise retained-frame reuse.
@@ -2920,7 +2707,7 @@ mod tests {
                             .all(|(a, b)| a.abs_diff(*b) <= 1)
                     );
                 }
-                let budget = candidate.retention.budget.clone();
+                let budget = candidate.retention.budget().clone();
                 candidate.update_transparency(!transparent);
                 assert!(candidate.retained.is_none());
                 let scene = fixture::scene(0);

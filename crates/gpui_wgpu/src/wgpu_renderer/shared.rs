@@ -1,6 +1,7 @@
 //! Device-scoped weak caches. Dropping the final renderer releases the cache.
 use super::pipelines::{WgpuBindGroupLayouts, WgpuPipelines};
 use crate::RendererTier;
+use gpui_render::{gpu_policy::RetentionBudget, scratch_pool::Pool, sharing::Registry};
 use std::{
     cell::RefCell,
     sync::{Arc, Weak},
@@ -19,25 +20,75 @@ struct Entry {
     layouts: Weak<WgpuBindGroupLayouts>,
     pipelines: Weak<WgpuPipelines>,
 }
-thread_local! { static CACHE: RefCell<Vec<Entry>> = const { RefCell::new(Vec::new()) }; }
 thread_local! {
-    static BUDGETS: RefCell<Vec<(Weak<wgpu::Device>, gpui_render::gpu_policy::RetentionBudget)>> = const { RefCell::new(Vec::new()) };
+    static CACHE: RefCell<Vec<Entry>> = const { RefCell::new(Vec::new()) };
+    static RETENTION: Registry<DeviceRetention> = const { Registry::new() };
 }
-pub(super) fn retention_budget(
-    device: &Arc<wgpu::Device>,
-) -> gpui_render::gpu_policy::RetentionBudget {
-    BUDGETS.with_borrow_mut(|budgets| {
-        budgets.retain(|(device, _)| device.strong_count() > 0);
-        if let Some((_, budget)) = budgets
-            .iter()
-            .find(|(d, _)| d.as_ptr() == Arc::as_ptr(device))
-        {
-            return budget.clone();
+
+type TextureKey = (
+    wgpu::Extent3d,
+    wgpu::TextureFormat,
+    u32,
+    wgpu::TextureUsages,
+);
+pub(super) type ScratchPool = Pool<TextureKey, wgpu::Texture>;
+
+/// Optional resources retained beyond a frame (path caches, retained frames, pooled
+/// scratch textures), charged to one budget per device rather than per window.
+pub(super) struct DeviceRetention {
+    device: Arc<wgpu::Device>,
+    pub(super) pool: ScratchPool,
+}
+
+impl DeviceRetention {
+    pub(super) fn for_device(device: &Arc<wgpu::Device>) -> Arc<Self> {
+        RETENTION.with(|retention| {
+            retention.get_or_insert_with(
+                |retention| Arc::ptr_eq(&retention.device, device),
+                || Self {
+                    device: device.clone(),
+                    pool: Pool::new(RetentionBudget::default()),
+                },
+            )
+        })
+    }
+
+    pub(super) fn budget(&self) -> &RetentionBudget {
+        self.pool.budget()
+    }
+
+    /// Offers `texture` for reuse once the queue finishes the work submitted so far.
+    pub(super) fn retire(&self, queue: &wgpu::Queue, texture: wgpu::Texture) {
+        let key = (
+            texture.size(),
+            texture.format(),
+            texture.sample_count(),
+            texture.usage(),
+        );
+        let bytes = u64::from(texture.width())
+            * u64::from(texture.height())
+            * 4
+            * u64::from(texture.sample_count());
+        if let Some(pending) = self.pool.retire(key, bytes, texture) {
+            queue.on_submitted_work_done(move || ScratchPool::complete(&pending));
         }
-        let budget = gpui_render::gpu_policy::RetentionBudget::default();
-        budgets.push((Arc::downgrade(device), budget.clone()));
-        budget
-    })
+    }
+}
+
+/// A texture for `descriptor`: an idle one from `pool` when it has one, otherwise new.
+pub(super) fn scratch_texture(
+    device: &wgpu::Device,
+    pool: Option<&ScratchPool>,
+    descriptor: &wgpu::TextureDescriptor<'_>,
+) -> wgpu::Texture {
+    let key = (
+        descriptor.size,
+        descriptor.format,
+        descriptor.sample_count,
+        descriptor.usage,
+    );
+    pool.and_then(|pool| pool.take(&key))
+        .unwrap_or_else(|| device.create_texture(descriptor))
 }
 
 pub(super) fn pipelines(
@@ -98,6 +149,68 @@ pub(super) fn pipelines(
 #[cfg(all(test, feature = "test-support"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scratch_reuse_waits_for_completion_and_releases_budget_on_checkout() {
+        let context = crate::WgpuContext::new_headless(None).unwrap();
+        let retention = DeviceRetention::for_device(&context.device);
+        let descriptor = wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: 16,
+                height: 16,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        };
+        let submission = context.queue.submit([]);
+        retention.retire(&context.queue, context.device.create_texture(&descriptor));
+        assert_eq!(retention.budget().used(), 1024);
+        assert_eq!(
+            retention.pool.bytes(),
+            (0, 1024),
+            "in flight until the queue finishes"
+        );
+        context
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })
+            .unwrap();
+        assert_eq!(retention.pool.bytes(), (1024, 0));
+
+        let multisampled = wgpu::TextureDescriptor {
+            sample_count: 4,
+            ..descriptor.clone()
+        };
+        scratch_texture(&context.device, Some(&retention.pool), &multisampled);
+        assert_eq!(
+            retention.pool.bytes(),
+            (1024, 0),
+            "only an identical texture is reused"
+        );
+        let reused = scratch_texture(&context.device, Some(&retention.pool), &descriptor);
+        assert_eq!(retention.pool.bytes(), (0, 0));
+        assert_eq!(retention.budget().used(), 0, "checkout releases the budget");
+
+        let budget = retention.budget().clone();
+        retention.retire(&context.queue, reused);
+        assert_eq!(budget.used(), 1024);
+        let weak = Arc::downgrade(&retention);
+        drop(retention);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(
+            budget.used(),
+            0,
+            "the last window closing releases unfinished retirements"
+        );
+    }
     #[test]
     fn device_pipelines_share_variants_without_retaining_the_last_window() {
         let context = crate::WgpuContext::new_headless(None).unwrap();

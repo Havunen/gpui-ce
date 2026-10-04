@@ -186,7 +186,7 @@ impl WgpuRenderer {
     pub fn unconfigure_surface(&mut self) {
         self.target.set_configured(false);
         if let Some(resources) = self.resources.as_mut() {
-            resources.invalidate_intermediate_textures();
+            resources.invalidate_intermediate_textures(self.options.pooled_targets);
         }
     }
 
@@ -238,7 +238,7 @@ impl WgpuRenderer {
             .expect("GPU resources not available");
         surface.configure(&resources.device, &target_config);
         resources.surface = Some(surface);
-        resources.invalidate_intermediate_textures();
+        resources.invalidate_intermediate_textures(self.options.pooled_targets);
         self.target.set_configured(true);
         Ok(())
     }

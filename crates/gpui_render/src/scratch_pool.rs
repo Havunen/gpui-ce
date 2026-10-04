@@ -1,4 +1,6 @@
-//! Exact-configuration scratch reuse. Completion callbacks own weak references only.
+//! Reuse of scratch resources with an identical configuration, once the GPU is done with
+//! them. Completion callbacks hold weak references only, so dropping the pool releases
+//! everything it retains even while those callbacks are still pending.
 use crate::gpu_policy::{RetentionBudget, RetentionLease};
 use std::sync::{
     Arc, Mutex, Weak,
@@ -23,6 +25,10 @@ impl<K: PartialEq, T> Pool<K, T> {
             entries: Mutex::new(Vec::new()),
             budget,
         }
+    }
+    /// The budget charged for retained resources, shared with other device caches.
+    pub fn budget(&self) -> &RetentionBudget {
+        &self.budget
     }
     pub fn take(&self, key: &K) -> Option<T> {
         let mut entries = self.entries.lock().unwrap();
