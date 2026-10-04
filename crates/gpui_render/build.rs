@@ -4,6 +4,7 @@
 //! (WebGpu WGSL, downlevel WGSL for WebGL2/GLES, HLSL/DXBC, GLSL, and MSL) and validates each
 //! against the Naga versions its consumers require. Dialect gaps close via mechanical
 //! transforms here, never per-backend hand edits.
+#![allow(clippy::disallowed_methods, reason = "build scripts are exempt")]
 
 #[path = "src/path_types.rs"]
 #[allow(dead_code)]
