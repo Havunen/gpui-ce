@@ -139,9 +139,6 @@ pub struct GpuFrameCollector {
 }
 impl GpuFrameCollector {
     pub fn collect_unseen(&mut self) -> Vec<GpuFrameMetrics> {
-        if !enabled() {
-            return Vec::new();
-        }
         POLLERS.with_borrow_mut(|pollers| pollers.retain_mut(|poll| poll()));
         let log = records().lock();
         if let Some((first, _)) = log.records.front() {

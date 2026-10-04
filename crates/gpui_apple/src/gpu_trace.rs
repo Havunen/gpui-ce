@@ -22,7 +22,7 @@ struct Slot {
 pub(crate) struct GpuTrace {
     device: metal::Device,
     slots: Vec<Slot>,
-    renderer: u64,
+    pub(crate) renderer: u64,
     submission: Cell<u64>,
 }
 struct Recording {
@@ -105,9 +105,6 @@ impl GpuTrace {
     }
 }
 pub(crate) fn attach(name: &'static str, descriptor: &RenderPassDescriptorRef) {
-    if !gpu_profiler::enabled() {
-        return;
-    }
     ACTIVE.with_borrow(|active| {
         let Some(recording) = active else {
             return;
@@ -176,24 +173,25 @@ impl Frame {
                     msg_send![object, resolveCounterRange: NSRange::new(0, names.len() * 4)]
                 };
                 if let (Some(data), Some(period)) = (data, period) {
-                    let length: usize = unsafe { msg_send![&*data, length] };
-                    let bytes: *const u8 = unsafe { msg_send![&*data, bytes] };
-                    if !bytes.is_null() && length >= names.len() * 32 {
-                        let values = unsafe { std::slice::from_raw_parts(bytes, names.len() * 32) };
-                        for (name, bytes) in names.iter().zip(values.chunks_exact(32)) {
-                            let ticks: Vec<_> = bytes
-                                .chunks_exact(8)
-                                .map(|b| u64::from_ne_bytes(b.try_into().unwrap()))
-                                .collect();
-                            let start = ticks[0].min(ticks[2]);
-                            let end = ticks[1].max(ticks[3]);
-                            if let Some(duration_ns) = gpu_profiler::elapsed_ns(start, end, period)
-                            {
-                                metrics.passes.push(GpuPassTiming {
-                                    name: (*name).into(),
-                                    duration_ns,
-                                });
-                            }
+                    // Four MTLCounterResultTimestamps per pass: vertex start/end, then
+                    // fragment start/end.
+                    for (name, pass) in names.iter().zip(data.to_vec().chunks_exact(32)) {
+                        let tick = |index: usize| {
+                            let bytes = &pass[index * 8..index * 8 + 8];
+                            let tick = u64::from_ne_bytes(bytes.try_into().unwrap());
+                            // A stage that did not run reports MTLCounterErrorValue.
+                            (tick != u64::MAX).then_some(tick)
+                        };
+                        let start = [tick(0), tick(2)].into_iter().flatten().min();
+                        let end = [tick(1), tick(3)].into_iter().flatten().max();
+                        if let Some(duration_ns) = start
+                            .zip(end)
+                            .and_then(|(start, end)| gpu_profiler::elapsed_ns(start, end, period))
+                        {
+                            metrics.passes.push(GpuPassTiming {
+                                name: (*name).into(),
+                                duration_ns,
+                            });
                         }
                     }
                 }

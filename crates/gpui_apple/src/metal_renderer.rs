@@ -2809,6 +2809,64 @@ mod tests {
     }
 
     #[test]
+    fn gpu_timings_report_the_passes_of_completed_frames() {
+        use gpui_render::optimization_fixture as fixture;
+        let mut renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())));
+        let trace = crate::gpu_trace::GpuTrace::new(&renderer.device);
+        let renderer_id = trace.renderer;
+        renderer.gpu_trace = Some(trace);
+        renderer
+            .render_scene_to_image(&fixture::scene(0), fixture::viewport(0))
+            .unwrap();
+
+        // Completion handlers may still be running when the command buffer's waiters wake.
+        let mut collector = gpui::gpu_profiler::GpuFrameCollector::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let frame = loop {
+            if let Some(frame) = collector
+                .collect_unseen()
+                .into_iter()
+                .find(|frame| frame.renderer_id == renderer_id)
+            {
+                break frame;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no GPU timing recorded"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert_eq!(frame.status, "available", "{frame:?}");
+        assert!(
+            frame
+                .gpu_duration_ns
+                .is_some_and(|ns| ns > 0 && ns < 1_000_000_000),
+            "{frame:?}"
+        );
+        if renderer
+            .device
+            .supports_counter_sampling(metal::MTLCounterSamplingPoint::AtStageBoundary)
+        {
+            assert!(frame.pass_timing_complete, "{frame:?}");
+            assert!(
+                frame
+                    .passes
+                    .iter()
+                    .any(|pass| pass.name == "path_rasterization"),
+                "{frame:?}"
+            );
+            assert!(
+                frame
+                    .passes
+                    .iter()
+                    .all(|pass| pass.duration_ns < 1_000_000_000),
+                "{frame:?}"
+            );
+        }
+    }
+
+    #[test]
     fn native_gpu_experiments_preserve_pixels_and_bounded_lifetimes() {
         use gpui_render::optimization_fixture as fixture;
         for transparent in [false, true] {
