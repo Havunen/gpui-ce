@@ -529,3 +529,51 @@ impl Drop for DirectXAtlas {
         }
     }
 }
+
+#[cfg(test)]
+mod shared_atlas_tests {
+    use super::*;
+    #[test]
+    fn shared_atlas_survives_one_window_closing_and_releases_the_final_lease() -> anyhow::Result<()>
+    {
+        let devices = crate::directx_devices::DirectXDevices::new()?;
+        let first = DirectXAtlas::new(&devices.device, &devices.device_context);
+        first.state.lock().shared = true;
+        let second = DirectXAtlas {
+            state: first.state.clone(),
+            owned: Mutex::default(),
+        };
+        let key = AtlasKey::Image(gpui::RenderImageParams {
+            image_id: gpui::ImageId(8),
+            frame_index: 0,
+        });
+        let mut build = || {
+            Ok(Some((
+                Size {
+                    width: DevicePixels(1),
+                    height: DevicePixels(1),
+                },
+                std::borrow::Cow::Owned(vec![0, 0, 0, 255]),
+            )))
+        };
+        let tile = first.get_or_insert_with(&key, &mut build)?.unwrap();
+        assert_eq!(
+            second
+                .get_or_insert_with(&key, &mut || panic!("shared tile rebuilt"))?
+                .unwrap(),
+            tile
+        );
+        first.remove(&key);
+        first.remove(&key);
+        assert_eq!(second.state.lock().owners[&key], 1);
+        first.get_or_insert_with(&key, &mut build)?;
+        drop(first);
+        assert_eq!(second.state.lock().owners[&key], 1);
+        second.remove(&key);
+        assert_eq!(second.allocated_bytes(), 0);
+        let weak = Arc::downgrade(&second.state);
+        drop(second);
+        assert!(weak.upgrade().is_none());
+        Ok(())
+    }
+}

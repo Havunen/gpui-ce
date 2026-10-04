@@ -15,7 +15,7 @@ path = "src/gpui_wgpu.rs"
 [features]
 default = []
 font-kit = ["dep:font-kit"]
-test-support = ["gpui/test-support", "dep:image"]
+test-support = ["gpui/test-support", "gpui_render/test-support", "dep:image"]
 custom-gpu = ["gpui/custom-gpu"]
 wgpu-surfaces = ["gpui/wgpu-surfaces"]
 

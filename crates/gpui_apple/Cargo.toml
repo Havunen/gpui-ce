@@ -43,4 +43,5 @@ parking_lot.workspace = true
 smallvec.workspace = true
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
+gpui_render = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }

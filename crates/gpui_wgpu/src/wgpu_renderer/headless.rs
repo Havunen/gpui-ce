@@ -260,6 +260,43 @@ mod path_target_tests {
     }
 
     #[test]
+    fn native_gpu_fixture_covers_cached_packed_and_retained_rendering() {
+        use gpui_render::optimization_fixture as fixture;
+        let context = WgpuContext::new_headless(None).unwrap();
+        for transparent in [false, true] {
+            for options in fixture::modes() {
+                let mut full = WgpuRenderer::new_headless(&context, fixture::viewport(0)).unwrap();
+                let mut candidate =
+                    WgpuRenderer::new_headless(&context, fixture::viewport(0)).unwrap();
+                full.options = Default::default();
+                candidate.options = options;
+                full.update_transparency(transparent);
+                candidate.update_transparency(transparent);
+                for frame in 0..12 {
+                    let scene = fixture::scene(frame);
+                    full.update_drawable_size(fixture::viewport(frame));
+                    candidate.update_drawable_size(fixture::viewport(frame));
+                    let expected = full.render_to_image(&scene).unwrap();
+                    for repeat in 0..2 {
+                        let actual = candidate.render_to_image(&scene).unwrap();
+                        let difference = actual
+                            .as_raw()
+                            .iter()
+                            .zip(expected.as_raw())
+                            .map(|(a, b)| a.abs_diff(*b))
+                            .max()
+                            .unwrap();
+                        assert!(
+                            difference <= 1,
+                            "{options:?}, transparent={transparent}, frame={frame}, repeat={repeat}, difference={difference}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn cropped_path_targets_match_full_viewport_pixels_when_growing_and_resizing() {
         let context = WgpuContext::new_headless(None).expect("hardware or software GPU");
         let target = size(DevicePixels(512), DevicePixels(320));

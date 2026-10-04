@@ -142,6 +142,7 @@ impl GpuTrace {
         succeeded: bool,
         path_size: (u32, u32),
         memory: gpu_profiler::GpuMemory,
+        cache: (u64, u64),
     ) {
         let mut state = self.state.borrow_mut();
         if let Some(index) = state.active.take() {
@@ -154,6 +155,8 @@ impl GpuTrace {
             if let Some(metrics) = &mut slot.metrics {
                 metrics.path_target = path_size;
                 metrics.memory = memory;
+                metrics.cache_hits = cache.0;
+                metrics.cache_misses = cache.1;
                 if !succeeded {
                     metrics.status = "render_failed";
                 }

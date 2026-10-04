@@ -138,10 +138,13 @@ impl Frame {
         command: &metal::CommandBufferRef,
         path_size: (u32, u32),
         memory: gpu_profiler::GpuMemory,
+        cache: (u64, u64),
     ) {
         let mut metrics = self.metrics.take().unwrap();
         metrics.path_target = path_size;
         metrics.memory = memory;
+        metrics.cache_hits = cache.0;
+        metrics.cache_misses = cache.1;
         metrics.query_samples_dropped = self.recording.dropped.get();
         let names = self.recording.names.borrow().clone();
         let samples = self.recording.buffer.clone();
@@ -210,7 +213,9 @@ impl Frame {
 impl Drop for Frame {
     fn drop(&mut self) {
         ACTIVE.with_borrow_mut(|active| *active = self.previous.take());
-        if self.metrics.is_some() {
+        if let Some(mut metrics) = self.metrics.take() {
+            metrics.status = "render_failed";
+            gpu_profiler::record(metrics);
             if let Some(busy) = &self.recording.busy {
                 busy.store(false, Ordering::Release);
             }

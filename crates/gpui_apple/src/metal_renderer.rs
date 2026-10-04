@@ -13,6 +13,10 @@ use gpui_render::{
         BlurAxis, BlurKernel, BlurUniforms, GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS, ScissorRectangle,
         downsampled_dimension,
     },
+    damage::{Damage, Snapshot},
+    gpu_policy::{RetentionBudget, RetentionLease},
+    native_path_cache::{self, PathCache, Source},
+    path_plan::{self, PixelRect},
     path_types::{self, PathRasterizationVertex},
     shaders::{
         common::{FontRasterizationUniforms, GlobalUniforms, ShaderBool, SurfaceColorFormat},
@@ -237,7 +241,7 @@ struct SharedPrograms {
     libraries: std::cell::RefCell<Vec<(&'static str, metal::Library)>>,
     pipelines: std::cell::RefCell<
         Vec<(
-            (u8, &'static str, &'static str, u64, u32),
+            (u8, &'static str, &'static str, &'static str, u64, u32),
             metal::RenderPipelineState,
         )>,
     >,
@@ -280,6 +284,7 @@ fn cached_pipeline(
     let key = (
         kind,
         shader.vertex_entry,
+        shader.fragment_entry,
         shader.msl,
         format as u64,
         samples,
@@ -292,7 +297,57 @@ fn cached_pipeline(
     pipeline
 }
 
+// Device lifetime, not window lifetime, owns the optional retention budget.
+type TextureKey = (u64, u64, u64, u64, u64, u64, u64);
+fn texture_key(texture: &metal::TextureRef) -> TextureKey {
+    (
+        texture.width(),
+        texture.height(),
+        texture.pixel_format() as u64,
+        texture.sample_count(),
+        texture.storage_mode() as u64,
+        texture.usage().bits(),
+        texture.texture_type() as u64,
+    )
+}
+struct DeviceRetention {
+    device: metal::Device,
+    budget: RetentionBudget,
+    pool: gpui_render::native_pool::Pool<TextureKey, metal::Texture>,
+}
+thread_local! { static RETENTION: std::cell::RefCell<Vec<std::sync::Weak<DeviceRetention>>> = const { std::cell::RefCell::new(Vec::new()) }; }
+fn device_retention(device: &metal::DeviceRef) -> Arc<DeviceRetention> {
+    RETENTION.with_borrow_mut(|entries| {
+        entries.retain(|entry| entry.strong_count() > 0);
+        if let Some(entry) = entries
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .find(|entry| entry.device.as_ptr() == device.as_ptr())
+        {
+            return entry;
+        }
+        let budget = RetentionBudget::default();
+        let entry = Arc::new(DeviceRetention {
+            device: device.to_owned(),
+            pool: gpui_render::native_pool::Pool::new(budget.clone()),
+            budget,
+        });
+        entries.push(Arc::downgrade(&entry));
+        entry
+    })
+}
+
+struct RetainedFrame {
+    texture: metal::Texture,
+    clear: metal::Texture,
+    snapshot: Option<Snapshot>,
+    lease: Arc<RetentionLease>,
+}
+
 pub struct MetalRenderer {
+    retention: Arc<DeviceRetention>,
+    retained: Option<RetainedFrame>,
+    path_cache: PathCache<metal::Texture>,
     options: gpui_render::gpu_policy::GpuOptions,
     _shared_programs: Option<std::rc::Rc<SharedPrograms>>,
     gpu_trace: Option<crate::gpu_trace::GpuTrace>,
@@ -568,7 +623,11 @@ impl MetalRenderer {
         let core_video_texture_cache =
             CVMetalTextureCache::new(None, device.clone(), None).unwrap();
 
+        let retention = device_retention(&device);
         Self {
+            retained: None,
+            path_cache: PathCache::new(retention.budget.clone()),
+            retention,
             options: gpui_render::gpu_policy::GpuOptions::from_env(),
             _shared_programs: shared,
             gpu_trace: gpui::gpu_profiler::enabled()
@@ -645,6 +704,9 @@ impl MetalRenderer {
         if self.intermediate_texture_size == Some(size) {
             return;
         }
+        self.retire_scratch();
+        self.path_cache.clear();
+        self.retained = None;
         self.path_intermediate_texture = None;
         self.path_intermediate_msaa_texture = None;
         self.scene_color_texture = None;
@@ -652,6 +714,67 @@ impl MetalRenderer {
         self.blur_pong_texture = None;
         self.group_textures.clear();
         self.intermediate_texture_size = (size.width.0 > 0 && size.height.0 > 0).then_some(size);
+    }
+
+    fn scratch_texture(&self, descriptor: &metal::TextureDescriptorRef) -> metal::Texture {
+        if self.options.pooled_targets {
+            let key = (
+                descriptor.width(),
+                descriptor.height(),
+                descriptor.pixel_format() as u64,
+                descriptor.sample_count(),
+                descriptor.storage_mode() as u64,
+                descriptor.usage().bits(),
+                descriptor.texture_type() as u64,
+            );
+            if let Some(texture) = self.retention.pool.take(&key) {
+                return texture;
+            }
+        }
+        self.device.new_texture(descriptor)
+    }
+    fn retire_textures(&self, textures: Vec<metal::Texture>) {
+        if !self.options.pooled_targets {
+            return;
+        }
+        let pending: Vec<_> = textures
+            .into_iter()
+            .filter_map(|texture| {
+                if texture.storage_mode() == metal::MTLStorageMode::Memoryless {
+                    return None;
+                }
+                let bytes = texture.width() * texture.height() * 4 * texture.sample_count();
+                self.retention
+                    .pool
+                    .retire(texture_key(&texture), bytes, texture)
+            })
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        // This queue fence is ordered after the window's last draw and never waits on the UI.
+        let command = self.command_queue.new_command_buffer();
+        let complete = ConcreteBlock::new(move |_: &metal::CommandBufferRef| {
+            for entry in &pending {
+                gpui_render::native_pool::Pool::complete(entry);
+            }
+        })
+        .copy();
+        command.add_completed_handler(&complete);
+        command.commit();
+    }
+    fn retire_scratch(&mut self) {
+        let textures: Vec<_> = self
+            .path_intermediate_texture
+            .take()
+            .into_iter()
+            .chain(self.path_intermediate_msaa_texture.take())
+            .chain(self.scene_color_texture.take())
+            .chain(self.blur_ping_texture.take())
+            .chain(self.blur_pong_texture.take())
+            .chain(self.group_textures.drain(..))
+            .collect();
+        self.retire_textures(textures);
     }
 
     fn prepare_intermediate_textures(&mut self, scene: &Scene, size: Size<DevicePixels>) {
@@ -663,6 +786,9 @@ impl MetalRenderer {
         let full_w = size.width.0 as u64;
         let full_h = size.height.0 as u64;
 
+        let device = self.device.clone();
+        let retention = self.retention.clone();
+        let pooled = self.options.pooled_targets;
         let make_color_texture = |width: u64, height: u64| {
             let descriptor = metal::TextureDescriptor::new();
             descriptor.set_width(width.max(1));
@@ -672,7 +798,21 @@ impl MetalRenderer {
             descriptor.set_usage(
                 metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
             );
-            self.device.new_texture(&descriptor)
+            if pooled {
+                let key = (
+                    descriptor.width(),
+                    descriptor.height(),
+                    descriptor.pixel_format() as u64,
+                    descriptor.sample_count(),
+                    descriptor.storage_mode() as u64,
+                    descriptor.usage().bits(),
+                    descriptor.texture_type() as u64,
+                );
+                if let Some(texture) = retention.pool.take(&key) {
+                    return texture;
+                }
+            }
+            device.new_texture(&descriptor)
         };
 
         let previous = self
@@ -687,6 +827,13 @@ impl MetalRenderer {
             self.options.cropped_paths,
         );
         if requirements.uses_path_target && path_size != previous {
+            let old: Vec<_> = self
+                .path_intermediate_texture
+                .take()
+                .into_iter()
+                .chain(self.path_intermediate_msaa_texture.take())
+                .collect();
+            self.retire_textures(old);
             let texture_descriptor = metal::TextureDescriptor::new();
             texture_descriptor.set_width(path_size.0 as u64);
             texture_descriptor.set_height(path_size.1 as u64);
@@ -695,7 +842,7 @@ impl MetalRenderer {
             texture_descriptor.set_usage(
                 metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
             );
-            self.path_intermediate_texture = Some(self.device.new_texture(&texture_descriptor));
+            self.path_intermediate_texture = Some(self.scratch_texture(&texture_descriptor));
 
             // Storage mode guidance:
             // https://developer.apple.com/documentation/metal/choosing-a-resource-storage-mode-for-apple-gpus
@@ -731,6 +878,9 @@ impl MetalRenderer {
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
+        if self.opaque == transparent {
+            self.retained = None;
+        }
         self.opaque = !transparent;
         if let Some(layer) = &self.layer {
             layer.set_opaque(!transparent);
@@ -950,7 +1100,11 @@ impl MetalRenderer {
         self.instance_buffer_pool.lock().acquire(
             &self.device,
             self.is_unified_memory,
-            required_instance_buffer_size(scene),
+            required_instance_buffer_size(scene).saturating_add(if self.options.batched_paths {
+                scene.render_commands().len() * 256
+            } else {
+                0
+            }),
         )
     }
 
@@ -986,13 +1140,163 @@ impl MetalRenderer {
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
     ) -> Result<metal::CommandBuffer> {
+        let result =
+            self.encode_primitives_to_texture(scene, instance_buffer, texture, viewport_size);
+        if result.is_err() {
+            self.path_cache.clear();
+            if let Some(retained) = &mut self.retained {
+                retained.snapshot = None;
+            }
+        }
+        result
+    }
+
+    fn encode_primitives_to_texture(
+        &mut self,
+        scene: &Scene,
+        instance_buffer: &mut InstanceBuffer,
+        texture: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+    ) -> Result<metal::CommandBuffer> {
         let gpu_frame = self.gpu_trace.as_ref().map(|trace| trace.begin(scene));
         self.prepare_intermediate_textures(scene, viewport_size);
+        self.path_cache.begin();
+        let mut used_paths = Vec::new();
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
         let alpha = if self.opaque { 1. } else { 0. };
         let mut instance_offset = 0;
         let scene_uniforms = SceneUniforms::new(viewport_size);
+
+        use gpui::PlatformAtlas as _;
+        let snapshot = self
+            .options
+            .partial_redraw
+            .then(|| Snapshot::capture(scene, self.sprite_atlas.generation()))
+            .flatten();
+        let frame_extent = (viewport_size.width.0 as u32, viewport_size.height.0 as u32);
+        if snapshot.is_some() && self.retained.is_none() {
+            if let Some(lease) = self
+                .retention
+                .budget
+                .try_acquire(u64::from(frame_extent.0) * u64::from(frame_extent.1) * 4 + 4)
+            {
+                let make = |width, height| {
+                    let descriptor = metal::TextureDescriptor::new();
+                    descriptor.set_width(width);
+                    descriptor.set_height(height);
+                    descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+                    descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+                    descriptor.set_usage(
+                        metal::MTLTextureUsage::ShaderRead | metal::MTLTextureUsage::RenderTarget,
+                    );
+                    self.device.new_texture(&descriptor)
+                };
+                let clear = make(1, 1);
+                let encoder = new_command_encoder_for_texture(
+                    command_buffer,
+                    &clear,
+                    size(DevicePixels(1), DevicePixels(1)),
+                    |a| {
+                        a.set_load_action(metal::MTLLoadAction::Clear);
+                        a.set_clear_color(metal::MTLClearColor::new(0., 0., 0., alpha));
+                    },
+                );
+                encoder.end_encoding();
+                self.retained = Some(RetainedFrame {
+                    texture: make(frame_extent.0 as u64, frame_extent.1 as u64),
+                    clear,
+                    snapshot: None,
+                    lease: Arc::new(lease),
+                });
+            }
+        }
+        let retained_owned = if snapshot.is_some() {
+            self.retained.as_ref().map(|r| r.texture.clone())
+        } else {
+            None
+        };
+        let damage = match (
+            snapshot.as_ref(),
+            self.retained.as_ref().and_then(|r| r.snapshot.as_ref()),
+        ) {
+            (Some(new), Some(old)) if retained_owned.is_some() => new.compare(old, frame_extent),
+            _ => Damage::Full,
+        };
+        if let Damage::Rect(rect) = damage {
+            let retained = self.retained.as_ref().unwrap();
+            self.run_metal_blur_pass(
+                command_buffer,
+                &self.blur_downsample_pipeline_state,
+                &retained.texture,
+                &retained.clear,
+                viewport_size,
+                &scene_uniforms,
+                BlurUniforms::copy([frame_extent.0 as f32, frame_extent.1 as f32]),
+                ScissorRectangle {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: rect.height,
+                },
+                metal::MTLPrimitiveType::Triangle,
+                3,
+                true,
+            );
+        }
+        let extent = self
+            .path_intermediate_texture
+            .as_ref()
+            .map(|t| (t.width() as u32, t.height() as u32))
+            .unwrap_or_default();
+        let path_plan = if damage == Damage::Unchanged {
+            Vec::new()
+        } else {
+            native_path_cache::plan(scene, extent, &mut self.path_cache, self.options)
+        };
+        let packed: Vec<_> = path_plan
+            .iter()
+            .zip(scene.render_commands())
+            .filter_map(|(source, command)| {
+                if let (
+                    Source::Packed { world, tile },
+                    RenderCommand::Batch(PrimitiveBatch::Paths {
+                        range,
+                        rasterization_vertex_count,
+                        ..
+                    }),
+                ) = (source, command)
+                {
+                    Some((
+                        &scene.paths[range.clone()],
+                        *rasterization_vertex_count,
+                        Some((*world, *tile)),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !packed.is_empty() {
+            anyhow::ensure!(
+                self.draw_path_batches(
+                    &packed,
+                    instance_buffer,
+                    &mut instance_offset,
+                    &scene_uniforms,
+                    command_buffer
+                ),
+                "packed path prepass exceeded the instance buffer"
+            );
+            if self.options.cached_layers {
+                for (paths, _, bounds) in &packed {
+                    let (world, tile) = bounds.unwrap();
+                    if let Some(entry) = self.capture_paths(paths, world, tile, command_buffer)? {
+                        used_paths.push(entry);
+                    }
+                }
+            }
+        }
 
         // Render the scene into an offscreen color texture (so filters can sample it), then
         // blit it to `texture`. Owned clones keep the textures borrowable without borrowing
@@ -1000,8 +1304,10 @@ impl MetalRenderer {
         // Only route through the offscreen scene texture when the scene actually contains blur
         // filters; otherwise render straight to `texture` exactly as before (no regression, no
         // extra blit for the common case).
-        let use_offscreen = scene.requires_offscreen_rendering();
-        let scene_color_owned = self.scene_color_texture.clone();
+        let use_offscreen = scene.requires_offscreen_rendering() || retained_owned.is_some();
+        let scene_color_owned = retained_owned
+            .clone()
+            .or_else(|| self.scene_color_texture.clone());
         let blur_ping_owned = self.blur_ping_texture.clone();
         let blur_pong_owned = self.blur_pong_texture.clone();
         let group_owned = self
@@ -1023,12 +1329,32 @@ impl MetalRenderer {
             current_target,
             viewport_size,
             |color_attachment| {
-                color_attachment.set_load_action(metal::MTLLoadAction::Clear);
+                color_attachment.set_load_action(if damage == Damage::Full {
+                    metal::MTLLoadAction::Clear
+                } else {
+                    metal::MTLLoadAction::Load
+                });
                 color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., alpha));
             },
         );
 
-        for command in scene.render_commands() {
+        let set_damage_scissor = |encoder: &metal::RenderCommandEncoderRef| {
+            if let Damage::Rect(rect) = damage {
+                encoder.set_scissor_rect(MTLScissorRect {
+                    x: rect.x as u64,
+                    y: rect.y as u64,
+                    width: rect.width as u64,
+                    height: rect.height as u64,
+                });
+            }
+        };
+        set_damage_scissor(command_encoder);
+        let commands = if damage == Damage::Unchanged {
+            &[][..]
+        } else {
+            scene.render_commands()
+        };
+        for (command_index, command) in commands.iter().enumerate() {
             let ok = match command {
                 RenderCommand::Batch(PrimitiveBatch::Shadows { range, smoothed }) => self
                     .draw_shadows(
@@ -1056,27 +1382,10 @@ impl MetalRenderer {
                         continue;
                     }
                     let paths = &scene.paths[range.clone()];
-                    command_encoder.end_encoding();
-
-                    let did_draw = self.draw_paths_to_intermediate(
-                        paths,
-                        *rasterization_vertex_count,
-                        instance_buffer,
-                        &mut instance_offset,
-                        &scene_uniforms,
-                        command_buffer,
-                    );
-
-                    command_encoder = new_command_encoder_for_texture(
-                        command_buffer,
-                        current_target,
-                        viewport_size,
-                        |color_attachment| {
-                            color_attachment.set_load_action(metal::MTLLoadAction::Load);
-                        },
-                    );
-
-                    if did_draw {
+                    if matches!(path_plan.get(command_index), Some(Source::Invisible)) {
+                        continue;
+                    }
+                    if let Some(Source::Packed { world, tile }) = path_plan.get(command_index) {
                         self.draw_paths_from_intermediate(
                             paths,
                             *sprite_count,
@@ -1084,9 +1393,65 @@ impl MetalRenderer {
                             &mut instance_offset,
                             &scene_uniforms,
                             command_encoder,
+                            Some((
+                                self.path_intermediate_texture.as_deref().unwrap(),
+                                *world,
+                                world.origin() - tile.origin(),
+                            )),
                         )
+                    } else if let Some(Source::Cached(cached)) = path_plan.get(command_index) {
+                        let ok = self.draw_paths_from_intermediate(
+                            paths,
+                            *sprite_count,
+                            instance_buffer,
+                            &mut instance_offset,
+                            &scene_uniforms,
+                            command_encoder,
+                            Some((&cached.resource, cached.bounds, cached.bounds.origin())),
+                        );
+                        used_paths.push(cached.clone());
+                        ok
                     } else {
-                        false
+                        command_encoder.end_encoding();
+                        let did_draw = self.draw_paths_to_intermediate(
+                            paths,
+                            *rasterization_vertex_count,
+                            instance_buffer,
+                            &mut instance_offset,
+                            &scene_uniforms,
+                            command_buffer,
+                        );
+                        if did_draw && self.options.cached_layers {
+                            if let Some(bounds) = path_plan::visible_rect(
+                                paths.iter().map(Path::clipped_bounds),
+                                extent,
+                            ) {
+                                if let Some(entry) =
+                                    self.capture_paths(paths, bounds, bounds, command_buffer)?
+                                {
+                                    used_paths.push(entry);
+                                }
+                            }
+                        }
+                        command_encoder = new_command_encoder_for_texture(
+                            command_buffer,
+                            current_target,
+                            viewport_size,
+                            |color_attachment| {
+                                color_attachment.set_load_action(metal::MTLLoadAction::Load)
+                            },
+                        );
+                        set_damage_scissor(command_encoder);
+                        did_draw
+                            && self.draw_paths_from_intermediate(
+                                paths,
+                                *sprite_count,
+                                instance_buffer,
+                                &mut instance_offset,
+                                &scene_uniforms,
+                                command_encoder,
+                                None,
+                            )
                     }
                 }
                 RenderCommand::Batch(PrimitiveBatch::Underlines(range)) => self.draw_underlines(
@@ -1282,6 +1647,22 @@ impl MetalRenderer {
             });
         }
 
+        // Command buffers retain textures, and this completion lease also keeps their
+        // budget charged when a later capture evicts an entry from the LRU.
+        if !used_paths.is_empty() || retained_owned.is_some() {
+            let retained_lease = retained_owned
+                .as_ref()
+                .and_then(|_| self.retained.as_ref().map(|r| r.lease.clone()));
+            let used_paths = Cell::new(Some((used_paths, retained_lease, self.retention.clone())));
+            let complete = ConcreteBlock::new(move |_: &metal::CommandBufferRef| {
+                drop(used_paths.take());
+            })
+            .copy();
+            command_buffer.add_completed_handler(&complete);
+        }
+        if let Some(retained) = &mut self.retained {
+            retained.snapshot = snapshot;
+        }
         if let Some(frame) = gpu_frame {
             let size = self
                 .path_intermediate_texture
@@ -1311,8 +1692,18 @@ impl MetalRenderer {
                     atlas_bytes: Some(self.sprite_atlas.allocated_bytes()),
                     filter_bytes: Some(filter_bytes),
                     upload_bytes: Some(instance_buffer.metal_buffer.length()),
-                    ..Default::default()
+                    cached_bytes: Some(self.path_cache.bytes()),
+                    retained_frame_bytes: Some(
+                        self.retained
+                            .as_ref()
+                            .map(|r| r.texture.width() * r.texture.height() * 4 + 4)
+                            .unwrap_or(0),
+                    ),
+                    device_retention_bytes: Some(self.retention.budget.used()),
+                    pooled_bytes: Some(self.retention.pool.bytes().0),
+                    pending_release_bytes: Some(self.retention.pool.bytes().1),
                 },
+                (self.path_cache.hits, self.path_cache.misses),
             );
         }
         Ok(command_buffer.to_owned())
@@ -1509,6 +1900,49 @@ impl MetalRenderer {
         encoder.end_encoding();
     }
 
+    fn capture_paths(
+        &mut self,
+        paths: &[Path<ScaledPixels>],
+        world: PixelRect,
+        source: PixelRect,
+        command: &metal::CommandBufferRef,
+    ) -> Result<Option<Arc<gpui_render::native_path_cache::Entry<metal::Texture>>>> {
+        let Some(intermediate) = &self.path_intermediate_texture else {
+            return Ok(None);
+        };
+        self.path_cache.capture(paths, world, || {
+            let descriptor = metal::TextureDescriptor::new();
+            descriptor.set_width(world.width as u64);
+            descriptor.set_height(world.height as u64);
+            descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+            descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+            descriptor.set_usage(metal::MTLTextureUsage::ShaderRead);
+            let texture = self.device.new_texture(&descriptor);
+            let encoder = command.new_blit_command_encoder();
+            encoder.copy_from_texture(
+                intermediate,
+                0,
+                0,
+                metal::MTLOrigin {
+                    x: source.x as u64,
+                    y: source.y as u64,
+                    z: 0,
+                },
+                metal::MTLSize {
+                    width: world.width as u64,
+                    height: world.height as u64,
+                    depth: 1,
+                },
+                &texture,
+                0,
+                0,
+                metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            );
+            encoder.end_encoding();
+            Ok(texture)
+        })
+    }
+
     fn draw_paths_to_intermediate(
         &self,
         paths: &[Path<ScaledPixels>],
@@ -1518,7 +1952,24 @@ impl MetalRenderer {
         scene_uniforms: &SceneUniforms,
         command_buffer: &metal::CommandBufferRef,
     ) -> bool {
-        if paths.is_empty() {
+        self.draw_path_batches(
+            &[(paths, rasterization_vertex_count, None)],
+            instance_buffer,
+            instance_offset,
+            scene_uniforms,
+            command_buffer,
+        )
+    }
+
+    fn draw_path_batches(
+        &self,
+        batches: &[(&[Path<ScaledPixels>], usize, Option<(PixelRect, PixelRect)>)],
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        scene_uniforms: &SceneUniforms,
+        command_buffer: &metal::CommandBufferRef,
+    ) -> bool {
+        if batches.is_empty() {
             return true;
         }
         let Some(intermediate_texture) = &self.path_intermediate_texture else {
@@ -1557,41 +2008,54 @@ impl MetalRenderer {
         };
         bind_scene_uniforms(command_encoder, &path_uniforms);
 
-        align_offset(instance_offset);
-        let vertices_bytes_len =
-            mem::size_of::<PathRasterizationVertex>() * rasterization_vertex_count;
-        let next_offset = *instance_offset + vertices_bytes_len;
-        if next_offset > instance_buffer.size {
-            command_encoder.end_encoding();
-            return false;
-        }
-        let buffer_contents =
-            unsafe { (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset) }
-                as *mut PathRasterizationVertex;
-        let mut vertices = path_types::rasterization_vertices(paths);
-        for index in 0..rasterization_vertex_count {
-            let Some(vertex) = vertices.next() else {
+        for &(paths, rasterization_vertex_count, packed) in batches {
+            if let Some((_, tile)) = packed {
+                command_encoder.set_scissor_rect(MTLScissorRect {
+                    x: tile.x as u64,
+                    y: tile.y as u64,
+                    width: tile.width as u64,
+                    height: tile.height as u64,
+                });
+            }
+            align_offset(instance_offset);
+            let vertices_bytes_len =
+                mem::size_of::<PathRasterizationVertex>() * rasterization_vertex_count;
+            let next_offset = *instance_offset + vertices_bytes_len;
+            if next_offset > instance_buffer.size {
                 command_encoder.end_encoding();
                 return false;
-            };
-            unsafe { buffer_contents.add(index).write(vertex) };
+            }
+            let buffer_contents = unsafe {
+                (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset)
+            } as *mut PathRasterizationVertex;
+            let mut vertices = path_types::rasterization_vertices(paths);
+            for index in 0..rasterization_vertex_count {
+                let Some(mut vertex) = vertices.next() else {
+                    command_encoder.end_encoding();
+                    return false;
+                };
+                if let Some((world, tile)) = packed {
+                    vertex.raster_offset = tile.origin() - world.origin();
+                }
+                unsafe { buffer_contents.add(index).write(vertex) };
+            }
+            if vertices.next().is_some() {
+                command_encoder.end_encoding();
+                return false;
+            }
+            bind_instance_bytes(
+                command_encoder,
+                &instance_buffer.metal_buffer,
+                *instance_offset,
+                vertices_bytes_len,
+            );
+            command_encoder.draw_primitives(
+                metal::MTLPrimitiveType::Triangle,
+                0,
+                rasterization_vertex_count as u64,
+            );
+            *instance_offset = next_offset;
         }
-        if vertices.next().is_some() {
-            command_encoder.end_encoding();
-            return false;
-        }
-        bind_instance_bytes(
-            command_encoder,
-            &instance_buffer.metal_buffer,
-            *instance_offset,
-            vertices_bytes_len,
-        );
-        command_encoder.draw_primitives(
-            metal::MTLPrimitiveType::Triangle,
-            0,
-            rasterization_vertex_count as u64,
-        );
-        *instance_offset = next_offset;
 
         command_encoder.end_encoding();
         true
@@ -1709,12 +2173,16 @@ impl MetalRenderer {
         instance_offset: &mut usize,
         scene_uniforms: &SceneUniforms,
         command_encoder: &metal::RenderCommandEncoderRef,
+        source: Option<(&metal::TextureRef, PixelRect, gpui::Point<ScaledPixels>)>,
     ) -> bool {
         let Some(_) = paths.first() else {
             return true;
         };
 
-        let Some(ref intermediate_texture) = self.path_intermediate_texture else {
+        let Some(intermediate_texture) = source
+            .map(|s| s.0)
+            .or(self.path_intermediate_texture.as_deref())
+        else {
             return false;
         };
 
@@ -1742,9 +2210,19 @@ impl MetalRenderer {
                 as *mut path_types::PathSprite;
         let mut sprites = path_types::sprites(paths);
         for index in 0..sprite_count {
-            let Some(sprite) = sprites.next() else {
+            let Some(mut sprite) = sprites.next() else {
                 return false;
             };
+            if let Some((_, bounds, origin)) = source {
+                sprite.texture_origin = origin;
+                sprite.bounds = sprite.bounds.intersect(&Bounds::new(
+                    bounds.origin(),
+                    size(
+                        ScaledPixels(bounds.width as f32),
+                        ScaledPixels(bounds.height as f32),
+                    ),
+                ));
+            }
             unsafe { buffer_contents.add(index).write(sprite) };
         }
         if sprites.next().is_some() {
@@ -2191,6 +2669,12 @@ fn build_blur_pipeline_state(
     })
 }
 
+impl Drop for MetalRenderer {
+    fn drop(&mut self) {
+        self.retire_scratch();
+    }
+}
+
 fn required_instance_buffer_size(scene: &Scene) -> usize {
     let mut required = 0;
     let mut reserve = |element_size: usize, count: usize| {
@@ -2283,6 +2767,75 @@ mod tests {
         pattern_slash, px, solid_background, white,
     };
     use std::borrow::Cow;
+
+    #[test]
+    fn native_gpu_experiments_preserve_pixels_and_bounded_lifetimes() {
+        use gpui_render::optimization_fixture as fixture;
+        for transparent in [false, true] {
+            for options in fixture::modes() {
+                let mut full = MetalRenderer::new_headless(Arc::new(Mutex::new(
+                    InstanceBufferPool::default(),
+                )));
+                let mut candidate = MetalRenderer::new_headless(Arc::new(Mutex::new(
+                    InstanceBufferPool::default(),
+                )));
+                full.options = Default::default();
+                candidate.options = options;
+                full.update_transparency(transparent);
+                candidate.update_transparency(transparent);
+                for frame in 0..12 {
+                    let scene = fixture::scene(frame);
+                    let size = fixture::viewport(frame);
+                    let expected = full.render_scene_to_image(&scene, size).unwrap();
+                    let actual = candidate.render_scene_to_image(&scene, size).unwrap();
+                    let difference = actual
+                        .as_raw()
+                        .iter()
+                        .zip(expected.as_raw())
+                        .map(|(a, b)| a.abs_diff(*b))
+                        .max()
+                        .unwrap();
+                    assert!(
+                        difference <= 1,
+                        "{options:?}, transparent={transparent}, frame={frame}, difference={difference}"
+                    );
+                    if options.cached_layers && !options.partial_redraw && frame == 4 {
+                        assert!(candidate.path_cache.hits >= 4);
+                    }
+                    if options.partial_redraw {
+                        assert!(candidate.retained.is_some());
+                    }
+                    assert!(
+                        candidate.path_cache.bytes() <= gpui_render::gpu_policy::WINDOW_LAYER_BYTES
+                    );
+                    assert!(
+                        candidate.retention.budget.used()
+                            <= gpui_render::gpu_policy::DEVICE_RETENTION_BYTES
+                    );
+                    // Re-present exactly the same scene to exercise retained-frame reuse.
+                    let repeated = candidate.render_scene_to_image(&scene, size).unwrap();
+                    assert!(
+                        repeated
+                            .as_raw()
+                            .iter()
+                            .zip(expected.as_raw())
+                            .all(|(a, b)| a.abs_diff(*b) <= 1)
+                    );
+                }
+                let budget = candidate.retention.budget.clone();
+                candidate.update_transparency(!transparent);
+                assert!(candidate.retained.is_none());
+                let scene = fixture::scene(0);
+                candidate
+                    .render_scene_to_image(&scene, fixture::viewport(0))
+                    .unwrap();
+                drop(candidate);
+                drop(full);
+                // Render-to-image waits for completion. The last renderer owns no global cache.
+                assert_eq!(budget.used(), 0);
+            }
+        }
+    }
 
     #[test]
     fn cropped_path_targets_match_full_viewport_pixels() {

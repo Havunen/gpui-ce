@@ -47,4 +47,5 @@ windows-version.workspace = true
 
 # Dependency crates do not inherit cfg(test); expose the matching test-only APIs.
 [target.'cfg(target_os = "windows")'.dev-dependencies]
+gpui_render = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }

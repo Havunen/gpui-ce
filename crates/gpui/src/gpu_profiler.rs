@@ -82,7 +82,7 @@ impl GpuFrameMetrics {
             submission_id,
             backend,
             implemented_experiments: match backend {
-                "wgpu" => &[
+                "wgpu" | "metal" | "d3d11" => &[
                     "cropped-paths",
                     "shared-resources",
                     "cached-layers",
@@ -90,7 +90,6 @@ impl GpuFrameMetrics {
                     "partial-redraw",
                     "pooled-targets",
                 ],
-                "metal" | "d3d11" => &["cropped-paths", "shared-resources"],
                 _ => &[],
             },
             submitted_at: Instant::now(),

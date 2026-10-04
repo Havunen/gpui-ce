@@ -321,7 +321,7 @@ Windows.Win32.ID3D11Buffer::{GetDesc}
 Windows.Win32.ID3D11Debug::{ReportLiveDeviceObjects}
 Windows.Win32.ID3D11Device::{CreateQuery, GetImmediateContext, CheckFeatureSupport, CreateBlendState, CreateBuffer, CreatePixelShader, CreateRasterizerState, CreateRenderTargetView, CreateSamplerState, CreateShaderResourceView, CreateTexture2D, CreateVertexShader, GetDeviceRemovedReason}
 Windows.Win32.ID3D11DeviceChild::{}
-Windows.Win32.ID3D11DeviceContext::{Begin, End, ClearRenderTargetView, ClearState, CopyResource, Draw, DrawInstanced, Flush, GetData, IASetPrimitiveTopology, Map, OMSetBlendState, OMSetRenderTargets, PSSetConstantBuffers, PSSetSamplers, PSSetShader, PSSetShaderResources, RSSetState, RSSetViewports, ResolveSubresource, Unmap, UpdateSubresource, VSSetConstantBuffers, VSSetShader, VSSetShaderResources}
+Windows.Win32.ID3D11DeviceContext::{Begin, End, ClearRenderTargetView, ClearState, CopyResource, CopySubresourceRegion, Draw, DrawInstanced, Flush, GetData, IASetPrimitiveTopology, Map, OMSetBlendState, OMSetRenderTargets, PSSetConstantBuffers, PSSetSamplers, PSSetShader, PSSetShaderResources, RSSetState, RSSetScissorRects, RSSetViewports, ResolveSubresource, Unmap, UpdateSubresource, VSSetConstantBuffers, VSSetShader, VSSetShaderResources}
 Windows.Win32.ID3D11PixelShader
 Windows.Win32.ID3D11RenderTargetView::{GetDesc}
 Windows.Win32.ID3D11Resource::{}
@@ -743,3 +743,5 @@ Windows.Win32.D3D11_QUERY_TIMESTAMP
 Windows.Win32.D3D11_QUERY_TIMESTAMP_DISJOINT
 Windows.Win32.D3D11_QUERY_DATA_TIMESTAMP_DISJOINT
 Windows.Win32.D3D11_ASYNC_GETDATA_DONOTFLUSH
+
+Windows.Win32.D3D11_QUERY_EVENT

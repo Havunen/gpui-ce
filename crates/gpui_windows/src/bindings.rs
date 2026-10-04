@@ -2962,6 +2962,7 @@ pub mod Windows {
             pub Query: D3D11_QUERY,
             pub MiscFlags: u32,
         }
+        pub const D3D11_QUERY_EVENT: D3D11_QUERY = 0;
         pub const D3D11_QUERY_TIMESTAMP: D3D11_QUERY = 2;
         pub const D3D11_QUERY_TIMESTAMP_DISJOINT: D3D11_QUERY = 3;
         #[repr(C)]
@@ -2978,6 +2979,7 @@ pub mod Windows {
             pub MultisampleEnable: windows_core::BOOL,
             pub AntialiasedLineEnable: windows_core::BOOL,
         }
+        pub type D3D11_RECT = RECT;
         #[repr(C)]
         #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
         pub struct D3D11_RENDER_TARGET_BLEND_DESC {
@@ -5128,6 +5130,43 @@ pub mod Windows {
                     );
                 }
             }
+            pub unsafe fn RSSetScissorRects(&self, prects: Option<&[D3D11_RECT]>) {
+                unsafe {
+                    (windows_core::Interface::vtable(self).RSSetScissorRects)(
+                        windows_core::Interface::as_raw(self),
+                        prects.map_or(0, |slice| slice.len().try_into().unwrap()),
+                        prects.map_or(core::ptr::null(), |slice| slice.as_ptr()),
+                    );
+                }
+            }
+            pub unsafe fn CopySubresourceRegion<P0, P5>(
+                &self,
+                pdstresource: P0,
+                dstsubresource: u32,
+                dstx: u32,
+                dsty: u32,
+                dstz: u32,
+                psrcresource: P5,
+                srcsubresource: u32,
+                psrcbox: Option<*const D3D11_BOX>,
+            ) where
+                P0: windows_core::Param<ID3D11Resource>,
+                P5: windows_core::Param<ID3D11Resource>,
+            {
+                unsafe {
+                    (windows_core::Interface::vtable(self).CopySubresourceRegion)(
+                        windows_core::Interface::as_raw(self),
+                        pdstresource.param().abi(),
+                        dstsubresource,
+                        dstx,
+                        dsty,
+                        dstz,
+                        psrcresource.param().abi(),
+                        srcsubresource,
+                        psrcbox.unwrap_or(core::mem::zeroed()) as _,
+                    );
+                }
+            }
             pub unsafe fn CopyResource<P0, P1>(&self, pdstresource: P0, psrcresource: P1)
             where
                 P0: windows_core::Param<ID3D11Resource>,
@@ -5320,8 +5359,19 @@ pub mod Windows {
                 unsafe extern "system" fn(*mut core::ffi::c_void, *mut core::ffi::c_void),
             pub RSSetViewports:
                 unsafe extern "system" fn(*mut core::ffi::c_void, u32, *const D3D11_VIEWPORT),
-            RSSetScissorRects: usize,
-            CopySubresourceRegion: usize,
+            pub RSSetScissorRects:
+                unsafe extern "system" fn(*mut core::ffi::c_void, u32, *const D3D11_RECT),
+            pub CopySubresourceRegion: unsafe extern "system" fn(
+                *mut core::ffi::c_void,
+                *mut core::ffi::c_void,
+                u32,
+                u32,
+                u32,
+                u32,
+                *mut core::ffi::c_void,
+                u32,
+                *const D3D11_BOX,
+            ),
             pub CopyResource: unsafe extern "system" fn(
                 *mut core::ffi::c_void,
                 *mut core::ffi::c_void,

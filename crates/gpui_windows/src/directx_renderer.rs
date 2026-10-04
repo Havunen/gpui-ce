@@ -13,6 +13,10 @@ use gpui_render::{
         BlurAxis, BlurKernel, BlurUniforms, FilterCompositeClip,
         GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS, downsampled_dimension,
     },
+    damage::{Damage, Snapshot},
+    gpu_policy::{RetentionBudget, RetentionLease},
+    native_path_cache::{self, PathCache, Source},
+    path_plan::{self, PixelRect},
     path_types::{PathRasterizationVertex, PathSprite},
     shaders::{
         common::{FontRasterizationUniforms, GlobalUniforms, ShaderBool, SurfaceColorFormat},
@@ -80,7 +84,213 @@ fn shared_shaders(device: &ID3D11Device) -> Option<std::rc::Rc<SharedShaders>> {
     }))
 }
 
+struct CachedPathTexture {
+    _texture: ID3D11Texture2D,
+    srv: Option<ID3D11ShaderResourceView>,
+}
+type CachedPathEntry = Arc<native_path_cache::Entry<CachedPathTexture>>;
+type ScratchKey = (u8, u32, u32, usize);
+enum Scratch {
+    Path(PathResources),
+    Blur(BlurResources),
+}
+type ScratchPool = gpui_render::native_pool::Pool<ScratchKey, Scratch>;
+type PendingScratch = std::sync::Weak<gpui_render::native_pool::Pending<ScratchKey, Scratch>>;
+fn texture_bytes(texture: &ID3D11Texture2D) -> u64 {
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    unsafe {
+        texture.GetDesc(&mut desc);
+    }
+    u64::from(desc.Width) * u64::from(desc.Height) * 4 * u64::from(desc.SampleDesc.Count)
+}
+struct DeviceRetention {
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    budget: RetentionBudget,
+    pool: ScratchPool,
+    pending_pool: std::cell::RefCell<Vec<(ID3D11Query, PendingScratch)>>,
+    pending: std::cell::RefCell<Vec<(ID3D11Query, Vec<CachedPathEntry>, Vec<Arc<RetentionLease>>)>>,
+}
+impl DeviceRetention {
+    fn retire(&self, value: Scratch) {
+        let (key, bytes) = match &value {
+            Scratch::Path(p) => {
+                let mut globals = 0;
+                for buffer in p
+                    .globals
+                    .cbuffers()
+                    .into_iter()
+                    .flatten()
+                    .chain([p.globals.draw_constants_buffer.clone()])
+                {
+                    let mut desc = D3D11_BUFFER_DESC::default();
+                    unsafe {
+                        buffer.GetDesc(&mut desc);
+                    }
+                    globals += u64::from(desc.ByteWidth);
+                }
+                (
+                    (
+                        0,
+                        p.viewport.Width as u32,
+                        p.viewport.Height as u32,
+                        PATH_MULTISAMPLE_COUNT as usize,
+                    ),
+                    texture_bytes(&p.texture) + texture_bytes(&p.msaa_texture) + globals,
+                )
+            }
+            Scratch::Blur(b) => {
+                let mut desc = D3D11_TEXTURE2D_DESC::default();
+                unsafe {
+                    b.scene_color.GetDesc(&mut desc);
+                }
+                (
+                    (1, desc.Width, desc.Height, b.groups.len()),
+                    [&b.scene_color, &b.ping, &b.pong]
+                        .into_iter()
+                        .chain(b.groups.iter())
+                        .map(texture_bytes)
+                        .sum(),
+                )
+            }
+        };
+        let mut query = None;
+        unsafe {
+            if self
+                .device
+                .CreateQuery(
+                    &D3D11_QUERY_DESC {
+                        Query: D3D11_QUERY_EVENT,
+                        MiscFlags: 0,
+                    },
+                    Some(&mut query),
+                )
+                .is_err()
+            {
+                return;
+            }
+        }
+        let Some(query) = query else { return };
+        if let Some(entry) = self.pool.retire(key, bytes, value) {
+            unsafe {
+                self.context.End(&query);
+            }
+            self.pending_pool.borrow_mut().push((query, entry));
+        }
+    }
+    fn poll(&self) {
+        self.pending_pool
+            .borrow_mut()
+            .retain(|(query, entry)| unsafe {
+                let ready = self
+                    .context
+                    .GetData(query, None, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH as u32)
+                    .0
+                    == 0;
+                if ready {
+                    ScratchPool::complete(entry);
+                }
+                !ready
+            });
+        self.pending.borrow_mut().retain(|(query, _, _)| unsafe {
+            self.context
+                .GetData(query, None, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH as u32)
+                .0
+                != 0
+        });
+    }
+}
+thread_local! { static RETENTION: std::cell::RefCell<Vec<std::rc::Weak<DeviceRetention>>> = const { std::cell::RefCell::new(Vec::new()) }; }
+fn device_retention(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+) -> std::rc::Rc<DeviceRetention> {
+    RETENTION.with_borrow_mut(|entries| {
+        entries.retain(|entry| entry.strong_count() > 0);
+        if let Some(entry) = entries
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .find(|entry| entry.device == *device)
+        {
+            return entry;
+        }
+        let budget = RetentionBudget::default();
+        let entry = std::rc::Rc::new(DeviceRetention {
+            device: device.clone(),
+            context: context.clone(),
+            pool: ScratchPool::new(budget.clone()),
+            pending_pool: Default::default(),
+            budget,
+            pending: Default::default(),
+        });
+        entries.push(std::rc::Rc::downgrade(&entry));
+        entry
+    })
+}
+// Keep evicted entries charged until the immediate context completes their last use.
+// The shared device state survives closing any one window; it has no strong global owner.
+struct PathFrame {
+    device: std::rc::Rc<DeviceRetention>,
+    query: Option<ID3D11Query>,
+    used: Vec<CachedPathEntry>,
+    leases: Vec<Arc<RetentionLease>>,
+}
+impl PathFrame {
+    fn new(device: std::rc::Rc<DeviceRetention>, enabled: bool) -> Self {
+        device.poll();
+        let mut query = None;
+        if enabled && device.pending.borrow().len() < 4 {
+            unsafe {
+                let _ = device.device.CreateQuery(
+                    &D3D11_QUERY_DESC {
+                        Query: D3D11_QUERY_EVENT,
+                        MiscFlags: 0,
+                    },
+                    Some(&mut query),
+                );
+            }
+        }
+        Self {
+            device,
+            query,
+            used: Vec::new(),
+            leases: Vec::new(),
+        }
+    }
+}
+impl Drop for PathFrame {
+    fn drop(&mut self) {
+        if let Some(query) = self.query.take() {
+            if !self.used.is_empty() || !self.leases.is_empty() {
+                unsafe {
+                    self.device.context.End(&query);
+                }
+                self.device.pending.borrow_mut().push((
+                    query,
+                    std::mem::take(&mut self.used),
+                    std::mem::take(&mut self.leases),
+                ));
+            }
+        }
+    }
+}
+
+struct RetainedFrame {
+    _texture: ID3D11Texture2D,
+    rtv: Option<ID3D11RenderTargetView>,
+    srv: Option<ID3D11ShaderResourceView>,
+    _clear: ID3D11Texture2D,
+    clear_srv: Option<ID3D11ShaderResourceView>,
+    lease: Arc<RetentionLease>,
+    snapshot: Option<Snapshot>,
+    opaque: bool,
+}
+
 pub(crate) struct DirectXRenderer {
+    retention: std::rc::Rc<DeviceRetention>,
+    retained: Option<RetainedFrame>,
+    path_cache: PathCache<CachedPathTexture>,
+    path_scissor_states: Option<(ID3D11RasterizerState, ID3D11RasterizerState)>,
     options: gpui_render::gpu_policy::GpuOptions,
     _shared_shaders: Option<std::rc::Rc<SharedShaders>>,
     gpu_trace: Option<std::rc::Rc<crate::gpu_trace::GpuTrace>>,
@@ -411,7 +621,12 @@ impl DirectXRenderer {
                     .map_err(|error| log::warn!("GPU timestamps unavailable: {error}"))
                     .ok()
             });
+        let retention = device_retention(&devices.device, &devices.device_context);
         Ok(DirectXRenderer {
+            retained: None,
+            path_cache: PathCache::new(retention.budget.clone()),
+            retention,
+            path_scissor_states: None,
             options: gpui_render::gpu_policy::GpuOptions::from_env(),
             gpu_trace,
             _shared_shaders: shared,
@@ -436,7 +651,7 @@ impl DirectXRenderer {
         self.atlas.clone()
     }
 
-    fn pre_draw(&self, clear_color: &[f32; 4]) -> Result<()> {
+    fn pre_draw(&self, clear_color: &[f32; 4], clear: bool) -> Result<()> {
         let resources = self.resources.as_ref().expect("resources missing");
         let device_context = &self
             .devices
@@ -471,13 +686,15 @@ impl DirectXRenderer {
             }],
         )?;
         unsafe {
-            device_context.ClearRenderTargetView(
-                resources
-                    .render_target_view
-                    .as_ref()
-                    .context("missing render target view")?,
-                clear_color,
-            );
+            if clear {
+                device_context.ClearRenderTargetView(
+                    resources
+                        .render_target_view
+                        .as_ref()
+                        .context("missing render target view")?,
+                    clear_color,
+                );
+            }
             device_context
                 .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
             device_context.RSSetViewports(Some(slice::from_ref(&resources.viewport)));
@@ -564,6 +781,10 @@ impl DirectXRenderer {
         self.gpu_trace = gpui::gpu_profiler::enabled()
             .then(|| crate::gpu_trace::GpuTrace::new(&devices.device, &devices.device_context))
             .and_then(Result::ok);
+        self.retention = device_retention(&devices.device, &devices.device_context);
+        self.path_cache = PathCache::new(self.retention.budget.clone());
+        self.retained = None;
+        self.path_scissor_states = None;
         self.devices = Some(devices);
         self.resources = Some(resources);
         self.globals = globals;
@@ -595,6 +816,17 @@ impl DirectXRenderer {
             trace.begin(scene);
         }
         let result = self.render_inner(scene, background);
+        if let (Some(states), Some(devices)) = (&self.path_scissor_states, &self.devices) {
+            unsafe {
+                devices.device_context.RSSetState(&states.0);
+            }
+        }
+        if result.is_err() {
+            self.path_cache.clear();
+            if let Some(retained) = &mut self.retained {
+                retained.snapshot = None;
+            }
+        }
         let path_size = self
             .resources
             .as_ref()
@@ -614,6 +846,15 @@ impl DirectXRenderer {
             };
             let mut memory = gpui::gpu_profiler::GpuMemory {
                 atlas_bytes: Some(self.atlas.allocated_bytes()),
+                cached_bytes: Some(self.path_cache.bytes()),
+                retained_frame_bytes: Some(if self.retained.is_some() {
+                    u64::from(self.width) * u64::from(self.height) * 4 + 4
+                } else {
+                    0
+                }),
+                device_retention_bytes: Some(self.retention.budget.used()),
+                pooled_bytes: Some(self.retention.pool.bytes().0),
+                pending_release_bytes: Some(self.retention.pool.bytes().1),
                 ..Default::default()
             };
             if let Some(resources) = &self.resources {
@@ -636,7 +877,12 @@ impl DirectXRenderer {
                         .unwrap_or(0),
                 );
             }
-            trace.finish(result.is_ok(), path_size, memory);
+            trace.finish(
+                result.is_ok(),
+                path_size,
+                memory,
+                (self.path_cache.hits, self.path_cache.misses),
+            );
         }
         result
     }
@@ -646,32 +892,100 @@ impl DirectXRenderer {
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
-        self.pre_draw(&match background_appearance {
-            appearance if appearance.is_opaque() => [1.0f32; 4],
-            _ => [0.0f32; 4],
-        })?;
-
-        self.upload_scene_buffers(scene)?;
-
-        // Only route through the offscreen scene texture when the scene contains blur filters;
-        // otherwise render straight to the swapchain exactly as before.
-        let use_offscreen = scene.requires_offscreen_rendering();
+        self.path_cache.begin();
+        let mut path_frame = PathFrame::new(
+            self.retention.clone(),
+            self.options.cached_layers || self.options.partial_redraw,
+        );
+        let mut path_options = self.options;
+        path_options.cached_layers &= path_frame.query.is_some();
+        let opaque = background_appearance.is_opaque();
+        if self.retained.as_ref().is_some_and(|r| r.opaque != opaque) {
+            self.retained = None;
+        }
+        let snapshot = (self.options.partial_redraw && path_frame.query.is_some())
+            .then(|| Snapshot::capture(scene, self.atlas.generation()))
+            .flatten();
+        if snapshot.is_some() && self.retained.is_none() {
+            if let Some(lease) = self
+                .retention
+                .budget
+                .try_acquire(u64::from(self.width) * u64::from(self.height) * 4 + 4)
+            {
+                let devices = self.devices.as_ref().context("devices missing")?;
+                let (texture, rtv, srv) =
+                    create_color_target(&devices.device, self.width, self.height)?;
+                let (clear, clear_rtv, clear_srv) = create_color_target(&devices.device, 1, 1)?;
+                unsafe {
+                    devices.device_context.ClearRenderTargetView(
+                        clear_rtv.as_ref().unwrap(),
+                        &if opaque { [1.; 4] } else { [0.; 4] },
+                    );
+                }
+                self.retained = Some(RetainedFrame {
+                    _texture: texture,
+                    rtv,
+                    srv,
+                    _clear: clear,
+                    clear_srv,
+                    lease: Arc::new(lease),
+                    snapshot: None,
+                    opaque,
+                });
+            }
+        }
+        let use_retained = snapshot.is_some() && self.retained.is_some();
+        let damage = match (
+            snapshot.as_ref(),
+            self.retained.as_ref().and_then(|r| r.snapshot.as_ref()),
+        ) {
+            (Some(new), Some(old)) if use_retained => new.compare(old, (self.width, self.height)),
+            _ => Damage::Full,
+        };
+        if use_retained {
+            path_frame
+                .leases
+                .push(self.retained.as_ref().unwrap().lease.clone());
+        }
+        self.pre_draw(&if opaque { [1.; 4] } else { [0.; 4] }, !use_retained)?;
+        if damage != Damage::Unchanged {
+            self.upload_scene_buffers(scene)?;
+        }
+        let use_offscreen = scene.requires_offscreen_rendering() || use_retained;
         let requirements = scene.render_plan().requirements();
         let device = &self.devices.as_ref().context("devices missing")?.device;
         let resources = self.resources.as_mut().context("resources missing")?;
         resources.retain_surface_views(&scene.surfaces);
         if requirements.uses_path_target {
-            resources.ensure_path_resources(device, scene, self.options.cropped_paths)?;
+            resources.ensure_path_resources(
+                device,
+                scene,
+                self.options.cropped_paths,
+                self.options.pooled_targets.then_some(&self.retention),
+            )?;
         }
-        if use_offscreen {
-            resources.ensure_blur_resources(device, requirements.isolated_target_count)?;
+        if scene.requires_offscreen_rendering() {
+            resources.ensure_blur_resources(
+                device,
+                requirements.isolated_target_count,
+                self.options.pooled_targets.then_some(&self.retention.pool),
+            )?;
         }
 
         // Clone the views we need (AddRef) so the loop can rebind render targets without holding a
         // borrow of `self` across the `&mut self` draw_* calls.
         let (scene_rtv, scene_srv, group_rtvs, group_srvs, swapchain_rtv) = {
             let r = self.resources.as_ref().context("resources missing")?;
-            if let Some(blur) = r.blur.as_ref() {
+            if use_retained {
+                let retained = self.retained.as_ref().unwrap();
+                (
+                    retained.rtv.clone(),
+                    retained.srv.clone(),
+                    SmallVec::new(),
+                    SmallVec::new(),
+                    r.render_target_view.clone(),
+                )
+            } else if let Some(blur) = r.blur.as_ref() {
                 (
                     blur.scene_color_rtv.clone(),
                     blur.scene_color_srv.clone(),
@@ -705,8 +1019,17 @@ impl DirectXRenderer {
 
         if use_offscreen {
             unsafe {
-                if let Some(rtv) = scene_rtv.as_ref() {
-                    ctx.ClearRenderTargetView(rtv, &[0.0; 4]);
+                if damage == Damage::Full {
+                    if let Some(rtv) = scene_rtv.as_ref() {
+                        ctx.ClearRenderTargetView(
+                            rtv,
+                            &if use_retained && opaque {
+                                [1.; 4]
+                            } else {
+                                [0.; 4]
+                            },
+                        );
+                    }
                 }
                 ctx.OMSetRenderTargets(Some(slice::from_ref(&scene_rtv)), None);
             }
@@ -729,12 +1052,78 @@ impl DirectXRenderer {
             ); MAX_FILTER_GROUP_DEPTH],
         >::new();
 
+        let extent = self
+            .resources
+            .as_ref()
+            .and_then(|r| r.path.as_ref())
+            .map(|p| (p.viewport.Width as u32, p.viewport.Height as u32))
+            .unwrap_or_default();
+        let path_plan = if damage == Damage::Unchanged {
+            Vec::new()
+        } else {
+            native_path_cache::plan(scene, extent, &mut self.path_cache, path_options)
+        };
+        let packed: Vec<_> = path_plan
+            .iter()
+            .zip(scene.render_commands())
+            .filter_map(|(source, command)| {
+                if let (
+                    Source::Packed { world, tile },
+                    RenderCommand::Batch(PrimitiveBatch::Paths {
+                        range,
+                        rasterization_vertex_count,
+                        ..
+                    }),
+                ) = (source, command)
+                {
+                    Some((
+                        &scene.paths[range.clone()],
+                        *rasterization_vertex_count,
+                        Some((*world, *tile)),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !packed.is_empty() {
+            self.draw_path_batches(&packed)?;
+            if path_options.cached_layers {
+                for (paths, _, bounds) in &packed {
+                    let (world, tile) = bounds.unwrap();
+                    if let Some(entry) = self.capture_paths(paths, world, tile)? {
+                        path_frame.used.push(entry);
+                    }
+                }
+            }
+        }
+        self.set_damage_scissor(damage)?;
+        if let Damage::Rect(_) = damage {
+            let source = self.retained.as_ref().unwrap().clear_srv.clone();
+            self.dx_blur_pass(
+                &self.pipelines.blur_downsample_vertex,
+                &self.pipelines.blur_downsample_fragment,
+                &self.pipelines.blur_blend_replace,
+                &scene_rtv,
+                &source,
+                BlurUniforms::copy([self.width as f32, self.height as f32]),
+                &self.resources.as_ref().unwrap().viewport,
+                D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+                3,
+                false,
+            )?;
+        }
         let annotation = self
             .devices
             .as_ref()
             .and_then(|devices| devices.annotation.clone())
             .filter(|annotation| unsafe { annotation.GetStatus().as_bool() });
-        for command in scene.render_commands() {
+        let commands = if damage == Damage::Unchanged {
+            &[][..]
+        } else {
+            scene.render_commands()
+        };
+        for (command_index, command) in commands.iter().enumerate() {
             let _gpu_span = if matches!(command, RenderCommand::Batch(PrimitiveBatch::Paths { .. }))
             {
                 None
@@ -767,8 +1156,29 @@ impl DirectXRenderer {
                         continue;
                     }
                     let paths = &scene.paths[range.clone()];
-                    self.draw_paths_to_intermediate(paths, *rasterization_vertex_count)?;
-                    self.draw_paths_from_intermediate(paths, *sprite_count)
+                    match path_plan.get(command_index) {
+                        Some(Source::Invisible) => continue,
+                        Some(Source::Cached(entry)) => {
+                            let source = (entry.resource.srv.clone(), entry.bounds, entry.bounds.origin());
+                            path_frame.used.push(entry.clone());
+                            self.draw_paths_from_intermediate(paths, *sprite_count, Some(source))
+                        }
+                        Some(Source::Packed { world, tile }) => {
+                            let srv = self.resources.as_ref().and_then(|r| r.path.as_ref()).unwrap().srv.clone();
+                            self.draw_paths_from_intermediate(paths, *sprite_count, Some((srv, *world, world.origin() - tile.origin())))
+                        }
+                        _ => {
+                            self.set_damage_scissor(Damage::Full)?;
+                            self.draw_paths_to_intermediate(paths, *rasterization_vertex_count)?;
+                            self.set_damage_scissor(damage)?;
+                            if path_options.cached_layers {
+                                if let Some(bounds) = path_plan::visible_rect(paths.iter().map(Path::clipped_bounds), extent) {
+                                    if let Some(entry) = self.capture_paths(paths, bounds, bounds)? { path_frame.used.push(entry); }
+                                }
+                            }
+                            self.draw_paths_from_intermediate(paths, *sprite_count, None)
+                        }
+                    }
                 }
                 RenderCommand::Batch(PrimitiveBatch::Underlines(range)) => {
                     self.draw_underlines(instance_range(range)?)
@@ -891,11 +1301,15 @@ impl DirectXRenderer {
             })?;
         }
 
+        self.set_damage_scissor(Damage::Full)?;
         // Present the offscreen scene by blitting it into the swapchain.
         if use_offscreen {
             self.dx_blit(&scene_srv, &swapchain_rtv)?;
         }
         self.active_render_target = None;
+        if let Some(retained) = &mut self.retained {
+            retained.snapshot = snapshot;
+        }
         Ok(())
     }
 
@@ -985,6 +1399,10 @@ impl DirectXRenderer {
         }
         self.width = width;
         self.height = height;
+        self.path_cache.clear();
+        self.retained = None;
+
+        self.retire_scratch();
 
         // Clear the render target before resizing
         let devices = self.devices.as_ref().context("devices missing")?;
@@ -1105,71 +1523,186 @@ impl DirectXRenderer {
         )
     }
 
+    fn retire_scratch(&mut self) {
+        if let Some(resources) = &mut self.resources {
+            let path = resources.path.take();
+            let blur = resources.blur.take();
+            if self.options.pooled_targets {
+                if let Some(path) = path {
+                    self.retention.retire(Scratch::Path(path));
+                }
+                if let Some(blur) = blur {
+                    self.retention.retire(Scratch::Blur(blur));
+                }
+            }
+        }
+    }
+
+    fn set_damage_scissor(&mut self, damage: Damage) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        if matches!(damage, Damage::Rect(_)) && self.path_scissor_states.is_none() {
+            self.path_scissor_states = Some((
+                create_rasterizer_state(&devices.device, false)?,
+                create_rasterizer_state(&devices.device, true)?,
+            ));
+        }
+        if let Some((normal, scissor)) = &self.path_scissor_states {
+            unsafe {
+                if let Damage::Rect(rect) = damage {
+                    devices.device_context.RSSetState(scissor);
+                    devices.device_context.RSSetScissorRects(Some(&[RECT {
+                        left: rect.x as i32,
+                        top: rect.y as i32,
+                        right: (rect.x + rect.width) as i32,
+                        bottom: (rect.y + rect.height) as i32,
+                    }]));
+                } else {
+                    devices.device_context.RSSetState(normal);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn capture_paths(
+        &mut self,
+        paths: &[Path<ScaledPixels>],
+        world: PixelRect,
+        source: PixelRect,
+    ) -> Result<Option<CachedPathEntry>> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let path = self
+            .resources
+            .as_ref()
+            .and_then(|r| r.path.as_ref())
+            .context("missing path target")?;
+        self.path_cache.capture(paths, world, || {
+            let (texture, srv) =
+                create_path_intermediate_texture(&devices.device, world.width, world.height)?;
+            unsafe {
+                devices.device_context.CopySubresourceRegion(
+                    &texture,
+                    0,
+                    0,
+                    0,
+                    0,
+                    &path.texture,
+                    0,
+                    Some(&D3D11_BOX {
+                        left: source.x,
+                        top: source.y,
+                        front: 0,
+                        right: source.x + source.width,
+                        bottom: source.y + source.height,
+                        back: 1,
+                    }),
+                );
+            }
+            Ok(CachedPathTexture {
+                _texture: texture,
+                srv,
+            })
+        })
+    }
+
     fn draw_paths_to_intermediate(
         &mut self,
         paths: &[Path<ScaledPixels>],
-        rasterization_vertex_count: usize,
+        count: usize,
+    ) -> Result<()> {
+        self.draw_path_batches(&[(paths, count, None)])
+    }
+
+    fn draw_path_batches(
+        &mut self,
+        batches: &[(&[Path<ScaledPixels>], usize, Option<(PixelRect, PixelRect)>)],
     ) -> Result<()> {
         let _gpu_span = self
             .gpu_trace
             .as_ref()
             .map(|trace| trace.span("path_rasterization"));
-        if paths.is_empty() {
+        if batches.is_empty() {
             return Ok(());
         }
-
-        self.path_rasterization_vertices.clear();
-        self.path_rasterization_vertices
-            .reserve(rasterization_vertex_count);
-        for path in paths {
-            self.path_rasterization_vertices
-                .extend(path.vertices.iter().map(|vertex| PathRasterizationVertex {
-                    xy_position: vertex.xy_position,
-                    curve_position: vertex.st_position,
-                    color: path.color,
-                    bounds: path.clipped_bounds(),
-                    raster_offset: Default::default(),
-                }));
-        }
-        debug_assert_eq!(
-            self.path_rasterization_vertices.len(),
-            rasterization_vertex_count
-        );
-
         let devices = self.devices.as_ref().context("devices missing")?;
+        let packed = batches.iter().any(|b| b.2.is_some());
+        if packed && self.path_scissor_states.is_none() {
+            self.path_scissor_states = Some((
+                create_rasterizer_state(&devices.device, false)?,
+                create_rasterizer_state(&devices.device, true)?,
+            ));
+        }
+        // Restore state on errors too; windows share this immediate context.
+        struct RestoreRaster(ID3D11DeviceContext, ID3D11RasterizerState);
+        impl Drop for RestoreRaster {
+            fn drop(&mut self) {
+                unsafe {
+                    self.0.RSSetState(&self.1);
+                }
+            }
+        }
+        let _restore = if packed {
+            let (normal, scissor) = self.path_scissor_states.as_ref().unwrap();
+            unsafe {
+                devices.device_context.RSSetState(scissor);
+            }
+            Some(RestoreRaster(
+                devices.device_context.clone(),
+                normal.clone(),
+            ))
+        } else {
+            None
+        };
         let resources = self.resources.as_ref().context("resources missing")?;
         let path = resources
             .path
             .as_ref()
             .context("path resources were not prepared")?;
-        // Clear intermediate MSAA texture
         unsafe {
             devices.device_context.ClearRenderTargetView(
                 path.msaa_view.as_ref().context("path MSAA view missing")?,
-                &[0.0; 4],
+                &[0.; 4],
             );
-            // Set intermediate MSAA texture as render target
             devices
                 .device_context
                 .OMSetRenderTargets(Some(slice::from_ref(&path.msaa_view)), None);
         }
-
-        self.pipelines.path_rasterization_pipeline.update_buffer(
-            &devices.device,
-            &devices.device_context,
-            &self.path_rasterization_vertices,
-        )?;
-        self.pipelines.path_rasterization_pipeline.draw_vertices(
-            &FrameBindings {
-                device_context: &devices.device_context,
-                viewport: &path.viewport,
-                globals: &path.globals,
-            },
-            u32::try_from(rasterization_vertex_count)
-                .context("path rasterization vertex count exceeds the D3D11 draw limit")?,
-        )?;
-
-        // Resolve MSAA to non-MSAA intermediate texture
+        for &(paths, count, tile) in batches {
+            self.path_rasterization_vertices.clear();
+            self.path_rasterization_vertices.reserve(count);
+            self.path_rasterization_vertices.extend(
+                gpui_render::path_types::rasterization_vertices(paths).map(|mut v| {
+                    if let Some((world, tile)) = tile {
+                        v.raster_offset = tile.origin() - world.origin();
+                    }
+                    v
+                }),
+            );
+            debug_assert_eq!(self.path_rasterization_vertices.len(), count);
+            if let Some((_, tile)) = tile {
+                unsafe {
+                    devices.device_context.RSSetScissorRects(Some(&[RECT {
+                        left: tile.x as i32,
+                        top: tile.y as i32,
+                        right: (tile.x + tile.width) as i32,
+                        bottom: (tile.y + tile.height) as i32,
+                    }]));
+                }
+            }
+            self.pipelines.path_rasterization_pipeline.update_buffer(
+                &devices.device,
+                &devices.device_context,
+                &self.path_rasterization_vertices,
+            )?;
+            self.pipelines.path_rasterization_pipeline.draw_vertices(
+                &FrameBindings {
+                    device_context: &devices.device_context,
+                    viewport: &path.viewport,
+                    globals: &path.globals,
+                },
+                u32::try_from(count).context("path rasterization exceeds the D3D11 draw limit")?,
+            )?;
+        }
         unsafe {
             devices.device_context.ResolveSubresource(
                 &path.texture,
@@ -1178,8 +1711,6 @@ impl DirectXRenderer {
                 0,
                 RENDER_TARGET_FORMAT,
             );
-            // Restore the active render target (the offscreen scene/group target when blurring,
-            // otherwise the swapchain) so the path sprites land on the correct surface.
             let restore_target = if self.active_render_target.is_some() {
                 &self.active_render_target
             } else {
@@ -1189,7 +1720,6 @@ impl DirectXRenderer {
                 .device_context
                 .OMSetRenderTargets(Some(slice::from_ref(restore_target)), None);
         }
-
         Ok(())
     }
 
@@ -1197,6 +1727,11 @@ impl DirectXRenderer {
         &mut self,
         paths: &[Path<ScaledPixels>],
         sprite_count: usize,
+        source: Option<(
+            Option<ID3D11ShaderResourceView>,
+            PixelRect,
+            Point<ScaledPixels>,
+        )>,
     ) -> Result<()> {
         let _gpu_span = self
             .gpu_trace
@@ -1231,6 +1766,19 @@ impl DirectXRenderer {
                 texture_origin: Default::default(),
             });
         }
+        if let Some((_, bounds, origin)) = &source {
+            let bounds = Bounds::new(
+                bounds.origin(),
+                size(
+                    ScaledPixels(bounds.width as f32),
+                    ScaledPixels(bounds.height as f32),
+                ),
+            );
+            for sprite in &mut self.path_sprites {
+                sprite.texture_origin = *origin;
+                sprite.bounds = sprite.bounds.intersect(&bounds);
+            }
+        }
         debug_assert_eq!(self.path_sprites.len(), sprite_count);
 
         let devices = self.devices.as_ref().context("devices missing")?;
@@ -1248,7 +1796,9 @@ impl DirectXRenderer {
             .context("path sprite count exceeds the D3D11 instance limit")?;
         self.pipelines.path_sprite_pipeline.draw_instances(
             &self.frame_bindings()?,
-            Some(slice::from_ref(&path.srv)),
+            Some(slice::from_ref(
+                source.as_ref().map(|s| &s.0).unwrap_or(&path.srv),
+            )),
             instances,
         )
     }
@@ -1699,14 +2249,25 @@ impl DirectXResources {
         &mut self,
         device: &ID3D11Device,
         isolated_target_count: usize,
+        pool: Option<&ScratchPool>,
     ) -> Result<()> {
         if self.blur.is_none() {
-            self.blur = Some(BlurResources::new(
-                device,
-                self.viewport.Width as u32,
-                self.viewport.Height as u32,
-                isolated_target_count,
-            )?);
+            self.blur = match pool.and_then(|p| {
+                p.take(&(
+                    1,
+                    self.viewport.Width as u32,
+                    self.viewport.Height as u32,
+                    isolated_target_count,
+                ))
+            }) {
+                Some(Scratch::Blur(blur)) => Some(blur),
+                _ => Some(BlurResources::new(
+                    device,
+                    self.viewport.Width as u32,
+                    self.viewport.Height as u32,
+                    isolated_target_count,
+                )?),
+            };
         }
         let blur = self
             .blur
@@ -1725,6 +2286,7 @@ impl DirectXResources {
         device: &ID3D11Device,
         scene: &Scene,
         cropped: bool,
+        retention: Option<&std::rc::Rc<DeviceRetention>>,
     ) -> Result<()> {
         let previous = self
             .path
@@ -1738,7 +2300,20 @@ impl DirectXResources {
             cropped,
         );
         if extent != previous {
-            self.path = Some(PathResources::new(device, extent.0, extent.1)?);
+            if let Some(retention) = retention {
+                if let Some(path) = self.path.take() {
+                    retention.retire(Scratch::Path(path));
+                }
+            }
+            self.path = Some(
+                match retention.and_then(|r| {
+                    r.pool
+                        .take(&(0, extent.0, extent.1, PATH_MULTISAMPLE_COUNT as usize))
+                }) {
+                    Some(Scratch::Path(path)) => path,
+                    _ => PathResources::new(device, extent.0, extent.1)?,
+                },
+            );
         }
         Ok(())
     }
@@ -2201,6 +2776,7 @@ impl<T> PipelineState<T> {
 
 impl Drop for DirectXRenderer {
     fn drop(&mut self) {
+        self.retire_scratch();
         if let Some(devices) = &self.devices {
             report_live_objects(&devices.device).ok();
         }
@@ -2449,6 +3025,12 @@ fn set_viewport(device_context: &ID3D11DeviceContext, width: f32, height: f32) -
 
 #[inline]
 fn set_rasterizer_state(device: &ID3D11Device, device_context: &ID3D11DeviceContext) -> Result<()> {
+    unsafe {
+        device_context.RSSetState(&create_rasterizer_state(device, false)?);
+    }
+    Ok(())
+}
+fn create_rasterizer_state(device: &ID3D11Device, scissor: bool) -> Result<ID3D11RasterizerState> {
     let desc = D3D11_RASTERIZER_DESC {
         FillMode: D3D11_FILL_SOLID,
         CullMode: D3D11_CULL_NONE,
@@ -2457,7 +3039,7 @@ fn set_rasterizer_state(device: &ID3D11Device, device_context: &ID3D11DeviceCont
         DepthBiasClamp: 0.0,
         SlopeScaledDepthBias: 0.0,
         DepthClipEnable: true.into(),
-        ScissorEnable: false.into(),
+        ScissorEnable: scissor.into(),
         MultisampleEnable: true.into(),
         AntialiasedLineEnable: false.into(),
     };
@@ -2466,8 +3048,7 @@ fn set_rasterizer_state(device: &ID3D11Device, device_context: &ID3D11DeviceCont
         device.CreateRasterizerState(&desc, Some(&mut state)).ok()?;
         state.unwrap()
     };
-    unsafe { device_context.RSSetState(&rasterizer_state) };
-    Ok(())
+    Ok(rasterizer_state)
 }
 
 // https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ns-d3d11-d3d11_blend_desc
@@ -3113,6 +3694,72 @@ mod tests {
 
     /// `GPUI_D3D_DEBUG=off` in a debug build creates devices without the debug
     /// layer; reporting their live objects after a device loss must not fail.
+
+    #[test]
+    fn native_gpu_experiments_preserve_pixels_and_bounded_lifetimes() -> Result<()> {
+        use gpui_render::optimization_fixture as fixture;
+        let first = HiddenWindow::new()?;
+        let second = HiddenWindow::new()?;
+        let devices = DirectXDevices::new()?;
+        for transparent in [false, true] {
+            for options in fixture::modes() {
+                let mut full = DirectXRenderer::new(first.0, &devices, true)?;
+                let mut candidate = DirectXRenderer::new(second.0, &devices, true)?;
+                full.options = Default::default();
+                candidate.options = options;
+                let background = if transparent {
+                    WindowBackgroundAppearance::Transparent
+                } else {
+                    WindowBackgroundAppearance::Opaque
+                };
+                for frame in 0..12 {
+                    let scene = fixture::scene(frame);
+                    let size = fixture::viewport(frame);
+                    full.resize(size)?;
+                    candidate.resize(size)?;
+                    let expected = full.render_to_image(&scene, background)?;
+                    let actual = candidate.render_to_image(&scene, background)?;
+                    let difference = actual
+                        .as_raw()
+                        .iter()
+                        .zip(expected.as_raw())
+                        .map(|(a, b)| a.abs_diff(*b))
+                        .max()
+                        .unwrap();
+                    assert!(
+                        difference <= 1,
+                        "{options:?}, transparent={transparent}, frame={frame}, difference={difference}"
+                    );
+                    if options.cached_layers && !options.partial_redraw && frame == 4 {
+                        assert!(candidate.path_cache.hits >= 4);
+                    }
+                    if options.partial_redraw {
+                        assert!(candidate.retained.is_some());
+                    }
+                    assert!(
+                        candidate.path_cache.bytes() <= gpui_render::gpu_policy::WINDOW_LAYER_BYTES
+                    );
+                    assert!(
+                        candidate.retention.budget.used()
+                            <= gpui_render::gpu_policy::DEVICE_RETENTION_BYTES
+                    );
+                    let repeated = candidate.render_to_image(&scene, background)?;
+                    assert!(
+                        repeated
+                            .as_raw()
+                            .iter()
+                            .zip(expected.as_raw())
+                            .all(|(a, b)| a.abs_diff(*b) <= 1)
+                    );
+                }
+                let budget = candidate.retention.budget.clone();
+                drop(candidate);
+                drop(full);
+                assert_eq!(budget.used(), 0);
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn cropped_path_targets_match_full_viewport_pixels() -> Result<()> {
