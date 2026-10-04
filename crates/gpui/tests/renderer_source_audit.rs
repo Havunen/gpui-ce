@@ -191,8 +191,10 @@ fn native_renderer_fallbacks_and_intermediates_are_lazy() {
         "{} must make large path targets optional",
         directx_path.display()
     );
+    // Regardless of formatting, or of further arguments such as a scratch pool.
+    let unformatted: String = directx.split_whitespace().collect();
     assert!(
-        directx.contains("ensure_blur_resources(device, requirements.isolated_target_count)"),
+        unformatted.contains("ensure_blur_resources(device,requirements.isolated_target_count"),
         "{} must allocate filter targets from the typed scene requirements",
         directx_path.display()
     );
