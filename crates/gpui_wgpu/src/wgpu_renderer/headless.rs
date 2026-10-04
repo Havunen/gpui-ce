@@ -230,3 +230,338 @@ impl gpui::PlatformHeadlessRenderer for WgpuHeadlessRenderer {
         self.renderer.sprite_atlas().clone()
     }
 }
+
+#[cfg(test)]
+mod path_target_tests {
+    use super::*;
+    use gpui::{
+        Bounds, ContentMask, PathBuilder, Quad, ScaledPixels, point, px, size, solid_background,
+    };
+
+    fn triangle(
+        x: f32,
+        y: f32,
+        edge: f32,
+        mask: ContentMask<ScaledPixels>,
+    ) -> gpui::Path<ScaledPixels> {
+        let mut builder = PathBuilder::fill();
+        builder.move_to(point(px(x), px(y)));
+        builder.line_to(point(px(x + edge), px(y)));
+        builder.line_to(point(px(x), px(y + edge)));
+        builder.close();
+        let mut path = builder.build().unwrap().scale(1.0);
+        path.content_mask = mask;
+        path.color = gpui::linear_gradient(
+            90.0,
+            gpui::linear_color_stop(gpui::rgb(0xff0000), 0.0),
+            gpui::linear_color_stop(gpui::rgb(0x00ff00), 1.0),
+        );
+        path
+    }
+
+    #[test]
+    fn cropped_path_targets_match_full_viewport_pixels_when_growing_and_resizing() {
+        let context = WgpuContext::new_headless(None).expect("hardware or software GPU");
+        let target = size(DevicePixels(512), DevicePixels(320));
+        let mask = ContentMask {
+            bounds: Bounds::new(
+                point(ScaledPixels(0.0), ScaledPixels(0.0)),
+                size(ScaledPixels(1024.0), ScaledPixels(640.0)),
+            ),
+            ..Default::default()
+        };
+        let mut full = WgpuRenderer::new_headless(&context, target).unwrap();
+        let mut cropped = WgpuRenderer::new_headless(&context, target).unwrap();
+        cropped.options.cropped_paths = true;
+        full.options.cropped_paths = false;
+        for (x, y, target) in [
+            (16.0, 16.0, target),
+            (180.0, 120.0, target),
+            (16.0, 16.0, target),
+            (40.0, 35.0, size(DevicePixels(360), DevicePixels(240))),
+        ] {
+            full.update_drawable_size(target);
+            cropped.update_drawable_size(target);
+            let mut force_full = Scene::default();
+            force_full.paths.push(triangle(
+                0.0,
+                0.0,
+                target.width.0.max(target.height.0) as f32,
+                mask,
+            ));
+            full.ensure_path_textures(&force_full);
+
+            let mut scene = Scene::default();
+            scene.insert_primitive(Quad {
+                bounds: mask.bounds,
+                content_mask: mask,
+                background: solid_background(gpui::black()),
+                ..Default::default()
+            });
+            scene.insert_primitive(triangle(x, y, 47.5, mask));
+            // A later path beyond the viewport makes the combined sprite span
+            // empty space past the cropped target. That space must stay black.
+            scene.insert_primitive(Quad {
+                bounds: Bounds::new(
+                    point(ScaledPixels(0.0), ScaledPixels(0.0)),
+                    size(ScaledPixels(1.0), ScaledPixels(1.0)),
+                ),
+                content_mask: mask,
+                background: solid_background(gpui::black()),
+                ..Default::default()
+            });
+            scene.insert_primitive(triangle(800.0, 10.0, 40.0, mask));
+            // Negative geometry and a clipped curve exercise coordinate/clip
+            // preservation independently of the viewport's dimensions.
+            let mut curve = PathBuilder::stroke(px(1.6));
+            curve.move_to(point(px(-10.0), px(30.0)));
+            curve.cubic_bezier_to(
+                point(px(40.0), px(70.0)),
+                point(px(24.0), px(22.0)),
+                point(px(5.0), px(60.0)),
+            );
+            let mut curve = curve.build().unwrap().scale(1.0);
+            curve.content_mask = ContentMask {
+                bounds: Bounds::new(
+                    point(ScaledPixels(0.0), ScaledPixels(0.0)),
+                    size(ScaledPixels(30.0), ScaledPixels(60.0)),
+                ),
+                ..Default::default()
+            };
+            curve.color = solid_background(gpui::white());
+            scene.insert_primitive(curve);
+            scene.finish();
+            let expected = full.render_to_image(&scene).expect("full target frame");
+            let actual = cropped
+                .render_to_image(&scene)
+                .expect("cropped target frame");
+            assert!(
+                actual.get_pixel(x as u32 + 8, y as u32 + 8)[0] > 100,
+                "triangle must render"
+            );
+            assert_eq!(
+                &actual.get_pixel(300, 200).0[..3],
+                &[0, 0, 0],
+                "no clamped edge smear"
+            );
+            let max_diff = actual
+                .as_raw()
+                .iter()
+                .zip(expected.as_raw())
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap();
+            assert!(
+                max_diff <= 1,
+                "cropped rendering changed a pixel by {max_diff}"
+            );
+            let texture = cropped
+                .resources()
+                .path_intermediate_texture
+                .as_ref()
+                .unwrap();
+            assert!(
+                texture.width() < target.width.0 as u32,
+                "narrow scene must keep a narrow target"
+            );
+            assert!(
+                texture.height() <= target.height.0 as u32,
+                "height reservation stays within the viewport"
+            );
+            if let Ok(directory) = std::env::var("GPUI_PATH_TEST_IMAGES") {
+                actual
+                    .save(
+                        std::path::Path::new(&directory)
+                            .join(format!("cropped-{x}-{y}-{}.png", target.width.0)),
+                    )
+                    .unwrap();
+                expected
+                    .save(
+                        std::path::Path::new(&directory)
+                            .join(format!("full-{x}-{y}-{}.png", target.width.0)),
+                    )
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn cached_and_packed_paths_preserve_pixels_and_invalidate_changed_geometry() {
+        let context = WgpuContext::new_headless(None).unwrap();
+        let viewport = size(DevicePixels(512), DevicePixels(320));
+        let mask = ContentMask {
+            bounds: Bounds::new(
+                point(ScaledPixels(-20.0), ScaledPixels(-20.0)),
+                size(ScaledPixels(600.0), ScaledPixels(400.0)),
+            ),
+            ..Default::default()
+        };
+        for (cache, packed) in [(true, false), (false, true), (true, true)] {
+            let mut reference = WgpuRenderer::new_headless(&context, viewport).unwrap();
+            reference.options = Default::default();
+            let mut candidate = WgpuRenderer::new_headless(&context, viewport).unwrap();
+            candidate.options.cropped_paths = true;
+            candidate.options.cached_layers = cache;
+            candidate.options.batched_paths = packed;
+            for frame in 0..8 {
+                let mut scene = Scene::default();
+                for row in 0..4 {
+                    let mut path = triangle(
+                        if row == 0 { -5.25 } else { 16.25 },
+                        12.25 + row as f32 * 50.0,
+                        24.5,
+                        mask,
+                    );
+                    path.order = row * 2 + 1;
+                    if frame >= 5 && row == 1 {
+                        path.color = gpui::rgba(0x00ffff88).into();
+                    }
+                    scene.paths.push(path);
+                    // A live row decoration between batches changes during hover.
+                    scene.quads.push(Quad {
+                        order: row * 2 + 2,
+                        bounds: Bounds::new(
+                            point(ScaledPixels(10.0), ScaledPixels(30.0 + row as f32 * 50.0)),
+                            size(ScaledPixels(32.0), ScaledPixels(10.0)),
+                        ),
+                        content_mask: mask,
+                        background: solid_background(if frame % 2 == 0 {
+                            gpui::rgba(0xffffff80)
+                        } else {
+                            gpui::rgba(0x0000ff80)
+                        }),
+                        ..Default::default()
+                    });
+                }
+                let mut invisible = triangle(700.0, 60.0, 20.0, mask);
+                invisible.order = 4;
+                scene.paths.push(invisible);
+                scene.finish();
+                let expected = reference.render_to_image(&scene).unwrap();
+                let actual = candidate.render_to_image(&scene).unwrap();
+                let difference = actual
+                    .as_raw()
+                    .iter()
+                    .zip(expected.as_raw())
+                    .map(|(a, b)| a.abs_diff(*b))
+                    .max()
+                    .unwrap();
+                assert!(
+                    difference <= 1,
+                    "cache={cache} packed={packed} frame={frame} difference={difference}"
+                );
+                if cache && frame == 4 {
+                    assert!(candidate.resources().path_cache.borrow().hits >= 4);
+                }
+                if cache && frame == 5 {
+                    assert!(candidate.resources().path_cache.borrow().misses >= 1);
+                }
+                assert!(
+                    candidate.resources().path_cache.borrow().bytes()
+                        <= gpui_render::gpu_policy::WINDOW_LAYER_BYTES
+                );
+            }
+        }
+    }
+    #[test]
+    fn retained_colour_damage_matches_full_redraw_and_recovers_after_fallbacks() {
+        let _ = env_logger::try_init();
+        let context = WgpuContext::new_headless(None).unwrap();
+        let viewport = size(DevicePixels(512), DevicePixels(320));
+        let mut reference = WgpuRenderer::new_headless(&context, viewport).unwrap();
+        reference.options = Default::default();
+        let mut candidate = WgpuRenderer::new_headless(&context, viewport).unwrap();
+        candidate.options.partial_redraw = true;
+        candidate.options.cached_layers = true;
+        candidate.options.batched_paths = true;
+        candidate.options.cropped_paths = true;
+        let mut observed_rect = false;
+        for frame in 0..16 {
+            let resized = if frame >= 12 {
+                size(DevicePixels(450), DevicePixels(280))
+            } else {
+                viewport
+            };
+            reference.update_drawable_size(resized);
+            candidate.update_drawable_size(resized);
+            let mask = ContentMask {
+                bounds: Bounds::new(
+                    point(ScaledPixels(0.), ScaledPixels(0.)),
+                    size(
+                        ScaledPixels(resized.width.0 as f32),
+                        ScaledPixels(resized.height.0 as f32),
+                    ),
+                ),
+                ..Default::default()
+            };
+            let mut scene = Scene::default();
+            scene.quads.push(Quad {
+                order: 0,
+                bounds: mask.bounds,
+                content_mask: mask,
+                background: gpui::rgba(0x12345688).into(),
+                ..Default::default()
+            });
+            let y = if frame == 7 { 140. } else { 50. };
+            scene.quads.push(Quad {
+                order: 1,
+                bounds: Bounds::new(
+                    point(ScaledPixels(10.), ScaledPixels(y)),
+                    size(ScaledPixels(100.), ScaledPixels(20.)),
+                ),
+                content_mask: mask,
+                background: gpui::rgba(if frame % 2 == 0 {
+                    0xff000088
+                } else {
+                    0x0000ff40
+                })
+                .into(),
+                ..Default::default()
+            });
+            let mut path = triangle(25., 55., 40., mask);
+            path.order = 2;
+            scene.paths.push(path);
+            if frame == 9 {
+                // A popup appears, then disappears.
+                scene.quads.push(Quad {
+                    order: 3,
+                    bounds: Bounds::new(
+                        point(ScaledPixels(20.), ScaledPixels(60.)),
+                        size(ScaledPixels(100.), ScaledPixels(80.)),
+                    ),
+                    content_mask: mask,
+                    background: gpui::white().into(),
+                    ..Default::default()
+                });
+            }
+            scene.finish();
+            if let Some(retained) = candidate.resources().retained.borrow().as_ref() {
+                if let Some(previous) = retained.snapshot.as_ref() {
+                    let snapshot = gpui_render::damage::Snapshot::capture(&scene, 0).unwrap();
+                    observed_rect |= matches!(
+                        snapshot
+                            .compare(previous, (resized.width.0 as u32, resized.height.0 as u32)),
+                        gpui_render::damage::Damage::Rect(_)
+                    );
+                }
+            }
+            let expected = reference.render_to_image(&scene).unwrap();
+            let actual = candidate.render_to_image(&scene).unwrap();
+            let difference = actual
+                .as_raw()
+                .iter()
+                .zip(expected.as_raw())
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap();
+            assert!(difference <= 1, "frame={frame} difference={difference}");
+        }
+        assert!(
+            observed_rect,
+            "must exercise incremental redraws, not just full fallback"
+        );
+        assert!(candidate.resources().retained.borrow().is_some());
+        candidate.update_transparency(true);
+        assert!(candidate.resources().retained.borrow().is_none());
+    }
+}

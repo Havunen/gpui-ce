@@ -3318,6 +3318,10 @@ impl Window {
 
         #[cfg(feature = "profiler")]
         {
+            if crate::gpu_profiler::enabled() {
+                self.rendered_frame.scene.gpu_window_id = self.handle.window_id().as_u64();
+                self.rendered_frame.scene.gpu_frame_id = crate::gpu_profiler::next_frame();
+            }
             let draw_duration = self
                 .window_profiler
                 .end_draw(frame_dirty.dirty_at, frame_dirty.invalidations);

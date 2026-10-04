@@ -9,6 +9,7 @@ pub mod path_rasterization {
         pub curve_position: Vec2f,
         pub color: Background,
         pub bounds: Bounds,
+        pub raster_offset: Vec2f,
     }
     storage!(group(1), binding(0), PATH_VERTICES: RuntimeArray<PathRasterizationVertex>);
 
@@ -45,7 +46,7 @@ pub mod path_rasterization {
     ) -> PathRasterizationVarying {
         let vertex = get!(PATH_VERTICES)[vertex_id as usize];
         PathRasterizationVarying {
-            position: viewport_to_clip_position(vertex.xy_position),
+            position: viewport_to_clip_position(vertex.xy_position + vertex.raster_offset),
             curve_position: vertex.curve_position,
             vertex_id,
             clip_distances: clip_distances(vertex.xy_position, vertex.bounds),
@@ -60,7 +61,11 @@ pub mod path_rasterization {
         }
         let vertex = get!(PATH_VERTICES)[input.vertex_id as usize];
         let paint = Paint::new(vertex.color, vertex.bounds);
-        let color = paint_color(paint, input.position.xy(), prepare_paint(paint));
+        let color = paint_color(
+            paint,
+            input.position.xy() - vertex.raster_offset,
+            prepare_paint(paint),
+        );
         premultiply(color, coverage)
     }
 }
@@ -73,6 +78,7 @@ pub mod path {
     #[derive(Clone, Copy, Wgsl)]
     pub struct PathSprite {
         pub bounds: Bounds,
+        pub texture_origin: Vec2f,
     }
     storage!(group(1), binding(0), PATH_SPRITES: RuntimeArray<PathSprite>);
     texture!(group(1), binding(1), PATH_TEXTURE: Texture2D<f32>);
@@ -95,12 +101,27 @@ pub mod path {
         let vertex = rectangle_vertex(vertex_id, sprite.bounds);
         PathVarying {
             position: vertex.clip_position,
-            texture_coords: vertex.viewport_position / get!(GLOBALS).viewport_size,
+            texture_coords: (vertex.viewport_position - sprite.texture_origin)
+                / vec2f(
+                    texture_dimensions(PATH_TEXTURE).x as f32,
+                    texture_dimensions(PATH_TEXTURE).y as f32,
+                ),
         }
     }
 
     #[fragment]
     pub fn fragment_path(input: PathVarying) -> Vec4f {
-        texture_sample(PATH_TEXTURE, PATH_SAMPLER, input.texture_coords)
+        let color = texture_sample(PATH_TEXTURE, PATH_SAMPLER, input.texture_coords);
+        // Combined path sprites can span off-screen paths and the empty gaps
+        // between paths. Sampling beyond a cropped target must not smear its
+        // last texel through that gap (the sampler clamps to its edge).
+        if input.texture_coords.x < 0.0
+            || input.texture_coords.y < 0.0
+            || input.texture_coords.x >= 1.0
+            || input.texture_coords.y >= 1.0
+        {
+            return transparent();
+        }
+        color
     }
 }

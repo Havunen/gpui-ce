@@ -444,10 +444,19 @@ struct TexturedBindGroups {
         (shader_interface::DataLayout, AtlasTextureId),
         (WgpuTextureIdentity, wgpu::BindGroup),
     >,
-    path: FxHashMap<shader_interface::DataLayout, wgpu::BindGroup>,
+    path: FxHashMap<(shader_interface::DataLayout, wgpu::TextureView), wgpu::BindGroup>,
 }
 
 impl InstanceBufferArena {
+    pub(super) fn allocated_bytes(&self) -> u64 {
+        match &self.storage {
+            InstanceStorage::Buffer(_) => self.capacity,
+            InstanceStorage::DataTexture { ranges, .. } => {
+                self.capacity * 2 + ranges.capacity * ranges.stride
+            }
+        }
+    }
+
     // Large scenes grow geometrically; ordinary UI frames skip a permanent floor.
     const INITIAL_CAPACITY: u64 = 64 * 1024;
 
@@ -676,7 +685,7 @@ impl InstanceBufferArena {
         let mut cache = self.textured_bind_groups.borrow_mut();
         cache
             .path
-            .entry(data_layout)
+            .entry((data_layout, texture.clone()))
             .or_insert_with(|| {
                 layouts.create_textured_instances(
                     device,
@@ -703,6 +712,12 @@ impl InstanceBufferArena {
 
     pub(super) fn invalidate_texture_bindings(&self) {
         *self.textured_bind_groups.borrow_mut() = TexturedBindGroups::default();
+    }
+    pub(super) fn retain_path_bindings(&self, active: &[wgpu::TextureView]) {
+        self.textured_bind_groups
+            .borrow_mut()
+            .path
+            .retain(|(_, texture), _| active.contains(texture));
     }
 }
 

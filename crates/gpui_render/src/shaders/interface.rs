@@ -232,13 +232,19 @@ pub const RENDER_BUFFER_LAYOUTS: &[gpui::SceneBufferLayout] = &[
         padding1,
         padding2
     ),
-    render_layout!(crate::path_types::PathSprite, "PathSprite", bounds),
+    render_layout!(
+        crate::path_types::PathSprite,
+        "PathSprite",
+        bounds,
+        texture_origin
+    ),
     render_layout!(
         crate::path_types::PathRasterizationVertex,
         "PathRasterizationVertex",
         xy_position,
         curve_position,
         color,
-        bounds
+        bounds,
+        raster_offset
     ),
 ];

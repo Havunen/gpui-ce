@@ -1,5 +1,5 @@
 use anyhow::{Context as _, Result};
-use collections::FxHashMap;
+use collections::{FxHashMap, FxHashSet};
 use etagere::{BucketedAtlasAllocator, size2};
 use gpui::{
     AtlasKey, AtlasTextureId, AtlasTextureKind, AtlasTextureList, AtlasTile, Bounds, DevicePixels,
@@ -21,7 +21,13 @@ fn etagere_point_to_device(point: etagere::Point) -> Point<DevicePixels> {
     }
 }
 
-pub struct WgpuAtlas(Mutex<WgpuAtlasState>);
+pub struct WgpuAtlas {
+    state: Arc<Mutex<WgpuAtlasState>>,
+    owned: Mutex<(u64, FxHashSet<AtlasKey>)>,
+}
+thread_local! {
+    static SHARED_ATLASES: std::cell::RefCell<Vec<std::sync::Weak<Mutex<WgpuAtlasState>>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
 /// Identity of a backing atlas texture, distinct from its reusable slot ID.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -34,6 +40,7 @@ struct PendingUpload {
 }
 
 struct WgpuAtlasState {
+    shared: bool,
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     max_texture_size: u32,
@@ -43,6 +50,8 @@ struct WgpuAtlasState {
     pending_uploads: Vec<PendingUpload>,
     next_texture_identity: u64,
     generation: u64,
+    epoch: u64,
+    owners: FxHashMap<AtlasKey, usize>,
 }
 
 pub struct WgpuTextureInfo {
@@ -58,34 +67,95 @@ impl WgpuAtlas {
         color_texture_format: wgpu::TextureFormat,
     ) -> Self {
         let max_texture_size = device.limits().max_texture_dimension_2d;
-        WgpuAtlas(Mutex::new(WgpuAtlasState {
-            device,
-            queue,
-            max_texture_size,
-            color_texture_format,
-            storage: WgpuAtlasStorage::default(),
-            tiles_by_key: Default::default(),
-            pending_uploads: Vec::new(),
-            next_texture_identity: 0,
-            generation: 0,
-        }))
+        WgpuAtlas {
+            state: Arc::new(Mutex::new(WgpuAtlasState {
+                shared: gpui_render::gpu_policy::GpuOptions::from_env().shared_resources,
+                device,
+                queue,
+                max_texture_size,
+                color_texture_format,
+                storage: WgpuAtlasStorage::default(),
+                tiles_by_key: Default::default(),
+                pending_uploads: Vec::new(),
+                next_texture_identity: 0,
+                generation: 0,
+                epoch: 0,
+                owners: FxHashMap::default(),
+            })),
+            owned: Mutex::default(),
+        }
     }
 
     pub fn from_context(context: &WgpuContext) -> Self {
-        Self::new(
-            context.device.clone(),
-            context.queue.clone(),
-            context.color_texture_format(),
-        )
+        let make = || {
+            Self::new(
+                context.device.clone(),
+                context.queue.clone(),
+                context.color_texture_format(),
+            )
+        };
+        if !gpui_render::gpu_policy::GpuOptions::from_env().shared_resources {
+            return make();
+        }
+        SHARED_ATLASES.with_borrow_mut(|cache| {
+            cache.retain(|weak| weak.strong_count() > 0);
+            for state in cache.iter().filter_map(std::sync::Weak::upgrade) {
+                let lock = state.lock();
+                if Arc::ptr_eq(&lock.device, &context.device)
+                    && lock.color_texture_format == context.color_texture_format()
+                {
+                    let epoch = lock.epoch;
+                    drop(lock);
+                    return Self {
+                        state,
+                        owned: Mutex::new((epoch, FxHashSet::default())),
+                    };
+                }
+            }
+            let atlas = make();
+            cache.push(Arc::downgrade(&atlas.state));
+            atlas
+        })
+    }
+
+    pub fn allocated_bytes(&self) -> u64 {
+        let lock = self.state.lock();
+        [
+            &lock.storage.monochrome_textures,
+            &lock.storage.subpixel_textures,
+            &lock.storage.polychrome_textures,
+        ]
+        .into_iter()
+        .flat_map(|list| list.textures.iter().flatten())
+        .map(|t| {
+            u64::from(t.texture.width())
+                * u64::from(t.texture.height())
+                * u64::from(t.bytes_per_pixel())
+        })
+        .sum()
+    }
+
+    fn retain_key(&self, lock: &mut WgpuAtlasState, key: &AtlasKey) {
+        if !lock.shared {
+            return;
+        }
+        let mut owned = self.owned.lock();
+        if owned.0 != lock.epoch {
+            owned.0 = lock.epoch;
+            owned.1.clear();
+        }
+        if owned.1.insert(key.clone()) {
+            *lock.owners.entry(key.clone()).or_default() += 1;
+        }
     }
 
     pub fn before_frame(&self) {
-        let mut lock = self.0.lock();
+        let mut lock = self.state.lock();
         lock.flush_uploads();
     }
 
     pub fn get_texture_info(&self, id: AtlasTextureId) -> WgpuTextureInfo {
-        let lock = self.0.lock();
+        let lock = self.state.lock();
         let texture = &lock.storage[id];
         WgpuTextureInfo {
             view: texture.view.clone(),
@@ -96,9 +166,11 @@ impl WgpuAtlas {
     /// Clears all cached textures and tiles, forcing them to be recreated.
     /// Use this for incremental recovery when the device is still valid.
     pub fn clear(&self) {
-        let mut lock = self.0.lock();
+        let mut lock = self.state.lock();
         lock.storage = WgpuAtlasStorage::default();
         lock.tiles_by_key.clear();
+        lock.owners.clear();
+        lock.epoch = lock.epoch.wrapping_add(1);
         lock.pending_uploads.clear();
         lock.generation = lock.generation.wrapping_add(1);
     }
@@ -106,12 +178,14 @@ impl WgpuAtlas {
     /// Handles device lost by clearing all textures and cached tiles.
     /// The atlas will lazily recreate textures as needed on subsequent frames.
     pub fn handle_device_lost(&self, context: &WgpuContext) {
-        let mut lock = self.0.lock();
+        let mut lock = self.state.lock();
         lock.device = context.device.clone();
         lock.queue = context.queue.clone();
         lock.color_texture_format = context.color_texture_format();
         lock.storage = WgpuAtlasStorage::default();
         lock.tiles_by_key.clear();
+        lock.owners.clear();
+        lock.epoch = lock.epoch.wrapping_add(1);
         lock.pending_uploads.clear();
         lock.generation = lock.generation.wrapping_add(1);
     }
@@ -123,9 +197,10 @@ impl PlatformAtlas for WgpuAtlas {
         key: &AtlasKey,
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>> {
-        let mut lock = self.0.lock();
-        if let Some(tile) = lock.tiles_by_key.get(key) {
-            Ok(Some(*tile))
+        let mut lock = self.state.lock();
+        if let Some(tile) = lock.tiles_by_key.get(key).copied() {
+            self.retain_key(&mut lock, key);
+            Ok(Some(tile))
         } else {
             profiling::scope!("new tile");
             let Some((size, bytes)) = build()? else {
@@ -143,19 +218,48 @@ impl PlatformAtlas for WgpuAtlas {
                 .context("failed to allocate")?;
             lock.upload_texture(tile.texture_id, tile.bounds, &bytes);
             lock.tiles_by_key.insert(key.clone(), tile);
+            self.retain_key(&mut lock, key);
             Ok(Some(tile))
         }
     }
 
     fn remove(&self, key: &AtlasKey) {
-        let mut lock = self.0.lock();
+        let mut lock = self.state.lock();
 
-        let Some(tile) = lock.tiles_by_key.remove(key) else {
+        if !lock.shared {
+            lock.release_key(key);
+            return;
+        }
+        let mut owned = self.owned.lock();
+        if owned.0 != lock.epoch || !owned.1.remove(key) {
+            return;
+        }
+        lock.release_key(key);
+    }
+
+    fn generation(&self) -> u64 {
+        self.state.lock().generation
+    }
+}
+
+impl WgpuAtlasState {
+    fn release_key(&mut self, key: &AtlasKey) {
+        if self.shared {
+            let Some(owners) = self.owners.get_mut(key) else {
+                return;
+            };
+            *owners -= 1;
+            if *owners > 0 {
+                return;
+            }
+            self.owners.remove(key);
+        }
+        let Some(tile) = self.tiles_by_key.remove(key) else {
             return;
         };
         let id = tile.texture_id;
 
-        let Some(texture_slot) = lock.storage[id.kind].textures.get_mut(id.index as usize) else {
+        let Some(texture_slot) = self.storage[id.kind].textures.get_mut(id.index as usize) else {
             return;
         };
 
@@ -163,24 +267,18 @@ impl PlatformAtlas for WgpuAtlas {
             texture.allocator.deallocate(tile.tile_id.into());
             texture.decrement_ref_count();
             if texture.is_unreferenced() {
-                lock.pending_uploads
+                self.pending_uploads
                     .retain(|upload| upload.id != texture.id);
-                lock.storage[id.kind]
+                self.storage[id.kind]
                     .free_list
                     .push(texture.id.index as usize);
             } else {
                 *texture_slot = Some(texture);
             }
-            lock.generation = lock.generation.wrapping_add(1);
+            self.generation = self.generation.wrapping_add(1);
         }
     }
 
-    fn generation(&self) -> u64 {
-        self.0.lock().generation
-    }
-}
-
-impl WgpuAtlasState {
     fn allocate(
         &mut self,
         size: Size<DevicePixels>,
@@ -493,6 +591,51 @@ mod tests {
     }
 
     #[test]
+    fn shared_atlas_keeps_tiles_until_the_last_window_releases_them() -> anyhow::Result<()> {
+        let (device, queue) = test_device_and_queue()?;
+        let first = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
+        first.state.lock().shared = true;
+        let second = WgpuAtlas {
+            state: first.state.clone(),
+            owned: Mutex::default(),
+        };
+        let key = AtlasKey::Image(RenderImageParams {
+            image_id: ImageId(8),
+            frame_index: 0,
+        });
+        let mut build = || {
+            Ok(Some((
+                Size {
+                    width: DevicePixels(1),
+                    height: DevicePixels(1),
+                },
+                Cow::Owned(vec![0, 0, 0, 255]),
+            )))
+        };
+        let tile = first.get_or_insert_with(&key, &mut build)?.unwrap();
+        let reused = second
+            .get_or_insert_with(&key, &mut || panic!("a shared tile must not be rebuilt"))?
+            .unwrap();
+        assert_eq!(tile, reused);
+        first.remove(&key);
+        assert!(second.state.lock().tiles_by_key.contains_key(&key));
+        assert_eq!(second.state.lock().owners[&key], 1);
+        // Repeated removal and a different window's removal do not release a lease twice.
+        first.remove(&key);
+        second.remove(&key);
+        assert!(second.state.lock().tiles_by_key.is_empty());
+        assert_eq!(second.allocated_bytes(), 0);
+        first.get_or_insert_with(&key, &mut build)?;
+        second.get_or_insert_with(&key, &mut build)?;
+        drop(first);
+        assert_eq!(second.state.lock().owners[&key], 1);
+        second.clear();
+        second.get_or_insert_with(&key, &mut build)?;
+        assert_eq!(second.state.lock().owners[&key], 1);
+        Ok(())
+    }
+
+    #[test]
     fn remove_deallocates_tile_space_for_reuse() -> anyhow::Result<()> {
         let (device, queue) = test_device_and_queue()?;
         let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
@@ -585,5 +728,20 @@ mod tests {
             swizzle_upload_data(&input, wgpu::TextureFormat::Rgba8Unorm),
             vec![0x30, 0x20, 0x10, 0x40, 0xCC, 0xBB, 0xAA, 0xDD]
         );
+    }
+}
+
+impl Drop for WgpuAtlas {
+    fn drop(&mut self) {
+        let mut state = self.state.lock();
+        if !state.shared {
+            return;
+        }
+        let owned = self.owned.get_mut();
+        if owned.0 == state.epoch {
+            for key in owned.1.drain() {
+                state.release_key(&key);
+            }
+        }
     }
 }

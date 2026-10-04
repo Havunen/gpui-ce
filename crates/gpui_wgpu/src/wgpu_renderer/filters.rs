@@ -34,7 +34,7 @@ impl WgpuRenderer {
     fn run_blur_pass(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        label: &str,
+        label: &'static str,
         pipeline: &pipelines::WgpuRenderPipeline,
         target: &wgpu::TextureView,
         source: &wgpu::TextureView,
@@ -48,6 +48,7 @@ impl WgpuRenderer {
             label,
             target,
             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            self.resources().gpu_trace.as_ref(),
         );
         pass.set_pipeline(pipeline);
         pass.set_bind_group(
@@ -153,8 +154,13 @@ impl WgpuRenderer {
         } else {
             &resources.pipelines.blur_composite
         };
-        let mut pass =
-            begin_color_render_pass(encoder, "blur_composite", target, wgpu::LoadOp::Load);
+        let mut pass = begin_color_render_pass(
+            encoder,
+            "blur_composite",
+            target,
+            wgpu::LoadOp::Load,
+            self.resources().gpu_trace.as_ref(),
+        );
         pass.set_pipeline(pipeline);
         pass.set_bind_group(
             shader_interface::GLOBAL_BIND_GROUP,
@@ -206,6 +212,7 @@ impl WgpuRenderer {
             "scene_blit",
             frame_view,
             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            self.resources().gpu_trace.as_ref(),
         );
         pass.set_pipeline(&resources.pipelines.blur_downsample);
         pass.set_bind_group(

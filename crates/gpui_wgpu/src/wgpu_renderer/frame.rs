@@ -9,6 +9,7 @@ use gpui::{
     Quad, RenderCommand, Scene, Shadow, SubpixelSprite, Underline,
 };
 use gpui_render::blur::{FilterCompositeClip, FilterCompositeParameters};
+use gpui_render::damage::Damage;
 use gpui_render::shaders::{
     common::{FontRasterizationUniforms, GlobalUniforms, ShaderBool},
     interface as shader_interface,
@@ -27,8 +28,86 @@ pub(super) fn render_to_view(
     // texture that reappears after an intervening primitive and recreate its platform view.
     renderer.retain_surface_cache(&scene.surfaces);
 
+    renderer.submission_id += 1;
+    if let Some(trace) = renderer.resources().gpu_trace.as_ref() {
+        let mut metrics = gpui::gpu_profiler::GpuFrameMetrics::new(
+            scene,
+            renderer.renderer_id,
+            renderer.submission_id,
+            "wgpu",
+        );
+        let r = renderer.resources();
+        let bytes = |texture: &wgpu::Texture| {
+            u64::from(texture.width())
+                * u64::from(texture.height())
+                * 4
+                * u64::from(texture.sample_count())
+        };
+        metrics.memory.atlas_bytes = Some(renderer.atlas.allocated_bytes());
+        metrics.memory.upload_bytes = Some(
+            r.instances.allocated_bytes()
+                + r.globals_buffer.size()
+                + r.surface_uniforms.buffer.size()
+                + r.filter_uniforms.buffer.size(),
+        );
+        metrics.memory.retained_frame_bytes = Some(
+            r.retained
+                .borrow()
+                .as_ref()
+                .map(|f| bytes(&f._texture))
+                .unwrap_or(0),
+        );
+        let (pooled, pending) = r
+            .texture_pool
+            .as_ref()
+            .map(|p| p.bytes())
+            .unwrap_or_default();
+        metrics.memory.pooled_bytes = Some(pooled);
+        metrics.memory.pending_release_bytes = Some(pending);
+        metrics.memory.device_retention_bytes =
+            Some(super::shared::retention_budget(&r.device).used());
+        metrics.path_target = r
+            .path_intermediate_texture
+            .as_ref()
+            .map(|t| (t.width(), t.height()))
+            .unwrap_or_default();
+        metrics.memory.path_bytes = r
+            .path_intermediate_texture
+            .iter()
+            .chain(r.path_msaa_texture.iter())
+            .map(bytes)
+            .sum();
+        metrics.memory.filter_bytes = Some(
+            r.scene_color_texture
+                .iter()
+                .chain(r.blur_ping_texture.iter())
+                .chain(r.blur_pong_texture.iter())
+                .chain(r.filter_group_textures.iter())
+                .map(bytes)
+                .sum(),
+        );
+        trace.begin(metrics);
+    }
     match FrameEncoder::new(renderer, scene, targets).encode(readback) {
-        Ok(command_buffer) => Some(renderer.resources().queue.submit([command_buffer])),
+        Ok((command_buffer, mut used_paths)) => {
+            let submission = renderer.resources().queue.submit([command_buffer]);
+            let resources = renderer.resources();
+            if renderer.options.cached_layers || renderer.options.partial_redraw {
+                used_paths.extend(resources.path_cache.borrow().leases());
+                let retained = resources
+                    .retained
+                    .borrow()
+                    .as_ref()
+                    .map(|frame| frame.lease.clone());
+                resources
+                    .queue
+                    .on_submitted_work_done(move || drop((used_paths, retained)));
+            }
+            if let Some(trace) = &resources.gpu_trace {
+                trace.submitted(submission.clone());
+            }
+            Some(submission)
+        }
         Err(DrawError::ExternalSurface) => None,
         Err(DrawError::CapacityPlanningInvariant) => {
             log::error!("frame storage exceeded its precomputed capacity");
@@ -50,6 +129,7 @@ pub(super) struct ReadbackCopy<'a> {
 }
 
 struct PreparedTargets {
+    damage: Damage,
     active: wgpu::TextureView,
     presentation: wgpu::TextureView,
     offscreen: Option<wgpu::TextureView>,
@@ -65,10 +145,24 @@ impl PreparedTargets {
         if !begin_frame(renderer) {
             return None;
         }
-        let requirements = {
+        let mut requirements = {
             let transport = renderer.resources().instances.transport();
             FrameRequirements::for_scene(scene, transport)
         };
+        if renderer.options.cached_layers
+            || renderer.options.batched_paths
+            || renderer.options.partial_redraw
+        {
+            requirements.storage_bytes = requirements.worst_storage_bytes;
+        }
+        if renderer.options.partial_redraw {
+            requirements.storage_bytes += 2 * std::mem::size_of::<Quad>() as u64;
+            requirements.instance_batches += 1;
+            requirements.uniforms.filter_count += 1;
+        }
+        requirements.storage_bytes = requirements
+            .storage_bytes
+            .next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT);
         let device = renderer.resources().device.clone();
         let resources = renderer.resources_mut();
         if !resources.instances.ensure_capacity(
@@ -92,14 +186,22 @@ impl PreparedTargets {
         }
 
         if requirements.uses_path_target {
-            renderer.ensure_path_textures();
+            renderer.ensure_path_textures(scene);
         }
         if requirements.uses_offscreen_target {
             renderer.ensure_filter_textures(requirements.isolated_target_count);
         }
         write_shader_globals(renderer);
 
-        if requirements.uses_offscreen_target {
+        if let Some((view, damage)) = renderer.prepare_retained_frame(scene) {
+            Some(Self {
+                active: view.clone(),
+                presentation: frame_view.clone(),
+                offscreen: Some(view),
+                instances,
+                damage,
+            })
+        } else if requirements.uses_offscreen_target {
             let resources = renderer.resources();
             let offscreen = resources
                 .scene_color_view
@@ -107,6 +209,7 @@ impl PreparedTargets {
                 .expect("blur texture preparation must create a scene target")
                 .clone();
             Some(Self {
+                damage: Damage::Full,
                 active: offscreen.clone(),
                 presentation: frame_view.clone(),
                 offscreen: Some(offscreen),
@@ -114,6 +217,7 @@ impl PreparedTargets {
             })
         } else {
             Some(Self {
+                damage: Damage::Full,
                 active: frame_view.clone(),
                 presentation: frame_view.clone(),
                 offscreen: None,
@@ -126,6 +230,12 @@ impl PreparedTargets {
 fn begin_frame(renderer: &mut WgpuRenderer) -> bool {
     let Some(error) = renderer.faults.pending_error.lock().unwrap().take() else {
         renderer.faults.consecutive_failed_frames = 0;
+        if renderer.options.cached_layers
+            || renderer.options.partial_redraw
+            || renderer.options.pooled_targets
+        {
+            let _ = renderer.resources().device.poll(wgpu::PollType::Poll);
+        }
         renderer.atlas.before_frame();
         return true;
     };
@@ -186,6 +296,12 @@ fn write_shader_globals(renderer: &mut WgpuRenderer) {
         padding: 0,
     };
     let path_globals = GlobalUniforms {
+        viewport_size: renderer
+            .resources()
+            .path_intermediate_texture
+            .as_ref()
+            .map(|texture| wgsl_rs::std::vec2f(texture.width() as f32, texture.height() as f32))
+            .unwrap_or(globals.viewport_size),
         premultiplied_alpha: ShaderBool::Disabled,
         ..globals
     };
@@ -233,6 +349,7 @@ fn write_shader_globals(renderer: &mut WgpuRenderer) {
 #[derive(Clone, Copy, Default)]
 pub(super) struct FrameRequirements {
     storage_bytes: u64,
+    worst_storage_bytes: u64,
     /// Instance batches this frame; one downlevel range-uniform slot per batch.
     instance_batches: u64,
     pub(super) uniforms: FrameUniformRequirements,
@@ -245,10 +362,14 @@ impl FrameRequirements {
     pub(super) fn for_scene(scene: &Scene, transport: InstanceTransport) -> Self {
         let planned = scene.render_plan().requirements();
         let mut storage_bytes = 0_u64;
+        let mut worst_storage_bytes = 0_u64;
         let mut instance_batches = 0_u64;
         let mut reserve = |element_size: usize, count: usize| {
             if count > 0 {
                 let stride = element_size as u64;
+                worst_storage_bytes = worst_storage_bytes
+                    .saturating_add(stride.saturating_mul(count as u64))
+                    .saturating_add(transport.batch_alignment(stride) - 1);
                 storage_bytes = storage_bytes.next_multiple_of(transport.batch_alignment(stride));
                 storage_bytes = storage_bytes.saturating_add(stride.saturating_mul(count as u64));
                 instance_batches += 1;
@@ -299,6 +420,7 @@ impl FrameRequirements {
 
         Self {
             storage_bytes,
+            worst_storage_bytes,
             instance_batches,
             uniforms: FrameUniformRequirements {
                 filter_count: FILTER_UNIFORMS_PER_COMPOSITE
@@ -314,6 +436,7 @@ impl FrameRequirements {
 }
 
 struct FrameEncoder<'a> {
+    damage: Damage,
     renderer: &'a WgpuRenderer,
     scene: &'a Scene,
     encoder: wgpu::CommandEncoder,
@@ -321,10 +444,91 @@ struct FrameEncoder<'a> {
     offscreen: Option<wgpu::TextureView>,
     presentation: wgpu::TextureView,
     instances: InstanceUpload,
+    paths: Vec<PathSource>,
+}
+
+enum PathSource {
+    Inline,
+    Cached(std::sync::Arc<super::path_cache::CachedPath>),
+    Packed {
+        world: gpui_render::path_plan::PixelRect,
+        tile: gpui_render::path_plan::PixelRect,
+    },
+}
+
+fn plan_paths(renderer: &WgpuRenderer, scene: &Scene) -> Vec<PathSource> {
+    if !renderer.options.cached_layers && !renderer.options.batched_paths {
+        return Vec::new();
+    }
+    use gpui_render::path_plan;
+    let r = renderer.resources();
+    let mut cache = r.path_cache.borrow_mut();
+    cache.begin();
+    let mut plan: Vec<_> = scene
+        .render_commands()
+        .iter()
+        .map(|command| {
+            if renderer.options.cached_layers {
+                if let RenderCommand::Batch(PrimitiveBatch::Paths { range, .. }) = command {
+                    if let Some(cached) = cache.get(&scene.paths[range.clone()]) {
+                        return PathSource::Cached(cached);
+                    }
+                }
+            }
+            PathSource::Inline
+        })
+        .collect();
+    if renderer.options.batched_paths && !scene.requires_offscreen_rendering() {
+        if let Some(target) = &r.path_intermediate_texture {
+            let extent = (target.width(), target.height());
+            let misses: Vec<_> = scene
+                .render_commands()
+                .iter()
+                .enumerate()
+                .filter_map(|(i, command)| {
+                    if matches!(plan[i], PathSource::Cached(_)) {
+                        return None;
+                    }
+                    if let RenderCommand::Batch(PrimitiveBatch::Paths {
+                        range,
+                        rasterization_vertex_count,
+                        ..
+                    }) = command
+                    {
+                        if *rasterization_vertex_count == 0 {
+                            return None;
+                        }
+                        let bounds = path_plan::visible_rect(
+                            scene.paths[range.clone()]
+                                .iter()
+                                .map(gpui::Path::clipped_bounds),
+                            extent,
+                        )?;
+                        Some((i, bounds))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if let Some(tiles) = path_plan::pack(
+                &misses.iter().map(|(_, rect)| *rect).collect::<Vec<_>>(),
+                extent,
+            ) {
+                for ((i, world), tile) in misses.into_iter().zip(tiles) {
+                    plan[i] = PathSource::Packed { world, tile };
+                }
+            }
+        }
+    }
+    let mut active = cache.views();
+    active.extend(r.path_intermediate_view.iter().cloned());
+    r.instances.retain_path_bindings(&active);
+    plan
 }
 
 impl<'a> FrameEncoder<'a> {
     fn new(renderer: &'a WgpuRenderer, scene: &'a Scene, targets: PreparedTargets) -> Self {
+        let paths = plan_paths(renderer, scene);
         let encoder =
             renderer
                 .resources()
@@ -336,17 +540,25 @@ impl<'a> FrameEncoder<'a> {
             renderer,
             scene,
             encoder,
+            damage: targets.damage,
             targets: TargetStack::new(targets.active),
             offscreen: targets.offscreen,
             presentation: targets.presentation,
             instances: targets.instances,
+            paths,
         }
     }
 
     fn encode(
         mut self,
         readback: Option<ReadbackCopy<'_>>,
-    ) -> Result<wgpu::CommandBuffer, DrawError> {
+    ) -> Result<
+        (
+            wgpu::CommandBuffer,
+            Vec<std::sync::Arc<super::path_cache::CachedPath>>,
+        ),
+        DrawError,
+    > {
         let result = self.encode_commands();
         if result.is_ok() {
             if let Some(offscreen) = &self.offscreen {
@@ -372,22 +584,98 @@ impl<'a> FrameEncoder<'a> {
                 );
             }
         }
+        if result.is_err() {
+            if let Some(retained) = self.renderer.resources().retained.borrow_mut().as_mut() {
+                retained.snapshot = None;
+            }
+        }
         self.instances.finish(&mut self.encoder);
         self.renderer.resources().finish_frame_uploads();
+        if let Some(trace) = &self.renderer.resources().gpu_trace {
+            if result.is_ok() {
+                let cache = self.renderer.resources().path_cache.borrow();
+                trace.cache_stats(cache.bytes(), cache.hits, cache.misses);
+                trace.resolve(&mut self.encoder);
+            } else {
+                trace.cancel();
+            }
+        }
         let command_buffer = self.encoder.finish();
-        result.map(|()| command_buffer)
+        let used_paths = self
+            .paths
+            .into_iter()
+            .filter_map(|path| match path {
+                PathSource::Cached(cached) => Some(cached),
+                _ => None,
+            })
+            .collect();
+        result.map(|()| (command_buffer, used_paths))
     }
 
     fn encode_commands(&mut self) -> DrawResult {
+        if self.damage == Damage::Unchanged {
+            return Ok(());
+        }
+        let packed: Vec<_> = self
+            .scene
+            .render_commands()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, command)| {
+                if let (
+                    PathSource::Packed { world, tile },
+                    RenderCommand::Batch(PrimitiveBatch::Paths { range, .. }),
+                ) = (self.paths.get(i).unwrap_or(&PathSource::Inline), command)
+                {
+                    Some((
+                        &self.scene.paths[range.clone()][..],
+                        tile.origin() - world.origin(),
+                        Some(*tile),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !packed.is_empty() {
+            self.renderer.draw_path_batches(
+                &mut self.encoder,
+                packed.into_iter(),
+                &mut self.instances,
+            )?;
+            for (i, command) in self.scene.render_commands().iter().enumerate() {
+                if let (
+                    PathSource::Packed { world, tile },
+                    RenderCommand::Batch(PrimitiveBatch::Paths { range, .. }),
+                ) = (self.paths.get(i).unwrap_or(&PathSource::Inline), command)
+                {
+                    capture_path(
+                        self.renderer,
+                        &mut self.encoder,
+                        *tile,
+                        *world,
+                        &self.scene.paths[range.clone()],
+                    );
+                }
+            }
+        }
         let mut pass = begin_scene_render_pass(
             self.renderer,
             &mut self.encoder,
             "main_pass",
             self.targets.current(),
-            wgpu::LoadOp::Clear(self.renderer.target.clear_color()),
+            if matches!(self.damage, Damage::Rect(_)) {
+                wgpu::LoadOp::Load
+            } else {
+                wgpu::LoadOp::Clear(self.renderer.target.clear_color())
+            },
+            self.damage,
         );
+        if matches!(self.damage, Damage::Rect(_)) {
+            self.renderer.clear_damage(&mut self.instances, &mut pass)?;
+        }
 
-        for command in self.scene.render_commands() {
+        for (command_index, command) in self.scene.render_commands().iter().enumerate() {
             match command {
                 RenderCommand::Batch(PrimitiveBatch::Paths {
                     range,
@@ -398,18 +686,76 @@ impl<'a> FrameEncoder<'a> {
                         continue;
                     }
                     let paths = &self.scene.paths[range.clone()];
+                    match self.paths.get(command_index).unwrap_or(&PathSource::Inline) {
+                        PathSource::Cached(cached) => {
+                            self.renderer.draw_paths_from_texture(
+                                paths,
+                                cached.bounds.origin(),
+                                Some(cached.bounds),
+                                &cached.view,
+                                &mut self.instances,
+                                &mut pass,
+                            )?;
+                            continue;
+                        }
+                        PathSource::Packed { world, tile } => {
+                            let view = self
+                                .renderer
+                                .resources()
+                                .path_intermediate_view
+                                .as_ref()
+                                .ok_or(DrawError::MissingIntermediateTarget)?;
+                            self.renderer.draw_paths_from_texture(
+                                paths,
+                                world.origin() - tile.origin(),
+                                Some(*world),
+                                view,
+                                &mut self.instances,
+                                &mut pass,
+                            )?;
+                            continue;
+                        }
+                        PathSource::Inline => {}
+                    }
+                    if gpui_render::path_plan::visible_rect(
+                        paths.iter().map(gpui::Path::clipped_bounds),
+                        (self.renderer.target.width(), self.renderer.target.height()),
+                    )
+                    .is_none()
+                    {
+                        continue;
+                    }
                     drop(pass);
                     let rasterized = self.renderer.draw_paths_to_intermediate(
                         &mut self.encoder,
                         paths,
                         &mut self.instances,
                     );
+                    if rasterized.is_ok() {
+                        if let Some(target) =
+                            self.renderer.resources().path_intermediate_texture.as_ref()
+                        {
+                            if let Some(bounds) = gpui_render::path_plan::visible_rect(
+                                paths.iter().map(gpui::Path::clipped_bounds),
+                                (target.width(), target.height()),
+                            ) {
+                                capture_path(
+                                    self.renderer,
+                                    &mut self.encoder,
+                                    bounds,
+                                    bounds,
+                                    paths,
+                                );
+                            }
+                        }
+                    }
                     pass = begin_scene_render_pass(
                         self.renderer,
                         &mut self.encoder,
                         "after_paths",
                         self.targets.current(),
                         wgpu::LoadOp::Load,
+                        self.damage,
                     );
                     rasterized?;
                     self.renderer.draw_paths_from_intermediate(
@@ -433,6 +779,7 @@ impl<'a> FrameEncoder<'a> {
                         "after_backdrop_filter",
                         self.targets.current(),
                         wgpu::LoadOp::Load,
+                        self.damage,
                     );
                 }
                 RenderCommand::Batch(PrimitiveBatch::FilterBoundary(_)) => {
@@ -459,6 +806,7 @@ impl<'a> FrameEncoder<'a> {
                         "filter_group",
                         self.targets.current(),
                         wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        Damage::Full,
                     );
                 }
                 RenderCommand::EndFilter {
@@ -489,6 +837,7 @@ impl<'a> FrameEncoder<'a> {
                         "after_content_filter",
                         self.targets.current(),
                         wgpu::LoadOp::Load,
+                        self.damage,
                     );
                 }
                 RenderCommand::BeginFilter {
@@ -507,14 +856,42 @@ impl<'a> FrameEncoder<'a> {
     }
 }
 
+fn capture_path(
+    renderer: &WgpuRenderer,
+    encoder: &mut wgpu::CommandEncoder,
+    source: gpui_render::path_plan::PixelRect,
+    world: gpui_render::path_plan::PixelRect,
+    paths: &[gpui::Path<gpui::ScaledPixels>],
+) {
+    if !renderer.options.cached_layers {
+        return;
+    }
+    let r = renderer.resources();
+    if let Some(texture) = &r.path_intermediate_texture {
+        r.path_cache
+            .borrow_mut()
+            .capture(&r.device, encoder, texture, source, world, paths);
+    }
+}
+
 fn begin_scene_render_pass<'a>(
     renderer: &'a WgpuRenderer,
     encoder: &'a mut wgpu::CommandEncoder,
-    label: &'a str,
+    label: &'static str,
     target: &'a wgpu::TextureView,
     load: wgpu::LoadOp<wgpu::Color>,
+    damage: Damage,
 ) -> wgpu::RenderPass<'a> {
-    let mut pass = begin_color_render_pass(encoder, label, target, load);
+    let mut pass = begin_color_render_pass(
+        encoder,
+        label,
+        target,
+        load,
+        renderer.resources().gpu_trace.as_ref(),
+    );
+    if let Damage::Rect(rect) = damage {
+        pass.set_scissor_rect(rect.x, rect.y, rect.width, rect.height);
+    }
     pass.set_bind_group(
         shader_interface::GLOBAL_BIND_GROUP,
         &renderer.resources().globals_bind_group,

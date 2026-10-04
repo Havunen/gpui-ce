@@ -13,6 +13,47 @@ use super::{
 };
 
 impl WgpuRenderer {
+    pub(super) fn clear_damage(
+        &self,
+        instances: &mut InstanceUpload,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> frame::DrawResult {
+        let r = self.resources();
+        let bounds = gpui::Bounds::new(
+            Default::default(),
+            gpui::size(
+                ScaledPixels(self.target.width() as f32),
+                ScaledPixels(self.target.height() as f32),
+            ),
+        );
+        let color = self.target.clear_color();
+        let quad = Quad {
+            bounds,
+            content_mask: gpui::ContentMask {
+                bounds,
+                ..Default::default()
+            },
+            background: gpui::Rgba::new(
+                color.r as f32,
+                color.g as f32,
+                color.b as f32,
+                color.a as f32,
+            )
+            .into(),
+            ..Default::default()
+        };
+        self.draw_instances(
+            &[quad],
+            r.pipelines.clear_quads(
+                &r.device,
+                &r.bind_group_layouts,
+                self.target.format(),
+                r.renderer_tier,
+            ),
+            instances,
+            pass,
+        )
+    }
     pub(super) fn draw_quads(
         &self,
         quads: &[Quad],
@@ -190,20 +231,44 @@ impl WgpuRenderer {
         instances: &mut InstanceUpload,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> frame::DrawResult {
+        let Some(view) = self.resources().path_intermediate_view.as_ref() else {
+            return Err(frame::DrawError::MissingIntermediateTarget);
+        };
+        self.draw_paths_from_texture(paths, Default::default(), None, view, instances, pass)
+    }
+
+    pub(super) fn draw_paths_from_texture(
+        &self,
+        paths: &[Path<ScaledPixels>],
+        origin: gpui::Point<ScaledPixels>,
+        clip: Option<gpui_render::path_plan::PixelRect>,
+        view: &wgpu::TextureView,
+        instances: &mut InstanceUpload,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> frame::DrawResult {
         let sprite_count = path_types::sprite_count(paths);
-        let Some(sprite_slice) = instances.write_iter(sprite_count, path_types::sprites(paths))
-        else {
+        let sprites = path_types::sprites(paths).map(|mut sprite| {
+            sprite.texture_origin = origin;
+            if let Some(clip) = clip {
+                sprite.bounds = sprite.bounds.intersect(&gpui::Bounds::new(
+                    clip.origin(),
+                    gpui::size(
+                        ScaledPixels(clip.width as f32),
+                        ScaledPixels(clip.height as f32),
+                    ),
+                ));
+            }
+            sprite
+        });
+        let Some(sprite_slice) = instances.write_iter(sprite_count, sprites) else {
             return Err(frame::DrawError::CapacityPlanningInvariant);
         };
         let resources = self.resources();
-        let Some(path_intermediate_view) = resources.path_intermediate_view.as_ref() else {
-            return Err(frame::DrawError::MissingIntermediateTarget);
-        };
         let bind_group = resources.instances.path_bind_group(
             &resources.device,
             &resources.bind_group_layouts,
             resources.pipelines.paths.data_layout(),
-            path_intermediate_view,
+            view,
             &resources.atlas_sampler,
         );
         self.draw_bound_slice(&resources.pipelines.paths, &bind_group, &sprite_slice, pass);
@@ -216,16 +281,25 @@ impl WgpuRenderer {
         paths: &[Path<ScaledPixels>],
         instances: &mut InstanceUpload,
     ) -> frame::DrawResult {
-        let vertex_count = path_types::rasterization_vertex_count(paths);
-        if vertex_count == 0 {
-            return Ok(());
-        }
+        self.draw_path_batches(
+            encoder,
+            std::iter::once((paths, Default::default(), None)),
+            instances,
+        )
+    }
 
-        let Some(vertex_slice) =
-            instances.write_iter(vertex_count, path_types::rasterization_vertices(paths))
-        else {
-            return Err(frame::DrawError::CapacityPlanningInvariant);
-        };
+    pub(super) fn draw_path_batches<'p>(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        batches: impl Iterator<
+            Item = (
+                &'p [Path<ScaledPixels>],
+                gpui::Point<ScaledPixels>,
+                Option<gpui_render::path_plan::PixelRect>,
+            ),
+        >,
+        instances: &mut InstanceUpload,
+    ) -> frame::DrawResult {
         let resources = self.resources();
         let Some(path_intermediate_view) = resources.path_intermediate_view.as_ref() else {
             return Err(frame::DrawError::MissingIntermediateTarget);
@@ -238,6 +312,10 @@ impl WgpuRenderer {
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("path_rasterization_pass"),
+            timestamp_writes: resources
+                .gpu_trace
+                .as_ref()
+                .and_then(|trace| trace.timestamps("path_rasterization")),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: target_view,
                 resolve_target,
@@ -262,8 +340,24 @@ impl WgpuRenderer {
             &resources.path_globals_bind_group,
             &[],
         );
-        vertex_slice.set_data_bind_group(&mut pass, resources.instances.bind_group());
-        pass.draw(vertex_slice.range(), 0..1);
+        for (paths, offset, clip) in batches {
+            let count = path_types::rasterization_vertex_count(paths);
+            if count == 0 {
+                continue;
+            }
+            let vertices = path_types::rasterization_vertices(paths).map(|mut v| {
+                v.raster_offset = offset;
+                v
+            });
+            let Some(slice) = instances.write_iter(count, vertices) else {
+                return Err(frame::DrawError::CapacityPlanningInvariant);
+            };
+            if let Some(clip) = clip {
+                pass.set_scissor_rect(clip.x, clip.y, clip.width, clip.height);
+            }
+            slice.set_data_bind_group(&mut pass, resources.instances.bind_group());
+            pass.draw(slice.range(), 0..1);
+        }
         Ok(())
     }
 }

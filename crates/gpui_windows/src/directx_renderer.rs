@@ -51,7 +51,39 @@ pub(crate) struct FontInfo {
     pub is_bgr: bool,
 }
 
+struct SharedShaders {
+    device: ID3D11Device,
+    vertices: std::cell::RefCell<Vec<(Vec<u8>, ID3D11VertexShader)>>,
+    fragments: std::cell::RefCell<Vec<(Vec<u8>, ID3D11PixelShader)>>,
+}
+thread_local! { static SHARED_SHADERS: std::cell::RefCell<Vec<std::rc::Weak<SharedShaders>>> = const { std::cell::RefCell::new(Vec::new()) }; }
+fn shared_shaders(device: &ID3D11Device) -> Option<std::rc::Rc<SharedShaders>> {
+    if !gpui_render::gpu_policy::GpuOptions::from_env().shared_resources {
+        return None;
+    }
+    Some(SHARED_SHADERS.with_borrow_mut(|cache| {
+        cache.retain(|entry| entry.strong_count() > 0);
+        if let Some(entry) = cache
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .find(|entry| entry.device == *device)
+        {
+            return entry;
+        }
+        let entry = std::rc::Rc::new(SharedShaders {
+            device: device.clone(),
+            vertices: Default::default(),
+            fragments: Default::default(),
+        });
+        cache.push(std::rc::Rc::downgrade(&entry));
+        entry
+    }))
+}
+
 pub(crate) struct DirectXRenderer {
+    options: gpui_render::gpu_policy::GpuOptions,
+    _shared_shaders: Option<std::rc::Rc<SharedShaders>>,
+    gpu_trace: Option<std::rc::Rc<crate::gpu_trace::GpuTrace>>,
     hwnd: HWND,
     atlas: Arc<DirectXAtlas>,
     devices: Option<DirectXRendererDevices>,
@@ -117,6 +149,8 @@ struct CachedSurfaceView {
 }
 
 struct PathResources {
+    viewport: D3D11_VIEWPORT,
+    globals: DirectXGlobalElements,
     texture: ID3D11Texture2D,
     srv: Option<ID3D11ShaderResourceView>,
     msaa_texture: ID3D11Texture2D,
@@ -128,7 +162,26 @@ impl PathResources {
         let (texture, srv) = create_path_intermediate_texture(device, width, height)?;
         let (msaa_texture, msaa_view) =
             create_path_intermediate_msaa_texture_and_view(device, width, height)?;
+        let globals = DirectXGlobalElements::new(device)?;
+        let context = unsafe { device.GetImmediateContext() }?;
+        update_buffer(
+            &context,
+            globals.globals_buffer.as_ref().unwrap(),
+            &[GlobalUniforms {
+                viewport_size: vec2f(width as f32, height as f32),
+                premultiplied_alpha: ShaderBool::Disabled,
+                padding: 0,
+            }],
+        )?;
         Ok(Self {
+            viewport: D3D11_VIEWPORT {
+                Width: width as f32,
+                Height: height as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+                ..Default::default()
+            },
+            globals,
             texture,
             srv,
             msaa_texture,
@@ -339,6 +392,7 @@ impl DirectXRenderer {
             .context("Creating DirectX resources")?;
         let globals = DirectXGlobalElements::new(&devices.device)
             .context("Creating DirectX global elements")?;
+        let shared = shared_shaders(&devices.device);
         let pipelines = DirectXRenderPipelines::new(&devices.device)
             .context("Creating DirectX render pipelines")?;
 
@@ -353,7 +407,17 @@ impl DirectXRenderer {
             Some(composition)
         };
 
+        let gpu_trace = gpui::gpu_profiler::enabled()
+            .then(|| crate::gpu_trace::GpuTrace::new(&devices.device, &devices.device_context))
+            .and_then(|result| {
+                result
+                    .map_err(|error| log::warn!("GPU timestamps unavailable: {error}"))
+                    .ok()
+            });
         Ok(DirectXRenderer {
+            options: gpui_render::gpu_policy::GpuOptions::from_env(),
+            gpu_trace,
+            _shared_shaders: shared,
             hwnd,
             atlas,
             devices: Some(devices),
@@ -479,6 +543,7 @@ impl DirectXRenderer {
         .context("Creating DirectX resources")?;
         let globals = DirectXGlobalElements::new(&devices.device)
             .context("Creating DirectXGlobalElements")?;
+        let shared = shared_shaders(&devices.device);
         let pipelines = DirectXRenderPipelines::new(&devices.device)
             .context("Creating DirectXRenderPipelines")?;
 
@@ -499,9 +564,13 @@ impl DirectXRenderer {
                 .device_context
                 .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
         }
+        self.gpu_trace = gpui::gpu_profiler::enabled()
+            .then(|| crate::gpu_trace::GpuTrace::new(&devices.device, &devices.device_context))
+            .and_then(Result::ok);
         self.devices = Some(devices);
         self.resources = Some(resources);
         self.globals = globals;
+        self._shared_shaders = shared;
         self.pipelines = pipelines;
         self.direct_composition = direct_composition;
         self.skip_draws = true;
@@ -524,7 +593,24 @@ impl DirectXRenderer {
 
     /// Encodes a complete frame without presenting it. Window drawing and test readback share
     /// this path so batching, filters, and resource-retention behavior cannot diverge.
-    fn render(
+    fn render(&mut self, scene: &Scene, background: WindowBackgroundAppearance) -> Result<()> {
+        if let Some(trace) = &self.gpu_trace {
+            trace.begin(scene);
+        }
+        let result = self.render_inner(scene, background);
+        let path_size = self
+            .resources
+            .as_ref()
+            .and_then(|r| r.path.as_ref())
+            .map(|p| (p.viewport.Width as u32, p.viewport.Height as u32))
+            .unwrap_or_default();
+        if let Some(trace) = &self.gpu_trace {
+            trace.finish(result.is_ok(), path_size);
+        }
+        result
+    }
+
+    fn render_inner(
         &mut self,
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
@@ -544,7 +630,7 @@ impl DirectXRenderer {
         let resources = self.resources.as_mut().context("resources missing")?;
         resources.retain_surface_views(&scene.surfaces);
         if requirements.uses_path_target {
-            resources.ensure_path_resources(device)?;
+            resources.ensure_path_resources(device, scene, self.options.cropped_paths)?;
         }
         if use_offscreen {
             resources.ensure_blur_resources(device, requirements.isolated_target_count)?;
@@ -980,6 +1066,10 @@ impl DirectXRenderer {
         paths: &[Path<ScaledPixels>],
         rasterization_vertex_count: usize,
     ) -> Result<()> {
+        let _gpu_span = self
+            .gpu_trace
+            .as_ref()
+            .map(|trace| trace.span("path_rasterization"));
         if paths.is_empty() {
             return Ok(());
         }
@@ -994,6 +1084,7 @@ impl DirectXRenderer {
                     curve_position: vertex.st_position,
                     color: path.color,
                     bounds: path.clipped_bounds(),
+                    raster_offset: Default::default(),
                 }));
         }
         debug_assert_eq!(
@@ -1025,7 +1116,11 @@ impl DirectXRenderer {
             &self.path_rasterization_vertices,
         )?;
         self.pipelines.path_rasterization_pipeline.draw_vertices(
-            &self.frame_bindings()?,
+            &FrameBindings {
+                device_context: &devices.device_context,
+                viewport: &path.viewport,
+                globals: &path.globals,
+            },
             u32::try_from(rasterization_vertex_count)
                 .context("path rasterization vertex count exceeds the D3D11 draw limit")?,
         )?;
@@ -1059,6 +1154,10 @@ impl DirectXRenderer {
         paths: &[Path<ScaledPixels>],
         sprite_count: usize,
     ) -> Result<()> {
+        let _gpu_span = self
+            .gpu_trace
+            .as_ref()
+            .map(|trace| trace.span("path_composite"));
         let Some(first_path) = paths.first() else {
             return Ok(());
         };
@@ -1076,13 +1175,17 @@ impl DirectXRenderer {
             self.path_sprites
                 .extend(paths.iter().map(|path| PathSprite {
                     bounds: path.clipped_bounds(),
+                    texture_origin: Default::default(),
                 }));
         } else {
             let mut bounds = first_path.clipped_bounds();
             for path in paths.iter().skip(1) {
                 bounds = bounds.union(&path.clipped_bounds());
             }
-            self.path_sprites.push(PathSprite { bounds });
+            self.path_sprites.push(PathSprite {
+                bounds,
+                texture_origin: Default::default(),
+            });
         }
         debug_assert_eq!(self.path_sprites.len(), sprite_count);
 
@@ -1573,13 +1676,25 @@ impl DirectXResources {
         )
     }
 
-    fn ensure_path_resources(&mut self, device: &ID3D11Device) -> Result<()> {
-        if self.path.is_none() {
-            self.path = Some(PathResources::new(
-                device,
-                self.viewport.Width as u32,
-                self.viewport.Height as u32,
-            )?);
+    fn ensure_path_resources(
+        &mut self,
+        device: &ID3D11Device,
+        scene: &Scene,
+        cropped: bool,
+    ) -> Result<()> {
+        let previous = self
+            .path
+            .as_ref()
+            .map(|p| (p.viewport.Width as u32, p.viewport.Height as u32))
+            .unwrap_or_default();
+        let extent = gpui_render::gpu_policy::path_target_extent(
+            scene.paths.iter().map(Path::clipped_bounds),
+            (self.viewport.Width as u32, self.viewport.Height as u32),
+            previous,
+            cropped,
+        );
+        if extent != previous {
+            self.path = Some(PathResources::new(device, extent.0, extent.1)?);
         }
         Ok(())
     }
@@ -2422,23 +2537,59 @@ fn create_blend_state_no_blend(device: &ID3D11Device) -> Result<ID3D11BlendState
 
 #[inline]
 fn create_vertex_shader(device: &ID3D11Device, bytes: &[u8]) -> Result<ID3D11VertexShader> {
+    let shared = shared_shaders(device);
+    if let Some(shared) = &shared {
+        if let Some((_, shader)) = shared
+            .vertices
+            .borrow()
+            .iter()
+            .find(|(b, _)| b.as_slice() == bytes)
+        {
+            return Ok(shader.clone());
+        }
+    }
     unsafe {
         let mut shader = None;
         device
             .CreateVertexShader(bytes, None, Some(&mut shader))
             .ok()?;
-        Ok(shader.unwrap())
+        let shader = shader.unwrap();
+        if let Some(shared) = &shared {
+            shared
+                .vertices
+                .borrow_mut()
+                .push((bytes.to_vec(), shader.clone()));
+        }
+        Ok(shader)
     }
 }
 
 #[inline]
 fn create_fragment_shader(device: &ID3D11Device, bytes: &[u8]) -> Result<ID3D11PixelShader> {
+    let shared = shared_shaders(device);
+    if let Some(shared) = &shared {
+        if let Some((_, shader)) = shared
+            .fragments
+            .borrow()
+            .iter()
+            .find(|(b, _)| b.as_slice() == bytes)
+        {
+            return Ok(shader.clone());
+        }
+    }
     unsafe {
         let mut shader = None;
         device
             .CreatePixelShader(bytes, None, Some(&mut shader))
             .ok()?;
-        Ok(shader.unwrap())
+        let shader = shader.unwrap();
+        if let Some(shared) = &shared {
+            shared
+                .fragments
+                .borrow_mut()
+                .push((bytes.to_vec(), shader.clone()));
+        }
+        Ok(shader)
     }
 }
 
@@ -2918,6 +3069,72 @@ mod tests {
 
     /// `GPUI_D3D_DEBUG=off` in a debug build creates devices without the debug
     /// layer; reporting their live objects after a device loss must not fail.
+
+    #[test]
+    fn cropped_path_targets_match_full_viewport_pixels() -> Result<()> {
+        let first = HiddenWindow::new()?;
+        let second = HiddenWindow::new()?;
+        let devices = DirectXDevices::new()?;
+        let mut full = DirectXRenderer::new(first.0, &devices, true)?;
+        let mut cropped = DirectXRenderer::new(second.0, &devices, true)?;
+        full.options.cropped_paths = false;
+        cropped.options.cropped_paths = true;
+        for (x, y, width, height) in [
+            (30., 10., 512, 320),
+            (150., 80., 512, 320),
+            (30., 10., 360, 240),
+        ] {
+            let bounds = gpui::Bounds::new(
+                gpui::point(gpui::ScaledPixels(0.), gpui::ScaledPixels(0.)),
+                gpui::size(gpui::ScaledPixels(512.), gpui::ScaledPixels(320.)),
+            );
+            let mask = gpui::ContentMask {
+                bounds,
+                ..Default::default()
+            };
+            let mut scene = gpui::Scene::default();
+            scene.insert_primitive(gpui::Quad {
+                bounds,
+                content_mask: mask,
+                background: gpui::rgba(0x123456ff).into(),
+                ..Default::default()
+            });
+            let mut path = gpui::PathBuilder::stroke(gpui::px(1.6));
+            path.move_to(gpui::point(gpui::px(-5.25), gpui::px(y)));
+            path.cubic_bezier_to(
+                gpui::point(gpui::px(x), gpui::px(y + 50.)),
+                gpui::point(gpui::px(x), gpui::px(y)),
+                gpui::point(gpui::px(x + 10.), gpui::px(y + 30.)),
+            );
+            let mut path = path.build().unwrap().scale(1.0);
+            path.content_mask = mask;
+            path.color = gpui::linear_gradient(
+                90.,
+                gpui::linear_color_stop(gpui::rgb(0xff0000), 0.),
+                gpui::linear_color_stop(gpui::rgb(0x00ff00), 1.),
+            );
+            scene.insert_primitive(path);
+            scene.finish();
+
+            let size = gpui::size(DevicePixels(width), DevicePixels(height));
+            full.resize(size)?;
+            cropped.resize(size)?;
+            let expected = full.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?;
+            let actual = cropped.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?;
+            let difference = actual
+                .as_raw()
+                .iter()
+                .zip(expected.as_raw())
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap();
+            assert!(
+                difference <= 1,
+                "cropped D3D11 changed pixels by {difference}"
+            );
+        }
+        Ok(())
+    }
     #[test]
     fn live_object_reports_skip_devices_without_the_debug_layer() -> Result<()> {
         let devices = DirectXDevices::with_debug_layer(false)?;

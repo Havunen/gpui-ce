@@ -18,19 +18,22 @@ mod buffers;
 mod drawing;
 mod filters;
 mod frame;
+mod gpu_trace;
 #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
 mod headless;
+mod path_cache;
 mod path_types;
 mod pipelines;
 mod platform;
 mod resources;
 mod settings;
+mod shared;
 mod surfaces;
 mod target;
+mod texture_pool;
 
 #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
 pub use headless::WgpuHeadlessRenderer;
-use pipelines::WgpuPipelines as ShaderPipelines;
 use resources::{GlobalBufferLayout, ResourceMetadata, WgpuResources};
 use settings::RenderingParameters;
 pub use settings::{FontRasterizationSettings, SubpixelOrder, WgpuSurfaceConfig};
@@ -48,6 +51,9 @@ struct GpuFaultState {
 }
 
 pub struct WgpuRenderer {
+    options: gpui_render::gpu_policy::GpuOptions,
+    renderer_id: u64,
+    submission_id: u64,
     /// Shared GPU context for device recovery coordination (unused on WASM).
     #[allow(dead_code)]
     context: Option<GpuContext>,
@@ -113,6 +119,9 @@ impl WgpuRenderer {
         } = metadata;
 
         Ok(Self {
+            options: gpui_render::gpu_policy::GpuOptions::from_env(),
+            renderer_id: gpui::gpu_profiler::next_renderer(),
+            submission_id: 0,
             context: gpu_context,
             compositor_gpu,
             extra_requirements,
@@ -152,12 +161,14 @@ impl WgpuRenderer {
     /// Selects the physical LCD component order used by subpixel glyph correction.
     pub fn set_subpixel_order(&mut self, order: SubpixelOrder) {
         self.subpixel_order = order;
+        self.invalidate_retained_frame();
     }
 
     /// Updates platform-specific text rasterization parameters.
     pub fn set_font_rasterization_settings(&mut self, settings: FontRasterizationSettings) {
         self.rendering_params.font_rasterization = settings;
         self.subpixel_order = settings.subpixel_order;
+        self.invalidate_retained_frame();
     }
 
     /// Compatibility wrapper for callers that still report the layout as a boolean.
@@ -187,15 +198,38 @@ impl WgpuRenderer {
         let Some(resources) = self.resources.as_mut() else {
             return;
         };
-        resources.pipelines = ShaderPipelines::new(
-            &resources.device,
-            &resources.bind_group_layouts,
-            config.format,
-            config.alpha_mode,
-            self.rendering_params.path_sample_count,
-            self.dual_source_blending,
-            resources.renderer_tier,
-        );
+        // Variant pipelines must use the layouts that own the existing bindings.
+        resources.invalidate_intermediate_textures();
+        resources.pipelines = if self.options.shared_resources {
+            shared::pipelines(
+                &resources.device,
+                config.format,
+                config.alpha_mode,
+                self.rendering_params.path_sample_count,
+                self.dual_source_blending,
+                resources.renderer_tier,
+                true,
+            )
+            .1
+        } else {
+            Arc::new(pipelines::WgpuPipelines::new(
+                &resources.device,
+                &resources.bind_group_layouts,
+                config.format,
+                config.alpha_mode,
+                self.rendering_params.path_sample_count,
+                self.dual_source_blending,
+                resources.renderer_tier,
+            ))
+        };
+    }
+
+    fn invalidate_retained_frame(&mut self) {
+        if let Some(resources) = self.resources.as_mut() {
+            if let Some(retained) = resources.retained.get_mut().as_mut() {
+                retained.snapshot = None;
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -274,12 +308,14 @@ impl WgpuRenderer {
 
 fn begin_color_render_pass<'encoder>(
     encoder: &'encoder mut wgpu::CommandEncoder,
-    label: &'encoder str,
+    label: &'static str,
     target: &'encoder wgpu::TextureView,
     load: wgpu::LoadOp<wgpu::Color>,
+    trace: Option<&'encoder gpu_trace::GpuTrace>,
 ) -> wgpu::RenderPass<'encoder> {
     encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some(label),
+        timestamp_writes: trace.and_then(|trace| trace.timestamps(label)),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
             view: target,
             resolve_target: None,

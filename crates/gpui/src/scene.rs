@@ -60,6 +60,8 @@ impl From<bool> for ShaderBool {
 #[derive(Default)]
 #[expect(missing_docs)]
 pub struct Scene {
+    pub gpu_window_id: u64,
+    pub gpu_frame_id: u64,
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<DrawOrder>,

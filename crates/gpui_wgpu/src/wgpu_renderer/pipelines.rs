@@ -49,6 +49,7 @@ fn instance_binding_entries(source: InstanceBindingSource<'_>) -> Vec<wgpu::Bind
 }
 
 pub(super) struct WgpuPipelines {
+    clear_quads: std::sync::OnceLock<WgpuRenderPipeline>,
     pub(super) quads: WgpuRenderPipeline,
     pub(super) smoothed_quads: WgpuRenderPipeline,
     pub(super) shadows: WgpuRenderPipeline,
@@ -327,6 +328,32 @@ impl WgpuBindGroupLayouts {
 }
 
 impl WgpuPipelines {
+    pub(super) fn clear_quads(
+        &self,
+        device: &wgpu::Device,
+        layouts: &WgpuBindGroupLayouts,
+        format: wgpu::TextureFormat,
+        tier: RendererTier,
+    ) -> &WgpuRenderPipeline {
+        self.clear_quads.get_or_init(|| {
+            let source = if tier == RendererTier::Modern {
+                BASE_WGSL
+            } else {
+                BASE_DOWNLEVEL_WGSL
+            };
+            let module = create_shader_module(device, "damage_clear", source);
+            let layout =
+                create_pipeline_layout(device, "damage_clear", layouts, &layouts.instances);
+            create_render_pipeline(
+                device,
+                shader::QUADS,
+                &layout,
+                &color_target(format, None),
+                1,
+                &module,
+            )
+        })
+    }
     pub(super) fn new(
         device: &wgpu::Device,
         bind_group_layouts: &WgpuBindGroupLayouts,
@@ -424,6 +451,7 @@ impl WgpuPipelines {
             };
 
         Self {
+            clear_quads: std::sync::OnceLock::new(),
             quads: create(shader::QUADS, &scene_target, 1, &shader_module),
             smoothed_quads: create(shader::SMOOTHED_QUADS, &scene_target, 1, &shader_module),
             shadows: create(shader::SHADOWS, &scene_target, 1, &shader_module),

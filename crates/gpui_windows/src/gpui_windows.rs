@@ -14,6 +14,7 @@ mod dispatcher;
 mod display;
 mod events;
 mod file_transfer;
+mod gpu_trace;
 mod keyboard;
 mod platform;
 mod system_notifications;

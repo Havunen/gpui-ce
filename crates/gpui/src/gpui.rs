@@ -27,6 +27,7 @@ pub(crate) use platform_scheduler::PlatformScheduler;
 mod geometry;
 mod gestures;
 mod global;
+pub mod gpu_profiler;
 mod input;
 mod inspector;
 mod interactive;

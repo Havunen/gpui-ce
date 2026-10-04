@@ -6,19 +6,21 @@
 use crate::shaders::interface::{BufferData, StorageAbi, storage_abi};
 use gpui::{Background, Bounds, Path, ScaledPixels};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 #[repr(C)]
 pub struct PathSprite {
     pub bounds: Bounds<ScaledPixels>,
+    pub texture_origin: gpui::Point<ScaledPixels>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 #[repr(C)]
 pub struct PathRasterizationVertex {
     pub xy_position: gpui::Point<ScaledPixels>,
     pub curve_position: gpui::Point<f32>,
     pub color: Background,
     pub bounds: Bounds<ScaledPixels>,
+    pub raster_offset: gpui::Point<ScaledPixels>,
 }
 
 unsafe impl BufferData for PathSprite {
@@ -49,6 +51,7 @@ pub fn rasterization_vertices(
                 curve_position: vertex.st_position,
                 color: path.color,
                 bounds,
+                raster_offset: Default::default(),
             })
     })
 }
@@ -80,10 +83,14 @@ impl Iterator for PathSprites<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(bounds) = self.combined.take() {
-            return Some(PathSprite { bounds });
+            return Some(PathSprite {
+                bounds,
+                texture_origin: Default::default(),
+            });
         }
         self.paths.as_mut()?.next().map(|path| PathSprite {
             bounds: path.clipped_bounds(),
+            texture_origin: Default::default(),
         })
     }
 }
@@ -102,6 +109,6 @@ pub fn sprite_count(paths: &[Path<ScaledPixels>]) -> usize {
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<PathSprite>() == 16);
-    assert!(std::mem::size_of::<PathRasterizationVertex>() == 104);
+    assert!(std::mem::size_of::<PathSprite>() == 24);
+    assert!(std::mem::size_of::<PathRasterizationVertex>() == 112);
 };
