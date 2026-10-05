@@ -5447,6 +5447,13 @@ impl Window {
         bounds
     }
 
+    /// Keep a custom text element's layout independent of its parent's inline
+    /// paragraph. Use this after requesting a text layout when the element owns
+    /// painting, selection, or hit testing through that layout.
+    pub fn mark_layout_as_atomic(&mut self, node_id: LayoutId) {
+        self.publish_inline_content(node_id, crate::InlineContent::Atomic);
+    }
+
     pub(crate) fn publish_inline_content(
         &mut self,
         node_id: LayoutId,
