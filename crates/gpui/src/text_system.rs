@@ -211,6 +211,11 @@ impl TextSystem {
         self.read_metrics(font_id, |metrics| metrics.x_height(font_size))
     }
 
+    /// Get the cap height for the given font and font size.
+    pub fn cap_height(&self, font_id: FontId, font_size: Pixels) -> Pixels {
+        self.read_metrics(font_id, |metrics| metrics.cap_height(font_size))
+    }
+
     /// Get the recommended baseline offset for the given font and line height.
     pub fn baseline_offset(
         &self,
