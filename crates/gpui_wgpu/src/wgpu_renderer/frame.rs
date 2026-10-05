@@ -92,7 +92,7 @@ impl PreparedTargets {
         }
 
         if requirements.uses_path_target {
-            renderer.ensure_path_textures();
+            renderer.ensure_path_textures(scene);
         }
         if requirements.uses_offscreen_target {
             renderer.ensure_filter_textures(requirements.isolated_target_count);
@@ -186,6 +186,12 @@ fn write_shader_globals(renderer: &mut WgpuRenderer) {
         padding: 0,
     };
     let path_globals = GlobalUniforms {
+        viewport_size: renderer
+            .resources()
+            .path_intermediate_texture
+            .as_ref()
+            .map(|texture| wgsl_rs::std::vec2f(texture.width() as f32, texture.height() as f32))
+            .unwrap_or(globals.viewport_size),
         premultiplied_alpha: ShaderBool::Disabled,
         ..globals
     };

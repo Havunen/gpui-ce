@@ -2,6 +2,9 @@ mod wgpu_atlas;
 mod wgpu_context;
 mod wgpu_renderer;
 
+#[cfg(all(test, not(target_family = "wasm")))]
+mod test_gpu;
+
 pub use wgpu;
 pub use wgpu_atlas::*;
 pub use wgpu_context::*;

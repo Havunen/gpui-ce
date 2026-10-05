@@ -234,3 +234,156 @@ impl gpui::PlatformHeadlessRenderer for WgpuHeadlessRenderer {
         self.renderer.sprite_atlas().clone()
     }
 }
+
+#[cfg(test)]
+mod path_target_tests {
+    use super::*;
+    use gpui::{
+        Bounds, ContentMask, PathBuilder, Quad, ScaledPixels, point, px, size, solid_background,
+    };
+
+    fn triangle(
+        x: f32,
+        y: f32,
+        edge: f32,
+        mask: ContentMask<ScaledPixels>,
+    ) -> gpui::Path<ScaledPixels> {
+        let mut builder = PathBuilder::fill();
+        builder.move_to(point(px(x), px(y)));
+        builder.line_to(point(px(x + edge), px(y)));
+        builder.line_to(point(px(x), px(y + edge)));
+        builder.close();
+        let mut path = builder.build().unwrap().scale(1.0);
+        path.content_mask = mask;
+        path.color = gpui::linear_gradient(
+            90.0,
+            gpui::linear_color_stop(gpui::rgb(0xff0000), 0.0),
+            gpui::linear_color_stop(gpui::rgb(0x00ff00), 1.0),
+        );
+        path
+    }
+
+    #[test]
+    fn cropped_path_targets_match_full_viewport_pixels_when_growing_and_resizing() {
+        let _gpu_test_guard = crate::test_gpu::guard();
+        let context = WgpuContext::new_headless(None).expect("hardware or software GPU");
+        let target = size(DevicePixels(512), DevicePixels(320));
+        let mask = ContentMask {
+            bounds: Bounds::new(
+                point(ScaledPixels(0.0), ScaledPixels(0.0)),
+                size(ScaledPixels(1024.0), ScaledPixels(640.0)),
+            ),
+            ..Default::default()
+        };
+        let mut full = WgpuRenderer::new_headless(&context, target).unwrap();
+        let mut cropped = WgpuRenderer::new_headless(&context, target).unwrap();
+        full.crop_path_targets = false;
+        cropped.crop_path_targets = true;
+        for (x, y, target) in [
+            (16.0, 16.0, target),
+            (180.0, 120.0, target),
+            (16.0, 16.0, target),
+            (40.0, 35.0, size(DevicePixels(360), DevicePixels(240))),
+        ] {
+            full.update_drawable_size(target);
+            cropped.update_drawable_size(target);
+            let mut force_full = Scene::default();
+            force_full.paths.push(triangle(
+                0.0,
+                0.0,
+                target.width.0.max(target.height.0) as f32,
+                mask,
+            ));
+            full.ensure_path_textures(&force_full);
+
+            let mut scene = Scene::default();
+            scene.insert_primitive(Quad {
+                bounds: mask.bounds,
+                content_mask: mask,
+                background: solid_background(gpui::black()),
+                ..Default::default()
+            });
+            scene.insert_primitive(triangle(x, y, 47.5, mask));
+            // A later path beyond the viewport makes the combined sprite span
+            // empty space past the cropped target. That space must stay black.
+            scene.insert_primitive(Quad {
+                bounds: Bounds::new(
+                    point(ScaledPixels(0.0), ScaledPixels(0.0)),
+                    size(ScaledPixels(1.0), ScaledPixels(1.0)),
+                ),
+                content_mask: mask,
+                background: solid_background(gpui::black()),
+                ..Default::default()
+            });
+            scene.insert_primitive(triangle(800.0, 10.0, 40.0, mask));
+            // Negative geometry and a clipped curve exercise coordinate/clip
+            // preservation independently of the viewport's dimensions.
+            let mut curve = PathBuilder::stroke(px(1.6));
+            curve.move_to(point(px(-10.0), px(30.0)));
+            curve.cubic_bezier_to(
+                point(px(40.0), px(70.0)),
+                point(px(24.0), px(22.0)),
+                point(px(5.0), px(60.0)),
+            );
+            let mut curve = curve.build().unwrap().scale(1.0);
+            curve.content_mask = ContentMask {
+                bounds: Bounds::new(
+                    point(ScaledPixels(0.0), ScaledPixels(0.0)),
+                    size(ScaledPixels(30.0), ScaledPixels(60.0)),
+                ),
+                ..Default::default()
+            };
+            curve.color = solid_background(gpui::white());
+            scene.insert_primitive(curve);
+            scene.finish();
+            let expected = full.render_to_image(&scene).expect("full target frame");
+            let actual = cropped
+                .render_to_image(&scene)
+                .expect("cropped target frame");
+            assert!(
+                actual.get_pixel(x as u32 + 8, y as u32 + 8)[0] > 100,
+                "triangle must render"
+            );
+            assert_eq!(
+                &actual.get_pixel(300, 200).0[..3],
+                &[0, 0, 0],
+                "no clamped edge smear"
+            );
+            let max_diff = actual
+                .as_raw()
+                .iter()
+                .zip(expected.as_raw())
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap();
+            assert!(
+                max_diff <= 1,
+                "cropped rendering changed a pixel by {max_diff}"
+            );
+            let texture = cropped
+                .resources()
+                .path_intermediate_texture
+                .as_ref()
+                .unwrap();
+            assert!(
+                texture.width() < target.width.0 as u32,
+                "narrow scene must keep a narrow target"
+            );
+            assert!(texture.height() < target.height.0 as u32);
+            if let Ok(directory) = std::env::var("GPUI_PATH_TEST_IMAGES") {
+                actual
+                    .save(
+                        std::path::Path::new(&directory)
+                            .join(format!("cropped-{x}-{y}-{}.png", target.width.0)),
+                    )
+                    .unwrap();
+                expected
+                    .save(
+                        std::path::Path::new(&directory)
+                            .join(format!("full-{x}-{y}-{}.png", target.width.0)),
+                    )
+                    .unwrap();
+            }
+        }
+    }
+}
