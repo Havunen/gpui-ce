@@ -556,15 +556,16 @@ mod tests {
     }
 
     /// Gradients add up to two units of dither per channel, seeded by a sine
-    /// hash of the pixel position (`gradient_dither`). The software rasterizer
-    /// CI renders with computes that hash identically everywhere, so gradient
-    /// pixels are byte-exact there. Hardware GPUs (Apple's, through wgpu on
-    /// macOS) evaluate it differently, so two renderings of a gradient can
-    /// differ by twice the dither plus rounding.
+    /// hash of the pixel position (`gradient_dither`). Software rasterizers
+    /// still differ in UNORM8 rounding across versions and backends; preserve
+    /// upgrades' two-unit tolerance there. Hardware GPUs can evaluate the
+    /// sine hash differently, so their gradients can differ by twice the
+    /// dither plus rounding. Alpha and same-backend cropped/full comparisons
+    /// remain exact.
     #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
     fn gradient_tolerance(context: &WgpuContext) -> u8 {
         if context.adapter.get_info().device_type == wgpu::DeviceType::Cpu {
-            0
+            2
         } else {
             5
         }
