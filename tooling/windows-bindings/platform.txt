@@ -15,6 +15,8 @@ Windows.UI.Notifications.ToastNotifier::{Show, Hide}
 Windows.UI.ViewManagement.UIColorType
 Windows.UI.ViewManagement.UISettings::{GetColorValue, get_AutoHideScrollBars}
 Windows.Win32.APPMODEL_ERROR_NO_PACKAGE
+Windows.Win32.APTTYPEQUALIFIER_IMPLICIT_MTA
+Windows.Win32.APTTYPE_MTA
 Windows.Win32.ATTR_INPUT
 Windows.Win32.AdjustWindowRectEx
 Windows.Win32.Arc
@@ -29,9 +31,13 @@ Windows.Win32.CLSCTX_ALL
 Windows.Win32.CLSCTX_INPROC_SERVER
 Windows.Win32.CLSID_DragDropHelper
 Windows.Win32.CLSID_RecycleBin
+Windows.Win32.CLSID_WICImagingFactory
+Windows.Win32.COINIT_APARTMENTTHREADED
+Windows.Win32.COINIT_MULTITHREADED
 Windows.Win32.COLORREF
 Windows.Win32.COMDLG_FILTERSPEC
 Windows.Win32.COMPOSITIONFORM
+Windows.Win32.CO_E_NOTINITIALIZED
 Windows.Win32.CPS_COMPLETE
 Windows.Win32.CREATESTRUCTW
 Windows.Win32.CREDENTIALW
@@ -44,7 +50,10 @@ Windows.Win32.CW_USEDEFAULT
 Windows.Win32.CloseClipboard
 Windows.Win32.CloseThreadpoolTimer
 Windows.Win32.CoCreateInstance
+Windows.Win32.CoGetApartmentType
+Windows.Win32.CoInitializeEx
 Windows.Win32.CoTaskMemFree
+Windows.Win32.CoUninitialize
 Windows.Win32.CountClipboardFormats
 Windows.Win32.CreateDXGIFactory2
 Windows.Win32.CreateSolidBrush
@@ -54,6 +63,14 @@ Windows.Win32.CredDeleteW
 Windows.Win32.CredFree
 Windows.Win32.CredReadW
 Windows.Win32.CredWriteW
+Windows.Win32.D2D1CreateFactory
+Windows.Win32.D2D1_ALPHA_MODE_PREMULTIPLIED
+Windows.Win32.D2D1_FACTORY_TYPE_SINGLE_THREADED
+Windows.Win32.D2D1_FEATURE_LEVEL_DEFAULT
+Windows.Win32.D2D1_RENDER_TARGET_PROPERTIES
+Windows.Win32.D2D1_RENDER_TARGET_TYPE_SOFTWARE
+Windows.Win32.D2D1_RENDER_TARGET_USAGE_NONE
+Windows.Win32.D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE
 Windows.Win32.D3D11CreateDevice
 Windows.Win32.D3D11_BIND_CONSTANT_BUFFER
 Windows.Win32.D3D11_BIND_RENDER_TARGET
@@ -144,11 +161,15 @@ Windows.Win32.DWMSBT_TABBEDWINDOW
 Windows.Win32.DWMWA_SYSTEMBACKDROP_TYPE
 Windows.Win32.DWMWA_USE_IMMERSIVE_DARK_MODE
 Windows.Win32.DWM_TIMING_INFO
+Windows.Win32.DWRITE_E_NOCOLOR
 Windows.Win32.DWRITE_E_NOFONT
 Windows.Win32.DWRITE_E_UNSUPPORTEDOPERATION
 Windows.Win32.DWRITE_FACTORY_TYPE_SHARED
 Windows.Win32.DWRITE_FONT_FEATURE
 Windows.Win32.DWRITE_FONT_FEATURE_TAG
+Windows.Win32.DWRITE_FONT_SIMULATIONS_BOLD
+Windows.Win32.DWRITE_FONT_SIMULATIONS_NONE
+Windows.Win32.DWRITE_FONT_SIMULATIONS_OBLIQUE
 Windows.Win32.DWRITE_FONT_STRETCH_NORMAL
 Windows.Win32.DWRITE_FONT_STYLE
 Windows.Win32.DWRITE_FONT_STYLE_ITALIC
@@ -156,6 +177,7 @@ Windows.Win32.DWRITE_FONT_STYLE_NORMAL
 Windows.Win32.DWRITE_FONT_STYLE_OBLIQUE
 Windows.Win32.DWRITE_FONT_WEIGHT
 Windows.Win32.DWRITE_FONT_WEIGHT_NORMAL
+Windows.Win32.DWRITE_GLYPH_IMAGE_FORMATS_CFF
 Windows.Win32.DWRITE_GLYPH_IMAGE_FORMATS_COLR
 Windows.Win32.DWRITE_GLYPH_IMAGE_FORMATS_JPEG
 Windows.Win32.DWRITE_GLYPH_IMAGE_FORMATS_PNG
@@ -180,6 +202,7 @@ Windows.Win32.DWRITE_RENDERING_MODE1_OUTLINE
 Windows.Win32.DWRITE_STRIKETHROUGH
 Windows.Win32.DWRITE_TEXTURE_ALIASED_1x1
 Windows.Win32.DWRITE_TEXTURE_CLEARTYPE_3x1
+Windows.Win32.DWRITE_TEXTURE_TYPE
 Windows.Win32.DWRITE_TEXT_ANTIALIAS_MODE_CLEARTYPE
 Windows.Win32.DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE
 Windows.Win32.DWRITE_TEXT_RANGE
@@ -243,9 +266,11 @@ Windows.Win32.GCS_RESULTSTR
 Windows.Win32.GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
 Windows.Win32.GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT
 Windows.Win32.GMEM_MOVEABLE
+Windows.Win32.GUID_WICPixelFormat32bppPBGRA
 Windows.Win32.GWLP_USERDATA
 Windows.Win32.GWL_STYLE
 Windows.Win32.GetActiveWindow
+Windows.Win32.GetAsyncKeyState
 Windows.Win32.GetClientRect
 Windows.Win32.GetClipboardData
 Windows.Win32.GetClipboardFormatNameW
@@ -268,10 +293,26 @@ Windows.Win32.GetModuleHandleW
 Windows.Win32.GetMonitorInfoW
 Windows.Win32.GetPointerType
 Windows.Win32.GetProcAddress
+Windows.Win32.ID2D1Factory::{CreateWicBitmapRenderTarget}
+Windows.Win32.ID2D1RenderTarget::{BeginDraw, Clear, CreateSolidColorBrush, DrawGlyphRun, EndDraw, GetMaximumBitmapSize, SetTextAntialiasMode, SetTextRenderingParams, SetTransform}
+Windows.Win32.ID2D1SolidColorBrush::{SetColor}
+Windows.Win32.IDWriteFactory6::{CreateFontFaceReference}
+Windows.Win32.IDWriteFontFaceReference1::{CreateFontFace}
+Windows.Win32.IWICBitmap::{Lock}
+Windows.Win32.IWICBitmapLock::{GetDataPointer, GetStride}
+Windows.Win32.IWICImagingFactory::{CreateBitmap, CreateBitmapFromMemory}
+Windows.Win32.KEYEVENTF_EXTENDEDKEY
 Windows.Win32.LoadLibraryA
 Windows.Win32.FreeLibrary
 Windows.Win32.DXGI_ERROR_NOT_FOUND
+Windows.Win32.RPC_E_CHANGED_MODE
+Windows.Win32.SPI_GETFONTSMOOTHING
 Windows.Win32.SW_HIDE
+Windows.Win32.VK_LSHIFT
+Windows.Win32.VK_RSHIFT
+Windows.Win32.WICBitmapCacheOnLoad
+Windows.Win32.WICBitmapLockRead
+Windows.Win32.WICRect
 Windows.Win32.WS_OVERLAPPED
 Windows.Win32.GetSystemMetrics
 Windows.Win32.GetSystemMetricsForDpi
@@ -350,7 +391,7 @@ Windows.Win32.IDWriteColorGlyphRunEnumerator1::{GetCurrentRun}
 Windows.Win32.IDWriteColorGlyphRunEnumerator::{GetCurrentRun, MoveNext}
 Windows.Win32.IDWriteFactory1::{}
 Windows.Win32.IDWriteFactory2::{CreateFontFallbackBuilder, CreateGlyphRunAnalysis, GetSystemFontFallback, TranslateColorGlyphRun}
-Windows.Win32.IDWriteFactory3::{CreateFontCollectionFromFontSet, CreateFontSetBuilder, CreateGlyphRunAnalysis, GetSystemFontCollection}
+Windows.Win32.IDWriteFactory3::{CreateFontCollectionFromFontSet, CreateFontFaceReference, CreateFontSetBuilder, CreateGlyphRunAnalysis, GetSystemFontCollection}
 Windows.Win32.IDWriteFactory4::{TranslateColorGlyphRun}
 Windows.Win32.IDWriteFactory5::{CreateFontSetBuilder, CreateInMemoryFontFileLoader}
 Windows.Win32.IDWriteFactory::{CreateFontFace, CreateGlyphRunAnalysis, CreateRenderingParams, CreateTextFormat, CreateTextLayout, CreateTypography, GetSystemFontCollection, RegisterFontFileLoader, UnregisterFontFileLoader}

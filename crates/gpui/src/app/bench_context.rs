@@ -1267,7 +1267,7 @@ mod tests {
 
     #[test]
     fn bench_task_reports_long_task_without_window() {
-        let platform = bench_platform(None, Arc::new(crate::NoopTextSystem::new()));
+        let platform = bench_platform(None, Arc::new(crate::TestTextSystem));
         let report = BenchReport::default();
         let name = "bench_task_reports_long_task_without_window";
 
@@ -1306,7 +1306,7 @@ mod tests {
     fn benchmark_contexts_forward_global_entity_operations() {
         struct GlobalEntity;
 
-        let platform = bench_platform(None, Arc::new(crate::NoopTextSystem::new()));
+        let platform = bench_platform(None, Arc::new(crate::TestTextSystem));
         let name = "benchmark_contexts_forward_global_entity_operations";
         let mut criterion = criterion::Criterion::default()
             .without_plots()

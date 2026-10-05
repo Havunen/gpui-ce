@@ -4,6 +4,7 @@ members = [
     "./crates/gpui_render/",
     "./crates/gpui_web/",
     "./crates/gpui_wgpu/",
+    "./crates/gpui_ce_parley/",
     "./crates/gpui_linux/",
     "./crates/gpui_macos/",
     "./crates/gpui_apple/",
@@ -68,6 +69,8 @@ derive_more = { version = "2.1", features = [
   "not",
 ] }
 dunce = "1.0"
+fontique = { version = "0.11.1", default-features = false }
+parley = { version = "0.11", default-features = false, features = ["std"] }
 futures = "0.3"
 futures-concurrency = "7.7"
 flume = "0.12"
@@ -78,6 +81,7 @@ itertools = "0.15"
 log = { version = "0.4", features = ["kv_unstable_serde", "serde"] }
 palette = { version = "0.7", features = ["serializing"] }
 parking_lot = "0.12"
+phf = { version = "0.13", features = ["macros"] }
 postage = { version = "0.5", features = ["futures-traits"] }
 proptest = { version = "1.11", features = ["attr-macro"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -234,7 +238,6 @@ calloop-wayland-source = "0.4"
 console_error_panic_hook = "0.1"
 core-graphics = "0.25"
 core-text = "22"
-cosmic-text = "0.19"
 dispatch2 = "0.3"
 embed-resource = "3"
 encoding_rs = "0.8"
@@ -262,7 +265,7 @@ smol_str = "0.3"
 spin = "0.12"
 swash = "0.2"
 taffy = { version = "=0.14.0", default-features = false, features = ["std", "taffy_tree", "flexbox", "grid", "block_layout", "calc", "content_size", "detailed_layout_info"] }
-skrifa = "0.47"
+skrifa = "0.44"
 usvg = { version = "0.48", default-features = false }
 waker-fn = "1.2"
 wasm-bindgen-futures = "0.4"
@@ -291,6 +294,7 @@ gpui_macos = { path = "./crates/gpui_macos/", version = "0.1.0", package = "gpui
 gpui_apple = { path = "./crates/gpui_apple/", version = "0.1.0", package = "gpui_ce_apple" }
 gpui_windows = { path = "./crates/gpui_windows/", version = "0.1.0", package = "gpui_ce_windows" }
 gpui_web = { path = "./crates/gpui_web/", version = "0.1.0", package = "gpui_ce_web" }
+gpui_parley = { path = "./crates/gpui_ce_parley/", version = "0.1.0", package = "gpui_ce_parley", default-features = false }
 
 gpui_wgpu = { path = "./crates/gpui_wgpu/", version = "0.1.0", package = "gpui_ce_wgpu" }
 

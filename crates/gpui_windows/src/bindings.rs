@@ -1189,9 +1189,30 @@ pub mod Windows {
             }
         }
         #[inline]
+        pub unsafe fn CoGetApartmentType(
+            papttype: *mut APTTYPE,
+            paptqualifier: *mut APTTYPEQUALIFIER,
+        ) -> windows_core::HRESULT {
+            windows_core::link!("ole32.dll" "system" fn CoGetApartmentType(papttype : *mut APTTYPE, paptqualifier : *mut APTTYPEQUALIFIER) -> windows_core::HRESULT);
+            unsafe { CoGetApartmentType(papttype as _, paptqualifier as _) }
+        }
+        #[inline]
+        pub unsafe fn CoInitializeEx(
+            pvreserved: Option<*const core::ffi::c_void>,
+            dwcoinit: u32,
+        ) -> windows_core::HRESULT {
+            windows_core::link!("ole32.dll" "system" fn CoInitializeEx(pvreserved : *const core::ffi::c_void, dwcoinit : u32) -> windows_core::HRESULT);
+            unsafe { CoInitializeEx(pvreserved.unwrap_or(core::mem::zeroed()) as _, dwcoinit) }
+        }
+        #[inline]
         pub unsafe fn CoTaskMemFree(pv: *mut core::ffi::c_void) {
             windows_core::link!("ole32.dll" "system" fn CoTaskMemFree(pv : *mut core::ffi::c_void));
             unsafe { CoTaskMemFree(pv as _) }
+        }
+        #[inline]
+        pub unsafe fn CoUninitialize() {
+            windows_core::link!("ole32.dll" "system" fn CoUninitialize());
+            unsafe { CoUninitialize() }
         }
         #[inline]
         pub unsafe fn CountClipboardFormats() -> i32 {
@@ -1314,6 +1335,26 @@ pub mod Windows {
         pub unsafe fn CredWriteW(credential: *const CREDENTIALW, flags: u32) -> windows_core::BOOL {
             windows_core::link!("advapi32.dll" "system" fn CredWriteW(credential : *const CREDENTIALW, flags : u32) -> windows_core::BOOL);
             unsafe { CredWriteW(credential, flags) }
+        }
+        #[inline]
+        pub unsafe fn D2D1CreateFactory<T>(
+            factorytype: D2D1_FACTORY_TYPE,
+            pfactoryoptions: Option<*const D2D1_FACTORY_OPTIONS>,
+        ) -> windows_core::Result<T>
+        where
+            T: windows_core::Interface,
+        {
+            windows_core::link!("d2d1.dll" "system" fn D2D1CreateFactory(factorytype : D2D1_FACTORY_TYPE, riid : *const windows_core::GUID, pfactoryoptions : *const D2D1_FACTORY_OPTIONS, ppifactory : *mut *mut core::ffi::c_void) -> windows_core::HRESULT);
+            let mut result__ = core::ptr::null_mut();
+            unsafe {
+                D2D1CreateFactory(
+                    factorytype,
+                    &T::IID,
+                    pfactoryoptions.unwrap_or(core::mem::zeroed()) as _,
+                    &mut result__,
+                )
+                .and_then(|| windows_core::imp::Type::from_abi(result__))
+            }
         }
         #[inline]
         pub unsafe fn D3D11CreateDevice<P0>(
@@ -1524,6 +1565,11 @@ pub mod Windows {
         pub unsafe fn GetActiveWindow() -> HWND {
             windows_core::link!("user32.dll" "system" fn GetActiveWindow() -> HWND);
             unsafe { GetActiveWindow() }
+        }
+        #[inline]
+        pub unsafe fn GetAsyncKeyState(vkey: i32) -> i16 {
+            windows_core::link!("user32.dll" "system" fn GetAsyncKeyState(vkey : i32) -> i16);
+            unsafe { GetAsyncKeyState(vkey) }
         }
         #[inline]
         pub unsafe fn GetClientRect(hwnd: HWND, lprect: *mut RECT) -> windows_core::BOOL {
@@ -2482,6 +2528,10 @@ pub mod Windows {
             unsafe { u_strlen(s) }
         }
         pub const APPMODEL_ERROR_NO_PACKAGE: i32 = 15700;
+        pub type APTTYPE = i32;
+        pub type APTTYPEQUALIFIER = i32;
+        pub const APTTYPEQUALIFIER_IMPLICIT_MTA: APTTYPEQUALIFIER = 1;
+        pub const APTTYPE_MTA: APTTYPE = 1;
         #[repr(transparent)]
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
         pub struct ATOM(pub u16);
@@ -2662,6 +2712,11 @@ pub mod Windows {
             windows_core::GUID::from_u128(0x4657278a_411b_11d2_839a_00c04fd918d0);
         pub const CLSID_RecycleBin: windows_core::GUID =
             windows_core::GUID::from_u128(0x645ff040_5081_101b_9f08_00aa002f954e);
+        pub const CLSID_WICImagingFactory: windows_core::GUID =
+            windows_core::GUID::from_u128(0xcacaf262_9370_4615_a13b_9f5539da4c0a);
+        pub type COINIT = i32;
+        pub const COINIT_APARTMENTTHREADED: COINIT = 2;
+        pub const COINIT_MULTITHREADED: COINIT = 0;
         #[repr(transparent)]
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
         pub struct COLORREF(pub u32);
@@ -2678,6 +2733,8 @@ pub mod Windows {
             pub ptCurrentPos: POINT,
             pub rcArea: RECT,
         }
+        pub const CO_E_NOTINITIALIZED: windows_core::HRESULT =
+            windows_core::HRESULT(0x800401F0_u32 as _);
         pub const CPS_COMPLETE: i32 = 1;
         #[repr(C)]
         #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2742,6 +2799,50 @@ pub mod Windows {
             pub Lo: u32,
             pub Hi: i32,
         }
+        pub type D2D1_ALPHA_MODE = i32;
+        pub const D2D1_ALPHA_MODE_PREMULTIPLIED: D2D1_ALPHA_MODE = 1;
+        #[repr(C)]
+        #[derive(Clone, Copy, Debug, Default, PartialEq)]
+        pub struct D2D1_BRUSH_PROPERTIES {
+            pub opacity: f32,
+            pub transform: windows_numerics::Matrix3x2,
+        }
+        pub type D2D1_DEBUG_LEVEL = i32;
+        #[repr(C)]
+        #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+        pub struct D2D1_FACTORY_OPTIONS {
+            pub debugLevel: D2D1_DEBUG_LEVEL,
+        }
+        pub type D2D1_FACTORY_TYPE = i32;
+        pub const D2D1_FACTORY_TYPE_SINGLE_THREADED: D2D1_FACTORY_TYPE = 0;
+        pub type D2D1_FEATURE_LEVEL = i32;
+        pub const D2D1_FEATURE_LEVEL_DEFAULT: D2D1_FEATURE_LEVEL = 0;
+        #[repr(C)]
+        #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+        pub struct D2D1_PIXEL_FORMAT {
+            pub format: DXGI_FORMAT,
+            pub alphaMode: D2D1_ALPHA_MODE,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy, Debug, Default, PartialEq)]
+        pub struct D2D1_RENDER_TARGET_PROPERTIES {
+            pub r#type: D2D1_RENDER_TARGET_TYPE,
+            pub pixelFormat: D2D1_PIXEL_FORMAT,
+            pub dpiX: f32,
+            pub dpiY: f32,
+            pub usage: D2D1_RENDER_TARGET_USAGE,
+            pub minLevel: D2D1_FEATURE_LEVEL,
+        }
+        pub type D2D1_RENDER_TARGET_TYPE = i32;
+        pub const D2D1_RENDER_TARGET_TYPE_SOFTWARE: D2D1_RENDER_TARGET_TYPE = 1;
+        pub type D2D1_RENDER_TARGET_USAGE = u32;
+        pub const D2D1_RENDER_TARGET_USAGE_NONE: D2D1_RENDER_TARGET_USAGE = 0;
+        #[repr(transparent)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+        pub struct D2D1_TAG(pub u64);
+        pub type D2D1_TEXT_ANTIALIAS_MODE = i32;
+        pub const D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE: D2D1_TEXT_ANTIALIAS_MODE = 2;
+        pub type D2D_COLOR_F = D3DCOLORVALUE;
         pub const D3D10_PRIMITIVE_TOPOLOGY_LINELIST: D3D_PRIMITIVE_TOPOLOGY = 2;
         pub const D3D10_PRIMITIVE_TOPOLOGY_LINELIST_ADJ: D3D_PRIMITIVE_TOPOLOGY = 10;
         pub const D3D10_PRIMITIVE_TOPOLOGY_LINESTRIP: D3D_PRIMITIVE_TOPOLOGY = 3;
@@ -3455,6 +3556,8 @@ pub mod Windows {
             pub glyphImageFormat: DWRITE_GLYPH_IMAGE_FORMATS,
             pub measuringMode: DWRITE_MEASURING_MODE,
         }
+        pub const DWRITE_E_NOCOLOR: windows_core::HRESULT =
+            windows_core::HRESULT(0x8898500C_u32 as _);
         pub const DWRITE_E_NOFONT: windows_core::HRESULT =
             windows_core::HRESULT(0x88985002_u32 as _);
         pub const DWRITE_E_UNSUPPORTEDOPERATION: windows_core::HRESULT =
@@ -3462,6 +3565,13 @@ pub mod Windows {
         pub type DWRITE_FACTORY_TYPE = i32;
         pub const DWRITE_FACTORY_TYPE_SHARED: DWRITE_FACTORY_TYPE = 0;
         pub type DWRITE_FLOW_DIRECTION = i32;
+        pub type DWRITE_FONT_AXIS_TAG = i32;
+        #[repr(C)]
+        #[derive(Clone, Copy, Debug, Default, PartialEq)]
+        pub struct DWRITE_FONT_AXIS_VALUE {
+            pub axisTag: DWRITE_FONT_AXIS_TAG,
+            pub value: f32,
+        }
         pub type DWRITE_FONT_FACE_TYPE = i32;
         #[repr(C)]
         #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -3611,6 +3721,9 @@ pub mod Windows {
         }
         pub type DWRITE_FONT_PROPERTY_ID = i32;
         pub type DWRITE_FONT_SIMULATIONS = u32;
+        pub const DWRITE_FONT_SIMULATIONS_BOLD: DWRITE_FONT_SIMULATIONS = 1;
+        pub const DWRITE_FONT_SIMULATIONS_NONE: DWRITE_FONT_SIMULATIONS = 0;
+        pub const DWRITE_FONT_SIMULATIONS_OBLIQUE: DWRITE_FONT_SIMULATIONS = 2;
         pub type DWRITE_FONT_STRETCH = i32;
         pub const DWRITE_FONT_STRETCH_NORMAL: DWRITE_FONT_STRETCH = 5;
         pub type DWRITE_FONT_STYLE = i32;
@@ -3636,6 +3749,7 @@ pub mod Windows {
         pub const DWRITE_FONT_WEIGHT_ULTRA_BOLD: DWRITE_FONT_WEIGHT = 800;
         pub const DWRITE_FONT_WEIGHT_ULTRA_LIGHT: DWRITE_FONT_WEIGHT = 200;
         pub type DWRITE_GLYPH_IMAGE_FORMATS = u32;
+        pub const DWRITE_GLYPH_IMAGE_FORMATS_CFF: DWRITE_GLYPH_IMAGE_FORMATS = 2;
         pub const DWRITE_GLYPH_IMAGE_FORMATS_COLR: DWRITE_GLYPH_IMAGE_FORMATS = 4;
         pub const DWRITE_GLYPH_IMAGE_FORMATS_JPEG: DWRITE_GLYPH_IMAGE_FORMATS = 32;
         pub const DWRITE_GLYPH_IMAGE_FORMATS_PNG: DWRITE_GLYPH_IMAGE_FORMATS = 16;
@@ -4097,6 +4211,8 @@ pub mod Windows {
         pub const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: i32 = 4;
         pub const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: i32 = 2;
         pub const GMEM_MOVEABLE: i32 = 2;
+        pub const GUID_WICPixelFormat32bppPBGRA: windows_core::GUID =
+            windows_core::GUID::from_u128(0x6fddc324_4e03_4bfe_b185_3d77768dc910);
         pub const GWLP_USERDATA: i32 = -21;
         pub const GWL_STYLE: i32 = -16;
         #[repr(transparent)]
@@ -4288,6 +4404,314 @@ pub mod Windows {
             GetRemovedDestinations: usize,
             DeleteList: usize,
             AbortList: usize,
+        }
+        windows_core::imp::define_interface!(
+            ID2D1Brush,
+            ID2D1Brush_Vtbl,
+            0x2cd906a8_12e2_11dc_9fed_001143a055f9
+        );
+        impl core::ops::Deref for ID2D1Brush {
+            type Target = ID2D1Resource;
+            fn deref(&self) -> &Self::Target {
+                unsafe { core::mem::transmute(self) }
+            }
+        }
+        windows_core::imp::interface_hierarchy!(ID2D1Brush, windows_core::IUnknown, ID2D1Resource);
+        #[repr(C)]
+        pub struct ID2D1Brush_Vtbl {
+            pub base__: ID2D1Resource_Vtbl,
+            SetOpacity: usize,
+            SetTransform: usize,
+            GetOpacity: usize,
+            GetTransform: usize,
+        }
+        windows_core::imp::define_interface!(
+            ID2D1Factory,
+            ID2D1Factory_Vtbl,
+            0x06152247_6f50_465a_9245_118bfd3b6007
+        );
+        windows_core::imp::interface_hierarchy!(ID2D1Factory, windows_core::IUnknown);
+        impl ID2D1Factory {
+            pub unsafe fn CreateWicBitmapRenderTarget<P0>(
+                &self,
+                target: P0,
+                rendertargetproperties: *const D2D1_RENDER_TARGET_PROPERTIES,
+            ) -> windows_core::Result<ID2D1RenderTarget>
+            where
+                P0: windows_core::Param<IWICBitmap>,
+            {
+                unsafe {
+                    let mut result__ = core::mem::zeroed();
+                    (windows_core::Interface::vtable(self).CreateWicBitmapRenderTarget)(
+                        windows_core::Interface::as_raw(self),
+                        target.param().abi(),
+                        rendertargetproperties,
+                        &mut result__,
+                    )
+                    .and_then(|| windows_core::imp::Type::from_abi(result__))
+                }
+            }
+        }
+        #[repr(C)]
+        pub struct ID2D1Factory_Vtbl {
+            pub base__: windows_core::IUnknown_Vtbl,
+            ReloadSystemMetrics: usize,
+            GetDesktopDpi: usize,
+            CreateRectangleGeometry: usize,
+            CreateRoundedRectangleGeometry: usize,
+            CreateEllipseGeometry: usize,
+            CreateGeometryGroup: usize,
+            CreateTransformedGeometry: usize,
+            CreatePathGeometry: usize,
+            CreateStrokeStyle: usize,
+            CreateDrawingStateBlock: usize,
+            pub CreateWicBitmapRenderTarget: unsafe extern "system" fn(
+                *mut core::ffi::c_void,
+                *mut core::ffi::c_void,
+                *const D2D1_RENDER_TARGET_PROPERTIES,
+                *mut *mut core::ffi::c_void,
+            )
+                -> windows_core::HRESULT,
+            CreateHwndRenderTarget: usize,
+            CreateDxgiSurfaceRenderTarget: usize,
+            CreateDCRenderTarget: usize,
+        }
+        windows_core::imp::define_interface!(
+            ID2D1RenderTarget,
+            ID2D1RenderTarget_Vtbl,
+            0x2cd90694_12e2_11dc_9fed_001143a055f9
+        );
+        impl core::ops::Deref for ID2D1RenderTarget {
+            type Target = ID2D1Resource;
+            fn deref(&self) -> &Self::Target {
+                unsafe { core::mem::transmute(self) }
+            }
+        }
+        windows_core::imp::interface_hierarchy!(
+            ID2D1RenderTarget,
+            windows_core::IUnknown,
+            ID2D1Resource
+        );
+        impl ID2D1RenderTarget {
+            pub unsafe fn CreateSolidColorBrush(
+                &self,
+                color: *const D2D_COLOR_F,
+                brushproperties: Option<*const D2D1_BRUSH_PROPERTIES>,
+            ) -> windows_core::Result<ID2D1SolidColorBrush> {
+                unsafe {
+                    let mut result__ = core::mem::zeroed();
+                    (windows_core::Interface::vtable(self).CreateSolidColorBrush)(
+                        windows_core::Interface::as_raw(self),
+                        color,
+                        brushproperties.unwrap_or(core::mem::zeroed()) as _,
+                        &mut result__,
+                    )
+                    .and_then(|| windows_core::imp::Type::from_abi(result__))
+                }
+            }
+            pub unsafe fn DrawGlyphRun<P2>(
+                &self,
+                baselineorigin: windows_numerics::Vector2,
+                glyphrun: *const DWRITE_GLYPH_RUN,
+                foregroundbrush: P2,
+                measuringmode: DWRITE_MEASURING_MODE,
+            ) where
+                P2: windows_core::Param<ID2D1Brush>,
+            {
+                unsafe {
+                    (windows_core::Interface::vtable(self).DrawGlyphRun)(
+                        windows_core::Interface::as_raw(self),
+                        baselineorigin,
+                        glyphrun,
+                        foregroundbrush.param().abi(),
+                        measuringmode,
+                    );
+                }
+            }
+            pub unsafe fn SetTransform(&self, transform: *const windows_numerics::Matrix3x2) {
+                unsafe {
+                    (windows_core::Interface::vtable(self).SetTransform)(
+                        windows_core::Interface::as_raw(self),
+                        transform,
+                    );
+                }
+            }
+            pub unsafe fn SetTextAntialiasMode(&self, textantialiasmode: D2D1_TEXT_ANTIALIAS_MODE) {
+                unsafe {
+                    (windows_core::Interface::vtable(self).SetTextAntialiasMode)(
+                        windows_core::Interface::as_raw(self),
+                        textantialiasmode,
+                    );
+                }
+            }
+            pub unsafe fn SetTextRenderingParams<P0>(&self, textrenderingparams: P0)
+            where
+                P0: windows_core::Param<IDWriteRenderingParams>,
+            {
+                unsafe {
+                    (windows_core::Interface::vtable(self).SetTextRenderingParams)(
+                        windows_core::Interface::as_raw(self),
+                        textrenderingparams.param().abi(),
+                    );
+                }
+            }
+            pub unsafe fn Clear(&self, clearcolor: Option<*const D2D_COLOR_F>) {
+                unsafe {
+                    (windows_core::Interface::vtable(self).Clear)(
+                        windows_core::Interface::as_raw(self),
+                        clearcolor.unwrap_or(core::mem::zeroed()) as _,
+                    );
+                }
+            }
+            pub unsafe fn BeginDraw(&self) {
+                unsafe {
+                    (windows_core::Interface::vtable(self).BeginDraw)(
+                        windows_core::Interface::as_raw(self),
+                    );
+                }
+            }
+            pub unsafe fn EndDraw(
+                &self,
+                tag1: Option<*mut D2D1_TAG>,
+                tag2: Option<*mut D2D1_TAG>,
+            ) -> windows_core::HRESULT {
+                unsafe {
+                    (windows_core::Interface::vtable(self).EndDraw)(
+                        windows_core::Interface::as_raw(self),
+                        tag1.unwrap_or(core::mem::zeroed()) as _,
+                        tag2.unwrap_or(core::mem::zeroed()) as _,
+                    )
+                }
+            }
+            pub unsafe fn GetMaximumBitmapSize(&self) -> u32 {
+                unsafe {
+                    (windows_core::Interface::vtable(self).GetMaximumBitmapSize)(
+                        windows_core::Interface::as_raw(self),
+                    )
+                }
+            }
+        }
+        #[repr(C)]
+        pub struct ID2D1RenderTarget_Vtbl {
+            pub base__: ID2D1Resource_Vtbl,
+            CreateBitmap: usize,
+            CreateBitmapFromWicBitmap: usize,
+            CreateSharedBitmap: usize,
+            CreateBitmapBrush: usize,
+            pub CreateSolidColorBrush: unsafe extern "system" fn(
+                *mut core::ffi::c_void,
+                *const D2D_COLOR_F,
+                *const D2D1_BRUSH_PROPERTIES,
+                *mut *mut core::ffi::c_void,
+            )
+                -> windows_core::HRESULT,
+            CreateGradientStopCollection: usize,
+            CreateLinearGradientBrush: usize,
+            CreateRadialGradientBrush: usize,
+            CreateCompatibleRenderTarget: usize,
+            CreateLayer: usize,
+            CreateMesh: usize,
+            DrawLine: usize,
+            DrawRectangle: usize,
+            FillRectangle: usize,
+            DrawRoundedRectangle: usize,
+            FillRoundedRectangle: usize,
+            DrawEllipse: usize,
+            FillEllipse: usize,
+            DrawGeometry: usize,
+            FillGeometry: usize,
+            FillMesh: usize,
+            FillOpacityMask: usize,
+            DrawBitmap: usize,
+            DrawText: usize,
+            DrawTextLayout: usize,
+            pub DrawGlyphRun: unsafe extern "system" fn(
+                *mut core::ffi::c_void,
+                windows_numerics::Vector2,
+                *const DWRITE_GLYPH_RUN,
+                *mut core::ffi::c_void,
+                DWRITE_MEASURING_MODE,
+            ),
+            pub SetTransform: unsafe extern "system" fn(
+                *mut core::ffi::c_void,
+                *const windows_numerics::Matrix3x2,
+            ),
+            GetTransform: usize,
+            SetAntialiasMode: usize,
+            GetAntialiasMode: usize,
+            pub SetTextAntialiasMode:
+                unsafe extern "system" fn(*mut core::ffi::c_void, D2D1_TEXT_ANTIALIAS_MODE),
+            GetTextAntialiasMode: usize,
+            pub SetTextRenderingParams:
+                unsafe extern "system" fn(*mut core::ffi::c_void, *mut core::ffi::c_void),
+            GetTextRenderingParams: usize,
+            SetTags: usize,
+            GetTags: usize,
+            PushLayer: usize,
+            PopLayer: usize,
+            Flush: usize,
+            SaveDrawingState: usize,
+            RestoreDrawingState: usize,
+            PushAxisAlignedClip: usize,
+            PopAxisAlignedClip: usize,
+            pub Clear: unsafe extern "system" fn(*mut core::ffi::c_void, *const D2D_COLOR_F),
+            pub BeginDraw: unsafe extern "system" fn(*mut core::ffi::c_void),
+            pub EndDraw: unsafe extern "system" fn(
+                *mut core::ffi::c_void,
+                *mut D2D1_TAG,
+                *mut D2D1_TAG,
+            ) -> windows_core::HRESULT,
+            GetPixelFormat: usize,
+            SetDpi: usize,
+            GetDpi: usize,
+            GetSize: usize,
+            GetPixelSize: usize,
+            pub GetMaximumBitmapSize: unsafe extern "system" fn(*mut core::ffi::c_void) -> u32,
+            IsSupported: usize,
+        }
+        windows_core::imp::define_interface!(
+            ID2D1Resource,
+            ID2D1Resource_Vtbl,
+            0x2cd90691_12e2_11dc_9fed_001143a055f9
+        );
+        windows_core::imp::interface_hierarchy!(ID2D1Resource, windows_core::IUnknown);
+        #[repr(C)]
+        pub struct ID2D1Resource_Vtbl {
+            pub base__: windows_core::IUnknown_Vtbl,
+            GetFactory: usize,
+        }
+        windows_core::imp::define_interface!(
+            ID2D1SolidColorBrush,
+            ID2D1SolidColorBrush_Vtbl,
+            0x2cd906a9_12e2_11dc_9fed_001143a055f9
+        );
+        impl core::ops::Deref for ID2D1SolidColorBrush {
+            type Target = ID2D1Brush;
+            fn deref(&self) -> &Self::Target {
+                unsafe { core::mem::transmute(self) }
+            }
+        }
+        windows_core::imp::interface_hierarchy!(
+            ID2D1SolidColorBrush,
+            windows_core::IUnknown,
+            ID2D1Resource,
+            ID2D1Brush
+        );
+        impl ID2D1SolidColorBrush {
+            pub unsafe fn SetColor(&self, color: *const D2D_COLOR_F) {
+                unsafe {
+                    (windows_core::Interface::vtable(self).SetColor)(
+                        windows_core::Interface::as_raw(self),
+                        color,
+                    );
+                }
+            }
+        }
+        #[repr(C)]
+        pub struct ID2D1SolidColorBrush_Vtbl {
+            pub base__: ID2D1Brush_Vtbl,
+            pub SetColor: unsafe extern "system" fn(*mut core::ffi::c_void, *const D2D_COLOR_F),
+            GetColor: usize,
         }
         windows_core::imp::define_interface!(
             ID3D10Blob,
@@ -6343,6 +6767,50 @@ pub mod Windows {
                     .and_then(|| windows_core::imp::Type::from_abi(result__))
                 }
             }
+            pub unsafe fn CreateFontFaceReference<P0>(
+                &self,
+                fontfile: P0,
+                faceindex: u32,
+                fontsimulations: DWRITE_FONT_SIMULATIONS,
+            ) -> windows_core::Result<IDWriteFontFaceReference>
+            where
+                P0: windows_core::Param<IDWriteFontFile>,
+            {
+                unsafe {
+                    let mut result__ = core::mem::zeroed();
+                    (windows_core::Interface::vtable(self).CreateFontFaceReference)(
+                        windows_core::Interface::as_raw(self),
+                        fontfile.param().abi(),
+                        faceindex,
+                        fontsimulations,
+                        &mut result__,
+                    )
+                    .and_then(|| windows_core::imp::Type::from_abi(result__))
+                }
+            }
+            pub unsafe fn CreateFontFaceReference2<P0>(
+                &self,
+                filepath: P0,
+                lastwritetime: Option<*const FILETIME>,
+                faceindex: u32,
+                fontsimulations: DWRITE_FONT_SIMULATIONS,
+            ) -> windows_core::Result<IDWriteFontFaceReference>
+            where
+                P0: windows_core::Param<windows_core::PCWSTR>,
+            {
+                unsafe {
+                    let mut result__ = core::mem::zeroed();
+                    (windows_core::Interface::vtable(self).CreateFontFaceReference2)(
+                        windows_core::Interface::as_raw(self),
+                        filepath.param().abi(),
+                        lastwritetime.unwrap_or(core::mem::zeroed()) as _,
+                        faceindex,
+                        fontsimulations,
+                        &mut result__,
+                    )
+                    .and_then(|| windows_core::imp::Type::from_abi(result__))
+                }
+            }
             pub unsafe fn CreateFontSetBuilder(
                 &self,
             ) -> windows_core::Result<IDWriteFontSetBuilder> {
@@ -6405,8 +6873,23 @@ pub mod Windows {
             )
                 -> windows_core::HRESULT,
             CreateCustomRenderingParams: usize,
-            CreateFontFaceReference: usize,
-            CreateFontFaceReference2: usize,
+            pub CreateFontFaceReference: unsafe extern "system" fn(
+                *mut core::ffi::c_void,
+                *mut core::ffi::c_void,
+                u32,
+                DWRITE_FONT_SIMULATIONS,
+                *mut *mut core::ffi::c_void,
+            )
+                -> windows_core::HRESULT,
+            pub CreateFontFaceReference2: unsafe extern "system" fn(
+                *mut core::ffi::c_void,
+                windows_core::PCWSTR,
+                *const FILETIME,
+                u32,
+                DWRITE_FONT_SIMULATIONS,
+                *mut *mut core::ffi::c_void,
+            )
+                -> windows_core::HRESULT,
             GetSystemFontSet: usize,
             pub CreateFontSetBuilder: unsafe extern "system" fn(
                 *mut core::ffi::c_void,
@@ -6555,6 +7038,73 @@ pub mod Windows {
             CreateHttpFontFileLoader: usize,
             AnalyzeContainerType: usize,
             UnpackFontFile: usize,
+        }
+        windows_core::imp::define_interface!(
+            IDWriteFactory6,
+            IDWriteFactory6_Vtbl,
+            0xf3744d80_21f7_42eb_b35d_995bc72fc223
+        );
+        impl core::ops::Deref for IDWriteFactory6 {
+            type Target = IDWriteFactory5;
+            fn deref(&self) -> &Self::Target {
+                unsafe { core::mem::transmute(self) }
+            }
+        }
+        windows_core::imp::interface_hierarchy!(
+            IDWriteFactory6,
+            windows_core::IUnknown,
+            IDWriteFactory,
+            IDWriteFactory1,
+            IDWriteFactory2,
+            IDWriteFactory3,
+            IDWriteFactory4,
+            IDWriteFactory5
+        );
+        impl IDWriteFactory6 {
+            pub unsafe fn CreateFontFaceReference<P0>(
+                &self,
+                fontfile: P0,
+                faceindex: u32,
+                fontsimulations: DWRITE_FONT_SIMULATIONS,
+                fontaxisvalues: &[DWRITE_FONT_AXIS_VALUE],
+            ) -> windows_core::Result<IDWriteFontFaceReference1>
+            where
+                P0: windows_core::Param<IDWriteFontFile>,
+            {
+                unsafe {
+                    let mut result__ = core::mem::zeroed();
+                    (windows_core::Interface::vtable(self).CreateFontFaceReference)(
+                        windows_core::Interface::as_raw(self),
+                        fontfile.param().abi(),
+                        faceindex,
+                        fontsimulations,
+                        fontaxisvalues.as_ptr(),
+                        fontaxisvalues.len().try_into().unwrap(),
+                        &mut result__,
+                    )
+                    .and_then(|| windows_core::imp::Type::from_abi(result__))
+                }
+            }
+        }
+        #[repr(C)]
+        pub struct IDWriteFactory6_Vtbl {
+            pub base__: IDWriteFactory5_Vtbl,
+            pub CreateFontFaceReference: unsafe extern "system" fn(
+                *mut core::ffi::c_void,
+                *mut core::ffi::c_void,
+                u32,
+                DWRITE_FONT_SIMULATIONS,
+                *const DWRITE_FONT_AXIS_VALUE,
+                u32,
+                *mut *mut core::ffi::c_void,
+            )
+                -> windows_core::HRESULT,
+            CreateFontResource: usize,
+            GetSystemFontSet: usize,
+            GetSystemFontCollection: usize,
+            CreateFontCollectionFromFontSet: usize,
+            CreateFontSetBuilder: usize,
+            CreateTextFormat: usize,
         }
         windows_core::imp::define_interface!(
             IDWriteFontCollection,
@@ -7098,6 +7648,35 @@ pub mod Windows {
             ReleaseGlyphImageData: usize,
         }
         windows_core::imp::define_interface!(
+            IDWriteFontFace5,
+            IDWriteFontFace5_Vtbl,
+            0x98eff3a5_b667_479a_b145_e2fa5b9fdc29
+        );
+        impl core::ops::Deref for IDWriteFontFace5 {
+            type Target = IDWriteFontFace4;
+            fn deref(&self) -> &Self::Target {
+                unsafe { core::mem::transmute(self) }
+            }
+        }
+        windows_core::imp::interface_hierarchy!(
+            IDWriteFontFace5,
+            windows_core::IUnknown,
+            IDWriteFontFace,
+            IDWriteFontFace1,
+            IDWriteFontFace2,
+            IDWriteFontFace3,
+            IDWriteFontFace4
+        );
+        #[repr(C)]
+        pub struct IDWriteFontFace5_Vtbl {
+            pub base__: IDWriteFontFace4_Vtbl,
+            GetFontAxisValueCount: usize,
+            GetFontAxisValues: usize,
+            HasVariations: usize,
+            GetFontResource: usize,
+            Equals: usize,
+        }
+        windows_core::imp::define_interface!(
             IDWriteFontFaceReference,
             IDWriteFontFaceReference_Vtbl,
             0x5e7fa7ca_dde3_424c_89f0_9fcd6fed58cd
@@ -7135,6 +7714,44 @@ pub mod Windows {
             EnqueueCharacterDownloadRequest: usize,
             EnqueueGlyphDownloadRequest: usize,
             EnqueueFileFragmentDownloadRequest: usize,
+        }
+        windows_core::imp::define_interface!(
+            IDWriteFontFaceReference1,
+            IDWriteFontFaceReference1_Vtbl,
+            0xc081fe77_2fd1_41ac_a5a3_34983c4ba61a
+        );
+        impl core::ops::Deref for IDWriteFontFaceReference1 {
+            type Target = IDWriteFontFaceReference;
+            fn deref(&self) -> &Self::Target {
+                unsafe { core::mem::transmute(self) }
+            }
+        }
+        windows_core::imp::interface_hierarchy!(
+            IDWriteFontFaceReference1,
+            windows_core::IUnknown,
+            IDWriteFontFaceReference
+        );
+        impl IDWriteFontFaceReference1 {
+            pub unsafe fn CreateFontFace(&self) -> windows_core::Result<IDWriteFontFace5> {
+                unsafe {
+                    let mut result__ = core::mem::zeroed();
+                    (windows_core::Interface::vtable(self).CreateFontFace)(
+                        windows_core::Interface::as_raw(self),
+                        &mut result__,
+                    )
+                    .and_then(|| windows_core::imp::Type::from_abi(result__))
+                }
+            }
+        }
+        #[repr(C)]
+        pub struct IDWriteFontFaceReference1_Vtbl {
+            pub base__: IDWriteFontFaceReference_Vtbl,
+            pub CreateFontFace: unsafe extern "system" fn(
+                *mut core::ffi::c_void,
+                *mut *mut core::ffi::c_void,
+            ) -> windows_core::HRESULT,
+            GetFontAxisValueCount: usize,
+            GetFontAxisValues: usize,
         }
         windows_core::imp::define_interface!(
             IDWriteFontFallback,
@@ -11698,6 +12315,211 @@ pub mod Windows {
         pub struct ITEMIDLIST {
             pub mkid: SHITEMID,
         }
+        windows_core::imp::define_interface!(
+            IWICBitmap,
+            IWICBitmap_Vtbl,
+            0x00000121_a8f2_4877_ba0a_fd2b6645fb94
+        );
+        impl core::ops::Deref for IWICBitmap {
+            type Target = IWICBitmapSource;
+            fn deref(&self) -> &Self::Target {
+                unsafe { core::mem::transmute(self) }
+            }
+        }
+        windows_core::imp::interface_hierarchy!(
+            IWICBitmap,
+            windows_core::IUnknown,
+            IWICBitmapSource
+        );
+        impl IWICBitmap {
+            pub unsafe fn Lock(
+                &self,
+                prclock: *const WICRect,
+                flags: u32,
+            ) -> windows_core::Result<IWICBitmapLock> {
+                unsafe {
+                    let mut result__ = core::mem::zeroed();
+                    (windows_core::Interface::vtable(self).Lock)(
+                        windows_core::Interface::as_raw(self),
+                        prclock,
+                        flags,
+                        &mut result__,
+                    )
+                    .and_then(|| windows_core::imp::Type::from_abi(result__))
+                }
+            }
+        }
+        #[repr(C)]
+        pub struct IWICBitmap_Vtbl {
+            pub base__: IWICBitmapSource_Vtbl,
+            pub Lock: unsafe extern "system" fn(
+                *mut core::ffi::c_void,
+                *const WICRect,
+                u32,
+                *mut *mut core::ffi::c_void,
+            ) -> windows_core::HRESULT,
+            SetPalette: usize,
+            SetResolution: usize,
+        }
+        windows_core::imp::define_interface!(
+            IWICBitmapLock,
+            IWICBitmapLock_Vtbl,
+            0x00000123_a8f2_4877_ba0a_fd2b6645fb94
+        );
+        windows_core::imp::interface_hierarchy!(IWICBitmapLock, windows_core::IUnknown);
+        impl IWICBitmapLock {
+            pub unsafe fn GetStride(&self) -> windows_core::Result<u32> {
+                unsafe {
+                    let mut result__ = core::mem::zeroed();
+                    (windows_core::Interface::vtable(self).GetStride)(
+                        windows_core::Interface::as_raw(self),
+                        &mut result__,
+                    )
+                    .map(|| result__)
+                }
+            }
+            pub unsafe fn GetDataPointer(
+                &self,
+                pcbbuffersize: *mut u32,
+                ppbdata: *mut WICInProcPointer,
+            ) -> windows_core::HRESULT {
+                unsafe {
+                    (windows_core::Interface::vtable(self).GetDataPointer)(
+                        windows_core::Interface::as_raw(self),
+                        pcbbuffersize as _,
+                        ppbdata as _,
+                    )
+                }
+            }
+        }
+        #[repr(C)]
+        pub struct IWICBitmapLock_Vtbl {
+            pub base__: windows_core::IUnknown_Vtbl,
+            GetSize: usize,
+            pub GetStride: unsafe extern "system" fn(
+                *mut core::ffi::c_void,
+                *mut u32,
+            ) -> windows_core::HRESULT,
+            pub GetDataPointer: unsafe extern "system" fn(
+                *mut core::ffi::c_void,
+                *mut u32,
+                *mut WICInProcPointer,
+            ) -> windows_core::HRESULT,
+            GetPixelFormat: usize,
+        }
+        windows_core::imp::define_interface!(
+            IWICBitmapSource,
+            IWICBitmapSource_Vtbl,
+            0x00000120_a8f2_4877_ba0a_fd2b6645fb94
+        );
+        windows_core::imp::interface_hierarchy!(IWICBitmapSource, windows_core::IUnknown);
+        #[repr(C)]
+        pub struct IWICBitmapSource_Vtbl {
+            pub base__: windows_core::IUnknown_Vtbl,
+            GetSize: usize,
+            GetPixelFormat: usize,
+            GetResolution: usize,
+            CopyPalette: usize,
+            CopyPixels: usize,
+        }
+        windows_core::imp::define_interface!(
+            IWICImagingFactory,
+            IWICImagingFactory_Vtbl,
+            0xec5ec8a9_c395_4314_9c77_54d7a935ff70
+        );
+        windows_core::imp::interface_hierarchy!(IWICImagingFactory, windows_core::IUnknown);
+        impl IWICImagingFactory {
+            pub unsafe fn CreateBitmap(
+                &self,
+                uiwidth: u32,
+                uiheight: u32,
+                pixelformat: REFWICPixelFormatGUID,
+                option: WICBitmapCreateCacheOption,
+            ) -> windows_core::Result<IWICBitmap> {
+                unsafe {
+                    let mut result__ = core::mem::zeroed();
+                    (windows_core::Interface::vtable(self).CreateBitmap)(
+                        windows_core::Interface::as_raw(self),
+                        uiwidth,
+                        uiheight,
+                        pixelformat,
+                        option,
+                        &mut result__,
+                    )
+                    .and_then(|| windows_core::imp::Type::from_abi(result__))
+                }
+            }
+            pub unsafe fn CreateBitmapFromMemory(
+                &self,
+                uiwidth: u32,
+                uiheight: u32,
+                pixelformat: REFWICPixelFormatGUID,
+                cbstride: u32,
+                cbbuffersize: u32,
+                pbbuffer: *const u8,
+            ) -> windows_core::Result<IWICBitmap> {
+                unsafe {
+                    let mut result__ = core::mem::zeroed();
+                    (windows_core::Interface::vtable(self).CreateBitmapFromMemory)(
+                        windows_core::Interface::as_raw(self),
+                        uiwidth,
+                        uiheight,
+                        pixelformat,
+                        cbstride,
+                        cbbuffersize,
+                        pbbuffer,
+                        &mut result__,
+                    )
+                    .and_then(|| windows_core::imp::Type::from_abi(result__))
+                }
+            }
+        }
+        #[repr(C)]
+        pub struct IWICImagingFactory_Vtbl {
+            pub base__: windows_core::IUnknown_Vtbl,
+            CreateDecoderFromFilename: usize,
+            CreateDecoderFromStream: usize,
+            CreateDecoderFromFileHandle: usize,
+            CreateComponentInfo: usize,
+            CreateDecoder: usize,
+            CreateEncoder: usize,
+            CreatePalette: usize,
+            CreateFormatConverter: usize,
+            CreateBitmapScaler: usize,
+            CreateBitmapClipper: usize,
+            CreateBitmapFlipRotator: usize,
+            CreateStream: usize,
+            CreateColorContext: usize,
+            CreateColorTransformer: usize,
+            pub CreateBitmap: unsafe extern "system" fn(
+                *mut core::ffi::c_void,
+                u32,
+                u32,
+                REFWICPixelFormatGUID,
+                WICBitmapCreateCacheOption,
+                *mut *mut core::ffi::c_void,
+            ) -> windows_core::HRESULT,
+            CreateBitmapFromSource: usize,
+            CreateBitmapFromSourceRect: usize,
+            pub CreateBitmapFromMemory: unsafe extern "system" fn(
+                *mut core::ffi::c_void,
+                u32,
+                u32,
+                REFWICPixelFormatGUID,
+                u32,
+                u32,
+                *const u8,
+                *mut *mut core::ffi::c_void,
+            )
+                -> windows_core::HRESULT,
+            CreateBitmapFromHBITMAP: usize,
+            CreateBitmapFromHICON: usize,
+            CreateComponentEnumerator: usize,
+            CreateFastMetadataEncoderFromDecoder: usize,
+            CreateFastMetadataEncoderFromFrameDecode: usize,
+            CreateQueryWriter: usize,
+            CreateQueryWriterFromReader: usize,
+        }
         #[repr(C)]
         #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
         pub struct KEYBDINPUT {
@@ -11707,6 +12529,7 @@ pub mod Windows {
             pub time: u32,
             pub dwExtraInfo: usize,
         }
+        pub const KEYEVENTF_EXTENDEDKEY: i32 = 1;
         pub const KEYEVENTF_KEYUP: i32 = 2;
         pub const KL_NAMELENGTH: i32 = 9;
         pub const LOCALE_NAME_MAX_LENGTH: i32 = 85;
@@ -12059,6 +12882,9 @@ pub mod Windows {
             pub right: i32,
             pub bottom: i32,
         }
+        pub type REFWICPixelFormatGUID = *const windows_core::GUID;
+        pub const RPC_E_CHANGED_MODE: windows_core::HRESULT =
+            windows_core::HRESULT(0x80010106_u32 as _);
         #[repr(C)]
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
         pub struct SAFEARRAY {
@@ -12111,6 +12937,7 @@ pub mod Windows {
         pub const SM_CXSIZEFRAME: i32 = 32;
         pub const SM_CYDOUBLECLK: i32 = 37;
         pub const SM_CYSIZEFRAME: i32 = 33;
+        pub const SPI_GETFONTSMOOTHING: i32 = 74;
         pub const SPI_GETFONTSMOOTHINGTYPE: i32 = 8202;
         pub const SPI_GETICONTITLELOGFONT: i32 = 31;
         pub const SPI_GETWHEELSCROLLCHARS: i32 = 108;
@@ -12363,6 +13190,7 @@ pub mod Windows {
         pub const VK_LCONTROL: i32 = 162;
         pub const VK_LEFT: i32 = 37;
         pub const VK_LMENU: i32 = 164;
+        pub const VK_LSHIFT: i32 = 160;
         pub const VK_LWIN: i32 = 91;
         pub const VK_MENU: i32 = 18;
         pub const VK_NEXT: i32 = 34;
@@ -12385,6 +13213,7 @@ pub mod Windows {
         pub const VK_RETURN: i32 = 13;
         pub const VK_RIGHT: i32 = 39;
         pub const VK_RMENU: i32 = 165;
+        pub const VK_RSHIFT: i32 = 161;
         pub const VK_RWIN: i32 = 92;
         pub const VK_SHIFT: i32 = 16;
         pub const VK_SPACE: i32 = 32;
@@ -12392,6 +13221,19 @@ pub mod Windows {
         pub const VK_UP: i32 = 38;
         pub const VT_LPWSTR: VARENUM = 31;
         pub const WHEEL_DELTA: i32 = 120;
+        pub const WICBitmapCacheOnLoad: WICBitmapCreateCacheOption = 2;
+        pub type WICBitmapCreateCacheOption = i32;
+        pub type WICBitmapLockFlags = i32;
+        pub const WICBitmapLockRead: WICBitmapLockFlags = 1;
+        pub type WICInProcPointer = *mut u8;
+        #[repr(C)]
+        #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+        pub struct WICRect {
+            pub X: i32,
+            pub Y: i32,
+            pub Width: i32,
+            pub Height: i32,
+        }
         #[repr(C)]
         #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
         pub struct WINDOWPLACEMENT {

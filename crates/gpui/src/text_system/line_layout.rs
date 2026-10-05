@@ -1,46 +1,462 @@
 use crate::{
-    FontId, GlyphId, Pixels, PlatformTextSystem, Point, SharedString, Size, TextAlign, point, px,
+    Bounds, FontId, GlyphId, InlineBidiScope, InlineBoxRequest, InlineLayoutRequest,
+    InlineTextStyle, Pixels, PlatformTextSystem, Point, SharedString, Size, StrikethroughStyle,
+    TextLayoutOptions, TextLayoutRequest, TextRun, UnderlineStyle, VerticalAlign,
 };
 use collections::FxHashMap;
+use palette::Hsla;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use smallvec::SmallVec;
 use std::{
     borrow::Borrow,
     hash::{Hash, Hasher},
     ops::Range,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
-use super::LineWrapper;
-
-/// A laid out and styled line of text
-#[derive(Default, Debug)]
+/// A laid-out and styled text document.
+#[derive(Clone, Debug)]
 pub struct LineLayout {
-    /// The font size for this line
+    /// The document's base font size.
     pub font_size: Pixels,
-    /// The width of the line
+    /// The width of the widest visual line.
     pub width: Pixels,
-    /// The ascent of the line
+    /// The document's ascent.
     pub ascent: Pixels,
-    /// The descent of the line
+    /// The document's descent.
     pub descent: Pixels,
-    /// The shaped runs that make up this line
-    pub runs: Vec<ShapedRun>,
-    /// The length of the line in utf-8 bytes
+    /// Visual lines in paint order. Unwrapped layouts contain one line.
+    pub visual_lines: SmallVec<[VisualLine; 1]>,
+    /// Style-specific paint runs referenced by `visual_lines`.
+    pub paint_fragments: Vec<PaintFragment>,
+    /// The length of the source text in UTF-8 bytes.
     pub len: usize,
+    /// Backend-native interaction model.
+    pub platform_layout: Arc<dyn PlatformTextLayout>,
 }
 
-/// A run of text that has been shaped .
-#[derive(Debug, Clone)]
-pub struct ShapedRun {
-    /// The font id for this run
+/// Font metrics used to construct the vertical extents of an inline line.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct InlineTextMetrics {
+    /// Distance above the text baseline.
+    pub ascent: Pixels,
+    /// Distance below the text baseline.
+    pub descent: Pixels,
+    /// Height of a lowercase x in the inline container's font.
+    pub x_height: Pixels,
+}
+
+/// A row in an inline layout.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct InlineVisualLine {
+    /// The row origin relative to the inline layout.
+    pub origin: Point<Pixels>,
+    /// The row size before it is placed in its containing element.
+    pub size: Size<Pixels>,
+    /// The baseline relative to `origin.y`.
+    pub baseline: Pixels,
+}
+
+/// The position assigned to an element embedded in text.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PositionedInlineBox {
+    /// The caller-provided box identifier.
+    pub id: u64,
+    /// Index of the visual line containing this box.
+    pub line_index: usize,
+    /// The box bounds relative to the complete inline layout.
+    pub bounds: Bounds<Pixels>,
+}
+
+/// The native geometry occupied by a text range on one visual line.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct InlineRangeGeometry {
+    /// Bounds relative to the complete text layout.
+    pub bounds: Bounds<Pixels>,
+    /// Index of the visual line containing these bounds.
+    pub visual_line_index: usize,
+}
+
+/// Text and element boxes laid out in one inline formatting context.
+#[derive(Clone, Debug)]
+pub struct InlineLayout {
+    /// The shaped text shared with the ordinary GPUI paint pipeline.
+    pub layout: Arc<LineLayout>,
+    /// Per-row block geometry from the text backend.
+    pub lines: Vec<InlineVisualLine>,
+    /// Positioned element boxes.
+    pub boxes: Vec<PositionedInlineBox>,
+    /// Shared horizontal anchor used to align every visual line.
+    pub alignment_offset: Pixels,
+    /// Natural size of the complete inline layout.
+    pub size: Size<Pixels>,
+}
+
+fn base_inline_line_bounds(metrics: InlineTextMetrics, line_height: Pixels) -> (Pixels, Pixels) {
+    let half_leading = ((line_height - metrics.ascent - metrics.descent) / 2.).max(Pixels::ZERO);
+
+    (
+        -metrics.ascent - half_leading,
+        metrics.descent + half_leading,
+    )
+}
+
+fn expand_inline_line_for_box(
+    top: &mut Pixels,
+    bottom: &mut Pixels,
+    top_box_height: &mut Pixels,
+    bottom_box_height: &mut Pixels,
+    height: Pixels,
+    metrics: InlineTextMetrics,
+    align: VerticalAlign,
+) {
+    match align {
+        VerticalAlign::Baseline => *top = (*top).min(-height),
+        VerticalAlign::Middle => {
+            let middle = -metrics.x_height / 2.;
+            *top = (*top).min(middle - height / 2.);
+            *bottom = (*bottom).max(middle + height / 2.);
+        }
+        VerticalAlign::Top => *top_box_height = (*top_box_height).max(height),
+        VerticalAlign::Bottom => *bottom_box_height = (*bottom_box_height).max(height),
+    }
+}
+
+fn aligned_inline_box_y(
+    line: InlineVisualLine,
+    metrics: InlineTextMetrics,
+    height: Pixels,
+    align: VerticalAlign,
+) -> Pixels {
+    match align {
+        VerticalAlign::Baseline => line.baseline - height,
+        VerticalAlign::Middle => line.baseline - metrics.x_height / 2. - height / 2.,
+        VerticalAlign::Top => Pixels::ZERO,
+        VerticalAlign::Bottom => line.size.height - height,
+    }
+}
+
+/// Applies CSS-like vertical alignment to boxes after a text backend assigns them to lines.
+pub fn align_inline_boxes(
+    lines: &mut [InlineVisualLine],
+    boxes: &mut [PositionedInlineBox],
+    size: &mut Size<Pixels>,
+    requests: &[InlineBoxRequest],
+    line_metrics: &[InlineTextMetrics],
+    text_bounds: &[(Pixels, Pixels)],
+    fallback_metrics: InlineTextMetrics,
+    line_height: Pixels,
+) {
+    let request_alignments = requests
+        .iter()
+        .map(|request| (request.id, request.vertical_align))
+        .collect::<FxHashMap<_, _>>();
+    let mut boxes_by_line: FxHashMap<_, Vec<_>> = FxHashMap::default();
+
+    for inline_box in boxes
+        .iter_mut()
+        .filter(|inline_box| inline_box.line_index < lines.len())
+    {
+        let align = request_alignments
+            .get(&inline_box.id)
+            .copied()
+            .unwrap_or(VerticalAlign::Baseline);
+
+        boxes_by_line
+            .entry(inline_box.line_index)
+            .or_default()
+            .push((inline_box, align));
+    }
+
+    let mut line_y = Pixels::ZERO;
+
+    for (line_index, line) in lines.iter_mut().enumerate() {
+        let line_boxes = boxes_by_line.remove(&line_index).unwrap_or_default();
+        let metrics = line_metrics
+            .get(line_index)
+            .copied()
+            .unwrap_or(fallback_metrics);
+        let (mut top, mut bottom) = text_bounds
+            .get(line_index)
+            .copied()
+            .unwrap_or_else(|| base_inline_line_bounds(metrics, line_height));
+        let mut top_box_height = Pixels::ZERO;
+        let mut bottom_box_height = Pixels::ZERO;
+
+        for (inline_box, align) in &line_boxes {
+            expand_inline_line_for_box(
+                &mut top,
+                &mut bottom,
+                &mut top_box_height,
+                &mut bottom_box_height,
+                inline_box.bounds.size.height,
+                metrics,
+                *align,
+            );
+        }
+
+        bottom = bottom.max(top + top_box_height);
+        top = top.min(bottom - bottom_box_height);
+        line.origin.y = line_y;
+        line.size.height = bottom - top;
+        line.baseline = -top;
+
+        for (inline_box, align) in line_boxes {
+            inline_box.bounds.origin.y =
+                line_y + aligned_inline_box_y(*line, metrics, inline_box.bounds.size.height, align);
+        }
+
+        line_y += line.size.height;
+    }
+
+    size.height = line_y;
+}
+
+/// Backend-owned text interaction for a laid-out string.
+///
+/// Byte positions are UTF-8 boundaries. Geometry is in GPUI layout coordinates, using the
+/// caller-provided line height. Implementations must preserve visual order and caret affinity.
+///
+/// A cluster is one backend-defined caret step. It may contain several Unicode scalar values, such
+/// as a combining sequence or an emoji ZWJ sequence. Logical clusters are independent of visual
+/// direction and soft-wrapped rows.
+pub trait PlatformTextLayout: Send + Sync + std::fmt::Debug {
+    /// Length of the source text in UTF-8 bytes.
+    fn len(&self) -> usize;
+
+    /// Number of visual lines.
+    fn line_count(&self) -> usize;
+
+    /// Natural layout size reported by the backend.
+    fn size(&self) -> Size<Pixels>;
+
+    /// Returns the UTF-8 byte index of the cluster under a point in GPUI layout coordinates.
+    fn byte_index_from_pixel_point(
+        &self,
+        pixel_point: Point<Pixels>,
+        line_height: Pixels,
+    ) -> Result<usize, usize>;
+
+    /// Returns the closest caret for a point in GPUI layout coordinates.
+    /// Points outside a visual row return `Err`.
+    fn caret_from_pixel_point(
+        &self,
+        pixel_point: Point<Pixels>,
+        line_height: Pixels,
+    ) -> Result<CaretPosition, CaretPosition>;
+
+    /// Returns the caret bounds in GPUI layout coordinates.
+    fn caret_bounds(&self, caret: CaretPosition, line_height: Pixels) -> Option<Bounds<Pixels>>;
+
+    /// Snaps a caret to a native cluster boundary.
+    fn normalized_caret(&self, caret: CaretPosition) -> CaretPosition;
+
+    /// Returns the adjacent caret stop in visual order.
+    fn adjacent_visual_caret(
+        &self,
+        caret: CaretPosition,
+        direction: VisualDirection,
+    ) -> Option<CaretPosition>;
+
+    /// Returns bounds for a UTF-8 byte range in visual order.
+    fn selection_bounds(
+        &self,
+        byte_range: Range<usize>,
+        line_height: Pixels,
+    ) -> Vec<Bounds<Pixels>>;
+
+    /// Native range rectangles and their visual line indices, without selection-only extensions.
+    ///
+    /// Returns `None` for an empty input range. A nonempty range can produce an empty vector when
+    /// it has no drawable geometry. Backends supporting inline flow should preserve actual
+    /// vertical metrics here.
+    fn inline_geometry(&self, range: Range<usize>) -> Option<Vec<InlineRangeGeometry>> {
+        if range.is_empty() {
+            return None;
+        }
+
+        let line_height = self.size().height / self.line_count().max(1) as f32;
+
+        Some(
+            self.selection_bounds(range, line_height)
+                .into_iter()
+                .map(|bounds| InlineRangeGeometry {
+                    visual_line_index: (bounds.origin.y / line_height) as usize,
+                    bounds,
+                })
+                .collect(),
+        )
+    }
+
+    /// Returns native geometry for several ranges in input order.
+    fn inline_geometry_for_ranges(&self, ranges: &[Range<usize>]) -> Vec<Vec<InlineRangeGeometry>> {
+        ranges
+            .iter()
+            .map(|range| self.inline_geometry(range.clone()).unwrap_or_default())
+            .collect()
+    }
+
+    /// Returns the atomic logical cluster before the caret.
+    fn logical_cluster_before(&self, caret: CaretPosition) -> Option<Range<usize>>;
+
+    /// Returns the atomic logical cluster after the caret.
+    fn logical_cluster_after(&self, caret: CaretPosition) -> Option<Range<usize>>;
+
+    /// Returns the caret and retained horizontal coordinate after applying a movement.
+    fn caret_movement(
+        &self,
+        caret: CaretPosition,
+        movement: TextMovement,
+        vertical_navigation_x: Option<Pixels>,
+    ) -> CaretMovement;
+
+    /// Returns the word or line selected at a point in GPUI layout coordinates.
+    fn selection_from_pixel_point(
+        &self,
+        pixel_point: Point<Pixels>,
+        line_height: Pixels,
+        kind: TextSelectionKind,
+    ) -> Range<usize>;
+}
+
+/// A direction in visual, rather than logical, text order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VisualDirection {
+    /// Move toward the visual left.
+    Left,
+    /// Move toward the visual right.
+    Right,
+}
+
+/// The direction of a semantic text movement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextDirection {
+    /// Move toward the visual left.
+    Left,
+    /// Move toward the visual right.
+    Right,
+    /// Move to the visual row above.
+    Up,
+    /// Move to the visual row below.
+    Down,
+    /// Move to the start of a line or document boundary.
+    Start,
+    /// Move to the end of a line or document boundary.
+    End,
+}
+
+/// The boundary at which a semantic text movement stops.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextBoundary {
+    /// One backend-defined caret step. [`PlatformTextLayout::normalized_caret`] and
+    /// [`PlatformTextLayout::adjacent_visual_caret`] govern visual stops, while
+    /// [`PlatformTextLayout::logical_cluster_before`] and
+    /// [`PlatformTextLayout::logical_cluster_after`] return logical ranges.
+    /// [`PlatformTextSystem::layout_text`] provides [`LineLayout::platform_layout`].
+    /// Platform constructors use `gpui_ce_parley`, whose logical ranges are graphemes and
+    /// visual movement follows Parley cursors. Other backends may differ.
+    Cluster,
+    /// A word boundary.
+    Word,
+    /// One visual row produced by line breaking, including soft wrapping.
+    VisualLine,
+    /// A line delimited by a hard break.
+    HardLine,
+    /// The complete text document.
+    Document,
+}
+
+/// A semantic caret movement handled by the native text layout.
+///
+/// `direction` chooses where to move, and `boundary` chooses the unit. Consecutive vertical
+/// movements reuse the returned preferred horizontal coordinate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TextMovement {
+    /// The direction in which to move.
+    pub direction: TextDirection,
+    /// The boundary at which to stop.
+    pub boundary: TextBoundary,
+}
+
+impl TextDirection {
+    /// Creates a semantic movement in this direction with the requested boundary.
+    pub const fn with_boundary(self, boundary: TextBoundary) -> TextMovement {
+        TextMovement {
+            direction: self,
+            boundary,
+        }
+    }
+}
+
+/// A semantic selection derived from a point.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextSelectionKind {
+    /// Select a word.
+    Word,
+    /// Select a soft-wrapped visual row.
+    VisualLine,
+    /// Select a line delimited by a hard break.
+    HardLine,
+}
+
+/// A horizontal row produced by shaping and line breaking. Soft wrapping can split one logical
+/// line across several rows; bidirectional ordering does not change logical UTF-8 byte ranges.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct VisualLine {
+    /// The logical UTF-8 byte range assigned to this row.
+    pub text_range: Range<usize>,
+    /// Indices into [`LineLayout::paint_fragments`] for the positioned glyph runs
+    /// painted on this row, ordered by visual position.
+    pub paint_fragment_range: Range<usize>,
+    /// Horizontal distance consumed by the row's shaped content before alignment,
+    /// measured to the backend's final text pen position. Inline layouts include
+    /// advances from embedded boxes.
+    pub advance_width: Pixels,
+    /// Horizontal offset assigned by backend layout.
+    pub offset: Pixels,
+    /// Base direction used to order and align this visual line.
+    pub direction: crate::ResolvedDirection,
+}
+
+/// GPUI paint properties carried through Parley's brush.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PaintStyle {
+    /// Glyph foreground color.
+    pub color: Hsla,
+    /// Optional background color.
+    pub background_color: Option<Hsla>,
+    /// Optional underline style.
+    pub underline: Option<UnderlineStyle>,
+    /// Optional strikethrough style.
+    pub strikethrough: Option<StrikethroughStyle>,
+}
+
+/// A positioned, style-specific glyph run painted on one visual line.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaintFragment {
+    /// Index of the input text run that supplies paint properties.
+    pub source_run: usize,
+    /// Canonical font used by the glyphs.
     pub font_id: FontId,
-    /// The glyphs that make up this run
-    pub glyphs: Vec<ShapedGlyph>,
+    /// Resolved size of this shaped run.
+    pub font_size: Pixels,
+    /// Positioned glyphs local to the visual line.
+    pub glyphs: Arc<[ShapedGlyph]>,
+    /// Horizontal bounds of this fragment.
+    pub x_range: Range<Pixels>,
+    /// Paint properties shared by every glyph in the fragment.
+    pub style: PaintStyle,
+    /// Resolved underline offset from the baseline.
+    pub underline_offset: Option<Pixels>,
+    /// Resolved strikethrough offset from the baseline.
+    pub strikethrough_offset: Option<Pixels>,
 }
 
 /// A single glyph, ready to paint.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ShapedGlyph {
     /// The ID for this glyph, as determined by the text system.
     pub id: GlyphId,
@@ -48,617 +464,491 @@ pub struct ShapedGlyph {
     /// The position of this glyph in its containing line.
     pub position: Point<Pixels>,
 
-    /// The index of this glyph in the original text.
-    pub index: usize,
-
     /// Whether this glyph is an emoji
     pub is_emoji: bool,
 }
 
-impl LineLayout {
-    /// The index for the character at the given x coordinate
-    pub fn index_for_x(&self, x: Pixels) -> Option<usize> {
-        if x >= self.width {
-            None
+/// Determines which logical neighbor owns a caret at a shared text boundary.
+///
+/// At a soft wrap, downstream places the caret at the next row's start, and upstream places it at
+/// the previous row's end. At a bidirectional boundary, affinities can place the same byte index at
+/// different horizontal positions. They refer to logical order, not visual left and right.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum CaretAffinity {
+    /// The caret attaches to the logically following cluster.
+    #[default]
+    Downstream,
+    /// The caret attaches to the logically preceding cluster.
+    Upstream,
+}
+
+/// Hard line breaks that place an inserted-text caret downstream.
+static HARD_LINE_BREAK_CHARACTERS: phf::Set<char> = phf::phf_set! {
+    '\n',
+    '\r',
+    '\u{001c}',
+    '\u{001d}',
+    '\u{001e}',
+    '\u{0085}',
+    '\u{2028}',
+    '\u{2029}',
+};
+
+/// Returns whether `character` separates Unicode text paragraphs.
+///
+/// Line separator (`U+2028`) is a hard line break within the current paragraph. Consumers are
+/// responsible for treating a CRLF pair as one paragraph separator.
+pub fn is_paragraph_separator(character: char) -> bool {
+    character != '\u{2028}' && HARD_LINE_BREAK_CHARACTERS.contains(&character)
+}
+
+impl CaretAffinity {
+    /// Returns the affinity for a caret placed after inserted text.
+    pub fn for_inserted_text(text: &str) -> Self {
+        Self::from(text)
+    }
+}
+
+impl From<&str> for CaretAffinity {
+    fn from(text: &str) -> Self {
+        let Some(last_character) = text.chars().next_back() else {
+            return Self::Downstream;
+        };
+
+        if HARD_LINE_BREAK_CHARACTERS.contains(&last_character) {
+            return Self::Downstream;
+        }
+
+        Self::Upstream
+    }
+}
+
+/// A byte position together with the information needed to place it visually.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct CaretPosition {
+    /// The logical UTF-8 byte index.
+    pub index: usize,
+    /// The logical neighbor that owns this position.
+    pub affinity: CaretAffinity,
+}
+
+impl From<(usize, CaretAffinity)> for CaretPosition {
+    fn from((index, affinity): (usize, CaretAffinity)) -> Self {
+        Self { index, affinity }
+    }
+}
+
+impl CaretPosition {
+    /// Creates a caret attached to the next logical cluster.
+    pub const fn attached_to_next_cluster(index: usize) -> Self {
+        Self {
+            index,
+            affinity: CaretAffinity::Downstream,
+        }
+    }
+
+    /// Creates a caret attached to the previous logical cluster.
+    pub const fn attached_to_previous_cluster(index: usize) -> Self {
+        Self {
+            index,
+            affinity: CaretAffinity::Upstream,
+        }
+    }
+}
+
+/// An affinity-aware text selection.
+///
+/// The anchor stays fixed while the caret is the active endpoint. Either endpoint may be the
+/// logical start or end of the selected byte range.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CaretSelection {
+    /// The fixed position of the selection, which may be its logical start or end.
+    pub anchor: CaretPosition,
+    /// The active position of the selection. When it equals `anchor`, the selection is empty.
+    pub caret: CaretPosition,
+}
+
+impl From<usize> for CaretSelection {
+    fn from(index: usize) -> Self {
+        CaretPosition::attached_to_next_cluster(index).into()
+    }
+}
+
+impl From<CaretPosition> for CaretSelection {
+    fn from(caret: CaretPosition) -> Self {
+        Self {
+            anchor: caret,
+            caret,
+        }
+    }
+}
+
+/// Creates a downstream-affinity selection whose caret is `start` and anchor is `end`.
+impl From<Range<usize>> for CaretSelection {
+    fn from(range: Range<usize>) -> Self {
+        Self {
+            anchor: CaretPosition::attached_to_next_cluster(range.end),
+            caret: CaretPosition::attached_to_next_cluster(range.start),
+        }
+    }
+}
+
+impl CaretSelection {
+    /// Returns whether the selection is empty.
+    pub fn is_empty(&self) -> bool {
+        self.anchor.index == self.caret.index
+    }
+
+    /// Compares the active caret's UTF-8 byte index with the fixed anchor's index.
+    pub fn endpoint_ordering(self) -> std::cmp::Ordering {
+        self.caret.index.cmp(&self.anchor.index)
+    }
+
+    /// Returns the selected UTF-8 byte range in logical order.
+    pub fn byte_range(self) -> Range<usize> {
+        self.anchor.index.min(self.caret.index)..self.anchor.index.max(self.caret.index)
+    }
+
+    /// Limits both selection endpoints to `max_idx` while preserving their affinities.
+    pub fn min(mut self, max_idx: usize) -> Self {
+        self.caret.index = self.caret.index.min(max_idx);
+        self.anchor.index = self.anchor.index.min(max_idx);
+
+        self
+    }
+
+    /// Moves the active end while preserving the anchor.
+    pub fn with_caret(self, caret: CaretPosition) -> Self {
+        Self {
+            anchor: self.anchor,
+            caret,
+        }
+    }
+}
+
+/// The result of calculating movement through a laid-out document.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CaretMovement<T = CaretPosition> {
+    /// The value at the requested destination.
+    pub result: T,
+    /// The horizontal coordinate from the layout's left edge retained across consecutive vertical
+    /// movements.
+    pub vertical_navigation_x: Option<Pixels>,
+}
+
+/// The result of calculating a selection movement through a laid-out document.
+pub type CaretSelectionMovement = CaretMovement<CaretSelection>;
+
+impl CaretMovement<CaretSelection> {
+    /// Moves or extends the selection to `caret`, clearing the retained vertical coordinate.
+    pub fn move_or_select_to(self, caret: CaretPosition, extend: bool) -> Self {
+        let result = if extend {
+            self.result.with_caret(caret)
         } else {
-            for run in self.runs.iter().rev() {
-                for glyph in run.glyphs.iter().rev() {
-                    if glyph.position.x <= x {
-                        return Some(glyph.index);
-                    }
-                }
-            }
-            Some(0)
-        }
-    }
-
-    /// closest_index_for_x returns the character boundary closest to the given x coordinate
-    /// (e.g. to handle aligning up/down arrow keys)
-    pub fn closest_index_for_x(&self, x: Pixels) -> usize {
-        let mut prev_index = 0;
-        let mut prev_x = px(0.);
-
-        for run in self.runs.iter() {
-            for glyph in run.glyphs.iter() {
-                if glyph.position.x >= x {
-                    if glyph.position.x - x < x - prev_x {
-                        return glyph.index;
-                    } else {
-                        return prev_index;
-                    }
-                }
-                prev_index = glyph.index;
-                prev_x = glyph.position.x;
-            }
-        }
-
-        if self.len == 1 {
-            if x > self.width / 2. {
-                return 1;
-            } else {
-                return 0;
-            }
-        }
-
-        self.len
-    }
-
-    /// The x position of the character at the given index
-    pub fn x_for_index(&self, index: usize) -> Pixels {
-        for run in &self.runs {
-            for glyph in &run.glyphs {
-                if glyph.index >= index {
-                    return glyph.position.x;
-                }
-            }
-        }
-        self.width
-    }
-
-    /// The corresponding Font at the given index
-    pub fn font_id_for_index(&self, index: usize) -> Option<FontId> {
-        for run in &self.runs {
-            for glyph in &run.glyphs {
-                if glyph.index >= index {
-                    return Some(run.font_id);
-                }
-            }
-        }
-        None
-    }
-
-    /// Split this layout at a byte index, returning `(prefix, suffix)`.
-    ///
-    /// - `prefix` contains glyphs for bytes `[0, byte_index)` with original positions.
-    ///   Its width equals the x-advance up to the split point.
-    /// - `suffix` contains glyphs for bytes `[byte_index, len)` with positions
-    ///   shifted left so the first glyph starts at x=0, and byte indices rebased to 0.
-    /// - `font_size`, `ascent`, and `descent` are copied to both halves.
-    pub fn split_at(&self, byte_index: usize) -> (LineLayout, LineLayout) {
-        let x_offset = self.x_for_index(byte_index);
-
-        // Partition glyph runs. A single run may contribute glyphs to both halves.
-        let mut left_runs = Vec::new();
-        let mut right_runs = Vec::new();
-
-        for run in &self.runs {
-            let split_pos = run.glyphs.partition_point(|g| g.index < byte_index);
-
-            if split_pos > 0 {
-                left_runs.push(ShapedRun {
-                    font_id: run.font_id,
-                    glyphs: run.glyphs[..split_pos].to_vec(),
-                });
-            }
-
-            if split_pos < run.glyphs.len() {
-                let right_glyphs = run.glyphs[split_pos..]
-                    .iter()
-                    .map(|g| ShapedGlyph {
-                        id: g.id,
-                        position: point(g.position.x - x_offset, g.position.y),
-                        index: g.index - byte_index,
-                        is_emoji: g.is_emoji,
-                    })
-                    .collect();
-                right_runs.push(ShapedRun {
-                    font_id: run.font_id,
-                    glyphs: right_glyphs,
-                });
-            }
-        }
-
-        let left = LineLayout {
-            font_size: self.font_size,
-            width: x_offset,
-            ascent: self.ascent,
-            descent: self.descent,
-            runs: left_runs,
-            len: byte_index,
+            caret.into()
         };
 
-        let right = LineLayout {
-            font_size: self.font_size,
-            width: self.width - x_offset,
-            ascent: self.ascent,
-            descent: self.descent,
-            runs: right_runs,
-            len: self.len - byte_index,
-        };
-
-        (left, right)
-    }
-
-    fn compute_wrap_boundaries(
-        &self,
-        text: &str,
-        wrap_width: Pixels,
-        max_lines: Option<usize>,
-    ) -> SmallVec<[WrapBoundary; 1]> {
-        let mut boundaries = SmallVec::new();
-        let mut first_non_whitespace_ix = None;
-        let mut last_candidate_ix = None;
-        let mut last_candidate_x = px(0.);
-        // Glyphs are addressed as `(run_ix, glyph_ix)`, which orders them as the text does.
-        let mut last_boundary = (0, 0);
-        let mut last_boundary_x = px(0.);
-        let mut prev_ch = '\0';
-        let mut glyphs = self
-            .runs
-            .iter()
-            .enumerate()
-            .flat_map(move |(run_ix, run)| {
-                run.glyphs.iter().enumerate().map(move |(glyph_ix, glyph)| {
-                    let character = text[glyph.index..].chars().next().unwrap();
-                    ((run_ix, glyph_ix), character, glyph.position.x)
-                })
-            })
-            .peekable();
-
-        while let Some((glyph, ch, x)) = glyphs.next() {
-            if ch == '\n' {
-                continue;
-            }
-
-            // Here is very similar to `LineWrapper::wrap_line` to determine text wrapping,
-            // but there are some differences, so we have to duplicate the code here.
-            if LineWrapper::is_word_char(ch) {
-                if prev_ch == ' ' && ch != ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = Some(glyph);
-                    last_candidate_x = x;
-                }
-            } else {
-                if ch != ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = Some(glyph);
-                    last_candidate_x = x;
-                }
-            }
-
-            if ch != ' ' && first_non_whitespace_ix.is_none() {
-                first_non_whitespace_ix = Some(glyph);
-            }
-
-            let next_x = glyphs.peek().map_or(self.width, |(_, _, x)| *x);
-            let width = next_x - last_boundary_x;
-
-            if width > wrap_width && glyph > last_boundary {
-                // When used line_clamp, we should limit the number of lines.
-                if let Some(max_lines) = max_lines
-                    && boundaries.len() >= max_lines.saturating_sub(1)
-                {
-                    break;
-                }
-
-                let line_start = last_boundary;
-                (last_boundary, last_boundary_x) = last_candidate_ix
-                    .take()
-                    .map_or((glyph, x), |candidate| (candidate, last_candidate_x));
-                let (run_ix, glyph_ix) = last_boundary;
-                boundaries.push(WrapBoundary {
-                    run_ix,
-                    glyph_ix,
-                    trailing_whitespace_x: self.trailing_whitespace_x(
-                        text,
-                        line_start,
-                        last_boundary,
-                    ),
-                });
-            }
-            prev_ch = ch;
-        }
-
-        boundaries
-    }
-
-    /// Where the spaces a line was wrapped at begin: the x of the first of the `' '` glyphs
-    /// running up to the glyph at `boundary`, or that glyph's own x when the line does not end
-    /// in a space. The spaces are only followed back to the glyph at `line_start`, so a line of
-    /// nothing but spaces hangs whole.
-    fn trailing_whitespace_x(
-        &self,
-        text: &str,
-        line_start: (usize, usize),
-        boundary: (usize, usize),
-    ) -> Pixels {
-        let (run_ix, glyph_ix) = boundary;
-        self.runs[..=run_ix]
-            .iter()
-            .enumerate()
-            .rev()
-            .flat_map(|(ix, run)| {
-                let end = if ix == run_ix {
-                    glyph_ix
-                } else {
-                    run.glyphs.len()
-                };
-                run.glyphs[..end]
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .map(move |(glyph_ix, glyph)| ((ix, glyph_ix), glyph))
-            })
-            .take_while(|(ix, glyph)| *ix >= line_start && text[glyph.index..].starts_with(' '))
-            .last()
-            .map_or_else(
-                || self.runs[run_ix].glyphs[glyph_ix].position.x,
-                |(_, glyph)| glyph.position.x,
-            )
-    }
-
-    /// The glyph that starts the line after `boundary`.
-    pub(crate) fn glyph_at(&self, boundary: &WrapBoundary) -> &ShapedGlyph {
-        &self.runs[boundary.run_ix].glyphs[boundary.glyph_ix]
-    }
-
-    /// Where the line before `boundary` ends, as `(visible_end, end)`; the last line, which no
-    /// boundary follows, ends with the layout.
-    fn wrapped_line_end(&self, boundary: Option<&WrapBoundary>) -> (Pixels, Pixels) {
-        match boundary {
-            Some(boundary) => (
-                boundary.trailing_whitespace_x,
-                self.glyph_at(boundary).position.x,
-            ),
-            None => (self.width, self.width),
-        }
-    }
-
-    /// Where visual line `line_ix` of this layout lies once it is wrapped at `wrap_boundaries`.
-    /// `line_ix` is at most `wrap_boundaries.len()`, the index of the last line.
-    pub(crate) fn wrapped_line_extent(
-        &self,
-        wrap_boundaries: &[WrapBoundary],
-        line_ix: usize,
-    ) -> WrappedLineExtent {
-        debug_assert!(line_ix <= wrap_boundaries.len(), "no line {line_ix}");
-        let start = match line_ix.checked_sub(1) {
-            Some(previous) => self.glyph_at(&wrap_boundaries[previous]).position.x,
-            None => Pixels::ZERO,
-        };
-        let (visible_end, end) = self.wrapped_line_end(wrap_boundaries.get(line_ix));
-        WrappedLineExtent {
-            start,
-            visible_end,
-            end,
-        }
-    }
-
-    /// The extents of every visual line of this layout wrapped at `wrap_boundaries`, first line
-    /// first. Each line starts where the one before it ended, so every boundary is looked up once.
-    pub(crate) fn wrapped_line_extents<'a>(
-        &'a self,
-        wrap_boundaries: &'a [WrapBoundary],
-    ) -> impl Iterator<Item = WrappedLineExtent> + 'a {
-        let mut start = Pixels::ZERO;
-        wrap_boundaries
-            .iter()
-            .map(Some)
-            .chain([None])
-            .map(move |boundary| {
-                let (visible_end, end) = self.wrapped_line_end(boundary);
-                let extent = WrappedLineExtent {
-                    start,
-                    visible_end,
-                    end,
-                };
-                start = end;
-                extent
-            })
-    }
-
-    /// How far `align` shifts visual line `line_ix` right of this layout's origin when it is
-    /// painted in a box `align_width` wide, wrapped at `wrap_boundaries`. Painting and hit
-    /// testing share it, so a position resolves to the glyph painted there. A line the layout
-    /// does not have is not shifted.
-    pub(crate) fn wrapped_line_offset(
-        &self,
-        wrap_boundaries: &[WrapBoundary],
-        line_ix: usize,
-        align: TextAlign,
-        align_width: Pixels,
-    ) -> Pixels {
-        // Left-aligned text, by far the common case, never shifts: painting calls
-        // this once per soft wrap every frame, so skip the extent lookups for it.
-        if align == TextAlign::Left || line_ix > wrap_boundaries.len() {
-            return Pixels::ZERO;
-        }
-        self.wrapped_line_extent(wrap_boundaries, line_ix)
-            .alignment_offset(align, align_width)
-    }
-}
-
-/// Where one visual line of a wrapped layout lies within the unwrapped layout.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct WrappedLineExtent {
-    /// The x of the glyph that starts the line.
-    pub(crate) start: Pixels,
-    /// Where alignment measures the line to: the whitespace it was wrapped at hangs past this.
-    pub(crate) visible_end: Pixels,
-    /// The x of the glyph that starts the next line, or the layout's width for the last line.
-    pub(crate) end: Pixels,
-}
-
-impl WrappedLineExtent {
-    /// The line's width, the whitespace it was wrapped at included.
-    pub(crate) fn width(&self) -> Pixels {
-        self.end - self.start
-    }
-
-    /// How far `align` shifts the line right of the layout's origin in a box `align_width`
-    /// wide. A line wider than the box shifts left, past the box's edge.
-    pub(crate) fn alignment_offset(&self, align: TextAlign, align_width: Pixels) -> Pixels {
-        let visible_width = self.visible_end - self.start;
-        match align {
-            TextAlign::Left => Pixels::ZERO,
-            TextAlign::Center => (align_width - visible_width) / 2.,
-            TextAlign::Right => align_width - visible_width,
+        Self {
+            result,
+            vertical_navigation_x: None,
         }
     }
 }
 
-/// A line of text that has been wrapped to fit a given width
-#[derive(Default, Debug)]
-pub struct WrappedLineLayout {
-    /// The line layout, pre-wrapping.
-    pub unwrapped_layout: Arc<LineLayout>,
+/// The layout of shaped text, including its optional wrapping constraint.
+#[derive(Debug)]
+pub struct ShapedTextLayout {
+    /// The laid out document.
+    pub layout: Arc<LineLayout>,
 
-    /// The boundaries at which the line was wrapped
-    pub wrap_boundaries: SmallVec<[WrapBoundary; 1]>,
-
-    /// The width of the line, if it was wrapped
+    /// The width constraint, when wrapping is enabled.
     pub wrap_width: Option<Pixels>,
 }
 
-/// A boundary at which a line was wrapped
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct WrapBoundary {
-    /// The index in the run just before the line was wrapped
-    pub run_ix: usize,
-    /// The index of the glyph just before the line was wrapped
-    pub glyph_ix: usize,
-    /// Where the spaces the line was wrapped at begin, in the unwrapped layout: the glyph's own
-    /// x when the line does not end in a space. Alignment measures the line to here, so those
-    /// spaces hang past its aligned edge instead of pushing its text away from it. Whitespace at
-    /// the end of the text is not wrapped at and so aligns like any other glyph.
-    pub trailing_whitespace_x: Pixels,
-}
-
-impl WrapBoundary {
-    /// Whether the line after this boundary starts with glyph `glyph_ix` of run `run_ix`.
-    pub(crate) fn is_at(&self, run_ix: usize, glyph_ix: usize) -> bool {
-        (self.run_ix, self.glyph_ix) == (run_ix, glyph_ix)
-    }
-}
-
-impl WrappedLineLayout {
+impl ShapedTextLayout {
     /// The length of the underlying text, in utf8 bytes.
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
-        self.unwrapped_layout.len
+        self.layout.platform_layout.len()
     }
 
-    /// The width of this line, in pixels, whether or not it was wrapped.
+    /// The document width, capped by the wrapping constraint.
     pub fn width(&self) -> Pixels {
         self.wrap_width
             .unwrap_or(Pixels::MAX)
-            .min(self.unwrapped_layout.width)
+            .min(self.layout.width)
     }
 
-    /// The size of the whole wrapped text, for the given line_height.
-    /// can span multiple lines if there are multiple wrap boundaries.
+    /// The size of the complete text for the given line height.
     pub fn size(&self, line_height: Pixels) -> Size<Pixels> {
         Size {
             width: self.width(),
-            height: line_height * (self.wrap_boundaries.len() + 1),
+            height: line_height * self.line_count(),
         }
+    }
+
+    /// Returns the number of visual lines in this layout.
+    pub fn line_count(&self) -> usize {
+        self.layout.platform_layout.line_count()
     }
 
     /// The ascent of a line in this layout
     pub fn ascent(&self) -> Pixels {
-        self.unwrapped_layout.ascent
+        self.layout.ascent
     }
 
     /// The descent of a line in this layout
     pub fn descent(&self) -> Pixels {
-        self.unwrapped_layout.descent
+        self.layout.descent
     }
 
-    /// The wrap boundaries in this layout
-    pub fn wrap_boundaries(&self) -> &[WrapBoundary] {
-        &self.wrap_boundaries
+    /// Returns the visual lines in paint order.
+    pub fn visual_lines(&self) -> &[VisualLine] {
+        &self.layout.visual_lines
+    }
+
+    /// Returns the fragments belonging to a visual line.
+    pub fn fragments_for_line(&self, line: &VisualLine) -> &[PaintFragment] {
+        &self.layout.paint_fragments[line.paint_fragment_range.clone()]
     }
 
     /// The font size of this layout
     pub fn font_size(&self) -> Pixels {
-        self.unwrapped_layout.font_size
+        self.layout.font_size
     }
 
-    /// The runs in this layout, sans wrapping
-    pub fn runs(&self) -> &[ShapedRun] {
-        &self.unwrapped_layout.runs
-    }
-
-    /// How far `align` moves visual line `wrapped_line_ix` right of the layout's origin when it
-    /// is painted in a box `align_width` wide: the shift painting applies, so callers can place
-    /// things on aligned text. The whitespace a line was wrapped at hangs past its aligned edge
-    /// rather than counting toward its width. A line past the last is not moved.
-    pub fn wrapped_line_offset(
+    /// The UTF-8 byte index for a point in GPUI layout coordinates.
+    ///
+    /// The backend returns the logical start of the visual cluster under the point.
+    /// Whitespace is hit like any other cluster. Positions outside the line return the boundary at
+    /// that visual edge in `Err`.
+    ///
+    /// See also [`Self::closest_byte_index_for_pixel_point`].
+    pub fn byte_index_for_pixel_point(
         &self,
-        wrapped_line_ix: usize,
-        align: TextAlign,
-        align_width: Pixels,
-    ) -> Pixels {
-        self.unwrapped_layout.wrapped_line_offset(
-            &self.wrap_boundaries,
-            wrapped_line_ix,
-            align,
-            align_width,
+        pixel_point: Point<Pixels>,
+        line_height: Pixels,
+    ) -> Result<usize, usize> {
+        self.layout
+            .platform_layout
+            .byte_index_from_pixel_point(pixel_point, line_height)
+    }
+
+    /// The closest UTF-8 byte index to a point in GPUI layout coordinates.
+    ///
+    /// Closest means the character boundary closest to the given position.
+    /// The backend only returns cluster boundaries. For right-to-left clusters, the
+    /// visual left edge maps to the logical end and the visual right edge maps to the logical
+    /// start. Zero-width clusters share a stop with an adjacent cluster and use visual order to
+    /// break ties.
+    ///
+    pub fn closest_byte_index_for_pixel_point(
+        &self,
+        pixel_point: Point<Pixels>,
+        line_height: Pixels,
+    ) -> Result<usize, usize> {
+        self.closest_caret_for_pixel_point(pixel_point, line_height)
+            .map(|caret| caret.index)
+            .map_err(|caret| caret.index)
+    }
+
+    /// Returns the closest backend-native caret for a point in GPUI layout coordinates.
+    ///
+    /// Positions outside a visual line return the caret at that edge in `Err`, matching
+    /// [`Self::closest_byte_index_for_pixel_point`].
+    pub fn closest_caret_for_pixel_point(
+        &self,
+        pixel_point: Point<Pixels>,
+        line_height: Pixels,
+    ) -> Result<CaretPosition, CaretPosition> {
+        self.layout
+            .platform_layout
+            .caret_from_pixel_point(pixel_point, line_height)
+    }
+
+    /// Returns the visual position in pixels for a UTF-8 byte index.
+    ///
+    /// The backend maps cluster boundaries to direction-aware visual edges. An index
+    /// inside an atomic cluster snaps to its logical start. On a shared wrap boundary, the cluster
+    /// starting at the index owns the position, so the caret moves to the following visual line.
+    pub fn visual_position_for_byte_index(
+        &self,
+        byte_index: usize,
+        line_height: Pixels,
+    ) -> Option<Point<Pixels>> {
+        if byte_index > self.len() {
+            return None;
+        }
+
+        self.visual_position_for_caret(
+            CaretPosition::attached_to_next_cluster(byte_index),
+            line_height,
         )
     }
 
-    /// The index corresponding to a given position in this layout for the given line height.
-    ///
-    /// See also [`Self::closest_index_for_position`].
-    pub fn index_for_position(
+    /// Returns the visual position in pixels for an affinity-aware caret.
+    pub fn visual_position_for_caret(
         &self,
-        position: Point<Pixels>,
+        caret: CaretPosition,
         line_height: Pixels,
-    ) -> Result<usize, usize> {
-        self._index_for_position(position, line_height, false, TextAlign::Left, Pixels::ZERO)
-    }
-
-    /// [`Self::index_for_position`] for text painted with `align` in a box
-    /// `align_width` wide.
-    pub fn index_for_position_aligned(
-        &self,
-        position: Point<Pixels>,
-        line_height: Pixels,
-        align: TextAlign,
-        align_width: Pixels,
-    ) -> Result<usize, usize> {
-        self._index_for_position(position, line_height, false, align, align_width)
-    }
-
-    /// The closest index to a given position in this layout for the given line height.
-    ///
-    /// Closest means the character boundary closest to the given position.
-    ///
-    /// See also [`LineLayout::closest_index_for_x`].
-    pub fn closest_index_for_position(
-        &self,
-        position: Point<Pixels>,
-        line_height: Pixels,
-    ) -> Result<usize, usize> {
-        self._index_for_position(position, line_height, true, TextAlign::Left, Pixels::ZERO)
-    }
-
-    /// [`Self::closest_index_for_position`] for text painted with `align` in
-    /// a box `align_width` wide.
-    pub fn closest_index_for_position_aligned(
-        &self,
-        position: Point<Pixels>,
-        line_height: Pixels,
-        align: TextAlign,
-        align_width: Pixels,
-    ) -> Result<usize, usize> {
-        self._index_for_position(position, line_height, true, align, align_width)
-    }
-
-    fn _index_for_position(
-        &self,
-        mut position: Point<Pixels>,
-        line_height: Pixels,
-        closest: bool,
-        align: TextAlign,
-        align_width: Pixels,
-    ) -> Result<usize, usize> {
-        let wrapped_line_ix = (position.y / line_height) as usize;
-
-        let wrapped_line_start_index;
-        let wrapped_line_start_x;
-        if wrapped_line_ix > 0 {
-            let Some(line_start_boundary) = self.wrap_boundaries.get(wrapped_line_ix - 1) else {
-                return Err(0);
-            };
-            let glyph = self.unwrapped_layout.glyph_at(line_start_boundary);
-            wrapped_line_start_index = glyph.index;
-            wrapped_line_start_x = glyph.position.x;
-        } else {
-            wrapped_line_start_index = 0;
-            wrapped_line_start_x = Pixels::ZERO;
-        };
-
-        let wrapped_line_end_index;
-        let wrapped_line_end_x;
-        if wrapped_line_ix < self.wrap_boundaries.len() {
-            let next_wrap_boundary_ix = wrapped_line_ix;
-            let next_wrap_boundary = &self.wrap_boundaries[next_wrap_boundary_ix];
-            let glyph = self.unwrapped_layout.glyph_at(next_wrap_boundary);
-            wrapped_line_end_index = glyph.index;
-            wrapped_line_end_x = glyph.position.x;
-        } else {
-            wrapped_line_end_index = self.unwrapped_layout.len;
-            wrapped_line_end_x = self.unwrapped_layout.width;
-        };
-
-        position.x -= self.wrapped_line_offset(wrapped_line_ix, align, align_width);
-        let mut position_in_unwrapped_line = position;
-        position_in_unwrapped_line.x += wrapped_line_start_x;
-        if position_in_unwrapped_line.x < wrapped_line_start_x {
-            Err(wrapped_line_start_index)
-        } else if position_in_unwrapped_line.x >= wrapped_line_end_x {
-            Err(wrapped_line_end_index)
-        } else {
-            if closest {
-                Ok(self
-                    .unwrapped_layout
-                    .closest_index_for_x(position_in_unwrapped_line.x))
-            } else {
-                Ok(self
-                    .unwrapped_layout
-                    .index_for_x(position_in_unwrapped_line.x)
-                    .unwrap())
-            }
-        }
-    }
-
-    /// Returns the pixel position for the given byte index.
-    pub fn position_for_index(&self, index: usize, line_height: Pixels) -> Option<Point<Pixels>> {
-        self.position_for_index_aligned(index, line_height, TextAlign::Left, Pixels::ZERO)
-    }
-
-    /// [`Self::position_for_index`] for text painted with `align` in a box
-    /// `align_width` wide. An index on a wrap boundary stays at the end of
-    /// the line above, as it does unaligned.
-    pub fn position_for_index_aligned(
-        &self,
-        index: usize,
-        line_height: Pixels,
-        align: TextAlign,
-        align_width: Pixels,
     ) -> Option<Point<Pixels>> {
-        let mut line_start_ix = 0;
-        let mut line_end_indices = self
-            .wrap_boundaries
-            .iter()
-            .map(|wrap_boundary| self.unwrapped_layout.glyph_at(wrap_boundary).index)
-            .chain([self.len()])
-            .enumerate();
-        for (ix, line_end_ix) in line_end_indices {
-            let line_y = ix as f32 * line_height;
-            if index < line_start_ix {
-                break;
-            } else if index > line_end_ix {
-                line_start_ix = line_end_ix;
-                continue;
-            } else {
-                let line_start_x = self.unwrapped_layout.x_for_index(line_start_ix);
-                let x = self.unwrapped_layout.x_for_index(index) - line_start_x
-                    + self.wrapped_line_offset(ix, align, align_width);
-                return Some(point(x, line_y));
-            }
+        self.layout
+            .platform_layout
+            .caret_bounds(caret, line_height)
+            .map(|bounds| bounds.origin)
+    }
+
+    /// Snaps a byte position to a valid cluster boundary while preserving affinity when possible.
+    pub fn normalized_caret(&self, caret: CaretPosition) -> CaretPosition {
+        self.layout.platform_layout.normalized_caret(caret)
+    }
+
+    /// Returns the adjacent caret stop in visual order.
+    pub fn adjacent_visual_caret(
+        &self,
+        caret: CaretPosition,
+        direction: VisualDirection,
+    ) -> Option<CaretPosition> {
+        self.layout
+            .platform_layout
+            .adjacent_visual_caret(caret, direction)
+    }
+
+    /// Returns the logical cluster immediately before the caret.
+    pub fn logical_cluster_before(&self, caret: CaretPosition) -> Option<Range<usize>> {
+        self.layout.platform_layout.logical_cluster_before(caret)
+    }
+
+    /// Returns the logical cluster immediately after the caret.
+    pub fn logical_cluster_after(&self, caret: CaretPosition) -> Option<Range<usize>> {
+        self.layout.platform_layout.logical_cluster_after(caret)
+    }
+
+    /// Returns the caret and retained horizontal coordinate after applying `movement`.
+    /// This only calculates the destination and does not mutate editor state.
+    pub fn caret_movement(
+        &self,
+        caret: CaretPosition,
+        movement: TextMovement,
+        vertical_navigation_x: Option<Pixels>,
+    ) -> CaretMovement {
+        self.layout
+            .platform_layout
+            .caret_movement(caret, movement, vertical_navigation_x)
+    }
+
+    /// Returns a moved or extended affinity-aware selection using visual text order.
+    ///
+    /// Horizontal movement without extension collapses a non-empty selection toward the requested
+    /// visual edge. Other movement starts at the caret. Extending keeps the anchor fixed.
+    ///
+    /// `selection` is the current anchor and active caret.
+    /// `movement` supplies the direction and boundary.
+    /// `extend` keeps the anchor fixed when true and collapses the result when false.
+    /// `vertical_navigation_x` carries the horizontal target across vertical movements.
+    /// `line_height` converts caret positions into comparable visual coordinates.
+    pub fn selection_movement(
+        &self,
+        selection: CaretSelection,
+        movement: TextMovement,
+        extend: bool,
+        vertical_navigation_x: Option<Pixels>,
+        line_height: Pixels,
+    ) -> CaretSelectionMovement {
+        let forward = movement.direction == TextDirection::Right;
+        let horizontal = matches!(
+            movement.direction,
+            TextDirection::Left | TextDirection::Right
+        ) && matches!(
+            movement.boundary,
+            TextBoundary::Cluster | TextBoundary::Word
+        );
+
+        if !extend && !selection.is_empty() && horizontal {
+            let caret_visual_position =
+                self.visual_position_for_caret(selection.caret, line_height);
+            let anchor_visual_position =
+                self.visual_position_for_caret(selection.anchor, line_height);
+            let (visual_start, visual_end) = caret_visual_position
+                .zip(anchor_visual_position)
+                .map(|(caret_visual_position, anchor_visual_position)| {
+                    if (caret_visual_position.y, caret_visual_position.x)
+                        <= (anchor_visual_position.y, anchor_visual_position.x)
+                    {
+                        (selection.caret, selection.anchor)
+                    } else {
+                        (selection.anchor, selection.caret)
+                    }
+                })
+                .unwrap_or_else(|| {
+                    if selection.caret.index <= selection.anchor.index {
+                        (selection.caret, selection.anchor)
+                    } else {
+                        (selection.anchor, selection.caret)
+                    }
+                });
+
+            let caret = if forward { visual_end } else { visual_start };
+
+            return CaretSelectionMovement {
+                result: caret.into(),
+                vertical_navigation_x: None,
+            };
         }
 
-        None
+        let CaretMovement {
+            result: caret,
+            vertical_navigation_x,
+        } = self.caret_movement(selection.caret, movement, vertical_navigation_x);
+
+        CaretSelectionMovement {
+            result: if extend {
+                selection.with_caret(caret)
+            } else {
+                caret.into()
+            },
+            vertical_navigation_x,
+        }
+    }
+
+    /// Selects the word or line at a point in GPUI layout coordinates.
+    pub fn selection_from_pixel_point(
+        &self,
+        pixel_point: Point<Pixels>,
+        line_height: Pixels,
+        kind: TextSelectionKind,
+    ) -> Range<usize> {
+        self.layout
+            .platform_layout
+            .selection_from_pixel_point(pixel_point, line_height, kind)
+    }
+
+    /// Returns rectangles covering all selected clusters in visual order.
+    pub fn selection_bounds(
+        &self,
+        byte_range: Range<usize>,
+        line_height: Pixels,
+    ) -> SmallVec<[Bounds<Pixels>; 4]> {
+        let mut result = SmallVec::new();
+
+        if byte_range.is_empty() {
+            return result;
+        }
+
+        result.extend(
+            self.layout
+                .platform_layout
+                .selection_bounds(byte_range, line_height),
+        );
+        result
+    }
+}
+
+impl std::ops::Deref for ShapedTextLayout {
+    type Target = LineLayout;
+
+    fn deref(&self) -> &Self::Target {
+        &self.layout
     }
 }
 
@@ -666,51 +956,146 @@ pub(crate) struct LineLayoutCache {
     previous_frame: Mutex<FrameCache>,
     current_frame: RwLock<FrameCache>,
     platform_text_system: Arc<dyn PlatformTextSystem>,
+    font_generation: AtomicU64,
 }
 
 #[derive(Default)]
 struct FrameCache {
-    lines: FxHashMap<Arc<CacheKey>, Arc<LineLayout>>,
-    wrapped_lines: FxHashMap<Arc<CacheKey>, Arc<WrappedLineLayout>>,
-    used_lines: Vec<Arc<CacheKey>>,
-    used_wrapped_lines: Vec<Arc<CacheKey>>,
+    lines: FrameLayouts<CacheKey, LineLayout>,
+    shaped_texts: FrameLayouts<CacheKey, ShapedTextLayout>,
+    inline_layouts: FrameLayouts<InlineCacheKey, InlineLayout>,
+}
 
-    // Content-addressable caches keyed by caller-provided text hash + layout params.
-    // These allow cache hits without materializing a contiguous `SharedString`.
-    //
-    // IMPORTANT: To support allocation-free lookups, we store these maps using a key type
-    // (`HashedCacheKeyRef`) that can be computed without building a contiguous `&str`/`SharedString`.
-    // On miss, we allocate once and store under an owned `HashedCacheKey`.
-    lines_by_hash: FxHashMap<Arc<HashedCacheKey>, Arc<LineLayout>>,
-    wrapped_lines_by_hash: FxHashMap<Arc<HashedCacheKey>, Arc<WrappedLineLayout>>,
-    used_lines_by_hash: Vec<Arc<HashedCacheKey>>,
-    used_wrapped_lines_by_hash: Vec<Arc<HashedCacheKey>>,
+struct FrameLayouts<Key, Value> {
+    entries: FxHashMap<Arc<Key>, Arc<Value>>,
+    used: Vec<Arc<Key>>,
+}
+
+impl<Key, Value> Default for FrameLayouts<Key, Value> {
+    fn default() -> Self {
+        Self {
+            entries: FxHashMap::default(),
+            used: Vec::new(),
+        }
+    }
+}
+
+impl<Key, Value> FrameLayouts<Key, Value>
+where
+    Key: Eq + Hash,
+{
+    fn get<Query>(&self, key: &Query) -> Option<&Arc<Value>>
+    where
+        Arc<Key>: Borrow<Query>,
+        Query: Eq + Hash + ?Sized,
+    {
+        self.entries.get(key)
+    }
+
+    fn remove_entry<Query>(&mut self, key: &Query) -> Option<(Arc<Key>, Arc<Value>)>
+    where
+        Arc<Key>: Borrow<Query>,
+        Query: Eq + Hash + ?Sized,
+    {
+        self.entries.remove_entry(key)
+    }
+
+    fn insert(&mut self, key: Arc<Key>, value: Arc<Value>) {
+        self.entries.insert(key.clone(), value);
+        self.used.push(key);
+    }
+
+    fn reuse(&mut self, previous: &mut Self, range: Range<usize>) {
+        for key in &previous.used[range] {
+            if let Some(layout) = previous.entries.remove(key) {
+                self.entries.insert(key.clone(), layout);
+            }
+
+            self.used.push(key.clone());
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.used.clear();
+    }
+}
+
+fn repaint_line_layout(layout: Arc<LineLayout>, runs: &[TextRun]) -> Arc<LineLayout> {
+    let paint_matches = layout.paint_fragments.iter().all(|fragment| {
+        runs.get(fragment.source_run)
+            .is_some_and(|run| fragment.style == PaintStyle::from(run))
+    });
+
+    if paint_matches {
+        return layout;
+    }
+
+    let mut repainted = (*layout).clone();
+
+    for fragment in &mut repainted.paint_fragments {
+        if let Some(run) = runs.get(fragment.source_run) {
+            fragment.style = PaintStyle::from(run);
+        }
+    }
+
+    Arc::new(repainted)
+}
+
+fn repaint_shaped_text_layout(
+    layout: Arc<ShapedTextLayout>,
+    runs: &[TextRun],
+) -> Arc<ShapedTextLayout> {
+    let repainted = repaint_line_layout(layout.layout.clone(), runs);
+
+    if Arc::ptr_eq(&repainted, &layout.layout) {
+        return layout;
+    }
+
+    Arc::new(ShapedTextLayout {
+        layout: repainted,
+        wrap_width: layout.wrap_width,
+    })
 }
 
 #[derive(Clone, Default)]
 pub(crate) struct LineLayoutIndex {
     lines_index: usize,
-    wrapped_lines_index: usize,
-    lines_by_hash_index: usize,
-    wrapped_lines_by_hash_index: usize,
+    shaped_texts_index: usize,
+    inline_layouts_index: usize,
 }
 
 impl LineLayoutCache {
     pub fn new(platform_text_system: Arc<dyn PlatformTextSystem>) -> Self {
+        let font_generation = platform_text_system.font_generation();
         Self {
             previous_frame: Mutex::default(),
             current_frame: RwLock::default(),
             platform_text_system,
+            font_generation: AtomicU64::new(font_generation),
         }
     }
 
     pub fn layout_index(&self) -> LineLayoutIndex {
         let frame = self.current_frame.read();
         LineLayoutIndex {
-            lines_index: frame.used_lines.len(),
-            wrapped_lines_index: frame.used_wrapped_lines.len(),
-            lines_by_hash_index: frame.used_lines_by_hash.len(),
-            wrapped_lines_by_hash_index: frame.used_wrapped_lines_by_hash.len(),
+            lines_index: frame.lines.used.len(),
+            shaped_texts_index: frame.shaped_texts.used.len(),
+            inline_layouts_index: frame.inline_layouts.used.len(),
+        }
+    }
+
+    /// Invalidates every cached layout after backend shaping state changes.
+    pub fn clear(&self) {
+        *self.previous_frame.lock() = FrameCache::default();
+        *self.current_frame.write() = FrameCache::default();
+    }
+
+    fn sync_font_generation(&self) {
+        let generation = self.platform_text_system.font_generation();
+        if self.font_generation.load(Ordering::Acquire) != generation {
+            self.clear();
+            self.font_generation.store(generation, Ordering::Release);
         }
     }
 
@@ -718,53 +1103,31 @@ impl LineLayoutCache {
         let mut previous_frame = &mut *self.previous_frame.lock();
         let mut current_frame = &mut *self.current_frame.write();
 
-        for key in &previous_frame.used_lines[range.start.lines_index..range.end.lines_index] {
-            if let Some((key, line)) = previous_frame.lines.remove_entry(key) {
-                current_frame.lines.insert(key, line);
-            }
-            current_frame.used_lines.push(key.clone());
-        }
-
-        for key in &previous_frame.used_wrapped_lines
-            [range.start.wrapped_lines_index..range.end.wrapped_lines_index]
-        {
-            if let Some((key, line)) = previous_frame.wrapped_lines.remove_entry(key) {
-                current_frame.wrapped_lines.insert(key, line);
-            }
-            current_frame.used_wrapped_lines.push(key.clone());
-        }
-
-        for key in &previous_frame.used_lines_by_hash
-            [range.start.lines_by_hash_index..range.end.lines_by_hash_index]
-        {
-            if let Some((key, line)) = previous_frame.lines_by_hash.remove_entry(key) {
-                current_frame.lines_by_hash.insert(key, line);
-            }
-            current_frame.used_lines_by_hash.push(key.clone());
-        }
-
-        for key in &previous_frame.used_wrapped_lines_by_hash
-            [range.start.wrapped_lines_by_hash_index..range.end.wrapped_lines_by_hash_index]
-        {
-            if let Some((key, line)) = previous_frame.wrapped_lines_by_hash.remove_entry(key) {
-                current_frame.wrapped_lines_by_hash.insert(key, line);
-            }
-            current_frame.used_wrapped_lines_by_hash.push(key.clone());
-        }
+        current_frame.lines.reuse(
+            &mut previous_frame.lines,
+            range.start.lines_index..range.end.lines_index,
+        );
+        current_frame.shaped_texts.reuse(
+            &mut previous_frame.shaped_texts,
+            range.start.shaped_texts_index..range.end.shaped_texts_index,
+        );
+        current_frame.inline_layouts.reuse(
+            &mut previous_frame.inline_layouts,
+            range.start.inline_layouts_index..range.end.inline_layouts_index,
+        );
     }
 
     pub fn truncate_layouts(&self, index: LineLayoutIndex) {
         let mut current_frame = &mut *self.current_frame.write();
-        current_frame.used_lines.truncate(index.lines_index);
+        current_frame.lines.used.truncate(index.lines_index);
         current_frame
-            .used_wrapped_lines
-            .truncate(index.wrapped_lines_index);
+            .shaped_texts
+            .used
+            .truncate(index.shaped_texts_index);
         current_frame
-            .used_lines_by_hash
-            .truncate(index.lines_by_hash_index);
-        current_frame
-            .used_wrapped_lines_by_hash
-            .truncate(index.wrapped_lines_by_hash_index);
+            .inline_layouts
+            .used
+            .truncate(index.inline_layouts_index);
     }
 
     pub fn finish_frame(&self) {
@@ -772,76 +1135,69 @@ impl LineLayoutCache {
         let mut curr_frame = self.current_frame.write();
         std::mem::swap(&mut *prev_frame, &mut *curr_frame);
         curr_frame.lines.clear();
-        curr_frame.wrapped_lines.clear();
-        curr_frame.used_lines.clear();
-        curr_frame.used_wrapped_lines.clear();
-
-        curr_frame.lines_by_hash.clear();
-        curr_frame.wrapped_lines_by_hash.clear();
-        curr_frame.used_lines_by_hash.clear();
-        curr_frame.used_wrapped_lines_by_hash.clear();
+        curr_frame.shaped_texts.clear();
+        curr_frame.inline_layouts.clear();
     }
 
-    pub fn layout_wrapped_line<Text>(
+    pub fn layout_text_with_options<Text>(
         &self,
         text: Text,
         font_size: Pixels,
-        runs: &[FontRun],
-        wrap_width: Option<Pixels>,
-        max_lines: Option<usize>,
-    ) -> Arc<WrappedLineLayout>
+        runs: &[TextRun],
+        options: TextLayoutOptions,
+    ) -> Arc<ShapedTextLayout>
     where
         Text: AsRef<str>,
         SharedString: From<Text>,
     {
+        self.sync_font_generation();
+        let wrap_width = options.wrap_width;
+        let shaping_runs = runs.iter().map(ShapingRun::from).collect::<SmallVec<_>>();
         let key = &CacheKeyRef {
             text: text.as_ref(),
             font_size,
-            runs,
-            wrap_width,
-            force_width: None,
+            runs: &shaping_runs,
+            options,
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
-        if let Some(layout) = current_frame.wrapped_lines.get(key) {
-            return layout.clone();
+        if let Some(layout) = current_frame.shaped_texts.get(key) {
+            return repaint_shaped_text_layout(layout.clone(), runs);
         }
 
-        let previous_frame_entry = self.previous_frame.lock().wrapped_lines.remove_entry(key);
+        let previous_frame_entry = self.previous_frame.lock().shaped_texts.remove_entry(key);
         if let Some((key, layout)) = previous_frame_entry {
             let mut current_frame = RwLockUpgradableReadGuard::upgrade(current_frame);
-            current_frame
-                .wrapped_lines
-                .insert(key.clone(), layout.clone());
-            current_frame.used_wrapped_lines.push(key);
-            layout
+            current_frame.shaped_texts.insert(key, layout.clone());
+            repaint_shaped_text_layout(layout, runs)
         } else {
             drop(current_frame);
             let text = SharedString::from(text);
-            let unwrapped_layout = self.layout_line::<&SharedString>(&text, font_size, runs, None);
-            let wrap_boundaries = if let Some(wrap_width) = wrap_width {
-                unwrapped_layout.compute_wrap_boundaries(text.as_ref(), wrap_width, max_lines)
+            let document_layout = if options != TextLayoutOptions::default() || text.contains('\n')
+            {
+                Arc::new(self.platform_text_system.layout_text(TextLayoutRequest {
+                    text: &text,
+                    font_size,
+                    runs,
+                    options,
+                }))
             } else {
-                SmallVec::new()
+                self.layout_line::<&SharedString>(&text, font_size, runs)
             };
-            let layout = Arc::new(WrappedLineLayout {
-                unwrapped_layout,
-                wrap_boundaries,
+
+            let layout = Arc::new(ShapedTextLayout {
+                layout: document_layout,
                 wrap_width,
             });
             let key = Arc::new(CacheKey {
                 text,
                 font_size,
-                runs: SmallVec::from(runs),
-                wrap_width,
-                force_width: None,
+                runs: shaping_runs,
+                options,
             });
 
             let mut current_frame = self.current_frame.write();
-            current_frame
-                .wrapped_lines
-                .insert(key.clone(), layout.clone());
-            current_frame.used_wrapped_lines.push(key);
+            current_frame.shaped_texts.insert(key, layout.clone());
 
             layout
         }
@@ -851,265 +1207,151 @@ impl LineLayoutCache {
         &self,
         text: Text,
         font_size: Pixels,
-        runs: &[FontRun],
-        force_width: Option<Pixels>,
+        runs: &[TextRun],
     ) -> Arc<LineLayout>
     where
         Text: AsRef<str>,
         SharedString: From<Text>,
     {
+        self.sync_font_generation();
+        let shaping_runs = runs.iter().map(ShapingRun::from).collect::<SmallVec<_>>();
         let key = &CacheKeyRef {
             text: text.as_ref(),
             font_size,
-            runs,
-            wrap_width: None,
-            force_width,
+            runs: &shaping_runs,
+            options: TextLayoutOptions::default(),
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
         if let Some(layout) = current_frame.lines.get(key) {
-            return layout.clone();
+            return repaint_line_layout(layout.clone(), runs);
         }
 
         let mut current_frame = RwLockUpgradableReadGuard::upgrade(current_frame);
         if let Some((key, layout)) = self.previous_frame.lock().lines.remove_entry(key) {
-            current_frame.lines.insert(key.clone(), layout.clone());
-            current_frame.used_lines.push(key);
-            layout
+            current_frame.lines.insert(key, layout.clone());
+            repaint_line_layout(layout, runs)
         } else {
             let text = SharedString::from(text);
-            let mut layout = self
-                .platform_text_system
-                .layout_line(&text, font_size, runs);
-
-            if let Some(force_width) = force_width {
-                apply_force_width_to_layout(&mut layout, force_width);
-            }
-
+            let layout = self.platform_text_system.layout_text(TextLayoutRequest {
+                text: &text,
+                font_size,
+                runs,
+                options: TextLayoutOptions::default(),
+            });
             let key = Arc::new(CacheKey {
                 text,
                 font_size,
-                runs: SmallVec::from(runs),
-                wrap_width: None,
-                force_width,
+                runs: shaping_runs,
+                options: TextLayoutOptions::default(),
             });
             let layout = Arc::new(layout);
-            current_frame.lines.insert(key.clone(), layout.clone());
-            current_frame.used_lines.push(key);
+            current_frame.lines.insert(key, layout.clone());
             layout
         }
     }
 
-    /// Try to retrieve a previously-shaped line layout using a caller-provided content hash.
-    ///
-    /// This is a *non-allocating* cache probe: it does not materialize any text. If the layout
-    /// is not already cached in either the current frame or previous frame, returns `None`.
-    ///
-    /// Contract (caller enforced):
-    /// - Same `text_hash` implies identical text content (collision risk accepted by caller).
-    /// - `text_len` should be the UTF-8 byte length of the text (helps reduce accidental collisions).
-    pub fn try_layout_line_by_hash(
-        &self,
-        text_hash: u64,
-        text_len: usize,
-        font_size: Pixels,
-        runs: &[FontRun],
-        force_width: Option<Pixels>,
-    ) -> Option<Arc<LineLayout>> {
-        let key_ref = HashedCacheKeyRef {
-            text_hash,
-            text_len,
-            font_size,
-            runs,
-            wrap_width: None,
-            force_width,
-        };
-
-        let current_frame = self.current_frame.read();
-        if let Some((_, layout)) = current_frame.lines_by_hash.iter().find(|(key, _)| {
-            HashedCacheKeyRef {
-                text_hash: key.text_hash,
-                text_len: key.text_len,
-                font_size: key.font_size,
-                runs: key.runs.as_slice(),
-                wrap_width: key.wrap_width,
-                force_width: key.force_width,
-            } == key_ref
-        }) {
-            return Some(layout.clone());
-        }
-
-        let previous_frame = self.previous_frame.lock();
-        if let Some((_, layout)) = previous_frame.lines_by_hash.iter().find(|(key, _)| {
-            HashedCacheKeyRef {
-                text_hash: key.text_hash,
-                text_len: key.text_len,
-                font_size: key.font_size,
-                runs: key.runs.as_slice(),
-                wrap_width: key.wrap_width,
-                force_width: key.force_width,
-            } == key_ref
-        }) {
-            return Some(layout.clone());
-        }
-
-        None
-    }
-
-    /// Layout a line of text using a caller-provided content hash as the cache key.
-    ///
-    /// This enables cache hits without materializing a contiguous `SharedString` for `text`.
-    /// If the cache misses, `materialize_text` is invoked to produce the `SharedString` for shaping.
-    ///
-    /// Contract (caller enforced):
-    /// - Same `text_hash` implies identical text content (collision risk accepted by caller).
-    /// - `text_len` should be the UTF-8 byte length of the text (helps reduce accidental collisions).
-    pub fn layout_line_by_hash(
-        &self,
-        text_hash: u64,
-        text_len: usize,
-        font_size: Pixels,
-        runs: &[FontRun],
-        force_width: Option<Pixels>,
-        materialize_text: impl FnOnce() -> SharedString,
-    ) -> Arc<LineLayout> {
-        let key_ref = HashedCacheKeyRef {
-            text_hash,
-            text_len,
-            font_size,
-            runs,
-            wrap_width: None,
-            force_width,
-        };
-
-        // Fast path: already cached (no allocation).
+    pub fn layout_inline(&self, request: InlineLayoutRequest<'_>) -> Arc<InlineLayout> {
+        self.sync_font_generation();
+        let key = &request as &dyn AsInlineCacheKeyRef;
         let current_frame = self.current_frame.upgradable_read();
-        if let Some((_, layout)) = current_frame.lines_by_hash.iter().find(|(key, _)| {
-            HashedCacheKeyRef {
-                text_hash: key.text_hash,
-                text_len: key.text_len,
-                font_size: key.font_size,
-                runs: key.runs.as_slice(),
-                wrap_width: key.wrap_width,
-                force_width: key.force_width,
-            } == key_ref
-        }) {
+
+        if let Some(layout) = current_frame.inline_layouts.get(key) {
             return layout.clone();
         }
 
-        let mut current_frame = RwLockUpgradableReadGuard::upgrade(current_frame);
+        let previous_frame_entry = self.previous_frame.lock().inline_layouts.remove_entry(key);
 
-        // Try to reuse from previous frame without allocating; do a linear scan to find a matching key.
-        // (We avoid `drain()` here because it would eagerly move all entries.)
-        let mut previous_frame = self.previous_frame.lock();
-        if let Some(existing_key) = previous_frame
-            .used_lines_by_hash
-            .iter()
-            .find(|key| {
-                HashedCacheKeyRef {
-                    text_hash: key.text_hash,
-                    text_len: key.text_len,
-                    font_size: key.font_size,
-                    runs: key.runs.as_slice(),
-                    wrap_width: key.wrap_width,
-                    force_width: key.force_width,
-                } == key_ref
-            })
-            .cloned()
-        {
-            if let Some((key, layout)) = previous_frame.lines_by_hash.remove_entry(&existing_key) {
-                current_frame
-                    .lines_by_hash
-                    .insert(key.clone(), layout.clone());
-                current_frame.used_lines_by_hash.push(key);
-                return layout;
-            }
+        if let Some((key, layout)) = previous_frame_entry {
+            let mut current_frame = RwLockUpgradableReadGuard::upgrade(current_frame);
+            current_frame.inline_layouts.insert(key, layout.clone());
+
+            return layout;
         }
 
-        let text = materialize_text();
-        let mut layout = self
-            .platform_text_system
-            .layout_line(&text, font_size, runs);
+        drop(current_frame);
+        let layout = Arc::new(self.platform_text_system.layout_inline(request));
+        let key = Arc::new(InlineCacheKey::from(request));
 
-        if let Some(force_width) = force_width {
-            apply_force_width_to_layout(&mut layout, force_width);
-        }
+        let mut current_frame = self.current_frame.write();
+        current_frame.inline_layouts.insert(key, layout.clone());
 
-        let key = Arc::new(HashedCacheKey {
-            text_hash,
-            text_len,
-            font_size,
-            runs: SmallVec::from(runs),
-            wrap_width: None,
-            force_width,
-        });
-        let layout = Arc::new(layout);
-        current_frame
-            .lines_by_hash
-            .insert(key.clone(), layout.clone());
-        current_frame.used_lines_by_hash.push(key);
         layout
     }
 }
 
-// Combining marks (e.g. Thai vowel signs, Arabic diacritics) are shaped by
-// HarfBuzz at the same x position as their base character. The force-width
-// loop must not advance the cell counter for these zero-advance glyphs,
-// otherwise they get displaced into the next cell. We detect them by checking
-// whether shaped x has advanced by at least half a cell beyond the last base.
-fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
-    let mut glyph_pos: usize = 0;
-    // NEG_INFINITY ensures the first glyph is always classified as a base.
-    let mut last_base_shaped_x = px(f32::NEG_INFINITY);
-    let mut last_base_actual_x = px(0.);
-    let mut last_base_index = None;
+trait AsInlineCacheKeyRef {
+    fn as_inline_cache_key_ref(&self) -> InlineLayoutRequest<'_>;
+}
 
-    for run in layout.runs.iter_mut() {
-        for glyph in run.glyphs.iter_mut() {
-            let shaped_x = glyph.position.x;
-            let shaped_x_advanced = shaped_x > last_base_shaped_x;
-            let starts_new_cluster = last_base_index != Some(glyph.index);
-            let advanced_far_enough = shaped_x > last_base_shaped_x + force_width * 0.5;
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct InlineCacheKey {
+    text: SharedString,
+    runs: SmallVec<[TextRun; 1]>,
+    text_styles: Vec<InlineTextStyle>,
+    boxes: Vec<InlineBoxRequest>,
+    font_size: Pixels,
+    line_height: Pixels,
+    text_metrics: InlineTextMetrics,
+    options: TextLayoutOptions,
+    bidi_scopes: Vec<InlineBidiScope>,
+}
 
-            if shaped_x_advanced && (starts_new_cluster || advanced_far_enough) {
-                let forced_x = glyph_pos * force_width;
-                if (shaped_x - forced_x).abs() > px(1.) {
-                    glyph.position.x = forced_x;
-                }
-                last_base_shaped_x = shaped_x;
-                last_base_actual_x = glyph.position.x;
-                last_base_index = Some(glyph.index);
-                glyph_pos += 1;
-            } else {
-                glyph.position.x = last_base_actual_x + (shaped_x - last_base_shaped_x);
-            }
+impl From<InlineLayoutRequest<'_>> for InlineCacheKey {
+    fn from(request: InlineLayoutRequest<'_>) -> Self {
+        Self {
+            text: SharedString::new(request.text),
+            runs: SmallVec::from(request.runs),
+            text_styles: request.text_styles.to_vec(),
+            boxes: request.boxes.to_vec(),
+            font_size: request.font_size,
+            line_height: request.line_height,
+            text_metrics: request.text_metrics,
+            options: request.options,
+            bidi_scopes: request.bidi_scopes.to_vec(),
         }
     }
 }
 
-/// A run of text with a single font.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-#[expect(missing_docs)]
-pub struct FontRun {
-    pub len: usize,
-    pub font_id: FontId,
-    pub letter_spacing: Option<Pixels>,
+impl AsInlineCacheKeyRef for InlineCacheKey {
+    fn as_inline_cache_key_ref(&self) -> InlineLayoutRequest<'_> {
+        InlineLayoutRequest {
+            text: &self.text,
+            runs: &self.runs,
+            text_styles: &self.text_styles,
+            boxes: &self.boxes,
+            font_size: self.font_size,
+            line_height: self.line_height,
+            text_metrics: self.text_metrics,
+            options: self.options,
+            bidi_scopes: &self.bidi_scopes,
+        }
+    }
 }
 
-impl Hash for FontRun {
+impl AsInlineCacheKeyRef for InlineLayoutRequest<'_> {
+    fn as_inline_cache_key_ref(&self) -> InlineLayoutRequest<'_> {
+        *self
+    }
+}
+
+impl PartialEq for dyn AsInlineCacheKeyRef + '_ {
+    fn eq(&self, other: &dyn AsInlineCacheKeyRef) -> bool {
+        self.as_inline_cache_key_ref() == other.as_inline_cache_key_ref()
+    }
+}
+
+impl Eq for dyn AsInlineCacheKeyRef + '_ {}
+
+impl Hash for dyn AsInlineCacheKeyRef + '_ {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.len.hash(state);
-        self.font_id.hash(state);
-        self.letter_spacing
-            .map(Pixels::as_f32)
-            .map(|value| {
-                if value == 0.0 {
-                    0.0f32.to_bits()
-                } else {
-                    value.to_bits()
-                }
-            })
-            .hash(state);
+        self.as_inline_cache_key_ref().hash(state);
+    }
+}
+
+impl<'a> Borrow<dyn AsInlineCacheKeyRef + 'a> for Arc<InlineCacheKey> {
+    fn borrow(&self) -> &(dyn AsInlineCacheKeyRef + 'a) {
+        self.as_ref() as &dyn AsInlineCacheKeyRef
     }
 }
 
@@ -1117,95 +1359,42 @@ trait AsCacheKeyRef {
     fn as_cache_key_ref(&self) -> CacheKeyRef<'_>;
 }
 
-#[derive(Clone, Debug, Eq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct CacheKey {
     text: SharedString,
     font_size: Pixels,
-    runs: SmallVec<[FontRun; 1]>,
-    wrap_width: Option<Pixels>,
-    force_width: Option<Pixels>,
+    runs: SmallVec<[ShapingRun; 1]>,
+    options: TextLayoutOptions,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 struct CacheKeyRef<'a> {
     text: &'a str,
     font_size: Pixels,
-    runs: &'a [FontRun],
-    wrap_width: Option<Pixels>,
-    force_width: Option<Pixels>,
+    runs: &'a [ShapingRun],
+    options: TextLayoutOptions,
 }
 
-#[derive(Clone, Debug)]
-struct HashedCacheKey {
-    text_hash: u64,
-    text_len: usize,
-    font_size: Pixels,
-    runs: SmallVec<[FontRun; 1]>,
-    wrap_width: Option<Pixels>,
-    force_width: Option<Pixels>,
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ShapingRun {
+    len: usize,
+    font: crate::Font,
+    letter_spacing: Option<Pixels>,
 }
 
-#[derive(Copy, Clone)]
-struct HashedCacheKeyRef<'a> {
-    text_hash: u64,
-    text_len: usize,
-    font_size: Pixels,
-    runs: &'a [FontRun],
-    wrap_width: Option<Pixels>,
-    force_width: Option<Pixels>,
+impl From<&TextRun> for ShapingRun {
+    fn from(run: &TextRun) -> Self {
+        Self {
+            len: run.len,
+            font: run.font.clone(),
+            letter_spacing: run.letter_spacing,
+        }
+    }
 }
 
 impl PartialEq for dyn AsCacheKeyRef + '_ {
     fn eq(&self, other: &dyn AsCacheKeyRef) -> bool {
         self.as_cache_key_ref() == other.as_cache_key_ref()
-    }
-}
-
-impl PartialEq for HashedCacheKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.text_hash == other.text_hash
-            && self.text_len == other.text_len
-            && self.font_size == other.font_size
-            && self.runs.as_slice() == other.runs.as_slice()
-            && self.wrap_width == other.wrap_width
-            && self.force_width == other.force_width
-    }
-}
-
-impl Eq for HashedCacheKey {}
-
-impl Hash for HashedCacheKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.text_hash.hash(state);
-        self.text_len.hash(state);
-        self.font_size.hash(state);
-        self.runs.as_slice().hash(state);
-        self.wrap_width.hash(state);
-        self.force_width.hash(state);
-    }
-}
-
-impl PartialEq for HashedCacheKeyRef<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        self.text_hash == other.text_hash
-            && self.text_len == other.text_len
-            && self.font_size == other.font_size
-            && self.runs == other.runs
-            && self.wrap_width == other.wrap_width
-            && self.force_width == other.force_width
-    }
-}
-
-impl Eq for HashedCacheKeyRef<'_> {}
-
-impl Hash for HashedCacheKeyRef<'_> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.text_hash.hash(state);
-        self.text_len.hash(state);
-        self.font_size.hash(state);
-        self.runs.hash(state);
-        self.wrap_width.hash(state);
-        self.force_width.hash(state);
     }
 }
 
@@ -1223,21 +1412,8 @@ impl AsCacheKeyRef for CacheKey {
             text: &self.text,
             font_size: self.font_size,
             runs: self.runs.as_slice(),
-            wrap_width: self.wrap_width,
-            force_width: self.force_width,
+            options: self.options,
         }
-    }
-}
-
-impl PartialEq for CacheKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_cache_key_ref().eq(&other.as_cache_key_ref())
-    }
-}
-
-impl Hash for CacheKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.as_cache_key_ref().hash(state);
     }
 }
 
@@ -1256,450 +1432,125 @@ impl AsCacheKeyRef for CacheKeyRef<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{GlyphId, NoopTextSystem};
-    use gpui_macros::perf;
-    use std::{hint::black_box, sync::Arc};
-
-    fn glyph_at(x: f32, index: usize) -> ShapedGlyph {
-        ShapedGlyph {
-            id: GlyphId(0),
-            position: point(px(x), px(0.)),
-            index,
-            is_emoji: false,
-        }
-    }
-
-    /// Ten 10px glyphs, "abc efg ij", wrapped at its two spaces: lines of 40,
-    /// 40 and 20px, which alignment measures as 30, 30 and 20px since the
-    /// spaces the first two lines were wrapped at hang.
-    fn wrapped_ten_glyphs() -> WrappedLineLayout {
-        let mut layout = make_layout((0..10).map(|ix| glyph_at(ix as f32 * 10., ix)).collect());
-        layout.len = 10;
-        WrappedLineLayout {
-            unwrapped_layout: Arc::new(layout),
-            wrap_boundaries: SmallVec::from_slice(&[
-                WrapBoundary {
-                    run_ix: 0,
-                    glyph_ix: 4,
-                    trailing_whitespace_x: px(30.),
-                },
-                WrapBoundary {
-                    run_ix: 0,
-                    glyph_ix: 8,
-                    trailing_whitespace_x: px(70.),
-                },
-            ]),
-            wrap_width: Some(px(60.)),
-        }
-    }
-
-    /// `text` in 10px glyphs, wrapped to `wrap_width`.
-    fn wrapped(text: &str, wrap_width: f32) -> WrappedLineLayout {
-        let glyphs = text
-            .char_indices()
-            .map(|(ix, _)| glyph_at(ix as f32 * 10., ix))
-            .collect();
-        let mut layout = make_layout(glyphs);
-        layout.width = px(text.len() as f32 * 10.);
-        layout.len = text.len();
-        let wrap_boundaries = layout.compute_wrap_boundaries(text, px(wrap_width), None);
-        WrappedLineLayout {
-            unwrapped_layout: Arc::new(layout),
-            wrap_boundaries,
-            wrap_width: Some(px(wrap_width)),
-        }
-    }
+    use crate::{point, px, size};
 
     #[test]
-    fn wrap_boundaries_record_where_the_spaces_wrapped_at_begin() {
-        let boundary = |glyph_ix, trailing_whitespace_x| WrapBoundary {
-            run_ix: 0,
-            glyph_ix,
-            trailing_whitespace_x: px(trailing_whitespace_x),
-        };
-        // Breaking before "def" and "gh" leaves the space before each at the end of its line.
-        assert_eq!(
-            wrapped("abc def gh", 45.).wrap_boundaries.as_slice(),
-            &[boundary(4, 30.), boundary(8, 70.)]
-        );
-        // A line broken inside a word ends where the next line starts.
-        assert_eq!(
-            wrapped("abcdefgh", 35.).wrap_boundaries.as_slice(),
-            &[boundary(3, 30.), boundary(6, 60.)]
-        );
-        // Spaces hang back no further than the start of their own line.
-        assert_eq!(
-            wrapped("a      b", 35.).wrap_boundaries.as_slice(),
-            &[boundary(3, 10.), boundary(6, 30.)]
-        );
-    }
-
-    #[test]
-    fn trailing_spaces_are_followed_back_across_shaped_runs() {
-        // "ab  cd" with a run break between the two spaces: the first space
-        // ends run 0, the second starts run 1 along with "cd".
-        let text = "ab  cd";
-        let glyphs: Vec<_> = text
-            .char_indices()
-            .map(|(ix, _)| glyph_at(ix as f32 * 10., ix))
-            .collect();
-        let (first_run, second_run) = glyphs.split_at(3);
-        let layout = LineLayout {
-            font_size: px(16.),
-            width: px(60.),
-            ascent: px(12.),
-            descent: px(4.),
-            runs: vec![
-                ShapedRun {
-                    font_id: FontId(0),
-                    glyphs: first_run.to_vec(),
-                },
-                ShapedRun {
-                    font_id: FontId(1),
-                    glyphs: second_run.to_vec(),
-                },
-            ],
-            len: text.len(),
-        };
-        assert_eq!(
-            layout
-                .compute_wrap_boundaries(text, px(45.), None)
-                .as_slice(),
-            &[WrapBoundary {
-                run_ix: 1,
-                glyph_ix: 1,
-                trailing_whitespace_x: px(20.),
-            }]
-        );
-    }
-
-    #[test]
-    fn line_extents_iterate_as_they_index() {
-        let layout = wrapped_ten_glyphs();
-        let by_index: Vec<_> = (0..3)
-            .map(|line_ix| {
-                layout
-                    .unwrapped_layout
-                    .wrapped_line_extent(&layout.wrap_boundaries, line_ix)
-            })
-            .collect();
-        let iterated: Vec<_> = layout
-            .unwrapped_layout
-            .wrapped_line_extents(&layout.wrap_boundaries)
-            .collect();
-        assert_eq!(iterated, by_index);
-        assert_eq!(
-            iterated[1],
-            WrappedLineExtent {
-                start: px(40.),
-                visible_end: px(70.),
-                end: px(80.),
-            }
-        );
-    }
-
-    #[test]
-    fn wrapped_line_offsets_follow_the_alignment() {
-        let layout = wrapped_ten_glyphs();
-        let offsets = |align, width| {
-            (0..4)
-                .map(|line| layout.wrapped_line_offset(line, align, px(width)))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(offsets(TextAlign::Left, 60.), vec![px(0.); 4]);
-        // The first two lines align as 30px: the spaces they wrap at hang.
-        assert_eq!(
-            offsets(TextAlign::Center, 60.),
-            vec![px(15.), px(15.), px(20.), px(0.)]
-        );
-        assert_eq!(
-            offsets(TextAlign::Right, 60.),
-            vec![px(30.), px(30.), px(40.), px(0.)]
-        );
-        // A line wider than its box overhangs it on both sides.
-        assert_eq!(
-            layout.wrapped_line_offset(0, TextAlign::Center, px(20.)),
-            px(-5.)
-        );
-    }
-
-    #[test]
-    fn aligned_hit_testing_finds_the_glyph_painted_there() {
-        let layout = wrapped_ten_glyphs();
-        let line_height = px(20.);
-        for align in [TextAlign::Left, TextAlign::Center, TextAlign::Right] {
-            for index in 0..=10 {
-                let position = layout
-                    .position_for_index_aligned(index, line_height, align, px(60.))
-                    .expect("every index has a position");
-                let hit = layout.index_for_position_aligned(
-                    point(position.x, position.y + line_height / 2.),
-                    line_height,
-                    align,
-                    px(60.),
-                );
-                assert_eq!(
-                    hit.unwrap_or_else(|clamped| clamped),
-                    index,
-                    "{align:?}: index {index} at {position:?} resolves to {hit:?}"
-                );
-            }
-        }
-
-        // The second glyph of the centred middle line is painted at its
-        // offset plus one glyph.
-        assert_eq!(
-            layout.position_for_index_aligned(5, line_height, TextAlign::Center, px(60.)),
-            Some(point(px(25.), px(20.)))
-        );
-        assert_eq!(
-            layout.index_for_position_aligned(
-                point(px(30.), px(30.)),
-                line_height,
-                TextAlign::Center,
-                px(60.)
+    fn caret_selection_endpoint_ordering_uses_byte_indices() {
+        for (caret, anchor, expected) in [
+            (
+                CaretPosition::attached_to_next_cluster(2),
+                CaretPosition::attached_to_next_cluster(5),
+                std::cmp::Ordering::Less,
             ),
-            Ok(5)
-        );
-        // The closest boundary to a position can be the glyph after it.
-        assert_eq!(
-            layout.closest_index_for_position_aligned(
-                point(px(32.), px(30.)),
-                line_height,
-                TextAlign::Center,
-                px(60.)
+            (
+                CaretPosition::attached_to_next_cluster(5),
+                CaretPosition::attached_to_previous_cluster(5),
+                std::cmp::Ordering::Equal,
             ),
-            Ok(6)
-        );
-        // A wrap boundary stays at the end of the line above, past the space
-        // that line hangs.
-        assert_eq!(
-            layout.position_for_index_aligned(4, line_height, TextAlign::Center, px(60.)),
-            Some(point(px(55.), px(0.)))
-        );
-    }
-
-    #[test]
-    fn clicks_beside_an_aligned_line_clamp_to_its_ends() {
-        let layout = wrapped_ten_glyphs();
-        let hit = |x: f32, y: f32| {
-            layout.index_for_position_aligned(
-                point(px(x), px(y)),
-                px(20.),
-                TextAlign::Center,
-                px(60.),
-            )
-        };
-        // The middle line is painted from 15 to 55, its hanging space included.
-        assert_eq!(hit(10., 30.), Err(4));
-        assert_eq!(hit(50., 30.), Ok(7));
-        assert_eq!(hit(56., 30.), Err(8));
-        assert_eq!(hit(200., 200.), Err(0));
-        // Unaligned hit-testing is unchanged.
-        assert_eq!(
-            layout.index_for_position(point(px(5.), px(30.)), px(20.)),
-            Ok(4)
-        );
-    }
-
-    fn make_layout(glyphs: Vec<ShapedGlyph>) -> LineLayout {
-        LineLayout {
-            font_size: px(16.),
-            width: px(100.),
-            ascent: px(12.),
-            descent: px(4.),
-            runs: vec![ShapedRun {
-                font_id: FontId(0),
-                glyphs,
-            }],
-            len: 0,
+            (
+                CaretPosition::attached_to_previous_cluster(8),
+                CaretPosition::attached_to_next_cluster(5),
+                std::cmp::Ordering::Greater,
+            ),
+        ] {
+            let selection = CaretSelection { anchor, caret };
+            assert_eq!(selection.endpoint_ordering(), expected);
         }
     }
 
-    #[perf(important)]
-    fn perf_hashed_line_layout_previous_frame_cache_hits() {
-        const LINE_COUNT: usize = 4_096;
-        const REPEATS: usize = 8;
-        const TEXT_SUFFIX: &str = "abcdefghijklmnop";
+    #[test]
+    fn paragraph_separators_match_unicode_bidi_class_b() {
+        for character in [
+            '\n', '\r', '\u{001c}', '\u{001d}', '\u{001e}', '\u{0085}', '\u{2029}',
+        ] {
+            assert!(is_paragraph_separator(character));
+        }
 
-        let cache = LineLayoutCache::new(Arc::new(NoopTextSystem::new()));
-        let text_len = "line-0000-abcdefghijklmnop".len();
-        let runs = [FontRun {
-            len: text_len,
-            font_id: FontId(0),
-            letter_spacing: None,
-        }];
+        for character in [' ', '\u{2028}'] {
+            assert!(!is_paragraph_separator(character));
+        }
+    }
 
-        for ix in 0..LINE_COUNT {
-            cache.layout_line_by_hash(ix as u64, text_len, px(16.), &runs, None, || {
-                SharedString::from(format!("line-{ix:04}-{TEXT_SUFFIX}"))
+    #[test]
+    fn inserted_text_affinity_tracks_trailing_paragraph_separators() {
+        for (text, expected) in [
+            ("", CaretAffinity::Downstream),
+            ("ordinary text", CaretAffinity::Upstream),
+            ("\n", CaretAffinity::Downstream),
+            ("\r", CaretAffinity::Downstream),
+            ("\u{001c}", CaretAffinity::Downstream),
+            ("\u{001d}", CaretAffinity::Downstream),
+            ("\u{001e}", CaretAffinity::Downstream),
+            ("\u{0085}", CaretAffinity::Downstream),
+            ("\u{2028}", CaretAffinity::Downstream),
+            ("\u{2029}", CaretAffinity::Downstream),
+            ("\nordinary text", CaretAffinity::Upstream),
+        ] {
+            assert_eq!(CaretAffinity::from(text), expected, "From({text:?})");
+            assert_eq!(
+                CaretAffinity::for_inserted_text(text),
+                expected,
+                "for_inserted_text({text:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_box_alignment_preserves_unsorted_boxes_and_empty_lines() {
+        let mut lines = [InlineVisualLine::default(); 3];
+        let mut boxes =
+            [(20, 2, 14.), (10, 0, 18.), (90, 3, 100.)].map(|(id, line_index, height)| {
+                PositionedInlineBox {
+                    id,
+                    line_index,
+                    bounds: Bounds::new(point(px(7.), px(99.)), size(px(5.), px(height))),
+                }
             });
-        }
+        let mut layout_size = size(px(100.), px(999.));
+        let original_lines = lines;
+        let original_boxes = boxes;
 
-        let mut total_width = px(0.);
-        for _ in 0..REPEATS {
-            cache.finish_frame();
-            for ix in 0..LINE_COUNT {
-                let layout =
-                    cache.layout_line_by_hash(ix as u64, text_len, px(16.), &runs, None, || {
-                        panic!("hashed line layout cache should hit")
-                    });
-                total_width += layout.width;
-            }
-        }
-
-        black_box(total_width);
-    }
-
-    fn glyph_x_positions(layout: &LineLayout) -> Vec<f32> {
-        layout.runs[0]
-            .glyphs
-            .iter()
-            .map(|g| f32::from(g.position.x))
-            .collect()
-    }
-
-    /// Lays out and wraps 1024 distinct lines of about 230 glyphs into 200px,
-    /// so every line is a cache miss that computes its wrap boundaries.
-    #[perf(important)]
-    fn perf_wrap_many_distinct_lines() {
-        const LINE_COUNT: usize = 1_024;
-        let cache = LineLayoutCache::new(Arc::new(NoopTextSystem::new()));
-        let mut total_boundaries = 0;
-        for ix in 0..LINE_COUNT {
-            let text = format!("line {ix:04} {}", "lorem ipsum dolor sit amet ".repeat(8));
-            let runs = [FontRun {
-                len: text.len(),
-                font_id: FontId(0),
-                letter_spacing: None,
-            }];
-            let layout = cache.layout_wrapped_line(text, px(16.), &runs, Some(px(200.)), None);
-            total_boundaries += layout.wrap_boundaries.len();
-        }
-        black_box(total_boundaries);
-    }
-
-    #[perf(important)]
-    fn perf_wrapped_line_position_for_index_many_soft_wraps() {
-        const LINE_LEN: usize = 8_192;
-        const WRAP_STEP: usize = 8;
-
-        let glyphs = (0..LINE_LEN)
-            .map(|ix| glyph_at(ix as f32, ix))
-            .collect::<Vec<_>>();
-        let wrap_boundaries = (WRAP_STEP..LINE_LEN)
-            .step_by(WRAP_STEP)
-            .map(|glyph_ix| WrapBoundary {
-                run_ix: 0,
-                glyph_ix,
-                trailing_whitespace_x: px(glyph_ix as f32),
-            })
-            .collect();
-        let layout = WrappedLineLayout {
-            unwrapped_layout: Arc::new(LineLayout {
-                font_size: px(16.),
-                width: px(LINE_LEN as f32),
-                ascent: px(12.),
-                descent: px(4.),
-                runs: vec![ShapedRun {
-                    font_id: FontId(0),
-                    glyphs,
-                }],
-                len: LINE_LEN,
-            }),
-            wrap_boundaries,
-            wrap_width: Some(px(WRAP_STEP as f32)),
+        let requests = [InlineBoxRequest {
+            id: 20,
+            index: 0,
+            size: boxes[0].bounds.size,
+            vertical_align: VerticalAlign::Top,
+        }];
+        let metrics = InlineTextMetrics {
+            ascent: px(8.),
+            descent: px(2.),
+            x_height: px(4.),
         };
 
-        let mut total_x = px(0.);
-        for ix in (0..LINE_LEN).step_by(17) {
-            let position = layout.position_for_index(ix, px(16.)).unwrap();
-            total_x += position.x;
+        align_inline_boxes(
+            &mut lines,
+            &mut boxes,
+            &mut layout_size,
+            &requests,
+            &[metrics],
+            &[(px(-7.), px(3.)), (px(-11.), px(4.))],
+            metrics,
+            px(12.),
+        );
+
+        for ((line, mut expected_line), (origin_y, height, baseline)) in lines
+            .iter()
+            .zip(original_lines)
+            .zip([(0., 21., 18.), (21., 15., 11.), (36., 14., 9.)])
+        {
+            expected_line.origin.y = px(origin_y);
+            expected_line.size.height = px(height);
+            expected_line.baseline = px(baseline);
+            assert_eq!(*line, expected_line);
         }
 
-        black_box(total_x);
-    }
+        for ((inline_box, mut expected_box), origin_y) in
+            boxes.iter().zip(original_boxes).zip([36., 0., 99.])
+        {
+            expected_box.bounds.origin.y = px(origin_y);
+            assert_eq!(*inline_box, expected_box);
+        }
 
-    #[test]
-    fn test_force_width_latin_unchanged() {
-        let cell_width = px(8.);
-        let mut layout = make_layout(vec![glyph_at(0., 0), glyph_at(8., 1), glyph_at(16., 2)]);
-
-        apply_force_width_to_layout(&mut layout, cell_width);
-
-        let positions = glyph_x_positions(&layout);
-        assert_eq!(positions, vec![0., 8., 16.]);
-    }
-
-    #[test]
-    fn test_force_width_combining_marks_not_advanced() {
-        let cell_width = px(8.);
-        // Simulates Thai "กี" — base consonant at x=0, combining vowel also at x=0
-        let mut layout = make_layout(vec![
-            glyph_at(0., 0), // ก (base)
-            glyph_at(0., 3), // ี (combining mark, same x)
-        ]);
-
-        apply_force_width_to_layout(&mut layout, cell_width);
-
-        let positions = glyph_x_positions(&layout);
-        assert_eq!(positions, vec![0., 0.]);
-    }
-
-    #[test]
-    fn test_force_width_base_after_combining_mark() {
-        let cell_width = px(8.);
-        let mut layout = make_layout(vec![glyph_at(0., 0), glyph_at(0., 3), glyph_at(8., 6)]);
-
-        apply_force_width_to_layout(&mut layout, cell_width);
-
-        let positions = glyph_x_positions(&layout);
-        assert_eq!(positions, vec![0., 0., 8.]);
-    }
-
-    #[test]
-    fn test_force_width_multiple_combining_marks() {
-        let cell_width = px(8.);
-        // Simulates "ก้" — base + vowel + tone mark (two combining marks stacked)
-        let mut layout = make_layout(vec![
-            glyph_at(0., 0), // ก (base)
-            glyph_at(0., 3), // vowel (combining)
-            glyph_at(0., 6), // tone mark (combining)
-            glyph_at(8., 9), // next base
-        ]);
-
-        apply_force_width_to_layout(&mut layout, cell_width);
-
-        let positions = glyph_x_positions(&layout);
-        assert_eq!(positions, vec![0., 0., 0., 8.]);
-    }
-
-    #[test]
-    fn test_force_width_corrects_drifted_base_positions() {
-        let cell_width = px(8.);
-        // Font metrics don't perfectly match cell grid — glyphs drift >1px from cell boundary
-        let mut layout = make_layout(vec![
-            glyph_at(0.5, 0),  // within 1px tolerance, kept as-is
-            glyph_at(10.2, 1), // >1px off from 8.0, corrected
-            glyph_at(19.8, 2), // >1px off from 16.0, corrected
-        ]);
-
-        apply_force_width_to_layout(&mut layout, cell_width);
-
-        let positions = glyph_x_positions(&layout);
-        assert_eq!(positions, vec![0.5, 8., 16.]);
-    }
-
-    #[test]
-    fn test_force_width_combining_mark_after_within_tolerance_base() {
-        let cell_width = px(8.);
-        // Base glyph is within 1px of grid so it keeps its shaped position.
-        // The combining mark must align to the base's actual position, not the grid slot.
-        let mut layout = make_layout(vec![glyph_at(0.5, 0), glyph_at(0.5, 3)]);
-
-        apply_force_width_to_layout(&mut layout, cell_width);
-
-        let positions = glyph_x_positions(&layout);
-        assert_eq!(positions, vec![0.5, 0.5]);
+        assert_eq!(layout_size, size(px(100.), px(50.)));
     }
 }
