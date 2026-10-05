@@ -906,6 +906,33 @@ impl TextLayout {
         )
     }
 
+    /// Truncate an unwrapped line using the same shaped geometry as text elements.
+    /// Custom canvas painters can use this without constructing a text element.
+    #[allow(clippy::too_many_arguments)]
+    pub fn truncate_line<'runs>(
+        text: SharedString,
+        font_size: Pixels,
+        max_width: Pixels,
+        affix: &str,
+        runs: &'runs [TextRun],
+        source: TruncateFrom,
+        window: &mut Window,
+    ) -> (SharedString, Cow<'runs, [TextRun]>) {
+        truncate_to_shaped_layout(
+            text,
+            font_size,
+            None,
+            max_width,
+            None,
+            affix,
+            runs,
+            source,
+            ParagraphDirection::Auto,
+            UnicodeBidi::Normal,
+            window,
+        )
+    }
+
     fn layout(
         &self,
         text: SharedString,
@@ -1135,6 +1162,11 @@ impl TextLayout {
     /// The line height for this layout.
     pub fn line_height(&self) -> Pixels {
         self.measured().line_height
+    }
+
+    /// The alignment used to lay out and paint this text.
+    pub fn text_align(&self) -> TextAlign {
+        self.measured().options.text_align
     }
 
     /// The UTF-8 length of the underlying text.
