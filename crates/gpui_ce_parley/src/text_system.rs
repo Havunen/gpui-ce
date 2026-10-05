@@ -1856,6 +1856,10 @@ impl ParleyTextSystem {
             let mut builder = layout_context.ranged_builder(font_context, text, 1.0, false);
             builder.set_line_break_override(Some(CHROMIUM_LINE_BREAK_OVERRIDE));
             builder.push_default(StyleProperty::FontSize(f32::from(font_size)));
+            // Preserve GPUI's wrapping contract: an otherwise unbreakable word
+            // must fit the available line by breaking between clusters. Normal
+            // word boundaries still take precedence, and nowrap is unbounded.
+            builder.push_default(StyleProperty::OverflowWrap(parley::OverflowWrap::BreakWord));
 
             let default_optical_settings = self.automatic_optical_sizing.then(|| {
                 [ParleyFontVariation::new(
@@ -2861,6 +2865,25 @@ mod tests {
         assert!(layout.visual_lines[0].offset > px(100.0));
         assert_eq!(layout.visual_lines[1].offset, Pixels::ZERO);
         assert_eq!(layout.visual_lines[3].text_range, text.len()..text.len());
+    }
+
+    #[test]
+    fn unbreakable_words_wrap_between_clusters_without_widening_the_container() {
+        let system = test_system();
+        for text in ["w".repeat(200), "e\u{301}".repeat(100), "日本".repeat(100)] {
+            let runs = [text_run(&text, IBM_PLEX.family)];
+            let wrapped = layout_wrapped(&system, &text, px(18.), &runs, px(120.), None);
+            assert!(wrapped.visual_lines.len() > 1);
+            for line in &wrapped.visual_lines {
+                assert!(line.advance_width <= px(120.), "{line:?}");
+                assert!(text.is_char_boundary(line.text_range.start));
+                assert!(text.is_char_boundary(line.text_range.end));
+                assert!(!text[line.text_range.clone()].starts_with('\u{301}'));
+            }
+            let unwrapped = layout_line(&system, &text, px(18.), &runs);
+            assert_eq!(unwrapped.visual_lines.len(), 1);
+            assert!(unwrapped.width > px(120.));
+        }
     }
 
     fn shaped_text_layout(layout: LineLayout, width: Pixels) -> gpui::ShapedTextLayout {
