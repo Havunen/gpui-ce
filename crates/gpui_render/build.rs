@@ -1054,6 +1054,10 @@ const REQUIRE_METALLIB: &str = "GPUI_RENDER_REQUIRE_METALLIB";
 /// (`xcodebuild -downloadComponent MetalToolchain`). Without it the renderer
 /// compiles the MSL at runtime, as before, unless `GPUI_RENDER_REQUIRE_METALLIB`
 /// asks for the build to fail instead.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "build scripts synchronously probe the host toolchain"
+)]
 fn metallib_target() -> Option<String> {
     println!("cargo:rerun-if-env-changed={REQUIRE_METALLIB}");
     println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
@@ -1078,6 +1082,10 @@ fn metallib_target() -> Option<String> {
 }
 
 /// Compile the generated `msl_name` into `{label}.metallib` for `min_version`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "build scripts must wait for shader compiler artifacts"
+)]
 fn write_metallib(
     out_dir: &std::path::Path,
     label: &str,
