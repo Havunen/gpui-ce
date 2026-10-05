@@ -78,3 +78,7 @@ required-features = ["custom-gpu"]
 name = "renderer"
 harness = false
 required-features = ["test-support"]
+
+[[example]]
+name = "path_target_footprint"
+required-features = ["test-support"]
