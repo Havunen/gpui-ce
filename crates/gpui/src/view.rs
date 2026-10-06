@@ -3,8 +3,8 @@ use crate::refineable::Refineable;
 use crate::{
     AnyElement, AnyEntity, AnyWeakEntity, App, Bounds, ContentMask, Context, Element, ElementId,
     Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement, LayoutId, PaintIndex,
-    Pixels, PrepaintStateIndex, Render, RenderOnce, ResolvedDirection, Style, StyleRefinement,
-    TextStyle, UnicodeBidi, WeakEntity,
+    Pixels, PrepaintStateIndex, Render, RenderOnce, RequestLayoutStateIndex, ResolvedDirection,
+    Style, StyleRefinement, TextStyle, UnicodeBidi, WeakEntity,
 };
 use crate::{Empty, Window};
 use anyhow::Result;
@@ -338,6 +338,7 @@ impl<V: View> IntoElement for ViewElement<V> {
 }
 
 struct ViewElementState {
+    request_layout_range: Option<Range<RequestLayoutStateIndex>>,
     prepaint_range: Range<PrepaintStateIndex>,
     paint_range: Range<PaintIndex>,
     cache_key: ViewElementCacheKey,
@@ -349,6 +350,7 @@ struct ViewElementState {
 pub struct ViewElementRequestLayoutState {
     element: Option<AnyElement>,
     detached_layout_id: Option<LayoutId>,
+    request_layout_range: Option<Range<RequestLayoutStateIndex>>,
     accessed_entities: FxHashSet<EntityId>,
 }
 
@@ -412,6 +414,7 @@ impl<V: View> Element for ViewElement<V> {
                     !known || window.dirty_views.contains(&entity_id) || window.refreshing;
 
                 if should_probe {
+                    let request_layout_start = window.request_layout_state_index();
                     let ((element, detached_layout_id), accessed_entities) = cx
                         .detect_accessed_entities(|cx| {
                             let mut element = render_view(self.view.take().unwrap(), window, cx);
@@ -419,6 +422,7 @@ impl<V: View> Element for ViewElement<V> {
 
                             (element, detached_layout_id)
                         });
+                    let request_layout_end = window.request_layout_state_index();
                     window.set_layout_logical_children(
                         layout_id,
                         std::slice::from_ref(&detached_layout_id),
@@ -429,6 +433,7 @@ impl<V: View> Element for ViewElement<V> {
                         ViewElementRequestLayoutState {
                             element: Some(element),
                             detached_layout_id: Some(detached_layout_id),
+                            request_layout_range: Some(request_layout_start..request_layout_end),
                             accessed_entities,
                         },
                     );
@@ -499,6 +504,13 @@ impl<V: View> Element for ViewElement<V> {
                             && !window.refreshing
                         {
                             let prepaint_start = window.prepaint_index();
+                            // The direction probe renders before prepaint, so its
+                            // animation states and shaped text lie outside the
+                            // original prepaint range. Fold them into this reuse's
+                            // range so subsequent cached frames also retain them.
+                            if let Some(range) = element_state.request_layout_range.take() {
+                                window.reuse_request_layout(range);
+                            }
                             window.reuse_prepaint(element_state.prepaint_range.clone());
                             cx.entities
                                 .extend_accessed(&element_state.accessed_entities);
@@ -546,6 +558,7 @@ impl<V: View> Element for ViewElement<V> {
                         (
                             Some(element),
                             ViewElementState {
+                                request_layout_range: request_layout.request_layout_range.take(),
                                 accessed_entities,
                                 prepaint_range: prepaint_start..prepaint_end,
                                 paint_range: PaintIndex::default()..PaintIndex::default(),
@@ -631,3 +644,6 @@ impl Render for EmptyView {
         Empty
     }
 }
+
+#[cfg(test)]
+mod tests;

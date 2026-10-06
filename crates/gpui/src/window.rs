@@ -1136,6 +1136,15 @@ pub(crate) struct Frame {
     pub(crate) tab_stops: TabStopMap,
 }
 
+// Cached views can render during request_layout, before their prepaint range
+// starts. Retain those accesses separately; extending the whole prepaint range
+// back into layout would also replay unrelated siblings' hitboxes and listeners.
+#[derive(Clone)]
+pub(crate) struct RequestLayoutStateIndex {
+    accessed_element_states_index: usize,
+    line_layout_index: LineLayoutIndex,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct PrepaintStateIndex {
     hitboxes_index: usize,
@@ -3825,6 +3834,24 @@ impl Window {
         let mut sorted_indices = (0..deferred_count).collect::<SmallVec<[_; 8]>>();
         sorted_indices.sort_by_key(|ix| self.next_frame.deferred_draws[*ix].priority);
         sorted_indices
+    }
+
+    pub(crate) fn request_layout_state_index(&self) -> RequestLayoutStateIndex {
+        RequestLayoutStateIndex {
+            accessed_element_states_index: self.next_frame.accessed_element_states.len(),
+            line_layout_index: self.text_system.layout_index(),
+        }
+    }
+
+    pub(crate) fn reuse_request_layout(&mut self, range: Range<RequestLayoutStateIndex>) {
+        self.next_frame.accessed_element_states.extend(
+            self.rendered_frame.accessed_element_states[range.start.accessed_element_states_index
+                ..range.end.accessed_element_states_index]
+                .iter()
+                .map(|(id, type_id)| (id.clone(), *type_id)),
+        );
+        self.text_system
+            .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
     }
 
     pub(crate) fn prepaint_index(&self) -> PrepaintStateIndex {
