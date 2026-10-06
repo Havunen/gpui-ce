@@ -274,16 +274,24 @@ impl WgpuRenderer {
     }
 }
 
-// Keep the measured Linux memory optimization opt-in until the native backend
-// validation is complete. Read the environment once, never on the draw path.
+// Linux uses the measured memory optimization by default; other targets remain
+// opt-in. An explicit experiment list overrides the default, including an empty
+// list to disable cropping. Read the environment once, never on the draw path.
 fn cropped_path_targets_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("GPUI_GPU_EXPERIMENTS").is_ok_and(|value| {
-            value
-                .split(',')
-                .any(|option| option.trim() == "cropped-paths")
-        })
+        cropped_path_targets_for_experiments(
+            std::env::var("GPUI_GPU_EXPERIMENTS").ok().as_deref(),
+            cfg!(target_os = "linux"),
+        )
+    })
+}
+
+fn cropped_path_targets_for_experiments(experiments: Option<&str>, default_enabled: bool) -> bool {
+    experiments.map_or(default_enabled, |value| {
+        value
+            .split(',')
+            .any(|option| option.trim() == "cropped-paths")
     })
 }
 
@@ -313,6 +321,28 @@ fn begin_color_render_pass<'encoder>(
 mod tests {
     use super::*;
     use crate::wgpu_renderer::filters::FrameUniformRequirements;
+
+    #[test]
+    fn cropped_path_target_experiments_override_platform_defaults() {
+        for default_enabled in [false, true] {
+            assert_eq!(
+                cropped_path_targets_for_experiments(None, default_enabled),
+                default_enabled
+            );
+            for experiments in ["", "  ", "fixed-refresh", "not-cropped-paths"] {
+                assert!(!cropped_path_targets_for_experiments(
+                    Some(experiments),
+                    default_enabled
+                ));
+            }
+            for experiments in ["cropped-paths", " fixed-refresh, cropped-paths "] {
+                assert!(cropped_path_targets_for_experiments(
+                    Some(experiments),
+                    default_enabled
+                ));
+            }
+        }
+    }
 
     #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
     fn dashed_border_scene(dash_length: f32, dash_gap: f32) -> Scene {

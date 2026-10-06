@@ -1,7 +1,7 @@
 //! Hold a rendered path scene alive for a process GPU-memory sampler.
 //! Build with --features test-support; compare this same executable with
-//! GPUI_GPU_EXPERIMENTS unset and set to cropped-paths. This measures allocation,
-//! not application latency or GPU execution time.
+//! GPUI_GPU_EXPERIMENTS set to an empty string and to cropped-paths. This measures
+//! allocation, not application latency or GPU execution time.
 use gpui::{Bounds, ContentMask, DevicePixels, PathBuilder, Scene, point, px, size};
 use gpui_ce_wgpu::WgpuHeadlessRenderer;
 use std::io::{self, Write};

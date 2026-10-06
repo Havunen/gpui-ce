@@ -13,9 +13,8 @@ import time
 
 def capture(binary, cropped):
     env = os.environ.copy()
-    env.pop('GPUI_GPU_EXPERIMENTS', None)
-    if cropped:
-        env['GPUI_GPU_EXPERIMENTS'] = 'cropped-paths'
+    # Select both modes explicitly: Linux enables cropping when the variable is absent.
+    env['GPUI_GPU_EXPERIMENTS'] = 'cropped-paths' if cropped else ''
     process = subprocess.Popen([str(binary)], env=env, stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
