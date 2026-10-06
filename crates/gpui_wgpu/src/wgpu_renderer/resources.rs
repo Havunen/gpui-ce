@@ -8,6 +8,7 @@ use collections::FxHashMap;
 
 use crate::WgpuContext;
 use gpui_render::blur::downsampled_dimension;
+use gpui_render::path_types::path_target_extent;
 use gpui_render::shaders::{
     blur::BlurUniforms,
     common::{FontRasterizationUniforms, GlobalUniforms},
@@ -252,15 +253,39 @@ impl WgpuResources {
 }
 
 impl WgpuRenderer {
-    pub(super) fn ensure_path_textures(&mut self) {
-        if self.resources().path_intermediate_texture.is_some() {
+    pub(super) fn ensure_path_textures(&mut self, scene: &gpui::Scene) {
+        let (mut width, mut height) = if self.crop_path_targets {
+            path_target_extent(
+                scene.paths.iter().map(|path| path.clipped_bounds()),
+                self.target.width(),
+                self.target.height(),
+            )
+        } else {
+            (self.target.width(), self.target.height())
+        };
+        if let Some(texture) = self.resources().path_intermediate_texture.as_ref() {
+            // Grow in coarse blocks to avoid reallocating for each small graph
+            // change. Window resize invalidates these targets as before.
+            if texture.width() >= width && texture.height() >= height {
+                return;
+            }
+            width = width.max(texture.width());
+            height = height.max(texture.height());
+        }
+        if width == 0 || height == 0 {
             return;
         }
         let format = self.target.format();
-        let width = self.target.width();
-        let height = self.target.height();
         let sample_count = self.rendering_params.path_sample_count;
+        if std::env::var_os("GPUI_PROFILE_PATH_TARGET").is_some() {
+            eprintln!(
+                "GPUI path target {width}x{height}, viewport {}x{}, samples {sample_count}",
+                self.target.width(),
+                self.target.height()
+            );
+        }
         let resources = self.resources_mut();
+        resources.instances.invalidate_texture_bindings();
         let (texture, view) = sampled_render_texture(&resources.device, format, width, height);
         resources.path_intermediate_texture = Some(texture);
         resources.path_intermediate_view = Some(view);

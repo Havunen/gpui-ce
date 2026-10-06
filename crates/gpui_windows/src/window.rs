@@ -536,7 +536,7 @@ impl WindowsWindow {
                 CW_USEDEFAULT,
                 parent_hwnd,
                 None,
-                Some(hinstance.into()),
+                Some(hinstance),
                 Some(&context as *const _ as *const _),
             )
             .ok()
@@ -722,6 +722,51 @@ impl PlatformWindow for WindowsWindow {
 
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
         self.state.input_handler.take()
+    }
+
+    fn show_character_palette(&self) {
+        // SendInput targets the foreground window, so don't open the picker for
+        // another application if this window has lost focus.
+        if unsafe { GetForegroundWindow() } != self.0.hwnd {
+            log::warn!("Cannot show the character palette for an inactive window");
+            return;
+        }
+
+        // Windows exposes its emoji picker through Win+period. Temporarily
+        // release the action's modifiers (e.g. Ctrl+Space) so they don't change
+        // that shortcut, then restore them in the same input batch.
+        const MODIFIER_KEYS: [i32; 6] = [
+            VK_LCONTROL,
+            VK_RCONTROL,
+            VK_LSHIFT,
+            VK_RSHIFT,
+            VK_LMENU,
+            VK_RMENU,
+        ];
+        let held_modifiers = MODIFIER_KEYS
+            .into_iter()
+            .filter(|&key| unsafe { GetAsyncKeyState(key) } < 0)
+            .collect::<Vec<_>>();
+        let win_held = [VK_LWIN, VK_RWIN]
+            .into_iter()
+            .any(|key| unsafe { GetAsyncKeyState(key) } < 0);
+        let inputs = character_palette_inputs(&held_modifiers, win_held);
+        let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+        if sent as usize != inputs.len() {
+            // A partial send must not leave our synthetic Win/period keys down
+            // or leave the caller's modifiers released.
+            let mut cleanup = vec![character_palette_key(VK_OEM_PERIOD, true)];
+            if !win_held {
+                cleanup.push(character_palette_key(VK_LWIN, true));
+            }
+            cleanup.extend(
+                held_modifiers
+                    .iter()
+                    .map(|&key| character_palette_key(key, false)),
+            );
+            unsafe { SendInput(&cleanup, std::mem::size_of::<INPUT>() as i32) };
+            log::warn!("Failed to open the Windows character palette: sent {sent} input events");
+        }
     }
 
     fn prompt(
@@ -1494,7 +1539,7 @@ fn register_window_class(icon_handle: HICON) {
             hIcon: icon_handle,
             lpszClassName: PCWSTR(WINDOW_CLASS_NAME.as_ptr()),
             style: ((CS_HREDRAW | CS_VREDRAW) as u32),
-            hInstance: get_module_handle().into(),
+            hInstance: get_module_handle(),
             hbrBackground: unsafe { CreateSolidBrush(COLORREF(0x00000000)) },
             ..Default::default()
         };
@@ -1742,11 +1787,89 @@ fn set_non_rude_hwnd(hwnd: HWND, non_rude: bool) {
     }
 }
 
+fn character_palette_key(key: i32, key_up: bool) -> INPUT {
+    let mut flags = 0;
+    if key_up {
+        flags |= KEYEVENTF_KEYUP as u32;
+    }
+    if matches!(key, VK_LWIN | VK_RWIN | VK_RCONTROL | VK_RMENU) {
+        flags |= KEYEVENTF_EXTENDEDKEY as u32;
+    }
+    INPUT {
+        r#type: INPUT_KEYBOARD as u32,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: key as u16,
+                dwFlags: flags,
+                ..Default::default()
+            },
+        },
+    }
+}
+
+fn character_palette_inputs(held_modifiers: &[i32], win_held: bool) -> Vec<INPUT> {
+    let mut inputs = held_modifiers
+        .iter()
+        .map(|&key| character_palette_key(key, true))
+        .collect::<Vec<_>>();
+    if !win_held {
+        inputs.push(character_palette_key(VK_LWIN, false));
+    }
+    inputs.push(character_palette_key(VK_OEM_PERIOD, false));
+    inputs.push(character_palette_key(VK_OEM_PERIOD, true));
+    if !win_held {
+        inputs.push(character_palette_key(VK_LWIN, true));
+    }
+    inputs.extend(
+        held_modifiers
+            .iter()
+            .map(|&key| character_palette_key(key, false)),
+    );
+    inputs
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ClickState;
+    use super::{ClickState, character_palette_inputs};
+    use crate::bindings::Windows::Win32::{
+        KEYEVENTF_KEYUP, VK_LCONTROL, VK_LWIN, VK_OEM_PERIOD, VK_RSHIFT,
+    };
     use gpui::{DevicePixels, MouseButton, point};
     use std::time::Duration;
+
+    #[test]
+    fn character_palette_preserves_held_modifiers() {
+        let inputs = character_palette_inputs(&[VK_LCONTROL, VK_RSHIFT], false);
+        let keys = inputs
+            .iter()
+            .map(|input| unsafe {
+                let key = input.Anonymous.ki;
+                (key.wVk as i32, key.dwFlags & KEYEVENTF_KEYUP as u32 != 0)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            vec![
+                (VK_LCONTROL, true),
+                (VK_RSHIFT, true),
+                (VK_LWIN, false),
+                (VK_OEM_PERIOD, false),
+                (VK_OEM_PERIOD, true),
+                (VK_LWIN, true),
+                (VK_LCONTROL, false),
+                (VK_RSHIFT, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn character_palette_does_not_release_a_held_windows_key() {
+        let inputs = character_palette_inputs(&[], true);
+        assert_eq!(inputs.len(), 2);
+        for input in inputs {
+            assert_eq!(unsafe { input.Anonymous.ki.wVk } as i32, VK_OEM_PERIOD);
+        }
+    }
 
     #[test]
     fn test_double_click_interval() {

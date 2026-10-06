@@ -114,11 +114,12 @@ jobs:
         run: cargo build --workspace --lib --bins --examples --target ${{ matrix.target }}
 
       - name: Run tests
-        run: cargo test --workspace --lib --tests --target ${{ matrix.target }}
+        # Keep the unresolved native access-violation workaround on Windows only.
+        run: cargo test --workspace --lib --tests --target ${{ matrix.target }} -- ${{ runner.os == 'Windows' && '--test-threads=1' || '' }}
 
       - name: Run profiler tests
         run: |
-          cargo test -p gpui-ce --features profiler --lib profiler:: --target ${{ matrix.target }}
+          cargo test -p gpui-ce --features profiler --lib profiler:: --target ${{ matrix.target }} -- ${{ runner.os == 'Windows' && '--test-threads=1' || '' }}
 
   ubuntu-container-build:
     name: Ubuntu ${{ matrix.ubuntu_version }} container x86_64

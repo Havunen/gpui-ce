@@ -2,7 +2,7 @@
 //!
 //! This replaces the macOS-only `HeadlessMetalAppContext` with a platform-neutral
 //! implementation backed by `TestPlatform`. Tests supply a real `PlatformTextSystem`
-//! (e.g. `CosmicTextSystem` on Windows, `MacTextSystem` on macOS) for accurate glyphs.
+//! to get accurate glyph measurements while keeping everything else deterministic.
 //!
 //! Optionally, a renderer factory can be provided to enable real GPU rendering
 //! and screenshot capture via [`HeadlessAppContext::capture_screenshot`].
@@ -10,8 +10,9 @@
 use crate::{
     AnyView, AnyWindowHandle, App, AppCell, AppContext, AssetRegistry, AssetSource,
     BackgroundExecutor, Bounds, Context, Entity, EntityId, EventEmitter, ForegroundExecutor,
-    Global, Pixels, PlatformHeadlessRenderer, PlatformTextSystem, Render, Reservation, Size, Task,
-    TestDispatcher, TestPlatform, TextSystem, Window, WindowBounds, WindowHandle, WindowOptions,
+    Global, Hsla, Pixels, PlatformHeadlessRenderer, PlatformTextSystem, Render, Reservation,
+    ScaledPixels, Size, Task, TestDispatcher, TestPlatform, TextSystem, Window, WindowBounds,
+    WindowHandle, WindowOptions,
     app::{GpuiBorrow, GpuiMode},
 };
 use anyhow::Result;
@@ -27,7 +28,9 @@ use std::{future::Future, rc::Rc, sync::Arc, time::Duration};
 /// # Usage
 ///
 /// ```ignore
-/// let text_system = Arc::new(gpui_wgpu::CosmicTextSystem::new("fallback"));
+/// let text_system = Arc::new(gpui_parley::ParleyTextSystem::new(
+///     gpui_parley::SystemFonts::Load,
+/// ));
 /// let mut cx = HeadlessAppContext::with_platform(
 ///     text_system,
 ///     Arc::new(Assets),
@@ -160,6 +163,74 @@ impl HeadlessAppContext {
     ) -> Result<R> {
         let mut app = self.app.borrow_mut();
         app.update_window(window, f)
+    }
+
+    /// Returns the most recently rendered bounds for an element's debug selector.
+    pub fn debug_bounds(
+        &mut self,
+        window: AnyWindowHandle,
+        selector: &str,
+    ) -> Result<Option<Bounds<Pixels>>> {
+        self.update_window(window, |_, window, _| {
+            window.rendered_frame.debug_bounds.get(selector).copied()
+        })
+    }
+
+    /// Returns the device-pixel bounds of rendered solid quads with the requested color.
+    pub fn solid_quad_bounds(
+        &mut self,
+        window: AnyWindowHandle,
+        color: Hsla,
+    ) -> Result<Vec<Bounds<ScaledPixels>>> {
+        let color = color.into();
+        self.update_window(window, |_, window, _| {
+            window
+                .rendered_frame
+                .scene
+                .quads
+                .iter()
+                .filter(|quad| quad.background.solid == color)
+                .map(|quad| quad.bounds)
+                .collect()
+        })
+    }
+
+    /// Returns the device-pixel bounds of painted monochrome glyphs of this color.
+    pub fn glyph_bounds(
+        &mut self,
+        window: AnyWindowHandle,
+        color: Hsla,
+    ) -> Result<Vec<Bounds<ScaledPixels>>> {
+        let color = color.into();
+        self.update_window(window, |_, window, _| {
+            window
+                .rendered_frame
+                .scene
+                .monochrome_sprites
+                .iter()
+                .filter(|sprite| sprite.color == color)
+                .map(|sprite| sprite.bounds)
+                .collect()
+        })
+    }
+
+    /// Returns the device-pixel bounds of painted underlines of this color.
+    pub fn underline_bounds(
+        &mut self,
+        window: AnyWindowHandle,
+        color: Hsla,
+    ) -> Result<Vec<Bounds<ScaledPixels>>> {
+        let color = color.into();
+        self.update_window(window, |_, window, _| {
+            window
+                .rendered_frame
+                .scene
+                .underlines
+                .iter()
+                .filter(|underline| underline.color == color)
+                .map(|underline| underline.bounds)
+                .collect()
+        })
     }
 
     /// Captures a screenshot from a window.
@@ -327,9 +398,10 @@ impl AppContext for HeadlessAppContext {
 mod tests {
     use super::*;
     use crate::{
-        AnyView, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels, IntoElement,
-        NoopTextSystem, ParentElement as _, PlatformAtlas, PrimitiveBatch, RenderImage, Scene,
-        StyleRefinement, Styled as _, TileId, div, img, px, size,
+        AnyView, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels, GlyphAtlasCache,
+        GlyphAtlasEntry, IntoElement, ParentElement as _, PlatformAtlas, PrimitiveBatch,
+        RenderGlyphParams, RenderImage, Scene, StyleRefinement, Styled as _, TestTextSystem,
+        TileId, ValidatedRasterizedGlyph, div, img, px, size,
     };
     use anyhow::Result;
     use image::{Frame as ImageFrame, ImageBuffer, Rgba, RgbaImage};
@@ -348,16 +420,42 @@ mod tests {
     #[derive(Default)]
     struct ResettableAtlasState {
         tiles_by_key: HashMap<AtlasKey, AtlasTile>,
+        glyph_cache: GlyphAtlasCache,
         live_textures: HashSet<AtlasTextureId>,
         next_texture_index: u32,
         next_tile_id: u32,
         generation: u64,
     }
 
+    impl ResettableAtlasState {
+        fn insert_tile(&mut self, key: AtlasKey, size: Size<DevicePixels>) -> AtlasTile {
+            let texture_id = AtlasTextureId {
+                index: self.next_texture_index,
+                kind: key.texture_kind(),
+            };
+            self.next_texture_index += 1;
+
+            let tile = AtlasTile {
+                texture_id,
+                tile_id: TileId(self.next_tile_id),
+                padding: 0,
+                bounds: Bounds {
+                    origin: Default::default(),
+                    size,
+                },
+            };
+            self.next_tile_id += 1;
+            self.live_textures.insert(texture_id);
+            self.tiles_by_key.insert(key, tile);
+            tile
+        }
+    }
+
     impl ResettableAtlas {
         fn reset_device_resources_for_test(&self) {
             let mut state = self.state.lock();
             state.tiles_by_key.clear();
+            state.glyph_cache.clear();
             state.live_textures.clear();
             state.next_texture_index = 0;
             state.next_tile_id = 0;
@@ -388,29 +486,34 @@ mod tests {
                 return Ok(Some(tile));
             }
 
-            let texture_id = AtlasTextureId {
-                index: state.next_texture_index,
-                kind: key.texture_kind(),
-            };
-            state.next_texture_index += 1;
+            Ok(Some(state.insert_tile(key.clone(), size)))
+        }
 
-            let tile = AtlasTile {
-                texture_id,
-                tile_id: TileId(state.next_tile_id),
-                padding: 0,
-                bounds: Bounds {
-                    origin: Default::default(),
-                    size,
-                },
+        fn get_or_insert_glyph_with(
+            &self,
+            params: &RenderGlyphParams,
+            build: &mut dyn FnMut() -> Result<ValidatedRasterizedGlyph>,
+        ) -> Result<GlyphAtlasEntry> {
+            if let Some(entry) = self.state.lock().glyph_cache.get(params) {
+                return Ok(entry);
+            }
+
+            let glyph = build()?;
+
+            let mut state = self.state.lock();
+            let tile = if glyph.size == Size::default() {
+                None
+            } else {
+                let key = (params.clone(), glyph.format).into();
+                Some(state.insert_tile(key, glyph.size))
             };
-            state.next_tile_id += 1;
-            state.live_textures.insert(texture_id);
-            state.tiles_by_key.insert(key.clone(), tile.clone());
-            Ok(Some(tile))
+
+            Ok(state.glyph_cache.insert(params, &glyph, tile))
         }
 
         fn remove(&self, key: &AtlasKey) {
             let mut state = self.state.lock();
+            state.glyph_cache.remove(key);
             if let Some(tile) = state.tiles_by_key.remove(key) {
                 state.live_textures.remove(&tile.texture_id);
                 state.generation = state.generation.wrapping_add(1);
@@ -491,15 +594,12 @@ mod tests {
     fn non_forced_present_after_atlas_reset_can_redraw_stale_scene() -> Result<()> {
         let atlas = Arc::new(ResettableAtlas::default());
         let renderer_atlas = atlas.clone();
-        let mut cx = HeadlessAppContext::with_platform(
-            Arc::new(NoopTextSystem::new()),
-            Arc::new(()),
-            move || {
+        let mut cx =
+            HeadlessAppContext::with_platform(Arc::new(TestTextSystem), Arc::new(()), move || {
                 Some(Box::new(CheckingHeadlessRenderer {
                     atlas: renderer_atlas.clone(),
                 }))
-            },
-        );
+            });
 
         let image = test_image();
         let window = cx.open_window(size(px(10.0), px(10.0)), move |_window, cx| {
@@ -519,15 +619,12 @@ mod tests {
     fn non_forced_redraw_after_atlas_reset_must_not_reuse_cached_sprite_scene() -> Result<()> {
         let atlas = Arc::new(ResettableAtlas::default());
         let renderer_atlas = atlas.clone();
-        let mut cx = HeadlessAppContext::with_platform(
-            Arc::new(NoopTextSystem::new()),
-            Arc::new(()),
-            move || {
+        let mut cx =
+            HeadlessAppContext::with_platform(Arc::new(TestTextSystem), Arc::new(()), move || {
                 Some(Box::new(CheckingHeadlessRenderer {
                     atlas: renderer_atlas.clone(),
                 }))
-            },
-        );
+            });
 
         let image = test_image();
         let window = cx.open_window(size(px(10.0), px(10.0)), move |_window, cx| {

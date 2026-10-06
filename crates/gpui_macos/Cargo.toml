@@ -20,7 +20,7 @@ test-support = [
   "gpui_apple/test-support",
   "gpui_wgpu?/test-support",
 ]
-font-kit = ["dep:font-kit"]
+font-kit = []
 screen-capture = [
   "gpui/screen-capture",
   "dep:core-video",
@@ -51,10 +51,11 @@ core-video = { workspace = true, optional = true }
 ctor.workspace = true
 dispatch2.workspace = true
 etagere.workspace = true
-font-kit = { workspace = true, optional = true, features = ["freetype-bundled"] }
+font-kit = { workspace = true, features = ["freetype-bundled"] }
 foreign-types.workspace = true
 futures.workspace = true
 gpui_apple.workspace = true
+gpui_parley = { workspace = true, features = ["system-fonts"] }
 gpui_util.workspace = true
 gpui_wgpu = { workspace = true, optional = true }
 image.workspace = true
@@ -76,6 +77,7 @@ pathfinder_geometry.workspace = true
 raw-window-handle.workspace = true
 semver.workspace = true
 smallvec.workspace = true
+skrifa.workspace = true
 strum.workspace = true
 uuid.workspace = true
 url.workspace = true

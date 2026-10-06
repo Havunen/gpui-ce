@@ -1,7 +1,7 @@
 use perf::*;
 use proc_macro::TokenStream;
 use quote::{ToTokens, quote};
-use syn::{ItemFn, LitStr, parse_macro_input, parse_quote};
+use syn::{FnModifiers, ItemFn, LitStr, parse_macro_input, parse_quote};
 
 /// A macro used in tests for cross-platform path string literals in tests. On Windows it replaces
 /// `/` with `\\` and adds `C:` to the beginning of absolute paths. On other platforms, the path is
@@ -258,7 +258,7 @@ pub fn perf(our_attr: TokenStream, input: TokenStream) -> TokenStream {
             ItemFn {
                 attrs: attrs_main,
                 vis: vis.clone(),
-                modifiers: modifiers.clone(),
+                modifiers,
                 sig: sig_main,
                 block: block_main,
             },
@@ -266,7 +266,7 @@ pub fn perf(our_attr: TokenStream, input: TokenStream) -> TokenStream {
             ItemFn {
                 attrs: attrs_meta,
                 vis,
-                modifiers: Default::default(),
+                modifiers: FnModifiers::default(),
                 sig: sig_meta,
                 block: block_meta,
             },

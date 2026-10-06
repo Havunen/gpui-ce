@@ -15,6 +15,15 @@
 //! and Tailwind-like styling that you can use to build your own custom elements. Div is
 //! constructed by combining these two systems into an all-in-one element.
 
+#[cfg(test)]
+use crate::{
+    AnyWindowHandle, Context, HighlightStyle, InputEvent, Keystroke, StyledText, TestAppContext,
+    canvas, hsla, util::FluentBuilder,
+};
+
+#[cfg(test)]
+use std::{cell::Cell, rc::Weak};
+
 use crate::{
     Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, AppContext, Bounds, ClickEvent,
     CursorStyle, DispatchPhase, Display, DragMoveRefresh, Element, ElementId, Entity, EntityId,
@@ -29,6 +38,7 @@ use crate::{
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
+use itertools::Either;
 use refineable::Refineable;
 use smallvec::SmallVec;
 use std::{
@@ -45,6 +55,9 @@ use std::{
 
 use super::ImageCacheProvider;
 
+mod inline;
+pub(crate) use inline::InlineContent;
+use inline::InlineDivFrameState;
 #[cfg(feature = "stacker")]
 type StackSafe<T> = stacksafe::StackSafe<T>;
 #[cfg(not(feature = "stacker"))]
@@ -2233,6 +2246,34 @@ impl Div {
 /// bounds of the children after the layout phase is complete.
 pub struct DivFrameState {
     child_layout_ids: SmallVec<[LayoutId; 2]>,
+    inline: Option<InlineDivFrameState>,
+    contents_in_parent_paragraph: bool,
+}
+
+impl DivFrameState {
+    fn standalone_inline(&self) -> Option<&InlineDivFrameState> {
+        if self.contents_in_parent_paragraph {
+            None
+        } else {
+            self.inline.as_ref()
+        }
+    }
+
+    fn standalone_inline_mut(&mut self) -> Option<&mut InlineDivFrameState> {
+        if self.contents_in_parent_paragraph {
+            None
+        } else {
+            self.inline.as_mut()
+        }
+    }
+
+    /// Returns the display text and layout used to paint each inline paragraph.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn measured_inline_paragraphs(&self) -> Vec<(SharedString, Arc<crate::InlineLayout>)> {
+        self.inline
+            .as_ref()
+            .map_or_else(Vec::new, |inline| inline.measured_paragraphs())
+    }
 }
 
 /// Interactivity state displayed an manipulated in the inspector.
@@ -2318,6 +2359,7 @@ impl Element for Div {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut child_layout_ids = SmallVec::new();
+        let mut inline = None;
         let image_cache = self
             .image_cache
             .as_mut()
@@ -2331,18 +2373,63 @@ impl Element for Div {
                 cx,
                 |style, window, cx| {
                     window.with_text_style(style.text_style().cloned(), |window| {
+                        let display = style.display;
+                        let collected_by_ancestor =
+                            window.collecting_inline && display == Display::Inline;
+                        let previous_collecting_inline = std::mem::replace(
+                            &mut window.collecting_inline,
+                            matches!(display, Display::Block | Display::Inline),
+                        );
                         child_layout_ids = self
                             .children
                             .iter_mut()
                             .map(|child| child.request_layout(window, cx))
-                            .collect::<SmallVec<_>>();
-                        window.request_layout(style, child_layout_ids.iter().copied(), cx)
+                            .collect();
+                        window.collecting_inline = previous_collecting_inline;
+
+                        let layout_id = if matches!(display, Display::Block | Display::Inline)
+                            && !collected_by_ancestor
+                        {
+                            let (node_id, state) = InlineDivFrameState::request_layout(
+                                &style,
+                                &child_layout_ids,
+                                window,
+                                cx,
+                            );
+
+                            inline = Some(state);
+                            node_id
+                        } else if collected_by_ancestor {
+                            window.request_layout(style, std::iter::empty(), cx)
+                        } else {
+                            window.request_layout(style, child_layout_ids.iter().copied(), cx)
+                        };
+
+                        if display == Display::Inline {
+                            window.publish_inline_content(
+                                layout_id,
+                                InlineContent::Container {
+                                    children: child_layout_ids.clone(),
+                                },
+                            );
+                        }
+
+                        window.set_layout_logical_children(layout_id, &child_layout_ids);
+
+                        layout_id
                     })
                 },
             )
         });
 
-        (layout_id, DivFrameState { child_layout_ids })
+        (
+            layout_id,
+            DivFrameState {
+                child_layout_ids,
+                inline,
+                contents_in_parent_paragraph: false,
+            },
+        )
     }
 
     #[cfg_attr(feature = "stacker", stacksafe::stacksafe)]
@@ -2372,7 +2459,17 @@ impl Element for Div {
         if let Some(handle) = self.interactivity.scroll_anchor.as_ref() {
             *handle.last_origin.borrow_mut() = bounds.origin - window.element_offset();
         }
-        let content_size = if request_layout.child_layout_ids.is_empty() {
+
+        request_layout.contents_in_parent_paragraph = window.current_inline_fragments.is_some();
+
+        let content_size = if let Some(inline) = request_layout.standalone_inline() {
+            inline.prepare_layout(
+                bounds,
+                self.interactivity.tracked_scroll_handle.as_ref(),
+                &request_layout.child_layout_ids,
+                window,
+            )
+        } else if request_layout.child_layout_ids.is_empty() {
             bounds.size
         } else if let Some(scroll_handle) = self.interactivity.tracked_scroll_handle.as_ref() {
             let mut state = scroll_handle.0.borrow_mut();
@@ -2417,19 +2514,17 @@ impl Element for Div {
                 #[inline]
                 fn prepaint_children(
                     children: &mut [StackSafe<AnyElement>],
-                    order_fn: Option<&dyn Fn(&mut Window, &mut App) -> SmallVec<[usize; 8]>>,
+                    order: Option<&[usize]>,
                     window: &mut Window,
                     cx: &mut App,
                 ) {
-                    if let Some(order_fn) = order_fn {
-                        let order = order_fn(window, cx);
-                        for idx in order {
-                            if let Some(child) = children.get_mut(idx) {
-                                child.prepaint(window, cx);
-                            }
-                        }
-                    } else {
-                        for child in children {
+                    let order = match order {
+                        Some(order) => Either::Left(order.iter().copied()),
+                        None => Either::Right(0..children.len()),
+                    };
+
+                    for index in order {
+                        if let Some(child) = children.get_mut(index) {
                             child.prepaint(window, cx);
                         }
                     }
@@ -2437,19 +2532,46 @@ impl Element for Div {
 
                 window.with_image_cache(image_cache, |window| {
                     window.with_style_transition_containing_bounds(bounds, |window| {
-                        window.with_element_offset(scroll_offset, |window| {
-                            prepaint_children(
-                                &mut self.children,
-                                self.prepaint_order_fn.as_deref(),
-                                window,
-                                cx,
-                            )
-                        });
-                    });
+                        let has_standalone_inline = request_layout.standalone_inline().is_some();
+                        let inline_order = if has_standalone_inline {
+                            self.prepaint_order_fn
+                                .as_ref()
+                                .map(|order_fn| order_fn(window, cx))
+                        } else {
+                            None
+                        };
 
-                    if let Some(listener) = self.prepaint_listener.as_ref() {
-                        listener(children_bounds, window, cx);
-                    }
+                        window.with_element_offset(scroll_offset, |window| {
+                            if let Some(inline) = request_layout.standalone_inline_mut() {
+                                inline.record_paragraph_origins(window);
+                                prepaint_children(
+                                    &mut self.children,
+                                    inline_order.as_deref(),
+                                    window,
+                                    cx,
+                                );
+                            } else {
+                                let order = self
+                                    .prepaint_order_fn
+                                    .as_ref()
+                                    .map(|order_fn| order_fn(window, cx));
+                                prepaint_children(&mut self.children, order.as_deref(), window, cx);
+                            }
+                        });
+
+                        if has_prepaint_listener && has_standalone_inline {
+                            children_bounds.extend(
+                                request_layout
+                                    .child_layout_ids
+                                    .iter()
+                                    .map(|layout_id| window.layout_bounds(*layout_id)),
+                            );
+                        }
+
+                        if let Some(listener) = self.prepaint_listener.as_ref() {
+                            listener(children_bounds, window, cx);
+                        }
+                    });
                 });
 
                 hitbox
@@ -2463,7 +2585,7 @@ impl Element for Div {
         global_id: Option<&GlobalElementId>,
         inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
+        request_layout: &mut Self::RequestLayoutState,
         hitbox: &mut Option<Hitbox>,
         window: &mut Window,
         cx: &mut App,
@@ -2489,6 +2611,10 @@ impl Element for Div {
 
                     for child in &mut self.children {
                         child.paint(window, cx);
+                    }
+
+                    if let Some(inline) = request_layout.standalone_inline() {
+                        inline.paint_paragraphs(window, cx);
                     }
                 },
             )
@@ -3125,7 +3251,6 @@ impl Interactivity {
                         None,
                     )
                     .ok()
-                    .and_then(|mut text| text.pop())
                 {
                     text.paint(hitbox.origin, FONT_SIZE, TextAlign::Left, None, window, cx)
                         .ok();
@@ -3704,14 +3829,15 @@ impl Interactivity {
                 let build_tooltip = Rc::new(move |window: &mut Window, cx: &mut App| {
                     Some(((tooltip_builder.build)(window, cx), tooltip_is_hoverable))
                 });
-                // Use bounds instead of testing hitbox since this is called during prepaint.
+
+                // Check hitbox geometry directly because hover state is unavailable during prepaint.
                 let check_is_hovered_during_prepaint = Rc::new({
                     let pending_mouse_down = pending_mouse_down.clone();
-                    let source_bounds = hitbox.bounds;
+                    let source_hitbox = hitbox.clone();
                     move |window: &Window| {
                         !window.last_input_was_keyboard()
                             && pending_mouse_down.borrow().is_none()
-                            && source_bounds.contains(&window.mouse_position())
+                            && source_hitbox.contains(&window.mouse_position())
                     }
                 });
                 let check_is_hovered = Rc::new({
@@ -4954,11 +5080,185 @@ impl ScrollHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        AnyWindowHandle, Context, InputEvent, Keystroke, MouseMoveEvent, TestAppContext, canvas,
-        util::FluentBuilder as _,
-    };
-    use std::{cell::Cell, rc::Weak};
+
+    #[gpui::test]
+    fn inline_div_places_element_children_in_text_flow(cx: &mut TestAppContext) {
+        let placed_children = Rc::new(RefCell::new(Vec::new()));
+        let captured_bounds = placed_children.clone();
+        let window = cx.add_empty_window();
+        let highlight_color = hsla(0.4, 0.6, 0.5, 1.0);
+
+        window.draw(
+            point(px(10.), px(20.)),
+            size(px(160.), px(80.)),
+            move |_, _| {
+                div()
+                    .block()
+                    .w(px(160.))
+                    .child(StyledText::new("prefix ").with_highlights([(
+                        0.."prefix ".len(),
+                        HighlightStyle {
+                            background_color: Some(highlight_color),
+                            ..Default::default()
+                        },
+                    )]))
+                    .child(div().inline_flex().size(px(18.)).align_baseline())
+                    .child(div().inline_flex().size(px(18.)).align_middle())
+                    .child(" suffix")
+                    .on_children_prepainted(move |bounds, _, _| {
+                        *captured_bounds.borrow_mut() = bounds;
+                    })
+                    .into_any_element()
+            },
+        );
+
+        let placed_children = placed_children.borrow();
+        assert_eq!(placed_children.len(), 4);
+        let baseline_box = placed_children[1];
+        let middle_box = placed_children[2];
+        assert_eq!(baseline_box.size, size(px(18.), px(18.)));
+        assert_eq!(middle_box.size, baseline_box.size);
+        assert!(baseline_box.origin.x > px(10.));
+        assert!(middle_box.origin.x >= baseline_box.right());
+        assert!(middle_box.right() <= px(170.));
+        assert!(baseline_box.origin.y >= px(20.));
+        assert!(middle_box.origin.y > baseline_box.origin.y);
+        assert!(middle_box.bottom() > baseline_box.bottom());
+        assert!(
+            window.update(|window, _| {
+                window
+                    .rendered_frame
+                    .scene
+                    .quads
+                    .iter()
+                    .any(|quad| quad.background.solid == highlight_color.into())
+            }),
+            "the highlighted inline text did not paint its background"
+        );
+    }
+
+    #[gpui::test]
+    fn default_block_preserves_grid_flow_and_hides_none_descendants(cx: &mut TestAppContext) {
+        let hidden_prepainted = Rc::new(Cell::new(false));
+        let hidden_prepaint = hidden_prepainted.clone();
+        let window = cx.add_empty_window();
+
+        window.draw(
+            point(px(10.), px(20.)),
+            size(px(200.), px(100.)),
+            move |_, _| {
+                div()
+                    .w(px(200.))
+                    .child(
+                        div()
+                            .grid()
+                            .w_full()
+                            .grid_cols(2)
+                            .debug_selector(|| "grid".into())
+                            .child(div().h(px(20.)).debug_selector(|| "grid-cell-1".into()))
+                            .child(div().h(px(30.)).debug_selector(|| "grid-cell-2".into())),
+                    )
+                    .child(div().hidden().h(px(300.)).child(canvas(
+                        move |_, _, _| hidden_prepaint.set(true),
+                        |_, _, _, _| {},
+                    )))
+                    .child(div().h(px(10.)).debug_selector(|| "following-block".into()))
+                    .into_any_element()
+            },
+        );
+
+        let [grid, first_cell, second_cell, following] =
+            ["grid", "grid-cell-1", "grid-cell-2", "following-block"].map(|selector| {
+                window
+                    .update(|window, _| window.rendered_frame.debug_bounds.get(selector).copied())
+                    .unwrap_or_else(|| panic!("{selector} was not rendered"))
+            });
+
+        assert_eq!(first_cell.origin.y, grid.origin.y);
+        assert_eq!(second_cell.origin.y, grid.origin.y);
+        assert!(second_cell.origin.x > first_cell.origin.x);
+        assert_eq!(following.origin.y, grid.bottom());
+        assert!(!hidden_prepainted.get());
+    }
+
+    struct ChildPrepaintTestView {
+        custom_order: bool,
+        visits: Rc<RefCell<Vec<(usize, Point<Pixels>)>>>,
+        callback_offsets: Rc<RefCell<Vec<Point<Pixels>>>>,
+        scroll_handle: ScrollHandle,
+    }
+
+    impl Render for ChildPrepaintTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let children = (0..3).map(|index| {
+                let visits = self.visits.clone();
+
+                canvas(
+                    move |_bounds, window, _cx| {
+                        visits.borrow_mut().push((index, window.element_offset()));
+                    },
+                    |_bounds, _state, _window, _cx| {},
+                )
+                .w_full()
+                .h(px(40.))
+                .flex_shrink_0()
+            });
+            let mut element = div().size_full().flex().flex_col().children(children);
+
+            if self.custom_order {
+                let visits = self.visits.clone();
+                let callback_offsets = self.callback_offsets.clone();
+                element = element.with_dynamic_prepaint_order(move |window, _cx| {
+                    assert!(visits.borrow().is_empty());
+                    callback_offsets.borrow_mut().push(window.element_offset());
+
+                    SmallVec::from_slice(&[2, 9, 0, 1])
+                });
+            }
+
+            element
+                .id("prepaint-order")
+                .overflow_y_scroll()
+                .track_scroll(&self.scroll_handle)
+        }
+    }
+
+    #[gpui::test]
+    fn child_prepaint_preserves_order_and_scroll_offset(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let origin = point(px(20.), px(30.));
+        let scroll_offset = point(px(0.), px(-15.));
+        let expected_offset = origin + scroll_offset;
+
+        for custom_order in [false, true] {
+            let visits = Rc::new(RefCell::new(Vec::new()));
+            let callback_offsets = Rc::new(RefCell::new(Vec::new()));
+            let scroll_handle = ScrollHandle::new();
+            scroll_handle.set_offset(scroll_offset);
+
+            cx.draw(origin, size(px(50.), px(50.)), |_window, cx| {
+                cx.new(|_cx| ChildPrepaintTestView {
+                    custom_order,
+                    visits: visits.clone(),
+                    callback_offsets: callback_offsets.clone(),
+                    scroll_handle,
+                })
+                .into_any_element()
+            });
+
+            let expected_order = if custom_order { [2, 0, 1] } else { [0, 1, 2] };
+            assert_eq!(
+                *visits.borrow(),
+                expected_order.map(|index| (index, expected_offset)),
+            );
+
+            if custom_order {
+                assert_eq!(*callback_offsets.borrow(), [expected_offset]);
+            } else {
+                assert!(callback_offsets.borrow().is_empty());
+            }
+        }
+    }
 
     struct GroupHoverTestView {
         render_count: Rc<Cell<usize>>,
@@ -4999,10 +5299,13 @@ mod tests {
                             .left_0()
                             .size(px(10.))
                             .group_hover("hover-group", |style| style.size(px(20.)))
-                            .child(canvas(
-                                move |bounds, _, _| stateful_width.set(bounds.size.width),
-                                |_, _, _, _| {},
-                            )),
+                            .child(
+                                canvas(
+                                    move |bounds, _, _| stateful_width.set(bounds.size.width),
+                                    |_, _, _, _| {},
+                                )
+                                .size_full(),
+                            ),
                     ),
             )
         }

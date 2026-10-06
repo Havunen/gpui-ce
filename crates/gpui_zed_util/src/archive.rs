@@ -1,7 +1,10 @@
 use std::path::Path;
 
 use anyhow::{Context as _, Result};
+#[cfg(windows)]
 use async_zip::base::read;
+#[cfg(unix)]
+use async_zip::base::read1::seek::ZipArchiveReader;
 #[cfg(not(windows))]
 use futures::AsyncSeek;
 use futures::{AsyncRead, io::BufReader};
@@ -68,7 +71,7 @@ pub async fn extract_zip<R: AsyncRead + Unpin>(destination: &Path, reader: R) ->
 #[cfg(unix)]
 pub async fn extract_zip<R: AsyncRead + Unpin>(destination: &Path, reader: R) -> Result<()> {
     // Unix needs file permissions copied when extracting.
-    // This is only possible to do when a reader impls `AsyncSeek` and `seek::ZipFileReader` is used.
+    // This is only possible to do when a reader impls `AsyncSeek` and `seek::ZipArchiveReader` is used.
     // `stream::ZipFileReader` also has the `unix_permissions` method, but it will always return `Some(0)`.
     //
     // A typical `reader` comes from a streaming network response, so cannot be sought right away,
@@ -87,15 +90,15 @@ pub async fn extract_seekable_zip<R: AsyncRead + AsyncSeek + Unpin>(
     destination: &Path,
     reader: R,
 ) -> Result<()> {
-    let mut reader = read::seek::ZipFileReader::new(BufReader::new(reader))
+    let mut reader = ZipArchiveReader::open(BufReader::new(reader))
         .await
         .context("reading the zip archive")?;
     let destination = &destination
         .canonicalize()
         .unwrap_or_else(|_| destination.to_path_buf());
-    for (i, entry) in reader.file().entries().to_vec().into_iter().enumerate() {
+    for (i, entry) in reader.cdrs().to_vec().into_iter().enumerate() {
         let filename = entry
-            .filename()
+            .insecure_file_name
             .as_str()
             .context("reading zip entry file name")?;
 
@@ -105,10 +108,7 @@ pub async fn extract_seekable_zip<R: AsyncRead + AsyncSeek + Unpin>(
 
         let path = destination.join(filename);
 
-        if entry
-            .dir()
-            .with_context(|| format!("reading zip entry metadata for path {path:?}"))?
-        {
+        if filename.ends_with('/') {
             std::fs::create_dir_all(&path)
                 .with_context(|| format!("creating directory {path:?}"))?;
         } else {
@@ -121,18 +121,20 @@ pub async fn extract_seekable_zip<R: AsyncRead + AsyncSeek + Unpin>(
                 .await
                 .with_context(|| format!("creating file {path:?}"))?;
             let mut entry_reader = reader
-                .reader_with_entry(i)
+                .file(i)
                 .await
                 .with_context(|| format!("reading entry for path {path:?}"))?;
             futures::io::copy(&mut entry_reader, &mut file)
                 .await
                 .with_context(|| format!("extracting into file {path:?}"))?;
 
-            if let Some(perms) = entry.unix_permissions()
+            // Unix archives store the file mode in the upper 16 bits of the external attributes.
+            let perms = entry.cdrh.exter_attr >> 16;
+            if entry.cdrh.v_made_by >> 8 == u16::from(async_zip::AttributeCompatibility::Unix)
                 && perms != 0o000
             {
                 use std::os::unix::fs::PermissionsExt;
-                let permissions = std::fs::Permissions::from_mode(u32::from(perms));
+                let permissions = std::fs::Permissions::from_mode(perms);
                 file.set_permissions(permissions)
                     .await
                     .with_context(|| format!("setting permissions for file {path:?}"))?;

@@ -1,11 +1,11 @@
 use crate::collections::HashMap;
 use crate::{
     AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels,
-    DispatchEventResult, GpuSpecs, Pixels, PlatformAtlas, PlatformDisplay,
-    PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, RequestFrameOptions, Scene, Size, TestPlatform, TextInputConfiguration,
-    TextInputStateChange, TileId, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowParams,
+    DispatchEventResult, GlyphAtlasCache, GlyphAtlasEntry, GpuSpecs, Pixels, PlatformAtlas,
+    PlatformDisplay, PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformWindow,
+    Point, PromptButton, RenderGlyphParams, RequestFrameOptions, Scene, Size, TestPlatform,
+    TextInputConfiguration, TextInputStateChange, TileId, ValidatedRasterizedGlyph,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
 };
 use gpui_util::ResultExt as _;
 #[cfg(any(test, feature = "test-support"))]
@@ -52,6 +52,8 @@ pub(crate) struct TestWindowState {
     start_external_drag_result: bool,
     can_start_external_drag: bool,
     modifiers: crate::Modifiers,
+    fixed_refresh_rate: bool,
+    presents: usize,
 }
 
 #[derive(Clone)]
@@ -119,8 +121,22 @@ impl TestWindow {
             start_external_drag_result: false,
             can_start_external_drag: true,
             modifiers: crate::Modifiers::default(),
+            fixed_refresh_rate: false,
+            presents: 0,
         })))
     }
+
+    /// Reports this window's display as refreshing at one fixed rate.
+    pub fn set_fixed_refresh_rate(&self, fixed: bool) {
+        self.0.lock().fixed_refresh_rate = fixed;
+    }
+
+    /// Returns how many frames were handed to the platform, drawn or
+    /// re-presented.
+    pub fn presents(&self) -> usize {
+        self.0.lock().presents
+    }
+
     pub fn simulate_scheduled_frame(&self) -> bool {
         let callback = {
             let mut state = self.0.lock();
@@ -478,12 +494,17 @@ impl PlatformWindow for TestWindow {
     fn draw(&self, scene: &Scene) {
         let scale_factor = self.scale_factor();
         let mut state = self.0.lock();
+        state.presents += 1;
         state.frame_callback_pending = true;
         state.frame_scheduled = true;
         let device_size: Size<DevicePixels> = state.bounds.size.to_device_pixels(scale_factor);
         if let Some(renderer) = &mut state.renderer {
             renderer.render_scene(scene, device_size).warn_on_err();
         }
+    }
+
+    fn has_fixed_refresh_rate(&self) -> bool {
+        self.0.lock().fixed_refresh_rate
     }
 
     fn sprite_atlas(&self) -> sync::Arc<dyn crate::PlatformAtlas> {
@@ -536,16 +557,50 @@ impl PlatformWindow for TestWindow {
 pub(crate) struct TestAtlasState {
     next_id: u32,
     tiles: HashMap<AtlasKey, AtlasTile>,
+    glyph_cache: GlyphAtlasCache,
 }
 
 pub(crate) struct TestAtlas(Mutex<TestAtlasState>);
+
+impl TestAtlasState {
+    fn insert_tile(&mut self, key: AtlasKey, size: Size<DevicePixels>) -> AtlasTile {
+        self.next_id += 1;
+        let texture_id = self.next_id;
+        self.next_id += 1;
+        let tile_id = self.next_id;
+        let tile = AtlasTile {
+            texture_id: AtlasTextureId {
+                index: texture_id,
+                kind: key.texture_kind(),
+            },
+            tile_id: TileId(tile_id),
+            padding: 0,
+            bounds: Bounds {
+                origin: Point::default(),
+                size,
+            },
+        };
+
+        self.tiles.insert(key, tile);
+
+        tile
+    }
+}
 
 impl TestAtlas {
     pub fn new() -> Self {
         TestAtlas(Mutex::new(TestAtlasState {
             next_id: 0,
             tiles: HashMap::default(),
+            glyph_cache: GlyphAtlasCache::default(),
         }))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn clear(&self) {
+        let mut state = self.0.lock();
+        state.tiles.clear();
+        state.glyph_cache.clear();
     }
 }
 
@@ -568,36 +623,47 @@ impl PlatformAtlas for TestAtlas {
         };
 
         let mut state = self.0.lock();
-        state.next_id += 1;
-        let texture_id = state.next_id;
-        state.next_id += 1;
-        let tile_id = state.next_id;
 
-        state.tiles.insert(
-            key.clone(),
-            crate::AtlasTile {
-                texture_id: AtlasTextureId {
-                    index: texture_id,
-                    kind: crate::AtlasTextureKind::Monochrome,
-                },
-                tile_id: TileId(tile_id),
-                padding: 0,
-                bounds: crate::Bounds {
-                    origin: Point::default(),
-                    size,
-                },
-            },
-        );
+        Ok(Some(state.insert_tile(key.clone(), size)))
+    }
 
-        Ok(Some(state.tiles[key]))
+    fn get_or_insert_glyph_with(
+        &self,
+        params: &RenderGlyphParams,
+        build: &mut dyn FnMut() -> anyhow::Result<ValidatedRasterizedGlyph>,
+    ) -> anyhow::Result<GlyphAtlasEntry> {
+        if let Some(entry) = self.0.lock().glyph_cache.get(params) {
+            return Ok(entry);
+        }
+
+        let glyph = build()?;
+
+        let mut state = self.0.lock();
+        let tile = if glyph.size == Size::default() {
+            None
+        } else {
+            let key = (params.clone(), glyph.format).into();
+
+            Some(state.insert_tile(key, glyph.size))
+        };
+
+        Ok(state.glyph_cache.insert(params, &glyph, tile))
     }
 
     fn remove(&self, key: &AtlasKey) {
         let mut state = self.0.lock();
+        state.glyph_cache.remove(key);
         state.tiles.remove(key);
     }
 
     fn contains(&self, key: &AtlasKey) -> bool {
-        self.0.lock().tiles.contains_key(key)
+        let state = self.0.lock();
+        match key {
+            AtlasKey::Glyph { params, format } => state
+                .glyph_cache
+                .get(params)
+                .is_some_and(|entry| entry.format == *format),
+            _ => state.tiles.contains_key(key),
+        }
     }
 }
