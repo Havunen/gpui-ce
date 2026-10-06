@@ -46,7 +46,7 @@ rust-version = "1.97"
 accesskit = { version = "0.25", features = ["enumn"] }
 accesskit_consumer = "0.39"
 accesskit_macos = "0.27"
-accesskit_unix = "0.23"
+accesskit_unix = "0.24"
 accesskit_windows = "0.35"
 anyhow = "1"
 backtrace = "0.3"
@@ -81,7 +81,7 @@ itertools = "0.15"
 log = { version = "0.4", features = ["kv_unstable_serde", "serde"] }
 palette = { version = "0.7", features = ["serializing"] }
 parking_lot = "0.12"
-phf = { version = "0.13", features = ["macros"] }
+phf = { version = "0.14", features = ["macros"] }
 postage = { version = "0.5", features = ["futures-traits"] }
 proptest = { version = "1.11", features = ["attr-macro"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -265,7 +265,7 @@ smol_str = "0.3"
 spin = "0.12"
 swash = "0.2"
 taffy = { version = "=0.14.0", default-features = false, features = ["std", "taffy_tree", "flexbox", "grid", "block_layout", "calc", "content_size", "detailed_layout_info"] }
-skrifa = "0.44"
+skrifa = "0.48"
 usvg = { version = "0.48", default-features = false }
 waker-fn = "1.2"
 wasm-bindgen-futures = "0.4"

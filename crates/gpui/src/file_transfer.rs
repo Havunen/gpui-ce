@@ -1,4 +1,5 @@
 use crate::{ClipboardEntry, ClipboardItem, ExternalPaths};
+#[cfg(not(target_family = "wasm"))]
 use std::path::PathBuf;
 
 /// Negotiated operation for a native file transfer.
@@ -31,6 +32,7 @@ pub const URI_LIST_MIME: &str = "text/uri-list";
 /// Native file clipboard format identifier.
 pub const KDE_CUT_MIME: &str = "application/x-kde-cutselection";
 
+#[cfg(not(target_family = "wasm"))]
 impl FileTransfer {
     /// Encode local file URLs with native path escaping.
     pub fn uri_list(&self) -> Vec<u8> {
@@ -316,7 +318,7 @@ pub struct FileDropTransfer {
     pub completion: FilePaste,
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use super::*;
     use crate::{ClipboardString, FileDragPaths, TestAppContext};

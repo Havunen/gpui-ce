@@ -40,7 +40,7 @@ serde_json_lenient = { version = "0.2", features = [
 shlex = "2.0"
 take-until = "0.3"
 tempfile = "3.27"
-unicase = "2.9"
+unicase = "2.10"
 url = "2"
 percent-encoding = "2.3"
 gpui_util = { package = "gpui_ce_util", version = "0.2.6", path = "../gpui_ce_util" }

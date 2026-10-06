@@ -5,8 +5,6 @@ on:
   push:
     branches:
       - main
-      - perf/verified_improvements
-      - perf/verified_improvements-candidate
 
 permissions:
   contents: read
