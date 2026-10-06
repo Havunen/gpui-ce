@@ -116,11 +116,11 @@ jobs:
         run: cargo build --workspace --lib --bins --examples --target ${{ matrix.target }}
 
       - name: Run tests
-        run: cargo test --workspace --lib --tests --target ${{ matrix.target }}
+        run: cargo test --workspace --lib --tests --target ${{ matrix.target }} -- --test-threads=1
 
       - name: Run profiler tests
         run: |
-          cargo test -p gpui-ce --features profiler --lib profiler:: --target ${{ matrix.target }}
+          cargo test -p gpui-ce --features profiler --lib profiler:: --target ${{ matrix.target }} -- --test-threads=1
 
   ubuntu-container-build:
     name: Ubuntu ${{ matrix.ubuntu_version }} container x86_64
@@ -188,11 +188,11 @@ jobs:
         run: cargo build --workspace --lib --bins --examples --target x86_64-unknown-linux-gnu
 
       - name: Run tests
-        run: cargo test --workspace --lib --tests --target x86_64-unknown-linux-gnu
+        run: cargo test --workspace --lib --tests --target x86_64-unknown-linux-gnu -- --test-threads=1
 
       - name: Run profiler tests
         run: |
-          cargo test -p gpui-ce --features profiler --lib profiler:: --target x86_64-unknown-linux-gnu
+          cargo test -p gpui-ce --features profiler --lib profiler:: --target x86_64-unknown-linux-gnu -- --test-threads=1
 
   check-target-variations:
     name: ${{ matrix.name }}
