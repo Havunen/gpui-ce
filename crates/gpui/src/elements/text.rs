@@ -1164,11 +1164,6 @@ impl TextLayout {
         self.measured().line_height
     }
 
-    /// The alignment used to lay out and paint this text.
-    pub fn text_align(&self) -> TextAlign {
-        self.measured().options.text_align
-    }
-
     /// The UTF-8 length of the underlying text.
     pub fn len(&self) -> usize {
         self.measured().len
