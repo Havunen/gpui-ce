@@ -97,6 +97,10 @@ impl TextSystem {
         result
     }
 
+    pub(crate) fn font_generation(&self) -> u64 {
+        self.platform_text_system.font_generation()
+    }
+
     /// Get the FontId for the configure font family and style.
     fn font_id(&self, font: &Font) -> Result<FontId> {
         fn clone_font_id_result(font_id: &Result<FontId>) -> Result<FontId> {

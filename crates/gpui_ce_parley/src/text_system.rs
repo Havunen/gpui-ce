@@ -4788,6 +4788,7 @@ mod tests {
         }
     }
 
+    mod cached_font_registration;
     mod inline_reflow;
 
     mod direction_layout {

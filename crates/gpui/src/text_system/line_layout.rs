@@ -966,6 +966,14 @@ struct FrameCache {
     inline_layouts: FrameLayouts<InlineCacheKey, InlineLayout>,
 }
 
+impl FrameCache {
+    fn clear_entries(&mut self) {
+        self.lines.entries.clear();
+        self.shaped_texts.entries.clear();
+        self.inline_layouts.entries.clear();
+    }
+}
+
 struct FrameLayouts<Key, Value> {
     entries: FxHashMap<Arc<Key>, Arc<Value>>,
     used: Vec<Arc<Key>>,
@@ -1087,8 +1095,11 @@ impl LineLayoutCache {
 
     /// Invalidates every cached layout after backend shaping state changes.
     pub fn clear(&self) {
-        *self.previous_frame.lock() = FrameCache::default();
-        *self.current_frame.write() = FrameCache::default();
+        // Cached views and deferred draws still hold ranges into the access
+        // logs. Keep those indices valid until finish_frame, including when
+        // font registration happens between prepaint and paint.
+        self.previous_frame.lock().clear_entries();
+        self.current_frame.write().clear_entries();
     }
 
     fn sync_font_generation(&self) {

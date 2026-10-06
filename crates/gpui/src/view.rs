@@ -365,6 +365,7 @@ struct ViewElementCacheKey {
     bounds: Bounds<Pixels>,
     content_mask: ContentMask<Pixels>,
     text_style: TextStyle,
+    font_generation: u64,
     direction: ResolvedDirection,
     unicode_bidi: UnicodeBidi,
 }
@@ -410,8 +411,13 @@ impl<V: View> Element for ViewElement<V> {
                         ((state.known, state.contribution), state)
                     },
                 );
-                let should_probe =
-                    !known || window.dirty_views.contains(&entity_id) || window.refreshing;
+                // Cache replay does not retain accessibility nodes or action
+                // listeners. Rebuild the subtree while keeping its cached layout
+                // boundary whenever an accessibility tree is active.
+                let should_probe = !known
+                    || window.dirty_views.contains(&entity_id)
+                    || window.refreshing
+                    || window.is_a11y_active();
 
                 if should_probe {
                     let request_layout_start = window.request_layout_state_index();
@@ -493,6 +499,7 @@ impl<V: View> Element for ViewElement<V> {
                             bounds,
                             content_mask: window.content_mask(),
                             text_style: window.text_style(),
+                            font_generation: window.text_system().font_generation(),
                             direction: window.resolved_direction(),
                             unicode_bidi: window.resolved_unicode_bidi(),
                         };
@@ -502,6 +509,7 @@ impl<V: View> Element for ViewElement<V> {
                             && element_state.cache_key == cache_key
                             && !window.dirty_views.contains(&entity_id)
                             && !window.refreshing
+                            && !window.is_a11y_active()
                         {
                             let prepaint_start = window.prepaint_index();
                             // The direction probe renders before prepaint, so its
