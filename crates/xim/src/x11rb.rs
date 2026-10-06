@@ -119,7 +119,7 @@ impl<C: HasConnection> HasConnection for X11rbServer<C> {
     }
 }
 
-impl<'x, C: HasConnection> HasConnection for &'x C {
+impl<C: HasConnection> HasConnection for &C {
     type Connection = C::Connection;
 
     #[inline(always)]
@@ -452,8 +452,8 @@ impl<C: HasConnection> X11rbClient<C> {
                     _ => continue,
                 };
 
-                if let Some(name) = name.strip_prefix("@server=") {
-                    if name == im_name {
+                if let Some(name) = name.strip_prefix("@server=")
+                    && name == im_name {
                         conn.convert_selection(
                             client_window,
                             server_atom,
@@ -478,7 +478,6 @@ impl<C: HasConnection> X11rbClient<C> {
                             buf: Vec::with_capacity(1024),
                         });
                     }
-                }
             }
 
             Err(ClientError::NoXimServer)
