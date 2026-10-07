@@ -192,6 +192,7 @@ pub struct WgpuContext {
     renderer_tier: RendererTier,
     device_lost: Arc<AtomicBool>,
     uncaptured_error: Arc<Mutex<Option<String>>>,
+    fatal_error: Arc<Mutex<Option<String>>>,
 }
 
 /// The resource transport selected for a device.
@@ -338,6 +339,7 @@ impl WgpuContextHandle {
     #[cfg(any(
         target_os = "linux",
         target_os = "freebsd",
+        target_os = "windows",
         all(target_os = "macos", feature = "custom-gpu"),
         all(target_family = "wasm", feature = "custom-gpu")
     ))]
@@ -607,7 +609,7 @@ impl WgpuContext {
         adapter: wgpu::Adapter,
         device: CreatedDevice,
     ) -> anyhow::Result<Self> {
-        let (device_lost, uncaptured_error) = install_device_callbacks(&device.device);
+        let (device_lost, uncaptured_error, fatal_error) = install_device_callbacks(&device.device);
         let info = adapter.get_info();
         log::info!("Selected GPU adapter: {:?} ({:?})", info.name, info.backend);
         #[cfg(target_family = "wasm")]
@@ -632,6 +634,7 @@ impl WgpuContext {
             renderer_tier: device.renderer_tier,
             device_lost,
             uncaptured_error,
+            fatal_error,
         })
     }
 
@@ -964,6 +967,10 @@ impl WgpuContext {
         Arc::clone(&self.device_lost)
     }
 
+    pub(crate) fn fatal_error_slot(&self) -> Arc<Mutex<Option<String>>> {
+        Arc::clone(&self.fatal_error)
+    }
+
     pub(crate) fn uncaptured_error_slot(&self) -> Arc<Mutex<Option<String>>> {
         Arc::clone(&self.uncaptured_error)
     }
@@ -984,7 +991,11 @@ fn renderer_tier(adapter: &wgpu::Adapter) -> RendererTier {
 
 fn install_device_callbacks(
     device: &wgpu::Device,
-) -> (Arc<AtomicBool>, Arc<Mutex<Option<String>>>) {
+) -> (
+    Arc<AtomicBool>,
+    Arc<Mutex<Option<String>>>,
+    Arc<Mutex<Option<String>>>,
+) {
     let device_lost = Arc::new(AtomicBool::new(false));
     device.set_device_lost_callback({
         let device_lost = Arc::clone(&device_lost);
@@ -996,15 +1007,23 @@ fn install_device_callbacks(
         }
     });
     let uncaptured_error = Arc::new(Mutex::new(None));
+    let fatal_error = Arc::new(Mutex::new(None));
     device.on_uncaptured_error(Arc::new({
         let uncaptured_error = Arc::clone(&uncaptured_error);
+        let fatal_error = Arc::clone(&fatal_error);
         move |error| {
             let message = error.to_string();
             log::error!("uncaptured wgpu error: {message}");
+            if matches!(
+                error,
+                wgpu::Error::OutOfMemory { .. } | wgpu::Error::Internal { .. }
+            ) {
+                *fatal_error.lock().unwrap() = Some(message.clone());
+            }
             *uncaptured_error.lock().unwrap() = Some(message);
         }
     }));
-    (device_lost, uncaptured_error)
+    (device_lost, uncaptured_error, fatal_error)
 }
 
 #[cfg(not(target_family = "wasm"))]

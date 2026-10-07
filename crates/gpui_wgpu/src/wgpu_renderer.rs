@@ -23,6 +23,7 @@ mod headless;
 mod path_types;
 mod pipelines;
 mod platform;
+pub use platform::RecoveryPending;
 mod resources;
 mod settings;
 mod surfaces;
@@ -42,6 +43,9 @@ pub type GpuContext = Rc<RefCell<Option<WgpuContext>>>;
 struct GpuFaultState {
     pending_error: Arc<Mutex<Option<String>>>,
     consecutive_failed_frames: u32,
+    terminal_error: Option<String>,
+    fatal_error: Arc<Mutex<Option<String>>>,
+    cleaned_up_failed_frames: bool,
     device_lost: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(not(target_family = "wasm"))]
     recovery_not_before: Option<std::time::Instant>,
@@ -51,6 +55,8 @@ pub struct WgpuRenderer {
     /// Shared GPU context for device recovery coordination (unused on WASM).
     #[allow(dead_code)]
     context: Option<GpuContext>,
+    #[cfg(not(target_family = "wasm"))]
+    native_backend: Option<crate::NativeBackend>,
     /// Compositor GPU hint for adapter selection (unused on WASM).
     #[allow(dead_code)]
     compositor_gpu: Option<CompositorGpuHint>,
@@ -115,6 +121,8 @@ impl WgpuRenderer {
 
         Ok(Self {
             context: gpu_context,
+            #[cfg(not(target_family = "wasm"))]
+            native_backend: None,
             compositor_gpu,
             extra_requirements,
             resources: Some(resources),
@@ -130,11 +138,22 @@ impl WgpuRenderer {
             faults: GpuFaultState {
                 pending_error: last_error,
                 consecutive_failed_frames: 0,
+                terminal_error: None,
+                fatal_error: context.fatal_error_slot(),
+                cleaned_up_failed_frames: false,
                 device_lost: context.device_lost_flag(),
                 #[cfg(not(target_family = "wasm"))]
                 recovery_not_before: None,
             },
         })
+    }
+
+    /// A confirmed GPU failure, consumed by platforms before their fatal error handling.
+    pub fn terminal_error(&self) -> Option<String> {
+        self.faults
+            .terminal_error
+            .clone()
+            .or_else(|| self.faults.fatal_error.lock().unwrap().clone())
     }
 
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {

@@ -57,7 +57,7 @@ pub struct WindowsWindowState {
     pub hovered: Cell<bool>,
     pub direct_manipulation: DirectManipulationHandler,
 
-    pub renderer: RefCell<DirectXRenderer>,
+    pub renderer: RefCell<WindowRenderer>,
     /// Set when the next `draw_window` call must be treated as a forced
     /// render. Used after a GPU device-lost recovery, where the next frame
     /// must both re-enable drawing (via `mark_drawable`) and bypass the GPUI
@@ -107,6 +107,7 @@ impl WindowsWindowState {
     fn new(
         hwnd: HWND,
         directx_devices: &DirectXDevices,
+        renderer_context: &RendererContext,
         window_params: &CREATESTRUCTW,
         current_cursor: Option<HCURSOR>,
         cursor_visible: Arc<AtomicBool>,
@@ -133,8 +134,13 @@ impl WindowsWindowState {
         };
         let border_offset = WindowBorderOffset::default();
         let restore_from_minimized = None;
-        let renderer = DirectXRenderer::new(hwnd, directx_devices, disable_direct_composition)
-            .context("Creating DirectX renderer")?;
+        let renderer = WindowRenderer::new(
+            hwnd,
+            directx_devices,
+            disable_direct_composition,
+            renderer_context,
+        )
+        .context("Creating DirectX renderer")?;
         let callbacks = Callbacks::default();
         let input_handler = None;
         let pending_surrogate = None;
@@ -249,6 +255,7 @@ impl WindowsWindowInner {
         let state = WindowsWindowState::new(
             hwnd,
             &context.directx_devices,
+            &context.renderer_context,
             cs,
             context.current_cursor,
             context.cursor_visible.clone(),
@@ -407,6 +414,7 @@ struct WindowCreateContext {
     appearance: WindowAppearance,
     disable_direct_composition: bool,
     directx_devices: DirectXDevices,
+    renderer_context: RendererContext,
     invalidate_devices: Arc<AtomicBool>,
     draw_coordinator: Rc<DrawCoordinator>,
     parent_hwnd: Option<HWND>,
@@ -435,6 +443,7 @@ impl WindowsWindow {
             platform_window_handle,
             disable_direct_composition,
             directx_devices,
+            renderer_context,
             invalidate_devices,
             draw_coordinator,
         } = creation_info;
@@ -520,6 +529,7 @@ impl WindowsWindow {
             appearance,
             disable_direct_composition,
             directx_devices,
+            renderer_context,
             invalidate_devices,
             draw_coordinator,
             parent_hwnd,
@@ -1152,6 +1162,33 @@ impl PlatformWindow for WindowsWindow {
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         self.state.renderer.borrow().gpu_specs().log_err()
+    }
+
+    #[cfg(feature = "windows-wgpu")]
+    fn gpu_context_info(&self) -> Option<Box<dyn std::any::Any>> {
+        self.state
+            .renderer
+            .borrow()
+            .gpu_context_info()
+            .map(|info| Box::new(info) as _)
+    }
+
+    #[cfg(feature = "windows-wgpu")]
+    fn gpu_context(&self) -> Option<Box<dyn std::any::Any>> {
+        self.state
+            .renderer
+            .borrow()
+            .gpu_context_info()
+            .map(|info| Box::new((info.device().clone(), info.queue().clone())) as _)
+    }
+
+    #[cfg(feature = "windows-wgpu")]
+    fn gpu_device_lost(&self) -> Option<bool> {
+        self.state
+            .renderer
+            .borrow()
+            .gpu_context_info()
+            .map(|info| info.device_lost())
     }
 
     fn update_ime_position(&self, bounds: Bounds<Pixels>) {

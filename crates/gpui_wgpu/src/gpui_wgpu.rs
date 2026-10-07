@@ -13,3 +13,5 @@ pub use wgpu_renderer::WgpuHeadlessRenderer;
 pub use wgpu_renderer::{
     FontRasterizationSettings, GpuContext, SubpixelOrder, WgpuRenderer, WgpuSurfaceConfig,
 };
+
+pub use wgpu_renderer::RecoveryPending;

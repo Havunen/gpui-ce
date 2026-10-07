@@ -39,6 +39,7 @@ pub struct WindowsPlatform {
     handle: HWND,
     suspend_resume_notification: RefCell<Option<HPOWERNOTIFY>>,
     disable_direct_composition: bool,
+    renderer_context: RendererContext,
     has_package_identity: bool,
     app_identity: RefCell<Option<(String, String)>>,
     system_notifications: RefCell<SystemNotificationState>,
@@ -99,6 +100,11 @@ impl WindowsPlatformState {
 
 impl WindowsPlatform {
     pub fn new(headless: bool) -> Result<Self> {
+        Self::new_with_renderer(headless, WindowsRendererOptions::default())
+    }
+
+    pub fn new_with_renderer(headless: bool, options: WindowsRendererOptions) -> Result<Self> {
+        let renderer_context = RendererContext::new(options)?;
         unsafe {
             OleInitialize(std::ptr::null())
                 .ok()
@@ -195,6 +201,7 @@ impl WindowsPlatform {
             text_system,
             suspend_resume_notification: RefCell::new(None),
             disable_direct_composition,
+            renderer_context,
             has_package_identity: has_package_identity(),
             drop_target_helper,
             invalidate_devices: Arc::new(AtomicBool::new(false)),
@@ -235,6 +242,7 @@ impl WindowsPlatform {
             platform_window_handle: self.handle,
             disable_direct_composition: self.disable_direct_composition,
             directx_devices: self.inner.state.directx_devices.borrow().clone().unwrap(),
+            renderer_context: self.renderer_context.clone(),
             invalidate_devices: self.invalidate_devices.clone(),
             draw_coordinator: self.inner.state.draw_coordinator.clone(),
         }
@@ -1212,6 +1220,7 @@ pub(crate) struct WindowCreationInfo {
     pub(crate) platform_window_handle: HWND,
     pub(crate) disable_direct_composition: bool,
     pub(crate) directx_devices: DirectXDevices,
+    pub(crate) renderer_context: RendererContext,
     /// Flag to instruct the `VSyncProvider` thread to invalidate the directx devices
     /// as resizing them has failed, causing us to have lost at least the render target.
     pub(crate) invalidate_devices: Arc<AtomicBool>,

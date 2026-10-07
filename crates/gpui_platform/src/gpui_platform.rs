@@ -20,6 +20,21 @@ pub fn application() -> gpui::Application {
     gpui::Application::with_platform(current_platform(false))
 }
 
+#[cfg(target_os = "windows")]
+pub use gpui_windows::{
+    WindowsRendererBackend, WindowsRendererEvent, WindowsRendererOptions, WindowsRendererPreference,
+};
+
+/// Constructs a Windows application with an explicit renderer policy.
+/// `application()` keeps its existing DX11 default.
+#[cfg(target_os = "windows")]
+pub fn application_with_windows_renderer(options: WindowsRendererOptions) -> gpui::Application {
+    gpui::Application::with_platform(Rc::new(
+        gpui_windows::WindowsPlatform::new_with_renderer(false, options)
+            .expect("failed to initialize Windows platform"),
+    ))
+}
+
 pub fn headless() -> gpui::Application {
     gpui::Application::with_platform(current_platform(true))
 }

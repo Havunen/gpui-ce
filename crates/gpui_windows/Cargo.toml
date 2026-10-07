@@ -15,6 +15,7 @@ path = "src/gpui_windows.rs"
 [features]
 default = ["gpui/default"]
 test-support = ["gpui/test-support"]
+windows-wgpu = ["dep:gpui_wgpu"]
 screen-capture = ["gpui/screen-capture"]
 
 [dependencies]
@@ -23,6 +24,7 @@ gpui_render.workspace = true
 wgsl-rs.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
+gpui_wgpu = { workspace = true, optional = true }
 accesskit.workspace = true
 accesskit_windows.workspace = true
 anyhow.workspace = true

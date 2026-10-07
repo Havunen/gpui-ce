@@ -339,6 +339,8 @@ impl WindowsWindowInner {
     }
 
     fn handle_destroy_msg(&self, handle: HWND) -> Option<isize> {
+        #[cfg(feature = "windows-wgpu")]
+        self.state.renderer.borrow_mut().destroy();
         let callback = { self.state.callbacks.close.take() };
         // Re-enable parent window if this was a modal dialog
         if let Some(parent_hwnd) = self.parent_hwnd {
@@ -1333,7 +1335,9 @@ impl WindowsWindowInner {
             }
         }
 
-        let force_render = force_render || self.state.force_render_pending.take();
+        // Recovery must run even when another source already requested a forced frame.
+        let renderer_force = self.state.renderer.borrow_mut().take_force_redraw();
+        let force_render = force_render || self.state.force_render_pending.take() || renderer_force;
         if force_render {
             // After device-loss recovery, force a render that rebuilds atlas textures.
             self.state.renderer.borrow_mut().mark_drawable();

@@ -12,6 +12,16 @@ use crate::{WgpuAtlas, WgpuContext};
 use super::GpuContext;
 use super::{WgpuRenderer, WgpuSurfaceConfig};
 
+/// Recovery is waiting for the driver to stabilize; no recreation was attempted.
+#[derive(Debug)]
+pub struct RecoveryPending;
+impl std::fmt::Display for RecoveryPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("waiting for the GPU driver to stabilize before recovery")
+    }
+}
+impl std::error::Error for RecoveryPending {}
+
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
@@ -42,6 +52,33 @@ impl WgpuRenderer {
             config,
             compositor_gpu,
             extra_requirements,
+            None,
+        )
+    }
+
+    /// Creates a Windows renderer using hardware DX12 only, including during recovery.
+    #[cfg(target_os = "windows")]
+    pub fn new_dx12<W>(
+        gpu_context: GpuContext,
+        window: &W,
+        config: WgpuSurfaceConfig,
+        compositor_gpu: Option<CompositorGpuHint>,
+        extra_requirements: Option<WgpuDeviceRequirements>,
+    ) -> anyhow::Result<Self>
+    where
+        W: HasWindowHandle + HasDisplayHandle + std::fmt::Debug + Send + Sync + Clone + 'static,
+    {
+        let handle = window
+            .window_handle()
+            .map_err(|error| anyhow::anyhow!("failed to get window handle: {error}"))?;
+        Self::new_for_target(
+            gpu_context,
+            &|| Some(Box::new(window.clone())),
+            NativeSurfaceTarget::Window(handle.as_raw()),
+            config,
+            compositor_gpu,
+            extra_requirements,
+            Some(NativeBackend::Dx12),
         )
     }
 
@@ -61,6 +98,7 @@ impl WgpuRenderer {
             config,
             None,
             extra_requirements,
+            None,
         )
     }
 
@@ -72,6 +110,7 @@ impl WgpuRenderer {
         config: WgpuSurfaceConfig,
         compositor_gpu: Option<CompositorGpuHint>,
         extra_requirements: Option<WgpuDeviceRequirements>,
+        backend: Option<NativeBackend>,
     ) -> anyhow::Result<Self> {
         let mut context_slot = gpu_context.borrow_mut();
         let (context, surface) = match context_slot.as_mut() {
@@ -85,14 +124,30 @@ impl WgpuRenderer {
                     display,
                     surface_target,
                     compositor_gpu,
-                    SoftwareAdapterPolicy::Allow,
+                    if backend.is_some() {
+                        SoftwareAdapterPolicy::Reject
+                    } else {
+                        SoftwareAdapterPolicy::Allow
+                    },
                     extra_requirements.as_ref(),
+                    backend,
                 )?;
                 (context_slot.insert(context), surface)
             }
         };
         let atlas = Arc::new(WgpuAtlas::from_context(context));
-        Self::new_internal(
+        let scopes = backend.map(|_| {
+            [
+                context
+                    .device
+                    .push_error_scope(wgpu::ErrorFilter::Validation),
+                context
+                    .device
+                    .push_error_scope(wgpu::ErrorFilter::OutOfMemory),
+                context.device.push_error_scope(wgpu::ErrorFilter::Internal),
+            ]
+        });
+        let result = Self::new_internal(
             Some(Rc::clone(&gpu_context)),
             context,
             Some(surface),
@@ -100,7 +155,24 @@ impl WgpuRenderer {
             compositor_gpu,
             extra_requirements,
             atlas,
-        )
+        );
+        let mut initialization_error = None;
+        if let Some(scopes) = scopes {
+            for scope in scopes.into_iter().rev() {
+                if let Some(error) = gpui::block_on(scope.pop()) {
+                    initialization_error.get_or_insert_with(|| error.to_string());
+                }
+            }
+        }
+        if let Some(error) = initialization_error {
+            anyhow::bail!("DX12 renderer initialization failed: {error}");
+        }
+        let mut renderer = result?;
+        renderer.native_backend = backend;
+        if let Some(error) = renderer.terminal_error() {
+            anyhow::bail!("DX12 renderer initialization failed: {error}");
+        }
+        Ok(renderer)
     }
 
     #[cfg(target_family = "wasm")]
@@ -149,8 +221,9 @@ impl WgpuRenderer {
             }
             wgpu::CurrentSurfaceTexture::Validation => {
                 self.target.request_redraw();
-                *self.faults.pending_error.lock().unwrap() =
-                    Some("surface texture validation error".to_string());
+                // This frame never reaches render_to_view; account for its error here so
+                // persistent acquisition failures cannot bypass the terminal-error limit.
+                super::frame::handle_gpu_error(self, "surface texture validation error".into());
                 return false;
             }
         };
@@ -294,10 +367,10 @@ impl WgpuRenderer {
                 None => {
                     self.faults.recovery_not_before =
                         Some(now + std::time::Duration::from_millis(350));
-                    anyhow::bail!("waiting for the GPU driver to stabilize before recovery");
+                    return Err(RecoveryPending.into());
                 }
                 Some(not_before) if now < not_before => {
-                    anyhow::bail!("waiting for the GPU driver to stabilize before recovery");
+                    return Err(RecoveryPending.into());
                 }
                 Some(_) => self.faults.recovery_not_before = None,
             }
@@ -315,6 +388,7 @@ impl WgpuRenderer {
                 self.compositor_gpu,
                 SoftwareAdapterPolicy::Reject,
                 self.extra_requirements.as_ref(),
+                self.native_backend,
             ) {
                 Ok(result) => result,
                 Err(error) => {
@@ -352,6 +426,7 @@ impl WgpuRenderer {
             self.extra_requirements.clone(),
             Arc::clone(&self.atlas),
         )?;
+        recovered.native_backend = self.native_backend;
         recovered.set_font_rasterization_settings(font_rasterization);
         recovered.set_subpixel_order(subpixel_order);
         *self = recovered;
@@ -407,8 +482,9 @@ fn initialize_context_and_surface(
     compositor_gpu: Option<CompositorGpuHint>,
     adapter_policy: SoftwareAdapterPolicy,
     extra_requirements: Option<&WgpuDeviceRequirements>,
+    backend: Option<NativeBackend>,
 ) -> anyhow::Result<(WgpuContext, wgpu::Surface<'static>)> {
-    NativeBackend::try_in_preference_order("a GPU context for the window", |backend| {
+    let attempt = |backend: NativeBackend| {
         let instance = backend.instance(display());
         let surface = create_surface(&instance.raw, surface_target)?;
         let context = WgpuContext::new_with_adapter_policy(
@@ -419,7 +495,11 @@ fn initialize_context_and_surface(
             extra_requirements,
         )?;
         Ok((context, surface))
-    })
+    };
+    match backend {
+        Some(backend) => attempt(backend),
+        None => NativeBackend::try_in_preference_order("a GPU context for the window", attempt),
+    }
 }
 
 #[cfg(not(target_family = "wasm"))]

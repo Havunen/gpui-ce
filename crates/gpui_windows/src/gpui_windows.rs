@@ -16,6 +16,7 @@ mod events;
 mod file_transfer;
 mod keyboard;
 mod platform;
+mod renderer;
 mod system_notifications;
 mod system_settings;
 mod util;
@@ -43,5 +44,9 @@ pub(crate) use window::*;
 pub(crate) use wrapper::*;
 
 pub use platform::WindowsPlatform;
+pub(crate) use renderer::{RendererContext, WindowRenderer};
+pub use renderer::{
+    WindowsRendererBackend, WindowsRendererEvent, WindowsRendererOptions, WindowsRendererPreference,
+};
 
 pub(crate) use crate::bindings::Windows::Win32::HWND;
