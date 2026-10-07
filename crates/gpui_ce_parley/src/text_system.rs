@@ -1321,8 +1321,7 @@ impl PlatformTextLayout for ParleyLayout {
                     };
                 };
 
-                let x = vertical_navigation_x
-                    .map_or_else(|| cursor.geometry(&self.layout, 0.0).x0 as f32, f32::from);
+                let x = vertical_navigation_x.map_or(geometry.x0 as f32, f32::from);
                 let moved = Cursor::from_point(&self.layout, x, self.native_y_for_line(target_ix));
                 return CaretMovement {
                     result: Self::caret_position(moved),
@@ -2610,7 +2609,7 @@ mod tests {
             CaretPosition::attached_to_previous_cluster(text.len()),
         ] {
             assert_eq!(
-                native.caret_bounds(caret, line_height).unwrap().origin.y,
+                native.caret_bounds(caret, line_height).unwrap().top(),
                 line_height * (layout.visual_lines.len() - 1),
                 "end of {text:?}, {caret:?}"
             );
@@ -2623,7 +2622,7 @@ mod tests {
                 (CaretPosition::attached_to_next_cluster(boundary), row + 1),
             ] {
                 assert_eq!(
-                    native.caret_bounds(caret, line_height).unwrap().origin.y,
+                    native.caret_bounds(caret, line_height).unwrap().top(),
                     line_height * expected_row,
                     "wrap in {text:?}, {caret:?}"
                 );
@@ -2684,11 +2683,7 @@ mod tests {
         let up =
             native.caret_movement(end, Direction::Up.with_boundary(Boundary::VisualLine), None);
         assert_eq!(
-            native
-                .caret_bounds(up.result, line_height)
-                .unwrap()
-                .origin
-                .y,
+            native.caret_bounds(up.result, line_height).unwrap().top(),
             px(0.0)
         );
         let down = native.caret_movement(
@@ -2697,11 +2692,7 @@ mod tests {
             up.vertical_navigation_x,
         );
         assert_eq!(
-            native
-                .caret_bounds(down.result, line_height)
-                .unwrap()
-                .origin
-                .y,
+            native.caret_bounds(down.result, line_height).unwrap().top(),
             line_height
         );
         assert_eq!(down.result.index, text.len());
