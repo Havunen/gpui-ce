@@ -156,6 +156,18 @@ impl WgpuRenderer {
             .or_else(|| self.faults.fatal_error.lock().unwrap().clone())
     }
 
+    // Only the strict Windows integration delegates fatal handling to its application.
+    pub(super) fn reports_terminal_errors(&self) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            self.native_backend == Some(crate::NativeBackend::Dx12)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            false
+        }
+    }
+
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
         if !self.target.resize(size) {
             return;

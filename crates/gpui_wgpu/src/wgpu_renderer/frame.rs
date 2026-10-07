@@ -141,8 +141,7 @@ pub(super) fn handle_gpu_error(renderer: &mut WgpuRenderer, error: String) -> bo
         renderer.faults.consecutive_failed_frames
     );
     if renderer.faults.consecutive_failed_frames > 10 {
-        #[cfg(target_os = "windows")]
-        if renderer.native_backend == Some(crate::NativeBackend::Dx12) {
+        if renderer.reports_terminal_errors() {
             renderer.faults.terminal_error = Some(format!(
                 "too many consecutive GPU errors; last error: {error}"
             ));
@@ -157,6 +156,11 @@ pub(super) fn handle_gpu_error(renderer: &mut WgpuRenderer, error: String) -> bo
         renderer.atlas.clear();
         renderer.target.request_redraw();
         renderer.faults.cleaned_up_failed_frames = true;
+        if !renderer.reports_terminal_errors() {
+            // Preserve the existing retry policy for other platform integrations.
+            renderer.faults.consecutive_failed_frames = 0;
+            renderer.faults.cleaned_up_failed_frames = false;
+        }
         return false;
     }
 
@@ -176,6 +180,11 @@ mod failure_tests {
             gpui::size(gpui::DevicePixels(16), gpui::DevicePixels(16)),
         )
         .unwrap();
+        for _ in 0..18 {
+            handle_gpu_error(&mut renderer, "injected validation failure".into());
+        }
+        assert_eq!(renderer.faults.consecutive_failed_frames, 0);
+        assert!(renderer.terminal_error().is_none());
         renderer.native_backend = Some(crate::NativeBackend::Dx12);
         for _ in 0..6 {
             handle_gpu_error(&mut renderer, "injected validation failure".into());

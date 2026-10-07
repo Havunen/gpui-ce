@@ -223,7 +223,12 @@ impl WgpuRenderer {
                 self.target.request_redraw();
                 // This frame never reaches render_to_view; account for its error here so
                 // persistent acquisition failures cannot bypass the terminal-error limit.
-                super::frame::handle_gpu_error(self, "surface texture validation error".into());
+                if self.reports_terminal_errors() {
+                    super::frame::handle_gpu_error(self, "surface texture validation error".into());
+                } else {
+                    *self.faults.pending_error.lock().unwrap() =
+                        Some("surface texture validation error".into());
+                }
                 return false;
             }
         };
