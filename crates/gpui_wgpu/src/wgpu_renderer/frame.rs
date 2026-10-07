@@ -28,7 +28,18 @@ pub(super) fn render_to_view(
     renderer.retain_surface_cache(&scene.surfaces);
 
     match FrameEncoder::new(renderer, scene, targets).encode(readback) {
-        Ok(command_buffer) => Some(renderer.resources().queue.submit([command_buffer])),
+        Ok(command_buffer) => {
+            let submission = renderer.resources().queue.submit([command_buffer]);
+            // A cleanup skipped a frame. Only a real submission without a new validation
+            // error can reset that retry budget; merely starting the next frame cannot.
+            if renderer.faults.cleaned_up_failed_frames
+                && renderer.faults.pending_error.lock().unwrap().is_none()
+            {
+                renderer.faults.consecutive_failed_frames = 0;
+                renderer.faults.cleaned_up_failed_frames = false;
+            }
+            Some(submission)
+        }
         Err(DrawError::ExternalSurface) => None,
         Err(DrawError::CapacityPlanningInvariant) => {
             log::error!("frame storage exceeded its precomputed capacity");
@@ -124,9 +135,12 @@ impl PreparedTargets {
 }
 
 fn begin_frame(renderer: &mut WgpuRenderer) -> bool {
-    let Some(error) = renderer.faults.pending_error.lock().unwrap().take() else {
-        renderer.faults.consecutive_failed_frames = 0;
-        renderer.faults.cleaned_up_failed_frames = false;
+    // Release the callback mutex before atlas uploads can report another GPU error.
+    let pending_error = renderer.faults.pending_error.lock().unwrap().take();
+    let Some(error) = pending_error else {
+        if !renderer.faults.cleaned_up_failed_frames {
+            renderer.faults.consecutive_failed_frames = 0;
+        }
         renderer.atlas.before_frame();
         return true;
     };
@@ -191,6 +205,10 @@ mod failure_tests {
         }
         assert!(renderer.faults.cleaned_up_failed_frames);
         assert!(begin_frame(&mut renderer));
+        assert_eq!(renderer.faults.consecutive_failed_frames, 6);
+        let mut scene = Scene::default();
+        scene.finish();
+        renderer.render_to_image(&scene).unwrap();
         assert_eq!(renderer.faults.consecutive_failed_frames, 0);
         for _ in 0..10 {
             handle_gpu_error(&mut renderer, "injected validation failure".into());

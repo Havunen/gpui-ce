@@ -389,6 +389,11 @@ impl WindowRenderer {
     #[cfg(feature = "windows-wgpu")]
     pub(crate) fn destroy(&mut self) {
         if let Self::Dx12(renderer) = self {
+            // Closing a hidden window must also save a confirmed failure that has not
+            // reached the foreground frame callback yet.
+            if let Some(error) = renderer.renderer.terminal_error() {
+                renderer.context.failed(error, true);
+            }
             renderer.renderer.destroy();
         }
     }

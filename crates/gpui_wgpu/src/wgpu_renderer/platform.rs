@@ -135,45 +135,18 @@ impl WgpuRenderer {
                 (context_slot.insert(context), surface)
             }
         };
-        let atlas = Arc::new(WgpuAtlas::from_context(context));
-        let scopes = backend.map(|_| {
-            [
-                context
-                    .device
-                    .push_error_scope(wgpu::ErrorFilter::Validation),
-                context
-                    .device
-                    .push_error_scope(wgpu::ErrorFilter::OutOfMemory),
-                context.device.push_error_scope(wgpu::ErrorFilter::Internal),
-            ]
-        });
-        let result = Self::new_internal(
-            Some(Rc::clone(&gpu_context)),
-            context,
-            Some(surface),
-            config,
-            compositor_gpu,
-            extra_requirements,
-            atlas,
-        );
-        let mut initialization_error = None;
-        if let Some(scopes) = scopes {
-            for scope in scopes.into_iter().rev() {
-                if let Some(error) = gpui::block_on(scope.pop()) {
-                    initialization_error.get_or_insert_with(|| error.to_string());
-                }
-            }
-        }
-        if let Some(error) = initialization_error {
-            anyhow::bail!("DX12 renderer initialization failed: {error}");
-        }
-        let mut renderer = result?;
+        let mut renderer = initialize_checked(context, backend, || {
+            Self::new_internal(
+                Some(Rc::clone(&gpu_context)),
+                context,
+                Some(surface),
+                config,
+                compositor_gpu,
+                extra_requirements,
+                Arc::new(WgpuAtlas::from_context(context)),
+            )
+        })?;
         renderer.native_backend = backend;
-        if renderer.reports_terminal_errors()
-            && let Some(error) = renderer.terminal_error()
-        {
-            anyhow::bail!("DX12 renderer initialization failed: {error}");
-        }
         Ok(renderer)
     }
 
@@ -420,19 +393,21 @@ impl WgpuRenderer {
         let context_slot = gpu_context.borrow();
         let context = context_slot.as_ref().expect("context should exist");
         self.resources = None;
-        self.atlas.handle_device_lost(context);
 
         let font_rasterization = self.rendering_params.font_rasterization;
         let subpixel_order = self.subpixel_order;
-        let mut recovered = Self::new_internal(
-            Some(Rc::clone(&gpu_context)),
-            context,
-            Some(surface),
-            config,
-            self.compositor_gpu,
-            self.extra_requirements.clone(),
-            Arc::clone(&self.atlas),
-        )?;
+        let mut recovered = initialize_checked(context, self.native_backend, || {
+            self.atlas.handle_device_lost(context);
+            Self::new_internal(
+                Some(Rc::clone(&gpu_context)),
+                context,
+                Some(surface),
+                config,
+                self.compositor_gpu,
+                self.extra_requirements.clone(),
+                Arc::clone(&self.atlas),
+            )
+        })?;
         recovered.native_backend = self.native_backend;
         recovered.set_font_rasterization_settings(font_rasterization);
         recovered.set_subpixel_order(subpixel_order);
@@ -481,6 +456,120 @@ impl NativeSurfaceTarget {
 /// per backend attempted.
 #[cfg(not(target_family = "wasm"))]
 type DisplayHandleSource<'a> = &'a dyn Fn() -> Option<Box<dyn wgpu::wgt::WgpuHasDisplayHandle>>;
+
+#[cfg(not(target_family = "wasm"))]
+// Startup and recovery both reject invalid resources before declaring the renderer usable.
+fn initialize_checked<T>(
+    context: &WgpuContext,
+    backend: Option<NativeBackend>,
+    initialize: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    if backend.is_none() {
+        return initialize();
+    }
+    let scopes = [
+        context
+            .device
+            .push_error_scope(wgpu::ErrorFilter::Validation),
+        context
+            .device
+            .push_error_scope(wgpu::ErrorFilter::OutOfMemory),
+        context.device.push_error_scope(wgpu::ErrorFilter::Internal),
+    ];
+    let result = initialize();
+    let mut initialization_error = None;
+    for scope in scopes.into_iter().rev() {
+        if let Some(error) = gpui::block_on(scope.pop()) {
+            initialization_error.get_or_insert_with(|| error.to_string());
+        }
+    }
+    if let Some(error) =
+        initialization_error.or_else(|| context.fatal_error_slot().lock().unwrap().clone())
+    {
+        anyhow::bail!("DX12 renderer initialization failed: {error}");
+    }
+    result
+}
+
+#[cfg(all(test, feature = "test-support", target_os = "windows"))]
+mod initialization_tests {
+    use super::*;
+    use std::{cell::Cell, rc::Rc};
+
+    #[test]
+    fn invalid_pipeline_is_rejected_and_partial_resources_drop_before_failure_returns() {
+        struct PartialResources {
+            _pipeline: wgpu::RenderPipeline,
+            dropped: Rc<Cell<bool>>,
+        }
+        impl Drop for PartialResources {
+            fn drop(&mut self) {
+                self.dropped.set(true);
+            }
+        }
+        let context = WgpuContext::new_headless(None).unwrap();
+        let dropped = Rc::new(Cell::new(false));
+        let result = initialize_checked(&context, Some(NativeBackend::Dx12), || {
+            let shader = context
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("recovery regression shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    "@vertex fn main() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }"
+                        .into(),
+                ),
+            });
+            let pipeline = context
+                .device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("injected invalid recovery pipeline"),
+                    layout: None,
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("missing_entry_point"),
+                        compilation_options: Default::default(),
+                        buffers: &[],
+                    },
+                    fragment: None,
+                    primitive: Default::default(),
+                    depth_stencil: None,
+                    multisample: Default::default(),
+                    multiview_mask: None,
+                    cache: None,
+                });
+            Ok(PartialResources {
+                _pipeline: pipeline,
+                dropped: dropped.clone(),
+            })
+        });
+        let Err(error) = result else {
+            panic!("invalid DX12 pipeline was accepted")
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("DX12 renderer initialization failed")
+        );
+        assert!(dropped.get());
+        assert!(context.uncaptured_error_slot().lock().unwrap().is_none());
+        // All scopes are drained, so a later healthy recreation can succeed.
+        assert_eq!(
+            initialize_checked(&context, Some(NativeBackend::Dx12), || Ok(12)).unwrap(),
+            12
+        );
+    }
+
+    #[test]
+    fn fatal_callbacks_are_checked_only_for_explicit_dx12_initialization() {
+        let context = WgpuContext::new_headless(None).unwrap();
+        let fatal = context.fatal_error_slot();
+        *fatal.lock().unwrap() = Some("injected out of memory".into());
+        assert_eq!(initialize_checked(&context, None, || Ok(11)).unwrap(), 11);
+        let error = initialize_checked(&context, Some(NativeBackend::Dx12), || Ok(12)).unwrap_err();
+        assert!(error.to_string().contains("out of memory"));
+        assert!(fatal.try_lock().is_ok());
+    }
+}
 
 #[cfg(not(target_family = "wasm"))]
 fn initialize_context_and_surface(
