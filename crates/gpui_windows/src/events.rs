@@ -1337,7 +1337,8 @@ impl WindowsWindowInner {
 
         // Recovery must run even when another source already requested a forced frame.
         let renderer_force = self.state.renderer.borrow_mut().take_force_redraw();
-        let force_render = force_render || self.state.force_render_pending.take() || renderer_force;
+        let pending_force = self.state.force_render_pending.take();
+        let force_render = force_render || pending_force || renderer_force;
         if force_render {
             // After device-loss recovery, force a render that rebuilds atlas textures.
             self.state.renderer.borrow_mut().mark_drawable();

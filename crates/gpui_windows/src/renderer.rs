@@ -513,6 +513,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn strict_dx11_override_skips_dx12_and_never_reports_persistable_failures() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let captured = events.clone();
+        let context = RendererContext::with_override(
+            WindowsRendererOptions {
+                preference: WindowsRendererPreference::Auto,
+                on_event: Some(Rc::new(move |event| captured.borrow_mut().push(event))),
+            },
+            Some("dx11"),
+        )
+        .unwrap();
+        assert_eq!(
+            context
+                .create_with(|| panic!("DX12 probe"), || panic!("DX12 device"), || Ok(11),)
+                .unwrap(),
+            11
+        );
+        context.failed("injected error".into(), true);
+        assert!(matches!(
+            events.borrow().as_slice(),
+            [WindowsRendererEvent::Selected {
+                backend: WindowsRendererBackend::Dx11,
+                overridden: true,
+            }]
+        ));
+    }
+
+    #[test]
+    fn invalid_overrides_fail_without_using_automatic_policy() {
+        assert!(
+            RendererContext::with_override(WindowsRendererOptions::default(), Some("vulkan"))
+                .is_err()
+        );
+    }
+
     #[cfg(feature = "windows-wgpu")]
     #[test]
     fn native_support_probe_does_not_construct_a_wgpu_context() {

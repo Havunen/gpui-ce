@@ -169,7 +169,9 @@ impl WgpuRenderer {
         }
         let mut renderer = result?;
         renderer.native_backend = backend;
-        if let Some(error) = renderer.terminal_error() {
+        if renderer.reports_terminal_errors()
+            && let Some(error) = renderer.terminal_error()
+        {
             anyhow::bail!("DX12 renderer initialization failed: {error}");
         }
         Ok(renderer)
