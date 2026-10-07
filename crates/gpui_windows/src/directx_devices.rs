@@ -81,15 +81,15 @@ fn check_debug_layer_available() -> bool {
     if !requested {
         return false;
     }
-    let available = unsafe { DXGIGetDebugInterface1::<IDXGIInfoQueue>(0) }
-        .log_err()
-        .is_some();
-    if !available {
-        log::warn!(
-            "Failed to get DXGI debug interface. DirectX debugging features will be disabled."
-        );
+    match unsafe { DXGIGetDebugInterface1::<IDXGIInfoQueue>(0) } {
+        Ok(_) => true,
+        Err(error) => {
+            // Graphics Tools is optional. A missing debug interface does not
+            // prevent creating a hardware device without the debug layer.
+            log::warn!("DirectX debugging features will be disabled: {error}");
+            false
+        }
     }
-    available
 }
 
 /// Parses a [`D3D_DEBUG`] value, returning `None` if it isn't recognized.

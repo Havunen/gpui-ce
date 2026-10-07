@@ -987,14 +987,14 @@ impl ParleyLayout {
         }
     }
 
-    fn line_index_at_block(&self, block: f32) -> usize {
+    fn line_index_for_cursor_top(&self, cursor_top: f32) -> usize {
         self.layout
             .lines()
-            .position(|line| {
-                let metrics = line.metrics();
-
-                block >= metrics.block_min_coord && block < metrics.block_max_coord
-            })
+            // Parley's cursor geometry copies the stored f32 line start into
+            // f64; converting it back to f32 preserves that value exactly.
+            // Adjacent line bounds can overlap due to independent rounding,
+            // so containment can mistakenly select the preceding line.
+            .position(|line| line.metrics().block_min_coord == cursor_top)
             .unwrap_or_else(|| self.layout.len().saturating_sub(1))
     }
 
@@ -1135,7 +1135,7 @@ impl PlatformTextLayout for ParleyLayout {
 
         let cursor = self.cursor(caret);
         let geometry = cursor.geometry(&self.layout, 0.0);
-        let line_index = self.line_index_at_block(geometry.y0 as f32);
+        let line_index = self.line_index_for_cursor_top(geometry.y0 as f32);
 
         Some(Bounds::from_corners(
             point(px(geometry.x0 as f32), line_height * line_index),
@@ -1303,7 +1303,7 @@ impl PlatformTextLayout for ParleyLayout {
                 };
 
                 let geometry = cursor.geometry(&self.layout, 0.0);
-                let line_index = self.line_index_at_block(geometry.y0 as f32);
+                let line_index = self.line_index_for_cursor_top(geometry.y0 as f32);
                 let target_ix = line_index
                     .checked_add_signed(delta)
                     .filter(|&target_ix| self.layout.get(target_ix).is_some());
@@ -1321,8 +1321,7 @@ impl PlatformTextLayout for ParleyLayout {
                     };
                 };
 
-                let x = vertical_navigation_x
-                    .map_or_else(|| cursor.geometry(&self.layout, 0.0).x0 as f32, f32::from);
+                let x = vertical_navigation_x.map_or(geometry.x0 as f32, f32::from);
                 let moved = Cursor::from_point(&self.layout, x, self.native_y_for_line(target_ix));
                 return CaretMovement {
                     result: Self::caret_position(moved),
@@ -2600,6 +2599,103 @@ mod tests {
                 ..Default::default()
             },
         })
+    }
+
+    fn assert_wrapped_caret_rows(layout: &LineLayout, text: &str) {
+        let native = &layout.platform_layout;
+        let line_height = px(20.0);
+        for caret in [
+            CaretPosition::attached_to_next_cluster(text.len()),
+            CaretPosition::attached_to_previous_cluster(text.len()),
+        ] {
+            assert_eq!(
+                native.caret_bounds(caret, line_height).unwrap().top(),
+                line_height * (layout.visual_lines.len() - 1),
+                "end of {text:?}, {caret:?}"
+            );
+        }
+        for (row, lines) in layout.visual_lines.windows(2).enumerate() {
+            let boundary = lines[1].text_range.start;
+            assert_eq!(lines[0].text_range.end, boundary);
+            for (caret, expected_row) in [
+                (CaretPosition::attached_to_previous_cluster(boundary), row),
+                (CaretPosition::attached_to_next_cluster(boundary), row + 1),
+            ] {
+                assert_eq!(
+                    native.caret_bounds(caret, line_height).unwrap().top(),
+                    line_height * expected_row,
+                    "wrap in {text:?}, {caret:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wrapped_caret_rows_match_line_starts_across_font_sizes_and_widths() {
+        let system = test_system();
+        let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu";
+        let mut checked = 0;
+        let mut rows_seen = [false; 4];
+        for font_size in [12.0, 13.0, 14.0, 16.0, 18.0, 21.0] {
+            for width in [120.0, 160.0, 220.0, 280.0, 350.0] {
+                for end in 1..=text.len() {
+                    let text = &text[..end];
+                    if text.ends_with(' ') {
+                        continue;
+                    }
+                    let layout = layout_wrapped(
+                        &system,
+                        text,
+                        px(font_size),
+                        &[text_run(text, IBM_PLEX.family)],
+                        px(width),
+                        None,
+                    );
+                    if let Some(seen) = rows_seen.get_mut(layout.visual_lines.len() - 1) {
+                        *seen = true;
+                    }
+                    assert_wrapped_caret_rows(&layout, text);
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 1650);
+        assert!(rows_seen.into_iter().all(|seen| seen));
+    }
+
+    #[test]
+    fn wrapped_second_row_caret_and_vertical_navigation() {
+        let system = test_system();
+        let text = "alpha beta gamma de";
+        let layout = layout_wrapped(
+            &system,
+            text,
+            px(13.0),
+            &[text_run(text, IBM_PLEX.family)],
+            px(120.0),
+            None,
+        );
+        assert_eq!(layout.visual_lines.len(), 2);
+        assert_wrapped_caret_rows(&layout, text);
+        let native = &layout.platform_layout;
+        let line_height = px(20.0);
+        let end = CaretPosition::attached_to_previous_cluster(text.len());
+        let up =
+            native.caret_movement(end, Direction::Up.with_boundary(Boundary::VisualLine), None);
+        assert_eq!(
+            native.caret_bounds(up.result, line_height).unwrap().top(),
+            px(0.0)
+        );
+        let down = native.caret_movement(
+            up.result,
+            Direction::Down.with_boundary(Boundary::VisualLine),
+            up.vertical_navigation_x,
+        );
+        assert_eq!(
+            native.caret_bounds(down.result, line_height).unwrap().top(),
+            line_height
+        );
+        assert_eq!(down.result.index, text.len());
     }
 
     #[test]
