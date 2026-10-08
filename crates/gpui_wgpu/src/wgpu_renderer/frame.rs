@@ -28,7 +28,18 @@ pub(super) fn render_to_view(
     renderer.retain_surface_cache(&scene.surfaces);
 
     match FrameEncoder::new(renderer, scene, targets).encode(readback) {
-        Ok(command_buffer) => Some(renderer.resources().queue.submit([command_buffer])),
+        Ok(command_buffer) => {
+            let submission = renderer.resources().queue.submit([command_buffer]);
+            // A cleanup skipped a frame. Only a real submission without a new validation
+            // error can reset that retry budget; merely starting the next frame cannot.
+            if renderer.faults.cleaned_up_failed_frames
+                && renderer.faults.pending_error.lock().unwrap().is_none()
+            {
+                renderer.faults.consecutive_failed_frames = 0;
+                renderer.faults.cleaned_up_failed_frames = false;
+            }
+            Some(submission)
+        }
         Err(DrawError::ExternalSurface) => None,
         Err(DrawError::CapacityPlanningInvariant) => {
             log::error!("frame storage exceeded its precomputed capacity");
@@ -124,32 +135,98 @@ impl PreparedTargets {
 }
 
 fn begin_frame(renderer: &mut WgpuRenderer) -> bool {
-    let Some(error) = renderer.faults.pending_error.lock().unwrap().take() else {
-        renderer.faults.consecutive_failed_frames = 0;
+    // Release the callback mutex before atlas uploads can report another GPU error.
+    let pending_error = renderer.faults.pending_error.lock().unwrap().take();
+    let Some(error) = pending_error else {
+        if !renderer.faults.cleaned_up_failed_frames {
+            renderer.faults.consecutive_failed_frames = 0;
+        }
         renderer.atlas.before_frame();
         return true;
     };
 
+    handle_gpu_error(renderer, error)
+}
+
+pub(super) fn handle_gpu_error(renderer: &mut WgpuRenderer, error: String) -> bool {
     renderer.faults.consecutive_failed_frames += 1;
     log::error!(
         "GPU error during frame (failure {} of 10): {error}",
         renderer.faults.consecutive_failed_frames
     );
     if renderer.faults.consecutive_failed_frames > 10 {
+        if renderer.reports_terminal_errors() {
+            renderer.faults.terminal_error = Some(format!(
+                "too many consecutive GPU errors; last error: {error}"
+            ));
+            return false;
+        }
         panic!("too many consecutive GPU errors; last error: {error}");
     }
-    if renderer.faults.consecutive_failed_frames > 5 {
+    if renderer.faults.consecutive_failed_frames > 5 && !renderer.faults.cleaned_up_failed_frames {
         if let Some(resources) = renderer.resources.as_mut() {
             resources.invalidate_intermediate_textures();
         }
         renderer.atlas.clear();
         renderer.target.request_redraw();
-        renderer.faults.consecutive_failed_frames = 0;
+        renderer.faults.cleaned_up_failed_frames = true;
+        if !renderer.reports_terminal_errors() {
+            // Preserve the existing retry policy for other platform integrations.
+            renderer.faults.consecutive_failed_frames = 0;
+            renderer.faults.cleaned_up_failed_frames = false;
+        }
         return false;
     }
 
     renderer.atlas.before_frame();
     true
+}
+
+#[cfg(all(test, feature = "test-support", target_os = "windows"))]
+mod failure_tests {
+    use super::*;
+
+    #[test]
+    fn persistent_dx12_errors_become_terminal_and_a_healthy_frame_resets_the_count() {
+        let context = crate::WgpuContext::new_headless(None).unwrap();
+        let mut renderer = WgpuRenderer::new_headless(
+            &context,
+            gpui::size(gpui::DevicePixels(16), gpui::DevicePixels(16)),
+        )
+        .unwrap();
+        for _ in 0..18 {
+            handle_gpu_error(&mut renderer, "injected validation failure".into());
+        }
+        assert_eq!(renderer.faults.consecutive_failed_frames, 0);
+        assert!(renderer.terminal_error().is_none());
+        renderer.native_backend = Some(crate::NativeBackend::Dx12);
+        for _ in 0..6 {
+            handle_gpu_error(&mut renderer, "injected validation failure".into());
+        }
+        assert!(renderer.faults.cleaned_up_failed_frames);
+        assert!(begin_frame(&mut renderer));
+        assert_eq!(renderer.faults.consecutive_failed_frames, 6);
+        let mut scene = Scene::default();
+        scene.finish();
+        renderer.render_to_image(&scene).unwrap();
+        assert_eq!(renderer.faults.consecutive_failed_frames, 0);
+        for _ in 0..10 {
+            handle_gpu_error(&mut renderer, "injected validation failure".into());
+        }
+        assert!(renderer.terminal_error().is_none());
+        assert!(!handle_gpu_error(
+            &mut renderer,
+            "injected validation failure".into()
+        ));
+        assert!(
+            renderer
+                .terminal_error()
+                .unwrap()
+                .contains("validation failure")
+        );
+        // The error can be consumed without holding a callback/GPU mutex across application notification.
+        assert!(renderer.faults.fatal_error.try_lock().is_ok());
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]

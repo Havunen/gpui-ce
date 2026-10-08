@@ -51,3 +51,25 @@ impl Deref for SafeHwnd {
         &self.raw
     }
 }
+
+#[cfg(feature = "windows-wgpu")]
+impl raw_window_handle::HasWindowHandle for SafeHwnd {
+    fn window_handle(
+        &self,
+    ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+        let hwnd = std::num::NonZeroIsize::new(self.raw.0 as isize)
+            .ok_or(raw_window_handle::HandleError::Unavailable)?;
+        let raw = raw_window_handle::Win32WindowHandle::new(hwnd).into();
+        // The renderer is detached in WM_DESTROY before this HWND goes away.
+        Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(raw) })
+    }
+}
+
+#[cfg(feature = "windows-wgpu")]
+impl raw_window_handle::HasDisplayHandle for SafeHwnd {
+    fn display_handle(
+        &self,
+    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
+        Ok(raw_window_handle::DisplayHandle::windows())
+    }
+}

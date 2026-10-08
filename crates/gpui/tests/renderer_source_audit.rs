@@ -3,6 +3,7 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 fn workspace_root() -> PathBuf {
@@ -212,26 +213,82 @@ fn native_renderer_fallbacks_and_intermediates_are_lazy() {
 #[test]
 fn windows_default_renderer_has_no_wgpu_path() {
     let root = workspace_root();
-    let manifest_path = root.join("crates/gpui_windows/Cargo.toml");
-    let manifest = fs::read_to_string(&manifest_path)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", manifest_path.display()));
+    // Inspect Cargo's feature definitions rather than rejecting the optional
+    // dependency's name. This also works when the audit runs on macOS or Linux.
+    let output = Command::new(env!("CARGO"))
+        .current_dir(&root)
+        .args([
+            "metadata",
+            "--format-version=1",
+            "--no-deps",
+            "--offline",
+            "--locked",
+        ])
+        .output()
+        .expect("failed to inspect workspace manifests");
     assert!(
-        !manifest.contains("gpui_wgpu") && !manifest.contains("wgpu.workspace"),
-        "{} must not pull WGPU into the native Windows renderer",
-        manifest_path.display()
+        output.status.success(),
+        "cargo metadata failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("invalid Cargo metadata");
+    let packages = metadata["packages"].as_array().expect("workspace packages");
+    let package = |name: &str| {
+        packages
+            .iter()
+            .find(|package| package["name"] == name)
+            .unwrap_or_else(|| panic!("missing workspace package {name}"))
+    };
+    let windows = package("gpui_ce_windows");
+    let platform = package("gpui_ce_platform");
+    let dependencies = windows["dependencies"]
+        .as_array()
+        .expect("Windows dependencies");
+    assert!(
+        !dependencies
+            .iter()
+            .any(|dependency| dependency["name"] == "wgpu"),
+        "Windows must use the shared optional WGPU renderer"
+    );
+    let wgpu = dependencies
+        .iter()
+        .find(|dependency| dependency["rename"] == "gpui_wgpu")
+        .expect("optional Windows WGPU dependency");
+    assert_eq!(wgpu["name"], "gpui_ce_wgpu");
+    assert_eq!(wgpu["optional"], true, "WGPU must remain optional");
+    assert_eq!(wgpu["target"], "cfg(target_os = \"windows\")");
+    assert_eq!(
+        windows["features"]["default"],
+        serde_json::json!(["gpui/default"])
+    );
+    assert_eq!(platform["features"]["default"], serde_json::json!([]));
+    assert_eq!(
+        windows["features"]["windows-wgpu"],
+        serde_json::json!(["dep:gpui_wgpu"])
+    );
+    assert_eq!(
+        platform["features"]["windows-wgpu"],
+        serde_json::json!(["gpui_windows/windows-wgpu"])
     );
 
-    let window_path = root.join("crates/gpui_windows/src/window.rs");
-    let window = fs::read_to_string(&window_path)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", window_path.display()));
+    let renderer_path = root.join("crates/gpui_windows/src/renderer.rs");
+    let renderer = fs::read_to_string(&renderer_path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", renderer_path.display()));
     assert!(
-        window.contains("RefCell<DirectXRenderer>"),
-        "{} must use the native DirectX renderer",
-        window_path.display()
+        renderer.contains("Dx11(DirectXRenderer)"),
+        "{} must retain the native DirectX renderer",
+        renderer_path.display()
     );
     assert!(
-        !window.contains("feature = \"wgpu\"") && !window.contains("WgpuRenderer"),
-        "{} must not contain a dormant WGPU renderer path",
-        window_path.display()
+        renderer
+            .lines()
+            .zip(renderer.lines().skip(1))
+            .any(|(guard, variant)| {
+                guard.trim() == "#[cfg(feature = \"windows-wgpu\")]"
+                    && variant.trim().starts_with("Dx12(")
+            }),
+        "{} must gate the DX12 renderer behind windows-wgpu",
+        renderer_path.display()
     );
 }
