@@ -1,11 +1,13 @@
+use crate::damage::{Damage, DamageTracker};
 use crate::metal_atlas::MetalAtlas;
 use anyhow::Result;
 use block::ConcreteBlock;
 use core_graphics::geometry::CGSize;
 use gpui::{
-    AtlasTextureId, Bounds, Corners, DevicePixels, FilterRenderTarget, MAX_FILTER_GROUP_DEPTH,
-    MonochromeSprite, PaintSurface, Path, PolychromeSprite, PrimitiveBatch, Quad, RenderCommand,
-    ScaledPixels, Scene, Shadow, Size, SurfaceSource, Underline, size,
+    AtlasTextureId, Bounds, ContentMask, Corners, DevicePixels, FilterRenderTarget,
+    MAX_FILTER_GROUP_DEPTH, MonochromeSprite, PaintSurface, Path, PlatformAtlas as _,
+    PolychromeSprite, PrimitiveBatch, Quad, RenderCommand, ScaledPixels, Scene, Shadow, Size,
+    SurfaceSource, Underline, hsla, size, solid_background,
 };
 use gpui_render::{
     artifacts::{NATIVE_SHADERS, NativeShader},
@@ -48,6 +50,11 @@ use std::{cell::Cell, mem, ptr, sync::Arc};
 ///   of ending the main pass around each batch with a full-window MSAA pass.
 /// - opaque quads (`no-opaque-quads`): opaque rectangles are drawn without
 ///   blending, so the tile hardware skips fragments a later opaque quad hides.
+/// - split rounded quads (`no-split-rounded`): large rounded opaque quads draw
+///   an opaque interior and blended rims (needs opaque quads).
+/// - partial redraw (`no-partial-redraw`): frames render into a retained
+///   texture that is copied to the drawable, and repaint only the region whose
+///   primitives changed since the previous frame (see [`crate::damage`]).
 ///
 /// Measurement only (render incorrectly): `skip-paths`, `skip-shadows`,
 /// `skip-quads`, `skip-sprites` drop a primitive kind to attribute GPU time.
@@ -57,6 +64,7 @@ struct Experiments {
     opaque_quads: bool,
     /// Rounded opaque quads draw an opaque interior (needs `opaque_quads`).
     split_rounded: bool,
+    partial_redraw: bool,
     skip_paths: bool,
     // Measurement only: drop a primitive kind to attribute GPU time, or draw
     // rounded opaque quads without blending (wrong corners) to bound what
@@ -76,6 +84,7 @@ fn experiments() -> Experiments {
             path_prepass: !flags.contains(&"no-path-prepass"),
             opaque_quads: !flags.contains(&"no-opaque-quads"),
             split_rounded: !flags.contains(&"no-split-rounded"),
+            partial_redraw: !flags.contains(&"no-partial-redraw"),
             skip_paths: flags.contains(&"skip-paths"),
             opaque_rounded: flags.contains(&"opaque-rounded"),
             skip_shadows: flags.contains(&"skip-shadows"),
@@ -310,6 +319,29 @@ fn split_rounded_opaque_quad(quad: &Quad) -> Option<[Quad; 5]> {
         strip(rect(inner_x1, inner_y0, x1, inner_y1)),
         interior,
     ])
+}
+
+/// Largest share of the viewport a frame repaints partially
+/// (partial redraw); a larger change repaints everything.
+const PARTIAL_REDRAW_MAX_AREA: f64 = 0.5;
+
+/// How a frame reaches the drawable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameMode {
+    /// Rendered straight into the drawable; the retained texture goes stale.
+    Direct,
+    /// Rendered whole into the retained texture, which is then copied.
+    Retained,
+    /// Only this region is rendered into the retained texture, over the
+    /// previous frame, which is then copied.
+    Partial {
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    },
+    /// Unchanged since the previous frame: the retained texture is copied.
+    Copy,
 }
 
 // Use 4x MSAA, all devices support it.
@@ -554,6 +586,13 @@ pub struct MetalRenderer {
     group_textures: Vec<metal::Texture>,
     intermediate_texture_size: Option<Size<DevicePixels>>,
     path_sample_count: u32,
+    /// The previous frame, for frames that repaint only what changed
+    /// (partial redraw). Valid when it holds the frame last presented.
+    retained_texture: Option<metal::Texture>,
+    retained_valid: bool,
+    /// The previous frame changed too much to repaint partially.
+    previous_change_large: bool,
+    damage: DamageTracker,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
@@ -833,6 +872,10 @@ impl MetalRenderer {
             group_textures: Vec::new(),
             intermediate_texture_size: None,
             path_sample_count: PATH_SAMPLE_COUNT,
+            retained_texture: None,
+            retained_valid: false,
+            previous_change_large: false,
+            damage: DamageTracker::default(),
             #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
             headless_render_target: None,
         }
@@ -878,6 +921,8 @@ impl MetalRenderer {
         self.blur_ping_texture = None;
         self.blur_pong_texture = None;
         self.group_textures.clear();
+        self.retained_texture = None;
+        self.retained_valid = false;
         self.intermediate_texture_size = (size.width.0 > 0 && size.height.0 > 0).then_some(size);
     }
 
@@ -948,6 +993,7 @@ impl MetalRenderer {
 
     pub fn update_transparency(&mut self, transparent: bool) {
         self.opaque = !transparent;
+        self.forget_previous_frame();
         if let Some(layer) = &self.layer {
             layer.set_opaque(!transparent);
         }
@@ -972,6 +1018,9 @@ impl MetalRenderer {
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
+        let damage_start = std::time::Instant::now();
+        let mode = self.frame_mode(scene, viewport_size);
+        let damage_time = damage_start.elapsed();
         let drawable = if let Some(drawable) = layer.next_drawable() {
             drawable
         } else {
@@ -979,29 +1028,52 @@ impl MetalRenderer {
                 "failed to retrieve next drawable, drawable size: {:?}",
                 viewport_size
             );
+            self.forget_previous_frame();
             return;
         };
 
         if crate::scene_stats::level() > 0 {
             crate::scene_stats::log(scene, viewport_size);
-        }
-        if let Some(prefix) = dump_frame_prefix() {
-            // Diagnostics: the same scene rendered offscreen and read back, so
-            // renderer variants can be compared pixel for pixel without screen
-            // capture. Each frame overwrites the file; the last one remains.
-            if let Err(error) = self.dump_scene(scene, viewport_size, prefix) {
-                log::error!("GPUI_DUMP_FRAME: {error}");
+            if self.experiments.partial_redraw {
+                let area = |width: u32, height: u32| {
+                    f64::from(width) * f64::from(height)
+                        / (f64::from(viewport_size.width.0.max(1))
+                            * f64::from(viewport_size.height.0.max(1)))
+                };
+                let repainted = match mode {
+                    FrameMode::Direct | FrameMode::Retained => 1.0,
+                    FrameMode::Copy => 0.0,
+                    FrameMode::Partial { width, height, .. } => area(width, height),
+                };
+                eprintln!(
+                    "gpui-damage mode={mode:?} repainted={repainted:.3} damage_us={}",
+                    damage_time.as_micros()
+                );
             }
         }
+        // Diagnostics: the same scene rendered offscreen and read back, so
+        // renderer variants can be compared pixel for pixel without screen
+        // capture. Each frame overwrites the file; the last one remains.
+        let full_render = dump_frame_prefix().and_then(|prefix| {
+            self.dump_scene(scene, viewport_size, prefix)
+                .inspect_err(|error| log::error!("GPUI_DUMP_FRAME: {error}"))
+                .ok()
+        });
         let mut instance_buffer = self.acquire_instance_buffer(scene);
-        let command_buffer =
-            match self.draw_primitives(scene, &mut instance_buffer, drawable, viewport_size) {
-                Ok(command_buffer) => command_buffer,
-                Err(error) => {
-                    log::error!("failed to render pre-sized scene: {error}");
-                    return;
-                }
-            };
+        let command_buffer = match self.draw_frame(
+            scene,
+            &mut instance_buffer,
+            drawable.texture(),
+            viewport_size,
+            mode,
+        ) {
+            Ok(command_buffer) => command_buffer,
+            Err(error) => {
+                log::error!("failed to render pre-sized scene: {error}");
+                self.forget_previous_frame();
+                return;
+            }
+        };
         self.release_instance_buffer_when_complete(&command_buffer, instance_buffer);
 
         if self.presents_with_transaction {
@@ -1012,6 +1084,183 @@ impl MetalRenderer {
             command_buffer.present_drawable(drawable);
             command_buffer.commit();
         }
+        if let Some(prefix) = dump_frame_prefix()
+            && let Some(expected) = full_render
+            && mode != FrameMode::Direct
+        {
+            // What the frame left in the retained texture must match the full
+            // render: report every frame, keep the first mismatch.
+            command_buffer.wait_until_completed();
+            match self.read_retained(viewport_size) {
+                Ok(retained) => {
+                    let differing = expected
+                        .pixels()
+                        .zip(retained.pixels())
+                        .filter(|(expected, actual)| expected != actual)
+                        .count();
+                    eprintln!("gpui-damage-check mode={mode:?} differing={differing}");
+                    static SAVED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if differing > 0 && !SAVED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        let saved = expected
+                            .save(prefix.with_extension("mismatch.expected.png"))
+                            .and_then(|_| {
+                                retained.save(prefix.with_extension("mismatch.retained.png"))
+                            });
+                        if let Err(error) = saved {
+                            log::error!("GPUI_DUMP_FRAME: {error}");
+                        }
+                    }
+                }
+                Err(error) => log::error!("GPUI_DUMP_FRAME: {error}"),
+            }
+        }
+    }
+
+    /// Forgets the previous frame, so the next one repaints everything.
+    fn forget_previous_frame(&mut self) {
+        self.damage.invalidate();
+        self.retained_valid = false;
+    }
+
+    /// How the next frame reaches the drawable (partial redraw).
+    fn frame_mode(&mut self, scene: &Scene, viewport_size: Size<DevicePixels>) -> FrameMode {
+        // Synchronous presents (live resize, window activation, display
+        // requests from the layer) always repaint everything.
+        if !self.experiments.partial_redraw || self.presents_with_transaction {
+            self.forget_previous_frame();
+            return FrameMode::Direct;
+        }
+        let damage = self
+            .damage
+            .update(scene, viewport_size, self.sprite_atlas.generation());
+        self.update_intermediate_texture_size(viewport_size);
+        let viewport_area =
+            f64::from(viewport_size.width.0.max(1)) * f64::from(viewport_size.height.0.max(1));
+        let partial = match damage {
+            Damage::Full => None,
+            Damage::None => Some(FrameMode::Copy),
+            Damage::Rect {
+                x,
+                y,
+                width,
+                height,
+            } => (f64::from(width) * f64::from(height) <= viewport_area * PARTIAL_REDRAW_MAX_AREA)
+                .then_some(FrameMode::Partial {
+                    x,
+                    y,
+                    width,
+                    height,
+                }),
+        };
+        let follows_large_change = mem::replace(&mut self.previous_change_large, partial.is_none());
+        match partial {
+            // A large change usually comes alone (a new selection or diff) and
+            // the frames after it change little, so it renders into the
+            // retained texture to keep them partial. A run of large changes
+            // renders straight to the drawable, which saves the copy.
+            None if follows_large_change => FrameMode::Direct,
+            None => FrameMode::Retained,
+            Some(_) if !self.retained_valid => FrameMode::Retained,
+            Some(partial) => partial,
+        }
+    }
+
+    /// Renders `scene` into `target` as `mode` says, keeping the retained
+    /// texture in step with what `target` shows.
+    fn draw_frame(
+        &mut self,
+        scene: &Scene,
+        instance_buffer: &mut InstanceBuffer,
+        target: &metal::TextureRef,
+        viewport_size: Size<DevicePixels>,
+        mode: FrameMode,
+    ) -> Result<metal::CommandBuffer> {
+        let region = match mode {
+            FrameMode::Direct => {
+                self.retained_valid = false;
+                return self.draw_primitives_to_texture(
+                    scene,
+                    instance_buffer,
+                    target,
+                    viewport_size,
+                    None,
+                );
+            }
+            FrameMode::Retained | FrameMode::Copy => None,
+            FrameMode::Partial {
+                x,
+                y,
+                width,
+                height,
+            } => Some(ScissorRectangle {
+                x,
+                y,
+                width,
+                height,
+            }),
+        };
+        self.update_intermediate_texture_size(viewport_size);
+        let retained = self.retained_texture(viewport_size);
+        let command_buffer = if mode == FrameMode::Copy {
+            self.command_queue.new_command_buffer().to_owned()
+        } else {
+            self.draw_primitives_to_texture(
+                scene,
+                instance_buffer,
+                &retained,
+                viewport_size,
+                region,
+            )?
+        };
+        self.retained_valid = true;
+        self.copy_texture(&command_buffer, &retained, target, viewport_size);
+        Ok(command_buffer)
+    }
+
+    fn retained_texture(&mut self, size: Size<DevicePixels>) -> metal::Texture {
+        self.retained_texture
+            .get_or_insert_with(|| {
+                let descriptor = metal::TextureDescriptor::new();
+                descriptor.set_width(size.width.0.max(1) as u64);
+                descriptor.set_height(size.height.0.max(1) as u64);
+                descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+                descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+                descriptor.set_usage(
+                    metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
+                );
+                self.device.new_texture(&descriptor)
+            })
+            .clone()
+    }
+
+    /// Copies all of `source` onto `target`; both are `size`.
+    fn copy_texture(
+        &self,
+        command_buffer: &metal::CommandBufferRef,
+        source: &metal::TextureRef,
+        target: &metal::TextureRef,
+        size: Size<DevicePixels>,
+    ) {
+        let (width, height) = (size.width.0.max(0), size.height.0.max(0));
+        self.run_metal_blur_pass(
+            command_buffer,
+            &self.blur_downsample_pipeline_state,
+            target,
+            source,
+            size,
+            &SceneUniforms::new(size),
+            BlurUniforms::copy([width as f32, height as f32]),
+            ScissorRectangle {
+                x: 0,
+                y: 0,
+                width: width as u32,
+                height: height as u32,
+            },
+            metal::MTLPrimitiveType::Triangle,
+            3,
+            false,
+        );
     }
 
     /// Renders the scene to a texture and returns the pixel data as an RGBA image.
@@ -1095,8 +1344,13 @@ impl MetalRenderer {
         let target_texture = self.device.new_texture(&texture_descriptor);
 
         let mut instance_buffer = self.acquire_instance_buffer(scene);
-        let command_buffer =
-            self.draw_primitives_to_texture(scene, &mut instance_buffer, &target_texture, size)?;
+        let command_buffer = self.draw_primitives_to_texture(
+            scene,
+            &mut instance_buffer,
+            &target_texture,
+            size,
+            None,
+        )?;
 
         if !self.is_unified_memory {
             let blit = command_buffer.new_blit_command_encoder();
@@ -1166,8 +1420,13 @@ impl MetalRenderer {
             .expect("just ensured the render target exists");
 
         let mut instance_buffer = self.acquire_instance_buffer(scene);
-        let command_buffer =
-            self.draw_primitives_to_texture(scene, &mut instance_buffer, &target_texture, size)?;
+        let command_buffer = self.draw_primitives_to_texture(
+            scene,
+            &mut instance_buffer,
+            &target_texture,
+            size,
+            None,
+        )?;
         self.release_instance_buffer_when_complete(&command_buffer, instance_buffer);
         command_buffer.commit();
         Ok(())
@@ -1196,6 +1455,7 @@ impl MetalRenderer {
         command_buffer.add_completed_handler(&block.copy());
     }
 
+    #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
     fn draw_primitives(
         &mut self,
         scene: &Scene,
@@ -1203,15 +1463,25 @@ impl MetalRenderer {
         drawable: &metal::MetalDrawableRef,
         viewport_size: Size<DevicePixels>,
     ) -> Result<metal::CommandBuffer> {
-        self.draw_primitives_to_texture(scene, instance_buffer, drawable.texture(), viewport_size)
+        self.draw_primitives_to_texture(
+            scene,
+            instance_buffer,
+            drawable.texture(),
+            viewport_size,
+            None,
+        )
     }
 
+    /// Encodes the scene into `texture`. With a `region`, only that part is
+    /// repainted and the rest of `texture` is kept (partial redraw); the
+    /// scene must then need no offscreen targets.
     fn draw_primitives_to_texture(
         &mut self,
         scene: &Scene,
         instance_buffer: &mut InstanceBuffer,
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
+        region: Option<ScissorRectangle>,
     ) -> Result<metal::CommandBuffer> {
         self.prepare_intermediate_textures(scene, viewport_size);
         let command_queue = self.command_queue.clone();
@@ -1260,6 +1530,7 @@ impl MetalRenderer {
                     scene,
                     layer,
                     layer_index,
+                    region,
                     instance_buffer,
                     &mut instance_offset,
                     command_buffer,
@@ -1274,10 +1545,31 @@ impl MetalRenderer {
             current_target,
             viewport_size,
             |color_attachment| {
-                color_attachment.set_load_action(metal::MTLLoadAction::Clear);
-                color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., alpha));
+                if region.is_some() {
+                    color_attachment.set_load_action(metal::MTLLoadAction::Load);
+                } else {
+                    color_attachment.set_load_action(metal::MTLLoadAction::Clear);
+                    color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., alpha));
+                }
             },
         );
+        if let Some(region) = region {
+            debug_assert!(!use_offscreen, "partial redraw of a scene with filters");
+            // Tiles outside the scissor cost next to nothing: cropping the
+            // pass to the region's right and bottom edges measured no faster.
+            set_scissor(command_encoder, region);
+            if !self.draw_clear_quad(
+                region,
+                alpha as f32,
+                instance_buffer,
+                &mut instance_offset,
+                &scene_uniforms,
+                command_encoder,
+            ) {
+                command_encoder.end_encoding();
+                anyhow::bail!("instance buffer too small for the clear quad");
+            }
+        }
 
         for (command_index, command) in scene.render_commands().iter().enumerate() {
             let skipped = match command {
@@ -1360,6 +1652,9 @@ impl MetalRenderer {
                                 color_attachment.set_load_action(metal::MTLLoadAction::Load);
                             },
                         );
+                        if let Some(region) = region {
+                            set_scissor(command_encoder, region);
+                        }
 
                         if did_draw {
                             self.draw_paths_from_intermediate(
@@ -1767,7 +2062,7 @@ impl MetalRenderer {
         scene: &Scene,
         size: Size<DevicePixels>,
         prefix: &std::path::Path,
-    ) -> Result<()> {
+    ) -> Result<image::RgbaImage> {
         let descriptor = metal::TextureDescriptor::new();
         descriptor.set_width(size.width.0.max(1) as u64);
         descriptor.set_height(size.height.0.max(1) as u64);
@@ -1782,7 +2077,7 @@ impl MetalRenderer {
         let target = self.device.new_texture(&descriptor);
         let mut instance_buffer = self.acquire_instance_buffer(scene);
         let command_buffer =
-            self.draw_primitives_to_texture(scene, &mut instance_buffer, &target, size)?;
+            self.draw_primitives_to_texture(scene, &mut instance_buffer, &target, size, None)?;
         if !self.is_unified_memory {
             let blit = command_buffer.new_blit_command_encoder();
             blit.synchronize_resource(&target);
@@ -1816,7 +2111,70 @@ impl MetalRenderer {
         let partial = prefix.with_extension("partial.png");
         image.save(&partial)?;
         std::fs::rename(&partial, &path)?;
-        Ok(())
+        Ok(image)
+    }
+
+    /// Reads back the retained texture, once the frame's commands completed.
+    fn read_retained(&self, size: Size<DevicePixels>) -> Result<image::RgbaImage> {
+        let retained = self
+            .retained_texture
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no retained texture"))?;
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(size.width.0.max(1) as u64);
+        descriptor.set_height(size.height.0.max(1) as u64);
+        descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_storage_mode(if self.is_unified_memory {
+            metal::MTLStorageMode::Shared
+        } else {
+            metal::MTLStorageMode::Managed
+        });
+        let readable = self.device.new_texture(&descriptor);
+        let (width, height) = (size.width.0.max(1) as u64, size.height.0.max(1) as u64);
+        let command_buffer = self.command_queue.new_command_buffer();
+        let blit = command_buffer.new_blit_command_encoder();
+        let origin = metal::MTLOrigin { x: 0, y: 0, z: 0 };
+        blit.copy_from_texture(
+            retained,
+            0,
+            0,
+            origin,
+            metal::MTLSize {
+                width,
+                height,
+                depth: 1,
+            },
+            &readable,
+            0,
+            0,
+            origin,
+        );
+        if !self.is_unified_memory {
+            blit.synchronize_resource(&readable);
+        }
+        blit.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        let bytes_per_row = width as usize * 4;
+        let mut pixels = vec![0u8; height as usize * bytes_per_row];
+        readable.get_bytes(
+            pixels.as_mut_ptr() as *mut std::ffi::c_void,
+            bytes_per_row as u64,
+            metal::MTLRegion {
+                origin,
+                size: metal::MTLSize {
+                    width,
+                    height,
+                    depth: 1,
+                },
+            },
+            0,
+        );
+        for chunk in pixels.chunks_exact_mut(4) {
+            chunk.swap(0, 2);
+        }
+        image::RgbaImage::from_raw(width as u32, height as u32, pixels)
+            .ok_or_else(|| anyhow::anyhow!("frame buffer size mismatch"))
     }
 
     /// Full-size resolve targets for prepass layers after the first.
@@ -1838,16 +2196,27 @@ impl MetalRenderer {
     /// One MSAA pass rasterizing every batch of a prepass layer, cropped to the
     /// layer's right/bottom extent so untouched tiles are neither cleared nor
     /// resolved. Sampling divides by the full texture size, so texels keep
-    /// their window positions.
+    /// their window positions. A partial frame rasterizes only its `region`,
+    /// the only part its main pass samples.
+    #[allow(clippy::too_many_arguments)]
     fn rasterize_path_layer(
         &self,
         scene: &Scene,
         layer: &PathLayerPlan,
         layer_index: usize,
+        region: Option<ScissorRectangle>,
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
         command_buffer: &metal::CommandBufferRef,
     ) -> bool {
+        let (mut width, mut height) = layer.extent;
+        if let Some(region) = region {
+            width = width.min(region.x + region.width);
+            height = height.min(region.y + region.height);
+            if region.x >= width || region.y >= height {
+                return true;
+            }
+        }
         let target = if layer_index == 0 {
             self.path_intermediate_texture.as_deref()
         } else {
@@ -1894,7 +2263,6 @@ impl MetalRenderer {
             return false;
         }
 
-        let (width, height) = layer.extent;
         let render_pass_descriptor = metal::RenderPassDescriptor::new();
         render_pass_descriptor.set_render_target_width(width as u64);
         render_pass_descriptor.set_render_target_height(height as u64);
@@ -1921,6 +2289,17 @@ impl MetalRenderer {
             znear: 0.0,
             zfar: 1.0,
         });
+        if let Some(region) = region {
+            set_scissor(
+                command_encoder,
+                ScissorRectangle {
+                    x: region.x,
+                    y: region.y,
+                    width: width - region.x,
+                    height: height - region.y,
+                },
+            );
+        }
         command_encoder.set_render_pipeline_state(&self.paths_rasterization_pipeline_state);
         // Clip space spans the cropped extent, so window coordinates land on
         // the same texels as in a full-size pass.
@@ -2121,6 +2500,56 @@ impl MetalRenderer {
             4,
             shadows.len() as u64,
         );
+        *instance_offset = next_offset;
+        true
+    }
+
+    /// Resets `region` of a partial frame to the clear colour. The load action
+    /// keeps the previous frame, so this overwrites instead of blending.
+    fn draw_clear_quad(
+        &self,
+        region: ScissorRectangle,
+        alpha: f32,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        scene_uniforms: &SceneUniforms,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) -> bool {
+        let bounds = Bounds {
+            origin: gpui::point(ScaledPixels(region.x as f32), ScaledPixels(region.y as f32)),
+            size: size(
+                ScaledPixels(region.width as f32),
+                ScaledPixels(region.height as f32),
+            ),
+        };
+        let quad = Quad {
+            bounds,
+            content_mask: ContentMask {
+                bounds,
+                ..Default::default()
+            },
+            background: solid_background(hsla(0., 0., 0., alpha)),
+            ..Default::default()
+        };
+        align_offset(instance_offset);
+        let next_offset = *instance_offset + mem::size_of::<Quad>();
+        if next_offset > instance_buffer.size {
+            return false;
+        }
+        unsafe {
+            let contents =
+                (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset);
+            ptr::write_unaligned(contents as *mut Quad, quad);
+        }
+        command_encoder.set_render_pipeline_state(&self.opaque_quads_pipeline_state);
+        bind_scene_uniforms(command_encoder, scene_uniforms);
+        bind_instances(
+            command_encoder,
+            &instance_buffer.metal_buffer,
+            *instance_offset,
+            std::slice::from_ref(&quad),
+        );
+        command_encoder.draw_primitives_instanced(metal::MTLPrimitiveType::TriangleStrip, 0, 4, 1);
         *instance_offset = next_offset;
         true
     }
@@ -2534,6 +2963,15 @@ impl MetalRenderer {
     }
 }
 
+fn set_scissor(encoder: &metal::RenderCommandEncoderRef, region: ScissorRectangle) {
+    encoder.set_scissor_rect(MTLScissorRect {
+        x: region.x as u64,
+        y: region.y as u64,
+        width: region.width as u64,
+        height: region.height as u64,
+    });
+}
+
 fn new_command_encoder_for_texture<'a>(
     command_buffer: &'a metal::CommandBufferRef,
     texture: &'a metal::TextureRef,
@@ -2718,7 +3156,8 @@ fn build_blur_pipeline_state(
 }
 
 fn required_instance_buffer_size(scene: &Scene) -> usize {
-    let mut required = 0;
+    // A partial frame first clears its region with one quad.
+    let mut required = mem::size_of::<Quad>().next_multiple_of(256);
     let mut reserve = |element_size: usize, count: usize| {
         if count > 0 {
             align_offset(&mut required);
@@ -3875,5 +4314,300 @@ mod tests {
             split_rounded_opaque_quad(&square).is_none(),
             "plain quads need no split"
         );
+    }
+
+    /// Renders `scene` the way `draw` presents it, into an offscreen target.
+    fn render_frame(
+        renderer: &mut MetalRenderer,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+    ) -> (FrameMode, RgbaImage) {
+        let mode = renderer.frame_mode(scene, size);
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(size.width.0 as u64);
+        descriptor.set_height(size.height.0 as u64);
+        descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        descriptor
+            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Managed);
+        let target = renderer.device.new_texture(&descriptor);
+        let mut instance_buffer = renderer.acquire_instance_buffer(scene);
+        let command_buffer = renderer
+            .draw_frame(scene, &mut instance_buffer, &target, size, mode)
+            .unwrap();
+        if !renderer.is_unified_memory {
+            let blit = command_buffer.new_blit_command_encoder();
+            blit.synchronize_resource(&target);
+            blit.end_encoding();
+        }
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        renderer
+            .instance_buffer_pool
+            .lock()
+            .release(instance_buffer);
+        let (width, height) = (size.width.0 as u32, size.height.0 as u32);
+        let mut pixels = vec![0u8; width as usize * height as usize * 4];
+        target.get_bytes(
+            pixels.as_mut_ptr() as *mut std::ffi::c_void,
+            u64::from(width) * 4,
+            metal::MTLRegion {
+                origin: metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                size: metal::MTLSize {
+                    width: u64::from(width),
+                    height: u64::from(height),
+                    depth: 1,
+                },
+            },
+            0,
+        );
+        for chunk in pixels.chunks_exact_mut(4) {
+            chunk.swap(0, 2);
+        }
+        (mode, RgbaImage::from_raw(width, height, pixels).unwrap())
+    }
+
+    #[derive(Clone, Copy)]
+    struct Frame {
+        background: Option<f32>,
+        row_hue: f32,
+        card_hue: f32,
+        hovered: Option<usize>,
+        triangle_x: f32,
+        shadow_x: f32,
+        translucent: bool,
+        spinner_angle: f32,
+    }
+
+    /// History-like rows, a rounded card, a shadowed element, a path, a
+    /// translucent overlay and a rotated sprite (a spinner).
+    fn partial_redraw_scene(frame: Frame, tile: gpui::AtlasTile) -> Scene {
+        let viewport = rect(0.0, 0.0, 512.0, 384.0);
+        let mut scene = Scene::default();
+        if let Some(hue) = frame.background {
+            scene.insert_primitive(quad(viewport, hue, 1.0));
+        }
+        for row in 0..8 {
+            let hue = if frame.hovered == Some(row) {
+                0.6
+            } else {
+                frame.row_hue
+            };
+            scene.insert_primitive(quad(
+                rect(16.0, 16.0 + row as f32 * 40.0, 220.0, 28.0),
+                hue,
+                1.0,
+            ));
+        }
+        let mut card = quad(rect(280.0, 20.0, 200.0, 140.0), frame.card_hue, 1.0);
+        card.corner_radii = Corners::all(ScaledPixels(12.0));
+        scene.insert_primitive(card);
+        // The blur crosses tile edges the element itself does not reach.
+        let element = rect(frame.shadow_x, 200.0, 60.0, 40.0);
+        scene.insert_primitive(Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(6.0),
+            bounds: element,
+            corner_radii: Corners::all(ScaledPixels(4.0)),
+            content_mask: ContentMask {
+                bounds: viewport,
+                ..Default::default()
+            },
+            color: solid_background(hsla(0.0, 0.0, 0.0, 0.6)),
+            element_bounds: element,
+            element_corner_radii: Corners::all(ScaledPixels(4.0)),
+            inset: gpui::ShaderBool::Disabled,
+            corner_smoothing: 0.0,
+        });
+        scene.insert_primitive(quad(element, 0.7, 1.0));
+        scene.insert_primitive(triangle(frame.triangle_x, 300.0, 40.0, 0.2, 0.9));
+        if frame.translucent {
+            scene.insert_primitive(quad(rect(200.0, 100.0, 120.0, 80.0), 0.9, 0.5));
+        }
+        let center =
+            |sign: f32| gpui::point(ScaledPixels(420.0 * sign), ScaledPixels(300.0 * sign));
+        scene.insert_primitive(MonochromeSprite {
+            order: 0,
+            padding: 0,
+            bounds: rect(404.0, 284.0, 32.0, 32.0),
+            content_mask: ContentMask {
+                bounds: viewport,
+                ..Default::default()
+            },
+            color: hsla(0.0, 0.0, 1.0, 1.0).into(),
+            tile,
+            transformation: TransformationMatrix::unit()
+                .translate(center(1.0))
+                .rotate(gpui::radians(frame.spinner_angle))
+                .translate(center(-1.0)),
+        });
+        scene.finish();
+        scene
+    }
+
+    #[test]
+    fn partial_redraw_matches_full_redraw() {
+        let size = gpui::size(DevicePixels(512), DevicePixels(384));
+        let experiments = Experiments {
+            path_prepass: true,
+            opaque_quads: true,
+            split_rounded: true,
+            ..Default::default()
+        };
+        let mask: Vec<u8> = (0..32 * 32)
+            .map(|index| ((index % 32) * 8) as u8 ^ ((index / 32) * 5) as u8)
+            .collect();
+        let spinner = |renderer: &MetalRenderer| {
+            renderer
+                .sprite_atlas()
+                .get_or_insert_with(
+                    &AtlasKey::Svg(RenderSvgParams {
+                        path: "spinner".into(),
+                        size: gpui::size(DevicePixels(32), DevicePixels(32)),
+                    }),
+                    &mut || {
+                        Ok(Some((
+                            gpui::size(DevicePixels(32), DevicePixels(32)),
+                            Cow::Owned(mask.clone()),
+                        )))
+                    },
+                )
+                .unwrap()
+                .unwrap()
+        };
+        for opaque in [true, false] {
+            let mut renderer = experiment_renderer(Experiments {
+                partial_redraw: true,
+                ..experiments
+            });
+            renderer.opaque = opaque;
+            // Full redraws from a renderer of their own, so nothing a partial
+            // frame skips is left behind in shared intermediate textures.
+            let mut reference = experiment_renderer(experiments);
+            reference.opaque = opaque;
+            let tile = spinner(&renderer);
+            assert_eq!(
+                tile,
+                spinner(&reference),
+                "both atlases place the tile alike"
+            );
+            let base = Frame {
+                // Transparent windows clear partial regions to transparent.
+                background: opaque.then_some(0.1),
+                row_hue: 0.3,
+                card_hue: 0.5,
+                hovered: None,
+                triangle_x: 40.0,
+                shadow_x: 300.0,
+                translucent: true,
+                spinner_angle: 0.0,
+            };
+            let hovered = Frame {
+                hovered: Some(2),
+                ..base
+            };
+            let moved = Frame {
+                triangle_x: 47.5,
+                shadow_x: 305.0,
+                ..hovered
+            };
+            let recolored = Frame {
+                row_hue: 0.35,
+                card_hue: 0.45,
+                translucent: false,
+                ..moved
+            };
+            let recolored_back = Frame {
+                row_hue: 0.3,
+                card_hue: 0.5,
+                hovered: Some(3),
+                ..recolored
+            };
+            let frames = [
+                ("first frame", base, "Retained"),
+                ("unchanged", base, "Copy"),
+                (
+                    "hover a row",
+                    Frame {
+                        hovered: Some(1),
+                        ..base
+                    },
+                    "Partial",
+                ),
+                ("hover the next row", hovered, "Partial"),
+                ("unchanged", hovered, "Copy"),
+                (
+                    "move a path",
+                    Frame {
+                        triangle_x: 47.5,
+                        ..hovered
+                    },
+                    "Partial",
+                ),
+                ("move a blurred shadow", moved, "Partial"),
+                (
+                    "remove a translucent quad",
+                    Frame {
+                        translucent: false,
+                        ..moved
+                    },
+                    "Partial",
+                ),
+                (
+                    "rotate a sprite",
+                    Frame {
+                        translucent: false,
+                        spinner_angle: 0.7,
+                        ..moved
+                    },
+                    "Partial",
+                ),
+                ("repaint most of the window", recolored, "Retained"),
+                (
+                    "hover after a large change",
+                    Frame {
+                        hovered: Some(3),
+                        ..recolored
+                    },
+                    "Partial",
+                ),
+                ("a large change", recolored_back, "Retained"),
+                (
+                    "a second large change in a row",
+                    Frame {
+                        hovered: Some(3),
+                        ..recolored
+                    },
+                    "Direct",
+                ),
+                (
+                    "unchanged, retained texture stale",
+                    Frame {
+                        hovered: Some(3),
+                        ..recolored
+                    },
+                    "Retained",
+                ),
+                (
+                    "hover again",
+                    Frame {
+                        hovered: Some(4),
+                        ..recolored
+                    },
+                    "Partial",
+                ),
+            ];
+            for (what, frame, expected) in frames {
+                let scene = partial_redraw_scene(frame, tile);
+                let full = reference.render_scene_to_image(&scene, size).unwrap();
+                let (mode, image) = render_frame(&mut renderer, &scene, size);
+                let kind = format!("{mode:?}");
+                assert!(
+                    kind.starts_with(expected),
+                    "{what} (opaque {opaque}): expected {expected}, got {kind}"
+                );
+                assert_same_pixels(&full, &image, &format!("{what} (opaque {opaque})"));
+            }
+        }
     }
 }
