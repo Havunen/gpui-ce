@@ -55,8 +55,13 @@ use std::{cell::Cell, mem, ptr, sync::Arc};
 struct Experiments {
     path_prepass: bool,
     opaque_quads: bool,
+    /// Rounded opaque quads draw an opaque interior (needs `opaque_quads`).
+    split_rounded: bool,
     skip_paths: bool,
-    // Measurement only: drop a primitive kind to attribute GPU time.
+    // Measurement only: drop a primitive kind to attribute GPU time, or draw
+    // rounded opaque quads without blending (wrong corners) to bound what
+    // splitting them into an opaque interior would save.
+    opaque_rounded: bool,
     skip_shadows: bool,
     skip_quads: bool,
     skip_sprites: bool,
@@ -70,7 +75,9 @@ fn experiments() -> Experiments {
         Experiments {
             path_prepass: !flags.contains(&"no-path-prepass"),
             opaque_quads: !flags.contains(&"no-opaque-quads"),
+            split_rounded: !flags.contains(&"no-split-rounded"),
             skip_paths: flags.contains(&"skip-paths"),
+            opaque_rounded: flags.contains(&"opaque-rounded"),
             skip_shadows: flags.contains(&"skip-shadows"),
             skip_quads: flags.contains(&"skip-quads"),
             skip_sprites: flags.contains(&"skip-sprites"),
@@ -202,8 +209,16 @@ fn plan_path_prepass(scene: &Scene, viewport: Size<DevicePixels>) -> Option<Path
 }
 
 pub(crate) fn quad_is_opaque(quad: &Quad) -> bool {
+    quad_is_opaque_with(quad, false)
+}
+
+fn quad_is_opaque_with(quad: &Quad, ignore_corners: bool) -> bool {
     let zero = |value: ScaledPixels| value.0 == 0.0;
-    let corners = &quad.corner_radii;
+    let corners = if ignore_corners {
+        &Corners::default()
+    } else {
+        &quad.corner_radii
+    };
     let borders = &quad.border_widths;
     let fade = &quad.content_mask.fade_out;
     let mask = &quad.content_mask.bounds;
@@ -228,6 +243,73 @@ pub(crate) fn quad_is_opaque(quad: &Quad) -> bool {
             .background
             .as_solid()
             .is_some_and(|color| color.alpha >= 1.0)
+}
+
+/// Rim of a split rounded quad, in device pixels: twice the shader's
+/// antialiasing band, so every partially covered edge pixel keeps the rounded
+/// shader.
+const SPLIT_QUAD_RIM: f32 = 2.0;
+/// Smaller rounded quads are not worth the extra instances.
+const SPLIT_QUAD_MIN_INTERIOR_AREA: f32 = 64.0 * 64.0;
+
+/// Splits an opaque rounded rectangle so that only its rim blends. Blending a
+/// large rounded card makes the GPU shade every layer beneath it; as an opaque
+/// plain quad its interior lets the tile hardware drop them. The four strips
+/// along the edges, which hold the corners, keep the original quad (bounds,
+/// radii, paint) clipped to each strip by its content mask, so every pixel is
+/// shaded by the same math as before. Interior pixels are at least one
+/// antialiasing band inside the edges and outside the corners, where the
+/// rounded shader returns the fill colour exactly.
+fn split_rounded_opaque_quad(quad: &Quad) -> Option<[Quad; 5]> {
+    let radii = &quad.corner_radii;
+    let (top_left, top_right, bottom_right, bottom_left) = (
+        radii.top_left.0,
+        radii.top_right.0,
+        radii.bottom_right.0,
+        radii.bottom_left.0,
+    );
+    if top_left <= 0.0 && top_right <= 0.0 && bottom_right <= 0.0 && bottom_left <= 0.0 {
+        return None;
+    }
+    if quad.corner_smoothing != 0.0 || !quad_is_opaque_with(quad, true) {
+        return None;
+    }
+    let (x0, y0) = (quad.bounds.origin.x.0, quad.bounds.origin.y.0);
+    let (x1, y1) = (
+        x0 + quad.bounds.size.width.0,
+        y0 + quad.bounds.size.height.0,
+    );
+    let top = top_left.max(top_right).max(SPLIT_QUAD_RIM);
+    let bottom = bottom_left.max(bottom_right).max(SPLIT_QUAD_RIM);
+    let left = top_left.max(bottom_left).max(SPLIT_QUAD_RIM);
+    let right = top_right.max(bottom_right).max(SPLIT_QUAD_RIM);
+    let (inner_x0, inner_y0, inner_x1, inner_y1) = (x0 + left, y0 + top, x1 - right, y1 - bottom);
+    if inner_x1 <= inner_x0
+        || inner_y1 <= inner_y0
+        || (inner_x1 - inner_x0) * (inner_y1 - inner_y0) < SPLIT_QUAD_MIN_INTERIOR_AREA
+    {
+        return None;
+    }
+    let rect = |x0: f32, y0: f32, x1: f32, y1: f32| Bounds {
+        origin: gpui::point(ScaledPixels(x0), ScaledPixels(y0)),
+        size: size(ScaledPixels(x1 - x0), ScaledPixels(y1 - y0)),
+    };
+    let strip = |mask: Bounds<ScaledPixels>| {
+        let mut piece = *quad;
+        piece.content_mask.bounds = mask;
+        piece
+    };
+    let mut interior = *quad;
+    interior.bounds = rect(inner_x0, inner_y0, inner_x1, inner_y1);
+    interior.content_mask.bounds = interior.bounds;
+    interior.corner_radii = Corners::default();
+    Some([
+        strip(rect(x0, y0, x1, inner_y0)),
+        strip(rect(x0, inner_y1, x1, y1)),
+        strip(rect(x0, inner_y0, inner_x0, inner_y1)),
+        strip(rect(inner_x1, inner_y0, x1, inner_y1)),
+        interior,
+    ])
 }
 
 // Use 4x MSAA, all devices support it.
@@ -2071,21 +2153,53 @@ impl MetalRenderer {
         command_encoder.set_render_pipeline_state(pipeline);
         bind_scene_uniforms(command_encoder, scene_uniforms);
 
-        let buffer_contents =
-            unsafe { (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset) };
-        unsafe {
-            ptr::copy_nonoverlapping(quads.as_ptr() as *const u8, buffer_contents, quad_bytes_len);
-        }
-
         if !smoothed && self.experiments.opaque_quads {
+            // Rounded opaque quads become an opaque interior plus blended rims.
+            let mut expanded = Vec::new();
+            if self.experiments.split_rounded {
+                for (index, quad) in quads.iter().enumerate() {
+                    if let Some(pieces) = split_rounded_opaque_quad(quad) {
+                        if expanded.is_empty() {
+                            expanded.reserve(quads.len() + 4);
+                            expanded.extend_from_slice(&quads[..index]);
+                        }
+                        expanded.extend_from_slice(&pieces);
+                    } else if !expanded.is_empty() {
+                        expanded.push(*quad);
+                    }
+                }
+            }
+            let quads: &[Quad] = if expanded.is_empty() {
+                quads
+            } else {
+                &expanded
+            };
+            let quad_bytes_len = mem::size_of_val(quads);
+            let next_offset = *instance_offset + quad_bytes_len;
+            if next_offset > instance_buffer.size {
+                return false;
+            }
+            let buffer_contents = unsafe {
+                (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset)
+            };
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    quads.as_ptr() as *const u8,
+                    buffer_contents,
+                    quad_bytes_len,
+                );
+            }
             // Runs of opaque and blended quads, in order. Opaque fragments
             // overwrite instead of blending, which lets the tile hardware drop
             // fragments a later opaque quad hides.
+            let ignore_corners = self.experiments.opaque_rounded;
             let mut start = 0;
             while start < quads.len() {
-                let opaque = quad_is_opaque(&quads[start]);
+                let opaque = quad_is_opaque_with(&quads[start], ignore_corners);
                 let mut end = start + 1;
-                while end < quads.len() && quad_is_opaque(&quads[end]) == opaque {
+                while end < quads.len()
+                    && quad_is_opaque_with(&quads[end], ignore_corners) == opaque
+                {
                     end += 1;
                 }
                 command_encoder.set_render_pipeline_state(if opaque {
@@ -2111,6 +2225,11 @@ impl MetalRenderer {
             return true;
         }
 
+        let buffer_contents =
+            unsafe { (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset) };
+        unsafe {
+            ptr::copy_nonoverlapping(quads.as_ptr() as *const u8, buffer_contents, quad_bytes_len);
+        }
         bind_instances(
             command_encoder,
             &instance_buffer.metal_buffer,
@@ -2613,7 +2732,14 @@ fn required_instance_buffer_size(scene: &Scene) -> usize {
         };
         match batch {
             PrimitiveBatch::Shadows { range, .. } => reserve(mem::size_of::<Shadow>(), range.len()),
-            PrimitiveBatch::Quads { range, .. } => reserve(mem::size_of::<Quad>(), range.len()),
+            PrimitiveBatch::Quads { range, .. } => {
+                // A split rounded quad takes four more instances.
+                let split = scene.quads[range.clone()]
+                    .iter()
+                    .filter(|quad| split_rounded_opaque_quad(quad).is_some())
+                    .count();
+                reserve(mem::size_of::<Quad>(), range.len() + 4 * split)
+            }
             PrimitiveBatch::Paths {
                 rasterization_vertex_count,
                 sprite_count,
@@ -3671,5 +3797,83 @@ mod tests {
             let image = both.render_scene_to_image(&scene, path_size).unwrap();
             assert_same_pixels(&legacy, &image, what);
         }
+    }
+
+    #[test]
+    fn split_rounded_quads_match_blended_quads() {
+        let size = gpui::size(DevicePixels(240), DevicePixels(200));
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad(rect(0.0, 0.0, 240.0, 200.0), 0.1, 1.0));
+        // A card rounded on its left corners at fractional bounds, the
+        // content card's shape.
+        let mut card = quad(rect(10.25, 12.5, 150.5, 120.75), 0.0, 1.0);
+        card.corner_radii = Corners {
+            top_left: ScaledPixels(16.0),
+            top_right: ScaledPixels(0.0),
+            bottom_right: ScaledPixels(0.0),
+            bottom_left: ScaledPixels(16.0),
+        };
+        scene.insert_primitive(card);
+        // Every corner rounded, with unequal radii.
+        let mut pill = quad(rect(120.0, 100.0, 110.0, 90.0), 0.55, 1.0);
+        pill.corner_radii = Corners {
+            top_left: ScaledPixels(20.0),
+            top_right: ScaledPixels(7.0),
+            bottom_right: ScaledPixels(30.0),
+            bottom_left: ScaledPixels(3.0),
+        };
+        scene.insert_primitive(pill);
+        // Translucent and bordered quads over both, which must still blend.
+        scene.insert_primitive(quad(rect(100.0, 80.0, 60.0, 60.0), 0.8, 0.4));
+        let mut bordered = quad(rect(140.0, 20.0, 80.0, 70.0), 0.3, 1.0);
+        bordered.corner_radii = Corners::all(ScaledPixels(12.0));
+        bordered.border_widths = Edges::all(ScaledPixels(2.0));
+        bordered.border_color = solid_background(hsla(0.0, 0.0, 0.1, 1.0));
+        scene.insert_primitive(bordered);
+        scene.finish();
+
+        let blended = experiment_renderer(Experiments::default())
+            .render_scene_to_image(&scene, size)
+            .unwrap();
+        let split = experiment_renderer(Experiments {
+            opaque_quads: true,
+            split_rounded: true,
+            ..Default::default()
+        })
+        .render_scene_to_image(&scene, size)
+        .unwrap();
+        assert_same_pixels(&blended, &split, "split rounded quads");
+    }
+
+    #[test]
+    fn only_large_opaque_rounded_quads_split() {
+        let mut card = quad(rect(0.0, 0.0, 400.0, 300.0), 0.0, 1.0);
+        card.corner_radii = Corners::all(ScaledPixels(16.0));
+        let pieces = split_rounded_opaque_quad(&card).expect("a large opaque card splits");
+        let area = |bounds: Bounds<ScaledPixels>| bounds.size.width.0 * bounds.size.height.0;
+        let covered: f32 = pieces
+            .iter()
+            .map(|piece| area(piece.content_mask.bounds))
+            .sum();
+        assert_eq!(covered, 400.0 * 300.0, "the pieces tile the quad exactly");
+        assert!(
+            quad_is_opaque(&pieces[4]),
+            "the interior draws without blending"
+        );
+
+        let mut translucent = card;
+        translucent.background = solid_background(hsla(0.0, 0.0, 1.0, 0.5));
+        assert!(split_rounded_opaque_quad(&translucent).is_none());
+        let mut bordered = card;
+        bordered.border_widths = Edges::all(ScaledPixels(1.0));
+        assert!(split_rounded_opaque_quad(&bordered).is_none());
+        let mut small = quad(rect(0.0, 0.0, 40.0, 24.0), 0.0, 1.0);
+        small.corner_radii = Corners::all(ScaledPixels(6.0));
+        assert!(split_rounded_opaque_quad(&small).is_none());
+        let square = quad(rect(0.0, 0.0, 400.0, 300.0), 0.0, 1.0);
+        assert!(
+            split_rounded_opaque_quad(&square).is_none(),
+            "plain quads need no split"
+        );
     }
 }
