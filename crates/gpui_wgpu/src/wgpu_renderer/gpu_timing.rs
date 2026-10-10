@@ -11,6 +11,60 @@ use std::{
 
 const MAX_PASSES: u32 = 256;
 const MAX_PENDING: usize = 8;
+#[cfg(not(target_family = "wasm"))]
+const READBACK_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[cfg(not(target_family = "wasm"))]
+#[derive(Debug, PartialEq, Eq)]
+enum ReadbackError<MapError, PollError> {
+    Map(MapError),
+    Poll(PollError),
+    CallbackDisconnected,
+    Timeout,
+}
+
+/// Queue completion does not prove that a mapping callback has been delivered:
+/// another thread may be dispatching that callback while this worker polls.
+/// Only this observer worker waits; foreground submissions remain nonblocking.
+#[cfg(not(target_family = "wasm"))]
+fn wait_for_map_callback<MapError, PollError>(
+    receiver: &std::sync::mpsc::Receiver<Result<(), MapError>>,
+    timeout: Duration,
+    mut poll: impl FnMut(bool, Duration) -> Result<wgpu::PollStatus, PollError>,
+) -> Result<(), ReadbackError<MapError, PollError>> {
+    use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
+    let deadline = std::time::Instant::now() + timeout;
+    let mut first_poll = true;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(ReadbackError::Timeout);
+        }
+        poll(first_poll, remaining).map_err(ReadbackError::Poll)?;
+        first_poll = false;
+        match receiver.try_recv() {
+            Ok(result) => return result.map_err(ReadbackError::Map),
+            Err(TryRecvError::Disconnected) => {
+                return Err(ReadbackError::CallbackDisconnected);
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(ReadbackError::Timeout);
+        }
+        // Wait briefly for callbacks dispatched by another polling thread, then
+        // poll again to make progress when this worker is the only device poller.
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(1))) {
+            Ok(result) => return result.map_err(ReadbackError::Map),
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(ReadbackError::CallbackDisconnected);
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
 pub(super) struct TimestampPass {
     pub query_set: wgpu::QuerySet,
     pub first: u32,
@@ -44,6 +98,7 @@ pub(super) struct GpuTimings {
     quad_scissor_supported: bool,
     enabled: bool,
     supported: bool,
+    encoder_timestamps: bool,
     backend: String,
     current: RefCell<Option<Frame>>,
     pending: Arc<AtomicUsize>,
@@ -58,7 +113,25 @@ impl GpuTimings {
         backend: String,
         quad_scissor_supported: bool,
     ) -> Self {
-        let enabled = gpu::timings_enabled();
+        Self::new_with_observer(
+            device,
+            queue,
+            backend,
+            quad_scissor_supported,
+            gpu::timings_enabled(),
+        )
+    }
+
+    pub(super) fn new_with_observer(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        backend: String,
+        quad_scissor_supported: bool,
+        enabled: bool,
+    ) -> Self {
+        let encoder_timestamps = device
+            .features()
+            .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
         let supported = device.features().contains(wgpu::Features::TIMESTAMP_QUERY)
             && !cfg!(target_family = "wasm")
             && queue.get_timestamp_period().is_finite()
@@ -81,12 +154,22 @@ impl GpuTimings {
                                 let _ = map_sender.send(result);
                             },
                         );
-                        let result = device.poll(wgpu::PollType::Wait {
-                            submission_index: Some(capture.submission),
-                            timeout: Some(Duration::from_secs(2)),
-                        });
-                        let mapped = map_receiver.try_recv();
-                        if result.is_ok() && matches!(mapped, Ok(Ok(()))) {
+                        let mut submission = Some(capture.submission);
+                        let mapped = wait_for_map_callback(
+                            &map_receiver,
+                            READBACK_TIMEOUT,
+                            |first, remaining| {
+                                device.poll(if first {
+                                    wgpu::PollType::Wait {
+                                        submission_index: submission.take(),
+                                        timeout: Some(remaining),
+                                    }
+                                } else {
+                                    wgpu::PollType::Poll
+                                })
+                            },
+                        );
+                        if mapped.is_ok() {
                             let slice = capture.frame.readback.slice(..bytes);
                             let data = slice.get_mapped_range();
                             let values: Vec<u64> = data
@@ -120,11 +203,12 @@ impl GpuTimings {
                             drop(data);
                             capture.frame.readback.unmap();
                         } else {
+                            // Cancel a still-pending map on timeout/poll failure.
+                            // A late callback cannot turn a failed sample complete.
+                            capture.frame.readback.unmap();
                             capture.frame.event = capture.frame.event.unavailable(
                                 "query-failed",
-                                format!(
-                                    "Timestamp readback failed: poll={result:?}, map={mapped:?}"
-                                ),
+                                format!("Timestamp readback failed: {mapped:?}"),
                             );
                         }
                         if capture.frame.overflow {
@@ -151,6 +235,7 @@ impl GpuTimings {
             quad_scissor_supported,
             enabled,
             supported,
+            encoder_timestamps,
             backend,
             current: RefCell::new(None),
             pending,
@@ -279,6 +364,31 @@ impl GpuTimings {
             last: index * 2 + 1,
         })
     }
+    pub fn can_time_encoder(&self) -> bool {
+        !self.enabled || (self.supported && self.encoder_timestamps && self.worker_available())
+    }
+    pub fn begin_encoder_interval(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        name: &str,
+    ) -> Option<TimestampPass> {
+        if !self.can_time_encoder() {
+            self.cancel("Encoder timestamp queries unavailable for retained copy");
+            return None;
+        }
+        let interval = self.pass(name)?;
+        encoder.write_timestamp(&interval.query_set, interval.first);
+        Some(interval)
+    }
+    pub fn end_encoder_interval(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        interval: Option<TimestampPass>,
+    ) {
+        if let Some(interval) = interval {
+            encoder.write_timestamp(&interval.query_set, interval.last);
+        }
+    }
     pub fn describe_damage(
         &self,
         kind: &str,
@@ -365,5 +475,77 @@ impl GpuTimings {
 impl Drop for GpuTimings {
     fn drop(&mut self) {
         self.cancel("Renderer dropped before submission");
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queue_empty_map_callback_stays_pending_until_delivered() {
+        let (sender, receiver) = std::sync::mpsc::channel::<Result<(), &'static str>>();
+        let mut polls = 0;
+        let result = wait_for_map_callback(&receiver, READBACK_TIMEOUT, |first, _| {
+            polls += 1;
+            assert_eq!(first, polls == 1);
+            if polls == 2 {
+                sender.send(Ok(())).unwrap();
+            } else {
+                assert!(matches!(
+                    receiver.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ));
+            }
+            Ok::<_, &'static str>(wgpu::PollStatus::QueueEmpty)
+        });
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            polls, 2,
+            "QueueEmpty with an undelivered callback is pending"
+        );
+    }
+
+    #[test]
+    fn map_callback_and_poll_errors_and_disconnect_remain_failures() {
+        let (sender, receiver) = std::sync::mpsc::channel::<Result<(), &'static str>>();
+        let mut polls = 0;
+        let result = wait_for_map_callback(&receiver, READBACK_TIMEOUT, |_, _| {
+            polls += 1;
+            if polls == 2 {
+                sender.send(Err("mapping failed")).unwrap();
+            }
+            Ok::<_, &'static str>(wgpu::PollStatus::QueueEmpty)
+        });
+        assert_eq!(result, Err(ReadbackError::Map("mapping failed")));
+        assert_eq!(polls, 2, "map failure after pending must stay a failure");
+
+        assert_eq!(
+            wait_for_map_callback(&receiver, READBACK_TIMEOUT, |_, _| {
+                Err::<wgpu::PollStatus, _>("device lost")
+            }),
+            Err(ReadbackError::Poll("device lost"))
+        );
+
+        drop(sender);
+        assert_eq!(
+            wait_for_map_callback(&receiver, READBACK_TIMEOUT, |_, _| {
+                Ok::<_, &'static str>(wgpu::PollStatus::QueueEmpty)
+            }),
+            Err(ReadbackError::CallbackDisconnected)
+        );
+    }
+
+    #[test]
+    fn undelivered_map_callback_has_a_bounded_timeout() {
+        let (_sender, receiver) = std::sync::mpsc::channel::<Result<(), &'static str>>();
+        let timeout = Duration::from_millis(2);
+        let began = std::time::Instant::now();
+        let result = wait_for_map_callback(&receiver, timeout, |_, remaining| {
+            assert!(remaining <= timeout);
+            Ok::<_, &'static str>(wgpu::PollStatus::QueueEmpty)
+        });
+        assert_eq!(result, Err(ReadbackError::Timeout));
+        assert!(began.elapsed() >= timeout);
     }
 }

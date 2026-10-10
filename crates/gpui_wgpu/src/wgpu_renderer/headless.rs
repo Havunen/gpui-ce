@@ -56,7 +56,13 @@ impl WgpuRenderer {
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: self.target.format(),
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::COPY_SRC
+                    | if self.target.retained_copy_enabled() {
+                        wgpu::TextureUsages::COPY_DST
+                    } else {
+                        wgpu::TextureUsages::empty()
+                    },
                 view_formats: &[],
             });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -195,9 +201,14 @@ impl WgpuHeadlessRenderer {
     ) -> anyhow::Result<()> {
         self.ensure_target(size)?;
         let target = self.target.as_ref().expect("target was just ensured");
-        let submission =
-            super::frame::render_to_view(&mut self.renderer, scene, &target.view, None)
-                .ok_or_else(|| anyhow::anyhow!("failed to render headless scene"))?;
+        let submission = super::frame::render_to_view(
+            &mut self.renderer,
+            scene,
+            &target.view,
+            Some(&target.texture),
+            None,
+        )
+        .ok_or_else(|| anyhow::anyhow!("failed to render headless scene"))?;
         self.renderer
             .resources()
             .device
@@ -229,7 +240,8 @@ impl gpui::PlatformHeadlessRenderer for WgpuHeadlessRenderer {
         self.ensure_target(size)?;
         let target = self.target.as_ref().expect("target was just ensured");
         anyhow::ensure!(
-            self.renderer.render_to_view(scene, &target.view),
+            self.renderer
+                .render_to_texture(scene, &target.texture, &target.view),
             "failed to render headless scene"
         );
         Ok(())
@@ -728,6 +740,567 @@ mod path_target_tests {
                 assert!(image.pixels().any(|pixel| pixel[3] > 0 && pixel[3] < 255));
             }
             previous = row;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn retained_damage_clear_prewarm_precedes_partial_and_tracks_pipeline_generation()
+    -> anyhow::Result<()> {
+        let _gpu_test_guard = crate::test_gpu::guard();
+        let context = WgpuContext::new_headless(None)?;
+        let adapter = context.adapter.get_info();
+        assert_eq!(adapter.backend, wgpu::Backend::Dx12);
+        assert!(
+            matches!(
+                adapter.device_type,
+                wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::DiscreteGpu
+            ),
+            "prewarm proof requires hardware DX12: {adapter:?}"
+        );
+        let target = size(DevicePixels(201), DevicePixels(103));
+        let mut full = WgpuRenderer::new_headless(&context, target)?;
+        let mut retained = WgpuRenderer::new_headless(&context, target)?;
+        full.retained.disable_for_tests();
+        retained.retained.disable_for_tests();
+        full.update_transparency(true);
+        retained.update_transparency(true);
+        full.timings.diagnostic_ablations = Default::default();
+        retained.timings.diagnostic_ablations = Default::default();
+        let resting = empty_transparent_hover_scene(None);
+        assert_retained_rgba(
+            &mut full,
+            &mut retained,
+            &resting,
+            1,
+            "full",
+            "shipping flags off",
+        )?;
+        assert!(
+            retained.resources().pipelines.damage_clear_quads.is_none(),
+            "default rendering must not create the experimental clear PSO"
+        );
+        retained.retained.enable_for_tests();
+        {
+            let _scope = gpui::profiler::gpu::set_gpu_frame_context(
+                Some("inactive-prewarm-test".into()),
+                false,
+                1,
+                1,
+            );
+            assert_eq!(
+                retained.render_to_image(&resting)?,
+                full.render_to_image(&resting)?
+            );
+        }
+        assert!(
+            retained.resources().pipelines.damage_clear_quads.is_none(),
+            "inactive-window fallback must not prewarm"
+        );
+        {
+            let _budget = gpui::profiler::gpu::reserve_retained_bytes(
+                "wgpu",
+                Arc::as_ptr(&context.device) as usize,
+                gpui::profiler::gpu::RETAINED_DEVICE_LIMIT,
+            )
+            .expect("the private device has no retained textures yet");
+            assert_retained_rgba(
+                &mut full,
+                &mut retained,
+                &resting,
+                1,
+                "full",
+                "budget fallback",
+            )?;
+            assert!(
+                retained.resources().pipelines.damage_clear_quads.is_none(),
+                "budget fallback must not create a PSO for an unallocated retained texture"
+            );
+        }
+        assert_retained_rgba(
+            &mut full,
+            &mut retained,
+            &resting,
+            1,
+            "full",
+            "qualified retained initialization",
+        )?;
+        let warmed = (**retained
+            .resources()
+            .pipelines
+            .damage_clear_quads
+            .as_ref()
+            .expect("the qualified Full must create the clear PSO before any Partial"))
+        .clone();
+        let hovered = empty_transparent_hover_scene(Some(0));
+        for damage in ["partial", "reuse"] {
+            assert_retained_rgba(
+                &mut full,
+                &mut retained,
+                &hovered,
+                2,
+                damage,
+                "warm first hover",
+            )?;
+            assert_eq!(
+                &**retained
+                    .resources()
+                    .pipelines
+                    .damage_clear_quads
+                    .as_ref()
+                    .unwrap(),
+                &warmed,
+                "Partial/Reuse must reuse the prewarmed pipeline handle"
+            );
+        }
+        for renderer in [&mut full, &mut retained] {
+            renderer.update_drawable_size(size(DevicePixels(203), DevicePixels(105)));
+        }
+        assert_retained_rgba(
+            &mut full,
+            &mut retained,
+            &hovered,
+            2,
+            "full",
+            "same-format resize",
+        )?;
+        assert_eq!(
+            &**retained
+                .resources()
+                .pipelines
+                .damage_clear_quads
+                .as_ref()
+                .unwrap(),
+            &warmed,
+            "same-format resize must not recreate the clear PSO"
+        );
+        for renderer in [&mut full, &mut retained] {
+            renderer
+                .target
+                .set_format_for_tests(wgpu::TextureFormat::Rgba8Unorm);
+            renderer.rebuild_pipelines();
+        }
+        assert!(retained.resources().pipelines.damage_clear_quads.is_none());
+        assert_retained_rgba(
+            &mut full,
+            &mut retained,
+            &hovered,
+            2,
+            "full",
+            "format generation rebuild",
+        )?;
+        let rebuilt = (**retained
+            .resources()
+            .pipelines
+            .damage_clear_quads
+            .as_ref()
+            .unwrap())
+        .clone();
+        assert_ne!(
+            rebuilt, warmed,
+            "format rebuild must create a pipeline for the new target format"
+        );
+        assert_retained_rgba(
+            &mut full,
+            &mut retained,
+            &empty_transparent_hover_scene(Some(1)),
+            3,
+            "partial",
+            "new format first hover",
+        )?;
+        assert_eq!(
+            &**retained
+                .resources()
+                .pipelines
+                .damage_clear_quads
+                .as_ref()
+                .unwrap(),
+            &rebuilt
+        );
+
+        let fresh_context = WgpuContext::new_headless(None)?;
+        let adapter = fresh_context.adapter.get_info();
+        assert_eq!(adapter.backend, wgpu::Backend::Dx12);
+        assert!(
+            matches!(
+                adapter.device_type,
+                wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::DiscreteGpu
+            ),
+            "recreated device proof requires hardware DX12: {adapter:?}"
+        );
+        let mut recreated =
+            WgpuRenderer::new_headless(&fresh_context, size(DevicePixels(203), DevicePixels(105)))?;
+        recreated.retained.enable_for_tests();
+        recreated.update_transparency(true);
+        recreated.timings.diagnostic_ablations = Default::default();
+        assert!(
+            recreated.resources().pipelines.damage_clear_quads.is_none(),
+            "a new device must not reuse a pipeline belonging to the previous device"
+        );
+        assert_retained_rgba(
+            &mut full,
+            &mut recreated,
+            &resting,
+            1,
+            "full",
+            "device recreation qualified Full",
+        )?;
+        let recreated_pipeline = (**recreated
+            .resources()
+            .pipelines
+            .damage_clear_quads
+            .as_ref()
+            .unwrap())
+        .clone();
+        assert_ne!(recreated_pipeline, rebuilt);
+        assert_retained_rgba(
+            &mut full,
+            &mut recreated,
+            &hovered,
+            2,
+            "partial",
+            "recreated device first hover",
+        )?;
+        assert_eq!(
+            &**recreated
+                .resources()
+                .pipelines
+                .damage_clear_quads
+                .as_ref()
+                .unwrap(),
+            &recreated_pipeline
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn retained_copy_full_partial_reuse_preserves_exact_rgba_and_odd_extents() -> anyhow::Result<()>
+    {
+        let _gpu_test_guard = crate::test_gpu::guard();
+        let requirements = crate::WgpuDeviceRequirements {
+            features: wgpu::Features::TIMESTAMP_QUERY
+                | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS,
+            ..Default::default()
+        };
+        let context = WgpuContext::new_headless(Some(&requirements))?;
+        let adapter = context.adapter.get_info();
+        assert_eq!(
+            adapter.backend,
+            wgpu::Backend::Dx12,
+            "this fixture must exercise the native DX12 copy implementation"
+        );
+        assert!(
+            matches!(
+                adapter.device_type,
+                wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::DiscreteGpu
+            ),
+            "mandatory copy pixels require hardware; CPU/WARP/unknown adapters do not qualify: {adapter:?}"
+        );
+        for format in [
+            wgpu::TextureFormat::Bgra8Unorm,
+            wgpu::TextureFormat::Rgba8Unorm,
+        ] {
+            for transparent in [false, true] {
+                let target = size(DevicePixels(201), DevicePixels(103));
+                let mut full = WgpuRenderer::new_headless(&context, target)?;
+                let mut retained = WgpuRenderer::new_headless(&context, target)?;
+                full.retained.disable_for_tests();
+                retained.retained.enable_for_tests();
+                for renderer in [&mut full, &mut retained] {
+                    renderer.timings.diagnostic_ablations = Default::default();
+                    renderer.target.set_format_for_tests(format);
+                    renderer.rebuild_pipelines();
+                    renderer.update_transparency(transparent);
+                }
+                retained.target.enable_retained_copy_for_tests();
+                assert!(
+                    retained
+                        .profile_capabilities()
+                        .active_experiments
+                        .iter()
+                        .any(|flag| flag == "retained-copy")
+                );
+                let glyph = retained_glyph_tile(&full)?;
+                assert_eq!(glyph, retained_glyph_tile(&retained)?);
+                let mut revision = 0;
+                let mut previous = None;
+                for (index, row) in [None, None, Some(0), Some(0), Some(2), Some(1), None, None]
+                    .into_iter()
+                    .enumerate()
+                {
+                    if index == 0 || row != previous {
+                        revision += 1;
+                    }
+                    let scene =
+                        transparent_composite_hover_scene(row, 0.25, 0.65, 0.45, glyph, Some(true));
+                    let label = format!(
+                        "copy format={format:?} alpha={transparent}, step={index}, row={row:?}"
+                    );
+                    let image = assert_retained_rgba(
+                        &mut full,
+                        &mut retained,
+                        &scene,
+                        revision,
+                        if index == 0 {
+                            "full"
+                        } else if row == previous {
+                            "reuse"
+                        } else {
+                            "partial"
+                        },
+                        &label,
+                    )?;
+                    assert_eq!(
+                        retained.last_retained_presentation, "copy",
+                        "{label}: no silent shader fallback"
+                    );
+                    if transparent {
+                        assert_eq!(
+                            *image.get_pixel(200, 102),
+                            image::Rgba([0, 0, 0, 0]),
+                            "{label}: untouched transparent corner"
+                        );
+                        assert!(image.pixels().any(|pixel| pixel[3] > 0 && pixel[3] < 255));
+                    }
+                    previous = row;
+                }
+                let scene =
+                    transparent_composite_hover_scene(None, 0.25, 0.65, 0.45, glyph, Some(true));
+                full.update_drawable_size(size(DevicePixels(203), DevicePixels(105)));
+                retained.update_drawable_size(size(DevicePixels(203), DevicePixels(105)));
+                for damage in ["full", "reuse"] {
+                    assert_retained_rgba(
+                        &mut full,
+                        &mut retained,
+                        &scene,
+                        revision,
+                        damage,
+                        "odd resize invalidation",
+                    )?;
+                    assert_eq!(retained.last_retained_presentation, "copy");
+                }
+                full.update_transparency(!transparent);
+                retained.update_transparency(!transparent);
+                for damage in ["full", "reuse"] {
+                    assert_retained_rgba(
+                        &mut full,
+                        &mut retained,
+                        &scene,
+                        revision,
+                        damage,
+                        "alpha transition",
+                    )?;
+                    assert_eq!(retained.last_retained_presentation, "copy");
+                }
+                retained.release_retained_frame();
+                assert_retained_rgba(
+                    &mut full,
+                    &mut retained,
+                    &scene,
+                    revision,
+                    "full",
+                    "released texture rebuild",
+                )?;
+                assert_eq!(retained.last_retained_presentation, "copy");
+
+                // A view-only caller cannot safely infer its underlying texture.
+                let target = retained.create_offscreen_target();
+                let _scope = gpui::profiler::gpu::set_gpu_frame_context(
+                    Some("view-only-copy-fallback".into()),
+                    true,
+                    revision,
+                    revision,
+                );
+                let submission = super::super::frame::render_to_view(
+                    &mut retained,
+                    &scene,
+                    &target.view,
+                    None,
+                    Some(target.readback_copy()),
+                )
+                .unwrap();
+                assert_eq!(
+                    retained.read_offscreen_target(&target, submission)?,
+                    full.render_to_image(&scene)?
+                );
+                assert_eq!(retained.last_retained_presentation, "blit");
+
+                retained.target.disable_retained_copy_for_tests();
+                let target = retained.create_offscreen_target();
+                retained.target.enable_retained_copy_for_tests();
+                assert!(
+                    !target
+                        .texture
+                        .usage()
+                        .contains(wgpu::TextureUsages::COPY_DST)
+                );
+                let submission = super::super::frame::render_to_view(
+                    &mut retained,
+                    &scene,
+                    &target.view,
+                    Some(&target.texture),
+                    Some(target.readback_copy()),
+                )
+                .unwrap();
+                assert_eq!(
+                    retained.read_offscreen_target(&target, submission)?,
+                    full.render_to_image(&scene)?
+                );
+                assert_eq!(
+                    retained.last_retained_presentation, "blit",
+                    "a texture without COPY_DST must not be copied"
+                );
+
+                // Surface replacement must drop unsupported COPY_DST usage and capability.
+                retained
+                    .target
+                    .update_surface_copy_support(wgpu::TextureUsages::RENDER_ATTACHMENT, &[format]);
+                assert!(
+                    !retained
+                        .profile_capabilities()
+                        .active_experiments
+                        .iter()
+                        .any(|flag| flag == "retained-copy")
+                );
+                assert!(
+                    !retained
+                        .target
+                        .configuration()
+                        .usage
+                        .contains(wgpu::TextureUsages::COPY_DST)
+                );
+                assert_retained_rgba(
+                    &mut full,
+                    &mut retained,
+                    &scene,
+                    revision,
+                    "full",
+                    "replacement without copy support",
+                )?;
+                assert_eq!(retained.last_retained_presentation, "blit");
+                retained.target.update_surface_copy_support(
+                    wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST,
+                    &[format],
+                );
+                assert_retained_rgba(
+                    &mut full,
+                    &mut retained,
+                    &scene,
+                    revision,
+                    "full",
+                    "replacement restores copy support",
+                )?;
+                assert_eq!(retained.last_retained_presentation, "copy");
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn retained_copy_timestamps_cover_full_partial_and_copy_only_reuse() -> anyhow::Result<()> {
+        let _gpu_test_guard = crate::test_gpu::guard();
+        let requirements = crate::WgpuDeviceRequirements {
+            features: wgpu::Features::TIMESTAMP_QUERY
+                | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS,
+            ..Default::default()
+        };
+        let context = WgpuContext::new_headless(Some(&requirements))?;
+        let adapter = context.adapter.get_info();
+        assert_eq!(adapter.backend, wgpu::Backend::Dx12);
+        assert!(
+            matches!(
+                adapter.device_type,
+                wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::DiscreteGpu
+            ),
+            "mandatory copy queries require hardware; CPU/WARP/unknown adapters do not qualify: {adapter:?}"
+        );
+        let mut retained =
+            WgpuRenderer::new_headless(&context, size(DevicePixels(201), DevicePixels(103)))?;
+        retained.retained.enable_for_tests();
+        retained.update_transparency(true);
+        retained.target.enable_retained_copy_for_tests();
+        retained.timings = super::super::gpu_timing::GpuTimings::new_with_observer(
+            context.device.clone(),
+            context.queue.clone(),
+            "wgpu-dx12".into(),
+            true,
+            true,
+        );
+        let renderer_id = retained.timings.renderer_id;
+        for (submission, row, revision, damage) in [
+            (101, None, 1, "full"),
+            (102, Some(0), 2, "partial"),
+            (103, Some(0), 2, "reuse"),
+        ] {
+            let _scope = gpui::profiler::gpu::set_gpu_frame_context(
+                Some("retained-copy-timestamp-test".into()),
+                true,
+                submission,
+                revision,
+            );
+            retained.render_to_image(&empty_transparent_hover_scene(row))?;
+            assert_eq!(retained.last_retained_presentation, "copy");
+            assert_eq!(retained.retained.last_damage(), damage);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut events = Vec::new();
+        while events.len() < 3 && std::time::Instant::now() < deadline {
+            let (drained, dropped) = gpui::profiler::gpu::take_gpu_events();
+            assert_eq!(dropped, 0, "timing events must not be silently discarded");
+            events.extend(
+                drained
+                    .into_iter()
+                    .filter(|event| event.renderer_id == renderer_id),
+            );
+            if events.len() < 3 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        events.sort_by_key(|event| event.submission_id);
+        assert_eq!(
+            events.len(),
+            3,
+            "every copy must have an asynchronous timing event"
+        );
+        for (event, (submission, revision, damage)) in
+            events
+                .iter()
+                .zip([(101, 1, "full"), (102, 2, "partial"), (103, 2, "reuse")])
+        {
+            assert_eq!(event.status, "complete", "{:?}", event.reason);
+            assert_eq!(
+                event.window.as_deref(),
+                Some("retained-copy-timestamp-test")
+            );
+            assert_eq!(
+                (event.submission_id, event.scene_revision),
+                (submission, revision)
+            );
+            assert_eq!(event.damage_kind, damage);
+            assert!(event.elapsed_ns.is_some_and(|elapsed| elapsed > 0));
+            assert_eq!(
+                event.passes.last().map(|pass| pass.name.as_str()),
+                Some("scene_copy")
+            );
+            assert_eq!(
+                event
+                    .passes
+                    .iter()
+                    .filter(|pass| pass.name == "scene_copy")
+                    .count(),
+                1
+            );
+            assert!(event.passes.last().unwrap().elapsed_ns > 0);
+            if damage == "reuse" {
+                assert_eq!(
+                    event.passes.len(),
+                    1,
+                    "Reuse must time its only copy command"
+                );
+            }
         }
         Ok(())
     }

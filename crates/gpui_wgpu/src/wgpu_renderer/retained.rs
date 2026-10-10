@@ -14,17 +14,19 @@ pub(super) struct RetainedFrame {
     last_damage: &'static str,
 }
 struct Target {
-    _texture: wgpu::Texture,
+    texture: wgpu::Texture,
     view: wgpu::TextureView,
     width: u32,
     height: u32,
     format: wgpu::TextureFormat,
     alpha_mode: wgpu::CompositeAlphaMode,
     clear_color: wgpu::Color,
+    copy_source: bool,
     reservation: GpuMemoryReservation,
 }
 pub(super) struct RetainedPlan {
     pub view: Option<wgpu::TextureView>,
+    pub copy_texture: Option<wgpu::Texture>,
     pub damage: Damage,
     pub snapshot: Option<SceneSnapshot>,
     pub bytes: u64,
@@ -79,6 +81,7 @@ impl RetainedFrame {
         width: u32,
         height: u32,
         eligible: bool,
+        copy_source: bool,
         device: &Arc<wgpu::Device>,
         queue: &Arc<wgpu::Queue>,
         format: wgpu::TextureFormat,
@@ -88,6 +91,7 @@ impl RetainedFrame {
         if !self.enabled {
             return RetainedPlan {
                 view: None,
+                copy_texture: None,
                 damage: Damage::Full,
                 snapshot: None,
                 bytes: 0,
@@ -101,6 +105,7 @@ impl RetainedFrame {
         let context = gpu::gpu_frame_context();
         let full = |reason| RetainedPlan {
             view: None,
+            copy_texture: None,
             damage: Damage::Full,
             snapshot: None,
             bytes: 0,
@@ -144,6 +149,7 @@ impl RetainedFrame {
                 || target.format != format
                 || target.alpha_mode != alpha_mode
                 || target.clear_color != clear_color
+                || target.copy_source != copy_source
         }) {
             target_change = Some("target-configuration-change");
             self.invalidate(queue);
@@ -157,6 +163,7 @@ impl RetainedFrame {
             if let Some(target) = &self.target {
                 return RetainedPlan {
                     view: Some(target.view.clone()),
+                    copy_texture: copy_source.then(|| target.texture.clone()),
                     damage: Damage::Reuse,
                     snapshot: None,
                     bytes: target.reservation.bytes,
@@ -196,18 +203,24 @@ impl RetainedFrame {
                 dimension: wgpu::TextureDimension::D2,
                 format,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | if copy_source {
+                        wgpu::TextureUsages::COPY_SRC
+                    } else {
+                        wgpu::TextureUsages::empty()
+                    },
                 view_formats: &[],
             });
             let view = texture.create_view(&Default::default());
             self.target = Some(Target {
-                _texture: texture,
+                texture,
                 view,
                 width,
                 height,
                 format,
                 alpha_mode,
                 clear_color,
+                copy_source,
                 reservation,
             });
         }
@@ -246,6 +259,7 @@ impl RetainedFrame {
         let target = self.target.as_ref().unwrap();
         RetainedPlan {
             view: Some(target.view.clone()),
+            copy_texture: copy_source.then(|| target.texture.clone()),
             damage,
             snapshot: Some(snapshot),
             bytes: target.reservation.bytes,

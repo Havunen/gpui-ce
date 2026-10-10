@@ -19,6 +19,7 @@ pub(super) fn render_to_view(
     renderer: &mut WgpuRenderer,
     scene: &Scene,
     frame_view: &wgpu::TextureView,
+    frame_texture: Option<&wgpu::Texture>,
     readback: Option<ReadbackCopy<'_>>,
 ) -> Option<wgpu::SubmissionIndex> {
     renderer.timings.begin(&renderer.resources().device);
@@ -40,27 +41,61 @@ pub(super) fn render_to_view(
         renderer.target.width(),
         renderer.target.height(),
         !renderer.timings.diagnostic_ablations.enabled(),
+        renderer.target.retained_copy_enabled() && renderer.timings.can_time_encoder(),
         &device,
         &queue,
         renderer.target.format(),
         renderer.target.configuration().alpha_mode,
         renderer.target.clear_color(),
     );
+    let retained_copy = if renderer.target.retained_copy_enabled()
+        && renderer.timings.can_time_encoder()
+        && targets.offscreen.is_none()
+    {
+        retained
+            .copy_texture
+            .as_ref()
+            .zip(frame_texture)
+            .filter(|(source, destination)| {
+                super::retained_copy::compatible(
+                    source,
+                    destination,
+                    renderer.target.format(),
+                    renderer.target.width(),
+                    renderer.target.height(),
+                    renderer.target.alpha_mode(),
+                )
+            })
+            .map(|(source, destination)| (source.clone(), destination.clone()))
+    } else {
+        None
+    };
     if let Some(view) = &retained.view {
         targets.active = view.clone();
-        // Retention introduces a final presentation copy even when the scene has
-        // no filters. Its BlurUniforms slot must be staged before encoding.
-        let mut uniforms =
-            FrameRequirements::for_scene(scene, renderer.resources().instances.transport())
-                .uniforms;
-        uniforms.filter_count = uniforms.filter_count.saturating_add(1);
-        if !renderer.ensure_uniform_capacity(uniforms) {
-            renderer
-                .timings
-                .cancel("Retained presentation uniform upload unavailable");
-            renderer.retained.invalidate(&queue);
-            return None;
+        // The sampled presentation fallback needs a BlurUniforms slot even
+        // without filters. A texture copy has no shader-uniform upload.
+        if retained_copy.is_none() {
+            let mut uniforms =
+                FrameRequirements::for_scene(scene, renderer.resources().instances.transport())
+                    .uniforms;
+            uniforms.filter_count = uniforms.filter_count.saturating_add(1);
+            if !renderer.ensure_uniform_capacity(uniforms) {
+                renderer
+                    .timings
+                    .cancel("Retained presentation uniform upload unavailable");
+                renderer.retained.invalidate(&queue);
+                return None;
+            }
         }
+    }
+    // Create the overwrite-clear PSO while a qualified retained Full frame is
+    // being initialized. Its first use must not compile a pipeline on hover.
+    // Ineligible scenes and exhausted retained budgets have no retained view.
+    if retained.view.is_some() && retained.damage == Damage::Full {
+        renderer
+            .resources_mut()
+            .pipelines
+            .ensure_damage_clear(&device);
     }
     let mut experiments = Vec::new();
     if renderer.crop_path_targets {
@@ -68,6 +103,9 @@ pub(super) fn render_to_view(
     }
     if renderer.retained.enabled() && !renderer.timings.diagnostic_ablations.enabled() {
         experiments.push("partial-redraw".into());
+        if renderer.target.retained_copy_enabled() && renderer.timings.can_time_encoder() {
+            experiments.push("retained-copy".into());
+        }
     }
     renderer.timings.describe_damage(
         retained.damage.kind(),
@@ -114,10 +152,27 @@ pub(super) fn render_to_view(
     // texture that reappears after an intervening primitive and recreate its platform view.
     renderer.retain_surface_cache(&scene.surfaces);
 
-    let retained_blit = retained.view.is_some();
+    let retained_blit = retained.view.is_some() && retained_copy.is_none();
+    #[cfg(test)]
+    {
+        renderer.last_retained_presentation = if retained_copy.is_some() {
+            "copy"
+        } else if retained_blit {
+            "blit"
+        } else {
+            "direct"
+        };
+    }
     let damage_kind = retained.damage.kind();
-    let result = FrameEncoder::new(renderer, scene, targets, retained.damage, retained_blit)
-        .encode(readback);
+    let result = FrameEncoder::new(
+        renderer,
+        scene,
+        targets,
+        retained.damage,
+        retained_blit,
+        retained_copy,
+    )
+    .encode(readback);
     renderer.retained.complete(
         retained.snapshot,
         retained.scene_revision,
@@ -674,6 +729,7 @@ struct FrameEncoder<'a> {
     instances: InstanceUpload,
     damage: Damage,
     retained_blit: bool,
+    retained_copy: Option<(wgpu::Texture, wgpu::Texture)>,
 }
 
 impl<'a> FrameEncoder<'a> {
@@ -683,6 +739,7 @@ impl<'a> FrameEncoder<'a> {
         targets: PreparedTargets,
         damage: Damage,
         retained_blit: bool,
+        retained_copy: Option<(wgpu::Texture, wgpu::Texture)>,
     ) -> Self {
         let encoder =
             renderer
@@ -701,6 +758,7 @@ impl<'a> FrameEncoder<'a> {
             instances: targets.instances,
             damage,
             retained_blit,
+            retained_copy,
         }
     }
 
@@ -710,6 +768,24 @@ impl<'a> FrameEncoder<'a> {
     ) -> Result<wgpu::CommandBuffer, DrawError> {
         let result = self.encode_commands();
         if result.is_ok() {
+            if let Some((source, destination)) = &self.retained_copy {
+                let interval = self
+                    .renderer
+                    .timings
+                    .begin_encoder_interval(&mut self.encoder, "scene_copy");
+                self.encoder.copy_texture_to_texture(
+                    source.as_image_copy(),
+                    destination.as_image_copy(),
+                    wgpu::Extent3d {
+                        width: self.renderer.target.width(),
+                        height: self.renderer.target.height(),
+                        depth_or_array_layers: 1,
+                    },
+                );
+                self.renderer
+                    .timings
+                    .end_encoder_interval(&mut self.encoder, interval);
+            }
             if self.retained_blit {
                 self.renderer.blit_to_frame(
                     &mut self.encoder,

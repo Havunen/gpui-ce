@@ -27,6 +27,7 @@ mod platform;
 pub use platform::RecoveryPending;
 mod resources;
 mod retained;
+pub(crate) mod retained_copy;
 mod settings;
 mod surfaces;
 mod target;
@@ -78,6 +79,8 @@ pub struct WgpuRenderer {
     faults: GpuFaultState,
     timings: gpu_timing::GpuTimings,
     retained: retained::RetainedFrame,
+    #[cfg(test)]
+    last_retained_presentation: &'static str,
 }
 
 impl WgpuRenderer {
@@ -102,15 +105,28 @@ impl WgpuRenderer {
         extra_requirements: Option<WgpuDeviceRequirements>,
         atlas: Arc<WgpuAtlas>,
     ) -> anyhow::Result<Self> {
-        let target =
-            RenderTarget::new(&context.adapter, &context.device, surface.as_ref(), config)?;
+        let adapter_info = context.adapter.get_info();
+        let target = RenderTarget::new(
+            &context.adapter,
+            &context.device,
+            surface.as_ref(),
+            config,
+            adapter_info.backend,
+        )?;
+        if cfg!(target_os = "windows")
+            && gpui::profiler::gpu::experiment_enabled("retained-copy")
+            && !target.retained_copy_enabled()
+        {
+            log::warn!(
+                "retained-copy was rejected: it requires partial-redraw, Windows DX12, a COPY_DST non-sRGB BGRA8/RGBA8 target, supported alpha and encoder timestamps when observing, without diagnostic ablations"
+            );
+        }
         if let Some(surface) = surface.as_ref() {
             surface.configure(&context.device, target.configuration());
         }
 
         let dual_source_blending = context.supports_dual_source_blending();
         let rendering_params = RenderingParameters::new(&context.adapter, target.format());
-        let adapter_info = context.adapter.get_info();
         let (resources, metadata) = WgpuResources::new(
             context,
             surface,
@@ -147,6 +163,8 @@ impl WgpuRenderer {
             uploaded_globals: None,
             timings,
             retained: retained::RetainedFrame::new(),
+            #[cfg(test)]
+            last_retained_presentation: "direct",
             faults: GpuFaultState {
                 pending_error: last_error,
                 consecutive_failed_frames: 0,
@@ -321,6 +339,14 @@ impl WgpuRenderer {
             capabilities
                 .active_experiments
                 .push("partial-redraw".into());
+            if self.target.retained_copy_enabled() && self.timings.can_time_encoder() {
+                capabilities.active_experiments.push("retained-copy".into());
+            }
+        }
+        if self.target.retained_copy_supported() && self.timings.can_time_encoder() {
+            capabilities
+                .implemented_experiments
+                .push("retained-copy".into());
         }
         capabilities.active_experiments.sort_unstable();
         capabilities
@@ -340,11 +366,14 @@ impl WgpuRenderer {
         self.target.maximum_dimension()
     }
 
-    /// Encodes and submits a complete scene into an arbitrary color target.
-    /// Swapchain drawing, window capture, and headless rendering all use this path so
-    /// platform integrations can't diverge in batching, filters, or pipeline state.
-    fn render_to_view(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> bool {
-        frame::render_to_view(self, scene, frame_view, None).is_some()
+    /// Encodes through the shared scene path with the exact presentation texture.
+    fn render_to_texture(
+        &mut self,
+        scene: &Scene,
+        texture: &wgpu::Texture,
+        view: &wgpu::TextureView,
+    ) -> bool {
+        frame::render_to_view(self, scene, view, Some(texture), None).is_some()
     }
 
     #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
@@ -354,7 +383,13 @@ impl WgpuRenderer {
         frame_view: &wgpu::TextureView,
         readback: frame::ReadbackCopy<'_>,
     ) -> Option<wgpu::SubmissionIndex> {
-        frame::render_to_view(self, scene, frame_view, Some(readback))
+        frame::render_to_view(
+            self,
+            scene,
+            frame_view,
+            Some(readback.texture),
+            Some(readback),
+        )
     }
 }
 

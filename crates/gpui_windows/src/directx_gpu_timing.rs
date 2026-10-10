@@ -100,6 +100,11 @@ pub(super) struct GpuTimings {
 }
 impl GpuTimings {
     pub fn new() -> Self {
+        if gpu::experiment_enabled("retained-copy") {
+            log::warn!(
+                "retained-copy was rejected: this experiment is unsupported by Windows D3D11"
+            );
+        }
         Self {
             diagnostic_ablations: gpu::DiagnosticAblations::from_environment(),
             clipped_quads: gpu::experiment_enabled("clipped-quads"),
