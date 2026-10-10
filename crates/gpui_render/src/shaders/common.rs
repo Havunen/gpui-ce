@@ -180,6 +180,16 @@ mod source {
         pub fn center(bounds: Bounds) -> Vec2f {
             bounds.origin + Bounds::half_size(bounds)
         }
+
+        /// The overlap of two bounds, empty (zero size) when they are disjoint.
+        pub fn intersect(a: Bounds, b: Bounds) -> Bounds {
+            let origin = max(a.origin, b.origin);
+            let end = max(min(a.origin + a.size, b.origin + b.size), origin);
+            Bounds {
+                origin,
+                size: end - origin,
+            }
+        }
     }
 
     #[repr(C)]
