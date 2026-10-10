@@ -40,6 +40,196 @@ use wgsl_rs::std::{vec2f, vec4f};
 
 use std::{cell::Cell, mem, ptr, sync::Arc};
 
+/// Renderer options (`GPUI_METAL_EXPERIMENTS`, comma separated).
+///
+/// On by default, each with an opt-out for comparisons:
+/// - path prepass (`no-path-prepass`): every path batch of a frame is rasterized
+///   in at most [`MAX_PATH_LAYERS`] cropped passes before the main pass, instead
+///   of ending the main pass around each batch with a full-window MSAA pass.
+/// - opaque quads (`no-opaque-quads`): opaque rectangles are drawn without
+///   blending, so the tile hardware skips fragments a later opaque quad hides.
+///
+/// Measurement only (render incorrectly): `skip-paths`, `skip-shadows`,
+/// `skip-quads`, `skip-sprites` drop a primitive kind to attribute GPU time.
+#[derive(Clone, Copy, Debug, Default)]
+struct Experiments {
+    path_prepass: bool,
+    opaque_quads: bool,
+    skip_paths: bool,
+    // Measurement only: drop a primitive kind to attribute GPU time.
+    skip_shadows: bool,
+    skip_quads: bool,
+    skip_sprites: bool,
+}
+
+fn experiments() -> Experiments {
+    static EXPERIMENTS: std::sync::OnceLock<Experiments> = std::sync::OnceLock::new();
+    *EXPERIMENTS.get_or_init(|| {
+        let value = std::env::var("GPUI_METAL_EXPERIMENTS").unwrap_or_default();
+        let flags: Vec<&str> = value.split(',').map(str::trim).collect();
+        Experiments {
+            path_prepass: !flags.contains(&"no-path-prepass"),
+            opaque_quads: !flags.contains(&"no-opaque-quads"),
+            skip_paths: flags.contains(&"skip-paths"),
+            skip_shadows: flags.contains(&"skip-shadows"),
+            skip_quads: flags.contains(&"skip-quads"),
+            skip_sprites: flags.contains(&"skip-sprites"),
+        }
+    })
+}
+
+fn dump_frame_prefix() -> Option<&'static std::path::Path> {
+    static PREFIX: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    PREFIX
+        .get_or_init(|| {
+            std::env::var_os("GPUI_DUMP_FRAME")
+                .filter(|value| !value.is_empty())
+                .map(std::path::PathBuf::from)
+        })
+        .as_deref()
+}
+
+/// Path batches of one frame are grouped into layers whose sampled regions are
+/// pairwise disjoint; each layer is one rasterization pass into its own target.
+const MAX_PATH_LAYERS: usize = 3;
+
+struct PathLayerPlan {
+    /// Right and bottom edge of the layer's geometry, in device pixels.
+    extent: (u32, u32),
+    /// Regions compositing samples (sprite bounds), grown by one pixel.
+    regions: Vec<Bounds<ScaledPixels>>,
+    union: Option<Bounds<ScaledPixels>>,
+    /// Indices into the scene's render commands.
+    batches: SmallVec<[usize; 8]>,
+}
+
+struct PathPrepassPlan {
+    /// The layer of each render command, for path batches with geometry.
+    layer_of_command: Vec<Option<u8>>,
+    layers: SmallVec<[PathLayerPlan; MAX_PATH_LAYERS]>,
+}
+
+fn grown(bounds: Bounds<ScaledPixels>) -> Bounds<ScaledPixels> {
+    Bounds {
+        origin: gpui::point(
+            ScaledPixels(bounds.origin.x.0 - 1.0),
+            ScaledPixels(bounds.origin.y.0 - 1.0),
+        ),
+        size: size(
+            ScaledPixels(bounds.size.width.0 + 2.0),
+            ScaledPixels(bounds.size.height.0 + 2.0),
+        ),
+    }
+}
+
+fn overlaps(a: &Bounds<ScaledPixels>, b: &Bounds<ScaledPixels>) -> bool {
+    a.origin.x.0 < b.origin.x.0 + b.size.width.0
+        && b.origin.x.0 < a.origin.x.0 + a.size.width.0
+        && a.origin.y.0 < b.origin.y.0 + b.size.height.0
+        && b.origin.y.0 < a.origin.y.0 + a.size.height.0
+}
+
+/// Plans the path prepass for a frame, or `None` when the batches need more
+/// layers than allowed (the frame then renders paths the original way).
+fn plan_path_prepass(scene: &Scene, viewport: Size<DevicePixels>) -> Option<PathPrepassPlan> {
+    let commands = scene.render_commands();
+    let mut plan = PathPrepassPlan {
+        layer_of_command: vec![None; commands.len()],
+        layers: SmallVec::new(),
+    };
+    for (index, command) in commands.iter().enumerate() {
+        let RenderCommand::Batch(PrimitiveBatch::Paths {
+            range,
+            rasterization_vertex_count,
+            ..
+        }) = command
+        else {
+            continue;
+        };
+        if *rasterization_vertex_count == 0 {
+            continue;
+        }
+        let paths = &scene.paths[range.clone()];
+        let regions: SmallVec<[Bounds<ScaledPixels>; 8]> = path_types::sprites(paths)
+            .map(|sprite| grown(sprite.bounds))
+            .collect();
+        let union = regions.iter().copied().reduce(|a, b| a.union(&b));
+        let (mut right, mut bottom) = (0.0f32, 0.0f32);
+        for path in paths {
+            let bounds = path.clipped_bounds();
+            right = right.max(bounds.origin.x.0 + bounds.size.width.0);
+            bottom = bottom.max(bounds.origin.y.0 + bounds.size.height.0);
+        }
+        let fits = |layer: &PathLayerPlan| {
+            let (Some(union), Some(layer_union)) = (union, layer.union) else {
+                return true;
+            };
+            !overlaps(&union, &layer_union)
+                || !regions
+                    .iter()
+                    .any(|a| layer.regions.iter().any(|b| overlaps(a, b)))
+        };
+        let layer_index = match plan.layers.iter().position(fits) {
+            Some(index) => index,
+            None if plan.layers.len() < MAX_PATH_LAYERS => {
+                plan.layers.push(PathLayerPlan {
+                    extent: (0, 0),
+                    regions: Vec::new(),
+                    union: None,
+                    batches: SmallVec::new(),
+                });
+                plan.layers.len() - 1
+            }
+            None => return None,
+        };
+        let layer = &mut plan.layers[layer_index];
+        layer.regions.extend(regions.iter().copied());
+        layer.union = match (layer.union, union) {
+            (Some(a), Some(b)) => Some(a.union(&b)),
+            (a, b) => a.or(b),
+        };
+        let clamp = |value: f32, limit: i32| -> u32 {
+            // Whole 32-pixel tiles; never beyond the target.
+            let value = (value.max(0.0).ceil() as u32).saturating_add(31) / 32 * 32;
+            value.clamp(1, limit.max(1) as u32)
+        };
+        layer.extent.0 = layer.extent.0.max(clamp(right, viewport.width.0));
+        layer.extent.1 = layer.extent.1.max(clamp(bottom, viewport.height.0));
+        layer.batches.push(index);
+        plan.layer_of_command[index] = Some(layer_index as u8);
+    }
+    Some(plan)
+}
+
+pub(crate) fn quad_is_opaque(quad: &Quad) -> bool {
+    let zero = |value: ScaledPixels| value.0 == 0.0;
+    let corners = &quad.corner_radii;
+    let borders = &quad.border_widths;
+    let fade = &quad.content_mask.fade_out;
+    let mask = &quad.content_mask.bounds;
+    let bounds = &quad.bounds;
+    zero(corners.top_left)
+        && zero(corners.top_right)
+        && zero(corners.bottom_right)
+        && zero(corners.bottom_left)
+        && zero(borders.top)
+        && zero(borders.right)
+        && zero(borders.bottom)
+        && zero(borders.left)
+        && zero(fade.top)
+        && zero(fade.right)
+        && zero(fade.bottom)
+        && zero(fade.left)
+        && mask.origin.x.0 <= bounds.origin.x.0
+        && mask.origin.y.0 <= bounds.origin.y.0
+        && mask.origin.x.0 + mask.size.width.0 >= bounds.origin.x.0 + bounds.size.width.0
+        && mask.origin.y.0 + mask.size.height.0 >= bounds.origin.y.0 + bounds.size.height.0
+        && quad
+            .background
+            .as_solid()
+            .is_some_and(|color| color.alpha >= 1.0)
+}
+
 // Use 4x MSAA, all devices support it.
 // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
 const PATH_SAMPLE_COUNT: u32 = 4;
@@ -245,6 +435,8 @@ pub struct MetalRenderer {
     shadows_pipeline_state: metal::RenderPipelineState,
     smoothed_shadows_pipeline_state: metal::RenderPipelineState,
     quads_pipeline_state: metal::RenderPipelineState,
+    /// The quad pipeline without blending, for opaque rectangles (`opaque-quads`).
+    opaque_quads_pipeline_state: metal::RenderPipelineState,
     smoothed_quads_pipeline_state: metal::RenderPipelineState,
     underlines_pipeline_state: metal::RenderPipelineState,
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
@@ -264,6 +456,9 @@ pub struct MetalRenderer {
     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
+    /// Resolve targets for path prepass layers after the first (`path-prepass`).
+    path_layer_textures: Vec<metal::Texture>,
+    experiments: Experiments,
     // Offscreen scene target (the scene is rendered here, then blitted to the drawable, so blur
     // passes can sample already-painted content), the half-res ping/pong blur targets, and a
     // full-res target for content-filter groups.
@@ -427,6 +622,12 @@ impl MetalRenderer {
             quads_shader,
             MTLPixelFormat::BGRA8Unorm,
         );
+        let opaque_quads_pipeline_state = build_opaque_pipeline_state(
+            &device,
+            &quads_library,
+            quads_shader,
+            MTLPixelFormat::BGRA8Unorm,
+        );
         let (smoothed_quads_shader, smoothed_quads_library) = pipeline("smoothed_quads");
         let smoothed_quads_pipeline_state = build_pipeline_state(
             &device,
@@ -525,6 +726,7 @@ impl MetalRenderer {
             shadows_pipeline_state,
             smoothed_shadows_pipeline_state,
             quads_pipeline_state,
+            opaque_quads_pipeline_state,
             smoothed_quads_pipeline_state,
             underlines_pipeline_state,
             monochrome_sprites_pipeline_state,
@@ -541,6 +743,8 @@ impl MetalRenderer {
             core_video_texture_cache,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
+            path_layer_textures: Vec::new(),
+            experiments: experiments(),
             scene_color_texture: None,
             blur_ping_texture: None,
             blur_pong_texture: None,
@@ -587,6 +791,7 @@ impl MetalRenderer {
         }
         self.path_intermediate_texture = None;
         self.path_intermediate_msaa_texture = None;
+        self.path_layer_textures.clear();
         self.scene_color_texture = None;
         self.blur_ping_texture = None;
         self.blur_pong_texture = None;
@@ -695,6 +900,17 @@ impl MetalRenderer {
             return;
         };
 
+        if crate::scene_stats::level() > 0 {
+            crate::scene_stats::log(scene, viewport_size);
+        }
+        if let Some(prefix) = dump_frame_prefix() {
+            // Diagnostics: the same scene rendered offscreen and read back, so
+            // renderer variants can be compared pixel for pixel without screen
+            // capture. Each frame overwrites the file; the last one remains.
+            if let Err(error) = self.dump_scene(scene, viewport_size, prefix) {
+                log::error!("GPUI_DUMP_FRAME: {error}");
+            }
+        }
         let mut instance_buffer = self.acquire_instance_buffer(scene);
         let command_buffer =
             match self.draw_primitives(scene, &mut instance_buffer, drawable, viewport_size) {
@@ -946,6 +1162,31 @@ impl MetalRenderer {
         let mut current_target: &metal::TextureRef = scene_color;
         let mut filter_stack = SmallVec::<[&metal::TextureRef; MAX_FILTER_GROUP_DEPTH]>::new();
 
+        let experiments = self.experiments;
+        let path_plan = if experiments.path_prepass
+            && !experiments.skip_paths
+            && scene.render_plan().requirements().uses_path_target
+        {
+            plan_path_prepass(scene, viewport_size)
+        } else {
+            None
+        };
+        if let Some(plan) = &path_plan {
+            self.ensure_path_layer_textures(plan.layers.len(), viewport_size);
+            for (layer_index, layer) in plan.layers.iter().enumerate() {
+                if !self.rasterize_path_layer(
+                    scene,
+                    layer,
+                    layer_index,
+                    instance_buffer,
+                    &mut instance_offset,
+                    command_buffer,
+                ) {
+                    anyhow::bail!("scene too large: {} paths", scene.paths.len());
+                }
+            }
+        }
+
         let mut command_encoder = new_command_encoder_for_texture(
             command_buffer,
             current_target,
@@ -956,7 +1197,19 @@ impl MetalRenderer {
             },
         );
 
-        for command in scene.render_commands() {
+        for (command_index, command) in scene.render_commands().iter().enumerate() {
+            let skipped = match command {
+                RenderCommand::Batch(PrimitiveBatch::Shadows { .. }) => experiments.skip_shadows,
+                RenderCommand::Batch(PrimitiveBatch::Quads { .. }) => experiments.skip_quads,
+                RenderCommand::Batch(
+                    PrimitiveBatch::MonochromeSprites { .. }
+                    | PrimitiveBatch::PolychromeSprites { .. },
+                ) => experiments.skip_sprites,
+                _ => false,
+            };
+            if skipped {
+                continue;
+            }
             let ok = match command {
                 RenderCommand::Batch(PrimitiveBatch::Shadows { range, smoothed }) => self
                     .draw_shadows(
@@ -980,41 +1233,64 @@ impl MetalRenderer {
                     rasterization_vertex_count,
                     sprite_count,
                 }) => {
-                    if *rasterization_vertex_count == 0 {
+                    if *rasterization_vertex_count == 0 || experiments.skip_paths {
                         continue;
                     }
                     let paths = &scene.paths[range.clone()];
-                    command_encoder.end_encoding();
-
-                    let did_draw = self.draw_paths_to_intermediate(
-                        paths,
-                        *rasterization_vertex_count,
-                        instance_buffer,
-                        &mut instance_offset,
-                        &scene_uniforms,
-                        command_buffer,
-                    );
-
-                    command_encoder = new_command_encoder_for_texture(
-                        command_buffer,
-                        current_target,
-                        viewport_size,
-                        |color_attachment| {
-                            color_attachment.set_load_action(metal::MTLLoadAction::Load);
-                        },
-                    );
-
-                    if did_draw {
-                        self.draw_paths_from_intermediate(
+                    if let Some(layer) = path_plan
+                        .as_ref()
+                        .and_then(|plan| plan.layer_of_command[command_index])
+                    {
+                        let texture = if layer == 0 {
+                            self.path_intermediate_texture.clone()
+                        } else {
+                            self.path_layer_textures.get(layer as usize - 1).cloned()
+                        };
+                        let Some(texture) = texture else {
+                            continue;
+                        };
+                        self.draw_paths_from_texture(
                             paths,
                             *sprite_count,
+                            &texture,
                             instance_buffer,
                             &mut instance_offset,
                             &scene_uniforms,
                             command_encoder,
                         )
                     } else {
-                        false
+                        command_encoder.end_encoding();
+
+                        let did_draw = self.draw_paths_to_intermediate(
+                            paths,
+                            *rasterization_vertex_count,
+                            instance_buffer,
+                            &mut instance_offset,
+                            &scene_uniforms,
+                            command_buffer,
+                        );
+
+                        command_encoder = new_command_encoder_for_texture(
+                            command_buffer,
+                            current_target,
+                            viewport_size,
+                            |color_attachment| {
+                                color_attachment.set_load_action(metal::MTLLoadAction::Load);
+                            },
+                        );
+
+                        if did_draw {
+                            self.draw_paths_from_intermediate(
+                                paths,
+                                *sprite_count,
+                                instance_buffer,
+                                &mut instance_offset,
+                                &scene_uniforms,
+                                command_encoder,
+                            )
+                        } else {
+                            false
+                        }
                     }
                 }
                 RenderCommand::Batch(PrimitiveBatch::Underlines(range)) => self.draw_underlines(
@@ -1404,6 +1680,238 @@ impl MetalRenderer {
         encoder.end_encoding();
     }
 
+    fn dump_scene(
+        &mut self,
+        scene: &Scene,
+        size: Size<DevicePixels>,
+        prefix: &std::path::Path,
+    ) -> Result<()> {
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(size.width.0.max(1) as u64);
+        descriptor.set_height(size.height.0.max(1) as u64);
+        descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+        descriptor
+            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+        descriptor.set_storage_mode(if self.is_unified_memory {
+            metal::MTLStorageMode::Shared
+        } else {
+            metal::MTLStorageMode::Managed
+        });
+        let target = self.device.new_texture(&descriptor);
+        let mut instance_buffer = self.acquire_instance_buffer(scene);
+        let command_buffer =
+            self.draw_primitives_to_texture(scene, &mut instance_buffer, &target, size)?;
+        if !self.is_unified_memory {
+            let blit = command_buffer.new_blit_command_encoder();
+            blit.synchronize_resource(&target);
+            blit.end_encoding();
+        }
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        self.instance_buffer_pool.lock().release(instance_buffer);
+        let (width, height) = (size.width.0.max(1) as u32, size.height.0.max(1) as u32);
+        let bytes_per_row = width as usize * 4;
+        let mut pixels = vec![0u8; height as usize * bytes_per_row];
+        target.get_bytes(
+            pixels.as_mut_ptr() as *mut std::ffi::c_void,
+            bytes_per_row as u64,
+            metal::MTLRegion {
+                origin: metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                size: metal::MTLSize {
+                    width: width as u64,
+                    height: height as u64,
+                    depth: 1,
+                },
+            },
+            0,
+        );
+        for chunk in pixels.chunks_exact_mut(4) {
+            chunk.swap(0, 2);
+        }
+        let image = image::RgbaImage::from_raw(width, height, pixels)
+            .ok_or_else(|| anyhow::anyhow!("frame buffer size mismatch"))?;
+        let path = prefix.with_extension("png");
+        let partial = prefix.with_extension("partial.png");
+        image.save(&partial)?;
+        std::fs::rename(&partial, &path)?;
+        Ok(())
+    }
+
+    /// Full-size resolve targets for prepass layers after the first.
+    fn ensure_path_layer_textures(&mut self, layers: usize, size: Size<DevicePixels>) {
+        while self.path_layer_textures.len() + 1 < layers {
+            let descriptor = metal::TextureDescriptor::new();
+            descriptor.set_width(size.width.0.max(1) as u64);
+            descriptor.set_height(size.height.0.max(1) as u64);
+            descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+            descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+            descriptor.set_usage(
+                metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead,
+            );
+            self.path_layer_textures
+                .push(self.device.new_texture(&descriptor));
+        }
+    }
+
+    /// One MSAA pass rasterizing every batch of a prepass layer, cropped to the
+    /// layer's right/bottom extent so untouched tiles are neither cleared nor
+    /// resolved. Sampling divides by the full texture size, so texels keep
+    /// their window positions.
+    fn rasterize_path_layer(
+        &self,
+        scene: &Scene,
+        layer: &PathLayerPlan,
+        layer_index: usize,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        command_buffer: &metal::CommandBufferRef,
+    ) -> bool {
+        let target = if layer_index == 0 {
+            self.path_intermediate_texture.as_deref()
+        } else {
+            self.path_layer_textures
+                .get(layer_index - 1)
+                .map(|texture| texture.as_ref())
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        let commands = scene.render_commands();
+        let mut vertex_count = 0;
+        for &index in &layer.batches {
+            if let RenderCommand::Batch(PrimitiveBatch::Paths {
+                rasterization_vertex_count,
+                ..
+            }) = &commands[index]
+            {
+                vertex_count += rasterization_vertex_count;
+            }
+        }
+        align_offset(instance_offset);
+        let bytes_len = mem::size_of::<PathRasterizationVertex>() * vertex_count;
+        let next_offset = *instance_offset + bytes_len;
+        if next_offset > instance_buffer.size {
+            return false;
+        }
+        let buffer_contents =
+            unsafe { (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset) }
+                as *mut PathRasterizationVertex;
+        let mut written = 0;
+        for &index in &layer.batches {
+            if let RenderCommand::Batch(PrimitiveBatch::Paths { range, .. }) = &commands[index] {
+                for vertex in path_types::rasterization_vertices(&scene.paths[range.clone()]) {
+                    if written == vertex_count {
+                        return false;
+                    }
+                    unsafe { buffer_contents.add(written).write(vertex) };
+                    written += 1;
+                }
+            }
+        }
+        if written != vertex_count {
+            return false;
+        }
+
+        let (width, height) = layer.extent;
+        let render_pass_descriptor = metal::RenderPassDescriptor::new();
+        render_pass_descriptor.set_render_target_width(width as u64);
+        render_pass_descriptor.set_render_target_height(height as u64);
+        let color_attachment = render_pass_descriptor
+            .color_attachments()
+            .object_at(0)
+            .unwrap();
+        color_attachment.set_load_action(metal::MTLLoadAction::Clear);
+        color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., 0.));
+        if let Some(msaa_texture) = &self.path_intermediate_msaa_texture {
+            color_attachment.set_texture(Some(msaa_texture));
+            color_attachment.set_resolve_texture(Some(target));
+            color_attachment.set_store_action(metal::MTLStoreAction::MultisampleResolve);
+        } else {
+            color_attachment.set_texture(Some(target));
+            color_attachment.set_store_action(metal::MTLStoreAction::Store);
+        }
+        let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
+        command_encoder.set_viewport(metal::MTLViewport {
+            originX: 0.0,
+            originY: 0.0,
+            width: width as f64,
+            height: height as f64,
+            znear: 0.0,
+            zfar: 1.0,
+        });
+        command_encoder.set_render_pipeline_state(&self.paths_rasterization_pipeline_state);
+        // Clip space spans the cropped extent, so window coordinates land on
+        // the same texels as in a full-size pass.
+        let uniforms = SceneUniforms::new(size(
+            DevicePixels(width as i32),
+            DevicePixels(height as i32),
+        ));
+        bind_scene_uniforms(command_encoder, &uniforms);
+        bind_instance_bytes(
+            command_encoder,
+            &instance_buffer.metal_buffer,
+            *instance_offset,
+            bytes_len,
+        );
+        command_encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, vertex_count as u64);
+        command_encoder.end_encoding();
+        *instance_offset = next_offset;
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_paths_from_texture(
+        &self,
+        paths: &[Path<ScaledPixels>],
+        sprite_count: usize,
+        texture: &metal::TextureRef,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        scene_uniforms: &SceneUniforms,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) -> bool {
+        if paths.is_empty() {
+            return true;
+        }
+        align_offset(instance_offset);
+        let sprite_bytes_len = mem::size_of::<path_types::PathSprite>() * sprite_count;
+        let next_offset = *instance_offset + sprite_bytes_len;
+        if next_offset > instance_buffer.size {
+            return false;
+        }
+        command_encoder.set_render_pipeline_state(&self.path_sprites_pipeline_state);
+        bind_scene_uniforms(command_encoder, scene_uniforms);
+        command_encoder.set_fragment_texture(PRIMARY_TEXTURE_SLOT, Some(texture));
+        command_encoder.set_fragment_sampler_state(SAMPLER_SLOT, Some(&self.sampler));
+        let buffer_contents =
+            unsafe { (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset) }
+                as *mut path_types::PathSprite;
+        let mut sprites = path_types::sprites(paths);
+        for index in 0..sprite_count {
+            let Some(sprite) = sprites.next() else {
+                return false;
+            };
+            unsafe { buffer_contents.add(index).write(sprite) };
+        }
+        if sprites.next().is_some() {
+            return false;
+        }
+        bind_instance_bytes(
+            command_encoder,
+            &instance_buffer.metal_buffer,
+            *instance_offset,
+            sprite_bytes_len,
+        );
+        command_encoder.draw_primitives_instanced(
+            metal::MTLPrimitiveType::TriangleStrip,
+            0,
+            4,
+            sprite_count as u64,
+        );
+        *instance_offset = next_offset;
+        true
+    }
+
     fn draw_paths_to_intermediate(
         &self,
         paths: &[Path<ScaledPixels>],
@@ -1568,6 +2076,41 @@ impl MetalRenderer {
         unsafe {
             ptr::copy_nonoverlapping(quads.as_ptr() as *const u8, buffer_contents, quad_bytes_len);
         }
+
+        if !smoothed && self.experiments.opaque_quads {
+            // Runs of opaque and blended quads, in order. Opaque fragments
+            // overwrite instead of blending, which lets the tile hardware drop
+            // fragments a later opaque quad hides.
+            let mut start = 0;
+            while start < quads.len() {
+                let opaque = quad_is_opaque(&quads[start]);
+                let mut end = start + 1;
+                while end < quads.len() && quad_is_opaque(&quads[end]) == opaque {
+                    end += 1;
+                }
+                command_encoder.set_render_pipeline_state(if opaque {
+                    &self.opaque_quads_pipeline_state
+                } else {
+                    &self.quads_pipeline_state
+                });
+                bind_instances(
+                    command_encoder,
+                    &instance_buffer.metal_buffer,
+                    *instance_offset + start * mem::size_of::<Quad>(),
+                    &quads[start..end],
+                );
+                command_encoder.draw_primitives_instanced(
+                    metal::MTLPrimitiveType::TriangleStrip,
+                    0,
+                    4,
+                    (end - start) as u64,
+                );
+                start = end;
+            }
+            *instance_offset = next_offset;
+            return true;
+        }
+
         bind_instances(
             command_encoder,
             &instance_buffer.metal_buffer,
@@ -1594,14 +2137,12 @@ impl MetalRenderer {
         scene_uniforms: &SceneUniforms,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
-        let Some(_) = paths.first() else {
+        if paths.is_empty() {
             return true;
-        };
-
-        let Some(ref intermediate_texture) = self.path_intermediate_texture else {
+        }
+        let Some(intermediate_texture) = self.path_intermediate_texture.as_deref() else {
             return false;
         };
-
         // When copying paths from the intermediate texture to the drawable,
         // each pixel must only be copied once, in case of transparent paths.
         //
@@ -1609,47 +2150,15 @@ impl MetalRenderer {
         // disjoint, so we can copy each path's bounds individually. If this
         // batch combines different draw orders, we perform a single copy
         // for a minimal spanning rect.
-        align_offset(instance_offset);
-        let sprite_bytes_len = mem::size_of::<path_types::PathSprite>() * sprite_count;
-        let next_offset = *instance_offset + sprite_bytes_len;
-        if next_offset > instance_buffer.size {
-            return false;
-        }
-
-        command_encoder.set_render_pipeline_state(&self.path_sprites_pipeline_state);
-        bind_scene_uniforms(command_encoder, scene_uniforms);
-        command_encoder.set_fragment_texture(PRIMARY_TEXTURE_SLOT, Some(intermediate_texture));
-        command_encoder.set_fragment_sampler_state(SAMPLER_SLOT, Some(&self.sampler));
-
-        let buffer_contents =
-            unsafe { (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset) }
-                as *mut path_types::PathSprite;
-        let mut sprites = path_types::sprites(paths);
-        for index in 0..sprite_count {
-            let Some(sprite) = sprites.next() else {
-                return false;
-            };
-            unsafe { buffer_contents.add(index).write(sprite) };
-        }
-        if sprites.next().is_some() {
-            return false;
-        }
-
-        bind_instance_bytes(
+        self.draw_paths_from_texture(
+            paths,
+            sprite_count,
+            intermediate_texture,
+            instance_buffer,
+            instance_offset,
+            scene_uniforms,
             command_encoder,
-            &instance_buffer.metal_buffer,
-            *instance_offset,
-            sprite_bytes_len,
-        );
-        command_encoder.draw_primitives_instanced(
-            metal::MTLPrimitiveType::TriangleStrip,
-            0,
-            4,
-            sprite_count as u64,
-        );
-        *instance_offset = next_offset;
-
-        true
+        )
     }
 
     fn draw_underlines(
@@ -1959,6 +2468,33 @@ fn build_pipeline_state(
     color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
     color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::One);
+
+    device
+        .new_render_pipeline_state(&descriptor)
+        .expect("could not create render pipeline state")
+}
+
+/// `build_pipeline_state` without blending: fragments overwrite the target.
+fn build_opaque_pipeline_state(
+    device: &metal::DeviceRef,
+    library: &metal::LibraryRef,
+    shader: &NativeShader,
+    pixel_format: metal::MTLPixelFormat,
+) -> metal::RenderPipelineState {
+    let vertex_fn = library
+        .get_function(shader.vertex_entry, None)
+        .unwrap_or_else(|error| panic!("error locating {}: {error}", shader.vertex_entry));
+    let fragment_fn = library
+        .get_function(shader.fragment_entry, None)
+        .unwrap_or_else(|error| panic!("error locating {}: {error}", shader.fragment_entry));
+
+    let descriptor = metal::RenderPipelineDescriptor::new();
+    descriptor.set_label(shader.label);
+    descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
+    descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
+    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
+    color_attachment.set_pixel_format(pixel_format);
+    color_attachment.set_blending_enabled(false);
 
     device
         .new_render_pipeline_state(&descriptor)
@@ -2948,5 +3484,192 @@ mod tests {
             }),
             "triangle edges are antialiased",
         );
+    }
+
+    fn experiment_renderer(experiments: Experiments) -> MetalRenderer {
+        let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
+        let mut renderer = MetalRenderer::new_headless(pool);
+        renderer.experiments = experiments;
+        renderer
+    }
+
+    fn rect(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: gpui::point(ScaledPixels(x), ScaledPixels(y)),
+            size: size(ScaledPixels(width), ScaledPixels(height)),
+        }
+    }
+
+    fn triangle(x: f32, y: f32, extent: f32, hue: f32, alpha: f32) -> Path<ScaledPixels> {
+        let mut path = Path::new(gpui::point(px(x), px(y)));
+        path.line_to(gpui::point(px(x + extent), px(y + extent * 0.15)));
+        path.line_to(gpui::point(px(x + extent * 0.4), px(y + extent)));
+        path.line_to(gpui::point(px(x), px(y)));
+        path.content_mask = ContentMask {
+            bounds: Bounds {
+                origin: gpui::point(px(0.0), px(0.0)),
+                size: size(px(4096.0), px(4096.0)),
+            },
+            ..Default::default()
+        };
+        path.color = solid_background(hsla(hue, 0.8, 0.5, alpha));
+        path.scale(1.0)
+    }
+
+    fn quad(bounds: Bounds<ScaledPixels>, hue: f32, alpha: f32) -> Quad {
+        Quad {
+            bounds,
+            content_mask: ContentMask {
+                bounds,
+                ..Default::default()
+            },
+            background: solid_background(hsla(hue, 0.6, 0.6, alpha)),
+            ..Default::default()
+        }
+    }
+
+    fn assert_same_pixels(expected: &RgbaImage, actual: &RgbaImage, what: &str) {
+        assert_eq!(expected.dimensions(), actual.dimensions());
+        let differing: Vec<_> = expected
+            .enumerate_pixels()
+            .filter(|(x, y, pixel)| actual.get_pixel(*x, *y) != *pixel)
+            .take(5)
+            .map(|(x, y, pixel)| (x, y, pixel.0, actual.get_pixel(x, y).0))
+            .collect();
+        assert!(
+            differing.is_empty(),
+            "{what}: pixels differ, e.g. {differing:?}"
+        );
+    }
+
+    /// Path batches separated by other primitives, both overlapping (one
+    /// layer each) and disjoint (sharing a layer), plus more overlapping
+    /// batches than layers so the frame falls back to per-batch passes.
+    fn path_layer_scenes() -> Vec<(&'static str, Scene)> {
+        let mut scenes = Vec::new();
+
+        // Fill, a quad over it, then an outline over both (the repo tab).
+        let mut scene = Scene::default();
+        scene.insert_primitive(triangle(4.0, 4.0, 40.0, 0.1, 1.0));
+        scene.insert_primitive(quad(rect(14.0, 14.0, 12.0, 8.0), 0.6, 1.0));
+        scene.insert_primitive(triangle(10.0, 10.0, 36.0, 0.3, 0.7));
+        // Disjoint batches far away, each over its own quad.
+        for row in 0..4 {
+            let y = 60.0 + row as f32 * 22.0;
+            scene.insert_primitive(quad(rect(70.0, y, 30.0, 20.0), 0.5, 1.0));
+            scene.insert_primitive(triangle(72.0, y + 2.0, 16.0, 0.05 * row as f32, 0.9));
+            scene.insert_primitive(quad(rect(80.0, y + 4.0, 6.0, 6.0), 0.9, 0.5));
+        }
+        scene.finish();
+        scenes.push(("overlapping and disjoint batches", scene));
+
+        // Five stacked batches over the same spot exceed the layer limit.
+        let mut scene = Scene::default();
+        for index in 0..5 {
+            let offset = index as f32 * 3.0;
+            scene.insert_primitive(triangle(
+                8.0 + offset,
+                8.0 + offset,
+                40.0,
+                0.15 * index as f32,
+                0.8,
+            ));
+            scene.insert_primitive(quad(rect(20.0 + offset, 20.0 + offset, 8.0, 8.0), 0.7, 0.6));
+        }
+        scene.finish();
+        scenes.push(("more overlapping batches than layers", scene));
+        scenes
+    }
+
+    #[test]
+    fn path_prepass_matches_per_batch_passes() {
+        let size = size(DevicePixels(160), DevicePixels(160));
+        for (what, scene) in path_layer_scenes() {
+            let legacy = experiment_renderer(Experiments::default())
+                .render_scene_to_image(&scene, size)
+                .unwrap();
+            let prepass = experiment_renderer(Experiments {
+                path_prepass: true,
+                ..Default::default()
+            })
+            .render_scene_to_image(&scene, size)
+            .unwrap();
+            assert_same_pixels(&legacy, &prepass, what);
+        }
+    }
+
+    #[test]
+    fn path_prepass_plans_layers_by_sampled_region() {
+        let size = size(DevicePixels(160), DevicePixels(160));
+        let scenes = path_layer_scenes();
+        let plan = plan_path_prepass(&scenes[0].1, size).expect("fits in the layer limit");
+        assert_eq!(plan.layers.len(), 2, "the outline overlaps the fill");
+        let batches: usize = plan.layers.iter().map(|layer| layer.batches.len()).sum();
+        assert!(batches >= 3, "disjoint rows share layers: {batches}");
+        for layer in &plan.layers {
+            assert!(layer.extent.0 <= 160 && layer.extent.1 <= 160);
+            assert_eq!(layer.extent.0 % 32, 0);
+        }
+        assert!(
+            plan_path_prepass(&scenes[1].1, size).is_none(),
+            "five stacked batches fall back"
+        );
+    }
+
+    #[test]
+    fn opaque_quads_match_blended_quads() {
+        let size = size(DevicePixels(96), DevicePixels(96));
+        let mut scene = Scene::default();
+        // Opaque background, then quads that must keep blending: clipped by
+        // their content mask, faded mask edges, rounded, bordered, translucent.
+        scene.insert_primitive(quad(rect(0.0, 0.0, 96.0, 96.0), 0.1, 1.0));
+        let mut clipped = quad(rect(10.0, 10.0, 40.0, 40.0), 0.3, 1.0);
+        clipped.content_mask.bounds = rect(20.0, 20.0, 40.0, 10.0);
+        scene.insert_primitive(clipped);
+        let mut faded = quad(rect(50.0, 10.0, 30.0, 30.0), 0.4, 1.0);
+        faded.content_mask.fade_out = Edges {
+            top: ScaledPixels(0.0),
+            right: ScaledPixels(8.0),
+            bottom: ScaledPixels(0.0),
+            left: ScaledPixels(0.0),
+        };
+        scene.insert_primitive(faded);
+        let mut rounded = quad(rect(10.0, 55.0, 30.0, 30.0), 0.5, 1.0);
+        rounded.corner_radii = Corners::all(ScaledPixels(9.0));
+        scene.insert_primitive(rounded);
+        let mut bordered = quad(rect(50.0, 50.0, 30.0, 30.0), 0.6, 1.0);
+        bordered.border_widths = Edges::all(ScaledPixels(2.0));
+        bordered.border_color = solid_background(hsla(0.0, 0.0, 0.1, 1.0));
+        scene.insert_primitive(bordered);
+        scene.insert_primitive(quad(rect(30.0, 30.0, 40.0, 40.0), 0.8, 0.5));
+        // Opaque quads stacked over the translucent one and each other.
+        scene.insert_primitive(quad(rect(35.0, 35.0, 10.0, 10.0), 0.9, 1.0));
+        scene.insert_primitive(quad(rect(40.5, 40.25, 10.0, 10.0), 0.2, 1.0));
+        scene.finish();
+
+        let blended = experiment_renderer(Experiments::default())
+            .render_scene_to_image(&scene, size)
+            .unwrap();
+        let opaque = experiment_renderer(Experiments {
+            opaque_quads: true,
+            ..Default::default()
+        })
+        .render_scene_to_image(&scene, size)
+        .unwrap();
+        assert_same_pixels(&blended, &opaque, "opaque quads");
+
+        let mut both = experiment_renderer(Experiments {
+            opaque_quads: true,
+            path_prepass: true,
+            ..Default::default()
+        });
+        let path_size = gpui::size(DevicePixels(160), DevicePixels(160));
+        for (what, scene) in path_layer_scenes() {
+            let legacy = experiment_renderer(Experiments::default())
+                .render_scene_to_image(&scene, path_size)
+                .unwrap();
+            let image = both.render_scene_to_image(&scene, path_size).unwrap();
+            assert_same_pixels(&legacy, &image, what);
+        }
     }
 }
