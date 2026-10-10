@@ -312,6 +312,8 @@ impl WgpuRenderer {
         let mut capabilities = self.timings.capabilities();
         capabilities.present_mode =
             Some(format!("{:?}", self.target.configuration().present_mode).to_ascii_lowercase());
+        capabilities.surface_alpha_mode =
+            Some(format!("{:?}", self.target.configuration().alpha_mode).to_ascii_lowercase());
         if self.crop_path_targets {
             capabilities.active_experiments.push("cropped-paths".into());
         }

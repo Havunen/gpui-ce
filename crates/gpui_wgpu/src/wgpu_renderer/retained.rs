@@ -19,6 +19,8 @@ struct Target {
     width: u32,
     height: u32,
     format: wgpu::TextureFormat,
+    alpha_mode: wgpu::CompositeAlphaMode,
+    clear_color: wgpu::Color,
     reservation: GpuMemoryReservation,
 }
 pub(super) struct RetainedPlan {
@@ -29,6 +31,7 @@ pub(super) struct RetainedPlan {
     pub scene_revision: u64,
     pub atlas_generation: u64,
     pub reuse_snapshot: bool,
+    pub fallback_reason: Option<&'static str>,
 }
 impl RetainedFrame {
     pub fn new() -> Self {
@@ -74,10 +77,12 @@ impl RetainedFrame {
         atlas: u64,
         width: u32,
         height: u32,
-        opaque: bool,
+        eligible: bool,
         device: &Arc<wgpu::Device>,
         queue: &Arc<wgpu::Queue>,
         format: wgpu::TextureFormat,
+        alpha_mode: wgpu::CompositeAlphaMode,
+        clear_color: wgpu::Color,
     ) -> RetainedPlan {
         if !self.enabled {
             return RetainedPlan {
@@ -88,10 +93,11 @@ impl RetainedFrame {
                 scene_revision: 0,
                 atlas_generation: 0,
                 reuse_snapshot: false,
+                fallback_reason: None,
             };
         }
         let context = gpu::gpu_frame_context();
-        let full = || RetainedPlan {
+        let full = |reason| RetainedPlan {
             view: None,
             damage: Damage::Full,
             snapshot: None,
@@ -99,15 +105,37 @@ impl RetainedFrame {
             scene_revision: context.scene_revision,
             atlas_generation: atlas,
             reuse_snapshot: false,
+            fallback_reason: Some(reason),
         };
-        if !opaque || !context.active || retained_bytes(format, width, height).is_none() {
+        if !eligible || !context.active {
             self.invalidate(queue);
-            return full();
+            return full(if !eligible {
+                "diagnostic-ablation"
+            } else {
+                "inactive-window"
+            });
+        }
+        if !matches!(
+            alpha_mode,
+            wgpu::CompositeAlphaMode::Opaque | wgpu::CompositeAlphaMode::PreMultiplied
+        ) {
+            self.invalidate(queue);
+            return full("unsupported-alpha-mode");
+        }
+        if retained_bytes(format, width, height).is_none() {
+            self.invalidate(queue);
+            return full("unsupported-target-format-or-size");
         }
         self.queue = Some(queue.clone());
+        let mut target_change = None;
         if self.target.as_ref().is_some_and(|target| {
-            target.width != width || target.height != height || target.format != format
+            target.width != width
+                || target.height != height
+                || target.format != format
+                || target.alpha_mode != alpha_mode
+                || target.clear_color != clear_color
         }) {
+            target_change = Some("target-configuration-change");
             self.invalidate(queue);
         }
         // Keepalive submissions reuse the same finished scene. Avoid cloning or comparing
@@ -125,22 +153,25 @@ impl RetainedFrame {
                     scene_revision: context.scene_revision,
                     atlas_generation: atlas,
                     reuse_snapshot: true,
+                    fallback_reason: None,
                 };
             }
         }
-        let snapshot = SceneSnapshot::capture(scene, atlas, width, height);
-        if snapshot.is_none() {
-            self.invalidate(queue);
-            return full();
-        }
+        let snapshot = match SceneSnapshot::capture_checked(scene, atlas, width, height) {
+            Ok(snapshot) => snapshot,
+            Err(reason) => {
+                self.invalidate(queue);
+                return full(reason.as_str());
+            }
+        };
         if self.target.is_none() {
             let Some(bytes) = retained_bytes(format, width, height) else {
-                return full();
+                return full("unsupported-target-format-or-size");
             };
             let Some(reservation) =
                 gpu::reserve_retained_bytes("wgpu", Arc::as_ptr(device) as usize, bytes)
             else {
-                return full();
+                return full("retained-device-budget");
             };
             let texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("gpui_retained_frame"),
@@ -164,22 +195,41 @@ impl RetainedFrame {
                 width,
                 height,
                 format,
+                alpha_mode,
+                clear_color,
                 reservation,
             });
         }
-        let damage = match (&snapshot, &self.snapshot) {
-            (Some(next), Some(previous)) => next.compare(previous),
-            _ => Damage::Full,
+        let (damage, comparison_reason) = match self.snapshot.as_ref() {
+            Some(previous) => match snapshot.compare_checked(previous) {
+                Ok(damage) => (damage, None),
+                Err(reason) => (Damage::Full, Some(reason)),
+            },
+            None => (Damage::Full, None),
+        };
+        let fallback_reason = if damage == Damage::Full {
+            Some(
+                target_change
+                    .or(comparison_reason)
+                    .unwrap_or(if self.snapshot.is_some() {
+                        "scene-change"
+                    } else {
+                        "initial-scene"
+                    }),
+            )
+        } else {
+            None
         };
         let target = self.target.as_ref().unwrap();
         RetainedPlan {
             view: Some(target.view.clone()),
             damage,
-            snapshot,
+            snapshot: Some(snapshot),
             bytes: target.reservation.bytes,
             scene_revision: context.scene_revision,
             atlas_generation: atlas,
             reuse_snapshot: false,
+            fallback_reason,
         }
     }
     pub fn complete(

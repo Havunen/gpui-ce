@@ -239,8 +239,12 @@ impl gpui::PlatformHeadlessRenderer for WgpuHeadlessRenderer {
 mod path_target_tests {
     use super::*;
     use gpui::{
-        Bounds, ContentMask, PathBuilder, Quad, ScaledPixels, point, px, size, solid_background,
+        AtlasKey, AtlasTile, Bounds, ContentMask, FontId, GlyphId, GlyphRenderMode,
+        MonochromeSprite, PathBuilder, PlatformAtlas, PreparedRasterStyle, Quad,
+        RasterizedGlyphFormat, RenderGlyphParams, ScaledPixels, Shadow, point, px, size,
+        solid_background,
     };
+    use std::borrow::Cow;
 
     fn scaled(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
         Bounds::new(
@@ -601,8 +605,458 @@ mod path_target_tests {
             assert_eq!(
                 retained.retained.last_damage(),
                 "full",
-                "transparent alpha uses full rendering"
+                "appearance transition invalidates the previous opaque target"
             );
+            assert_eq!(
+                retained.render_to_image(&scene)?,
+                full.render_to_image(&scene)?
+            );
+            assert_eq!(retained.retained.last_damage(), "reuse");
+        }
+        Ok(())
+    }
+
+    fn assert_retained_rgba(
+        full: &mut WgpuRenderer,
+        retained: &mut WgpuRenderer,
+        scene: &Scene,
+        revision: u64,
+        damage: &str,
+        context: &str,
+    ) -> anyhow::Result<image::RgbaImage> {
+        let _scope = gpui::profiler::gpu::set_gpu_frame_context(
+            Some("transparent-retained-wgpu-test".into()),
+            true,
+            revision,
+            revision,
+        );
+        let expected = full.render_to_image(scene)?;
+        let actual = retained.render_to_image(scene)?;
+        assert_eq!(actual.dimensions(), expected.dimensions(), "{context}");
+        let first_difference = actual
+            .as_raw()
+            .iter()
+            .zip(expected.as_raw())
+            .enumerate()
+            .find(|(_, (actual, expected))| actual != expected);
+        assert!(
+            first_difference.is_none(),
+            "{context}: exact RGBA comparison failed at byte {first_difference:?}"
+        );
+        assert_eq!(
+            retained.retained.last_damage(),
+            damage,
+            "{context}: the requested retained path must actually execute"
+        );
+        Ok(actual)
+    }
+
+    fn empty_transparent_hover_scene(row: Option<usize>) -> Scene {
+        let mut scene = Scene::default();
+        if let Some(row) = row {
+            scene.insert_primitive(Quad {
+                bounds: scaled(12.25, 10.5 + row as f32 * 25.0, 120.5, 13.25),
+                content_mask: full_mask(),
+                background: gpui::rgba(0x4488cc70).into(),
+                corner_radii: gpui::Corners::all(ScaledPixels(3.25)),
+                ..Default::default()
+            });
+        }
+        // A zero-alpha anchor preserves an exact following painter slot when the
+        // only visible primitive moves; every resting-frame pixel is still clear.
+        scene.insert_primitive(Quad {
+            bounds: scaled(190.0, 90.0, 2.0, 2.0),
+            content_mask: full_mask(),
+            background: gpui::rgba(0x00000000).into(),
+            ..Default::default()
+        });
+        scene.finish();
+        scene
+    }
+
+    #[test]
+    fn retained_transparent_clear_insert_move_erase_is_exact_rgba() -> anyhow::Result<()> {
+        let _gpu_test_guard = crate::test_gpu::guard();
+        let context = WgpuContext::new_headless(None)?;
+        let target = size(DevicePixels(200), DevicePixels(100));
+        let mut full = WgpuRenderer::new_headless(&context, target)?;
+        let mut retained = WgpuRenderer::new_headless(&context, target)?;
+        full.retained.disable_for_tests();
+        retained.retained.enable_for_tests();
+        full.update_transparency(true);
+        retained.update_transparency(true);
+        full.timings.diagnostic_ablations = Default::default();
+        retained.timings.diagnostic_ablations = Default::default();
+        let mut revision = 0;
+        let mut previous = None;
+        for (index, row) in [None, None, Some(0), Some(0), Some(1), Some(1), None, None]
+            .into_iter()
+            .enumerate()
+        {
+            if index == 0 || row != previous {
+                revision += 1;
+            }
+            let image = assert_retained_rgba(
+                &mut full,
+                &mut retained,
+                &empty_transparent_hover_scene(row),
+                revision,
+                if index == 0 {
+                    "full"
+                } else if row == previous {
+                    "reuse"
+                } else {
+                    "partial"
+                },
+                &format!("empty transparent target, step {index}, row {row:?}"),
+            )?;
+            if row.is_none() {
+                assert!(
+                    image.as_raw().iter().all(|byte| *byte == 0),
+                    "initial clear and erased hover must leave transparent black RGBA"
+                );
+            } else {
+                assert!(image.pixels().any(|pixel| pixel[3] > 0 && pixel[3] < 255));
+            }
+            previous = row;
+        }
+        Ok(())
+    }
+
+    fn retained_glyph_tile(renderer: &WgpuRenderer) -> anyhow::Result<AtlasTile> {
+        let key = AtlasKey::Glyph {
+            params: RenderGlyphParams {
+                font_id: FontId(0),
+                glyph_id: GlyphId(65),
+                font_size: px(8.0),
+                subpixel_variant: point(0, 0),
+                scale_factor: 1.0,
+                raster_style: PreparedRasterStyle::independent(GlyphRenderMode::Grayscale),
+            },
+            format: RasterizedGlyphFormat::AlphaMask,
+        };
+        // Deterministic glyph-shaped coverage exercises the real monochrome atlas
+        // pipeline without depending on a machine's font rasterizer or font files.
+        let coverage = [
+            0, 0, 96, 255, 255, 96, 0, 0, 0, 64, 255, 96, 96, 255, 64, 0, 0, 128, 255, 0, 0, 255,
+            128, 0, 32, 224, 160, 0, 0, 160, 224, 32, 96, 255, 255, 255, 255, 255, 255, 96, 160,
+            224, 64, 0, 0, 64, 224, 160, 224, 160, 0, 0, 0, 0, 160, 224, 255, 96, 0, 0, 0, 0, 96,
+            255,
+        ];
+        renderer
+            .atlas
+            .get_or_insert_with(&key, &mut || {
+                Ok(Some((
+                    size(DevicePixels(8), DevicePixels(8)),
+                    Cow::Borrowed(&coverage),
+                )))
+            })?
+            .ok_or_else(|| anyhow::anyhow!("retained glyph fixture must produce an atlas tile"))
+    }
+
+    fn transparent_composite_hover_scene(
+        row: Option<usize>,
+        fraction: f32,
+        smoothing: f32,
+        backing_alpha: f32,
+        glyph: AtlasTile,
+    ) -> Scene {
+        let mut scene = Scene::default();
+        let backing_bounds = scaled(4.25 + fraction, 3.5 + fraction, 190.5, 90.25);
+        let radii = gpui::Corners::all(ScaledPixels(9.25));
+        scene.insert_primitive(Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(2.5),
+            bounds: backing_bounds,
+            corner_radii: radii,
+            content_mask: full_mask(),
+            color: gpui::rgba(0x17243850).into(),
+            element_bounds: backing_bounds,
+            element_corner_radii: radii,
+            inset: false.into(),
+            corner_smoothing: smoothing,
+        });
+        scene.raise_order_floor();
+        scene.insert_primitive(Quad {
+            bounds: backing_bounds,
+            content_mask: full_mask(),
+            background: solid_background(gpui::hsla(0.62, 0.3, 0.35, backing_alpha)),
+            corner_radii: radii,
+            corner_smoothing: smoothing,
+            ..Default::default()
+        });
+        scene.raise_order_floor();
+        if let Some(row) = row {
+            scene.insert_primitive(Quad {
+                bounds: scaled(10.25 + fraction, 12.5 + row as f32 * 24.0, 165.5, 13.25),
+                content_mask: ContentMask {
+                    bounds: scaled(11.5 + fraction, 8.25, 162.5, 78.5),
+                    fade_out: gpui::Edges {
+                        left: ScaledPixels(1.25),
+                        right: ScaledPixels(1.75),
+                        ..Default::default()
+                    },
+                },
+                background: gpui::rgba(0x4f98df70).into(),
+                corner_radii: gpui::Corners::all(ScaledPixels(3.5)),
+                corner_smoothing: smoothing,
+                ..Default::default()
+            });
+        }
+        scene.raise_order_floor();
+        scene.insert_primitive(triangle(
+            17.25 + fraction,
+            10.5,
+            17.5,
+            ContentMask {
+                bounds: scaled(19.5 + fraction, 13.25, 13.75, 12.5),
+                fade_out: gpui::Edges::all(ScaledPixels(0.75)),
+            },
+        ));
+        scene.raise_order_floor();
+        if let Some(row) = row {
+            // The live history row adds an entire lane-name badge only while
+            // hovered. Variable run lengths and distant row moves must repaint
+            // both the old and new badge without losing the static text anchor.
+            for index in 0..7 + row {
+                scene.insert_primitive(MonochromeSprite {
+                    order: 0,
+                    padding: 0,
+                    bounds: scaled(
+                        112.25 + fraction + index as f32 * 6.5,
+                        14.5 + row as f32 * 24.0,
+                        6.5,
+                        10.75,
+                    ),
+                    content_mask: full_mask(),
+                    color: gpui::hsla(0.6, 0.4, 0.6, 0.6).into(),
+                    tile: glyph,
+                    transformation: Default::default(),
+                });
+            }
+        }
+        scene.raise_order_floor();
+        scene.insert_primitive(MonochromeSprite {
+            order: 0,
+            padding: 0,
+            bounds: scaled(44.25 + fraction, 14.5, 12.5, 10.75),
+            content_mask: ContentMask {
+                bounds: scaled(45.0 + fraction, 14.25, 11.5, 11.5),
+                fade_out: gpui::Edges::all(ScaledPixels(0.75)),
+            },
+            color: gpui::hsla(0.12, 0.8, 0.65, 0.85).into(),
+            tile: glyph,
+            transformation: Default::default(),
+        });
+        scene.raise_order_floor();
+        scene.insert_primitive(Quad {
+            bounds: scaled(80.25 + fraction, 6.5, 16.5, 78.25),
+            content_mask: full_mask(),
+            background: gpui::rgba(0xda624d60).into(),
+            corner_radii: gpui::Corners::all(ScaledPixels(4.25)),
+            corner_smoothing: smoothing,
+            ..Default::default()
+        });
+        scene.finish();
+        scene
+    }
+
+    #[test]
+    fn retained_transparent_composite_hover_matches_exact_rgba_and_invalidates_appearance()
+    -> anyhow::Result<()> {
+        let _gpu_test_guard = crate::test_gpu::guard();
+        let context = WgpuContext::new_headless(None)?;
+        for crop_paths in [false, true] {
+            for (fraction, smoothing, backing_alpha) in [
+                (0.0, 0.0, 0.45),
+                (0.25, 0.65, 1.0),
+                (0.5, 0.0, 1.0),
+                (0.75, 0.65, 0.45),
+            ] {
+                let target = size(DevicePixels(200), DevicePixels(100));
+                let mut full = WgpuRenderer::new_headless(&context, target)?;
+                let mut retained = WgpuRenderer::new_headless(&context, target)?;
+                full.retained.disable_for_tests();
+                retained.retained.enable_for_tests();
+                full.update_transparency(true);
+                retained.update_transparency(true);
+                full.crop_path_targets = crop_paths;
+                retained.crop_path_targets = crop_paths;
+                full.timings.diagnostic_ablations = Default::default();
+                retained.timings.diagnostic_ablations = Default::default();
+                let glyph = retained_glyph_tile(&full)?;
+                assert_eq!(glyph, retained_glyph_tile(&retained)?);
+                let label = format!(
+                    "fraction={fraction}, smoothing={smoothing}, backing={backing_alpha}, crop={crop_paths}"
+                );
+                let mut revision = 0;
+                let mut previous = None;
+                let resting = transparent_composite_hover_scene(
+                    None,
+                    fraction,
+                    smoothing,
+                    backing_alpha,
+                    glyph,
+                );
+                let mut resting_pixels = None;
+                for (index, row) in [
+                    None,
+                    None,
+                    Some(0),
+                    Some(0),
+                    Some(2),
+                    Some(0),
+                    Some(1),
+                    Some(2),
+                    None,
+                    None,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    if index == 0 || row != previous {
+                        revision += 1;
+                    }
+                    let scene = transparent_composite_hover_scene(
+                        row,
+                        fraction,
+                        smoothing,
+                        backing_alpha,
+                        glyph,
+                    );
+                    let image = assert_retained_rgba(
+                        &mut full,
+                        &mut retained,
+                        &scene,
+                        revision,
+                        if index == 0 {
+                            "full"
+                        } else if row == previous {
+                            "reuse"
+                        } else {
+                            "partial"
+                        },
+                        &format!("{label}, step={index}, row={row:?}"),
+                    )?;
+                    assert!(image.pixels().any(|pixel| pixel[3] > 0 && pixel[3] < 255));
+                    assert!(
+                        image.get_pixel(0, 0)[3] < 255,
+                        "rounded outside corner: {label}"
+                    );
+                    if backing_alpha == 1.0 {
+                        assert_eq!(image.get_pixel(150, 85)[3], 255, "opaque interior: {label}");
+                    }
+                    if index == 0 {
+                        resting_pixels = Some(image.clone());
+                    } else if row.is_none() {
+                        assert_eq!(
+                            Some(&image),
+                            resting_pixels.as_ref(),
+                            "erase restores every byte: {label}"
+                        );
+                    } else {
+                        assert_ne!(
+                            Some(&image),
+                            resting_pixels.as_ref(),
+                            "hover must visibly alter the fixture: {label}"
+                        );
+                    }
+                    previous = row;
+                }
+                // Invalidate independently of scene revision: resize, alpha mode,
+                // clear color, and atlas generation must never reuse stale pixels.
+                let resized = size(DevicePixels(193), DevicePixels(97));
+                full.update_drawable_size(resized);
+                retained.update_drawable_size(resized);
+                assert_retained_rgba(
+                    &mut full,
+                    &mut retained,
+                    &resting,
+                    revision,
+                    "full",
+                    &format!("resize: {label}"),
+                )?;
+                assert_retained_rgba(
+                    &mut full,
+                    &mut retained,
+                    &resting,
+                    revision,
+                    "reuse",
+                    &format!("resized reuse: {label}"),
+                )?;
+                for transparent in [false, true] {
+                    full.update_transparency(transparent);
+                    retained.update_transparency(transparent);
+                    assert_retained_rgba(
+                        &mut full,
+                        &mut retained,
+                        &resting,
+                        revision,
+                        "full",
+                        &format!("alpha transition to {transparent}: {label}"),
+                    )?;
+                    assert_retained_rgba(
+                        &mut full,
+                        &mut retained,
+                        &resting,
+                        revision,
+                        "reuse",
+                        &format!("alpha reuse {transparent}: {label}"),
+                    )?;
+                }
+                // A direct clear-color change must be detected by the retained
+                // appearance key even when no public alpha toggle fires.
+                full.target.clear_color = wgpu::Color {
+                    r: 0.04,
+                    g: 0.03,
+                    b: 0.02,
+                    a: 0.25,
+                };
+                retained.target.clear_color = full.target.clear_color;
+                assert_retained_rgba(
+                    &mut full,
+                    &mut retained,
+                    &resting,
+                    revision,
+                    "full",
+                    &format!("clear-color transition: {label}"),
+                )?;
+                assert_retained_rgba(
+                    &mut full,
+                    &mut retained,
+                    &resting,
+                    revision,
+                    "reuse",
+                    &format!("clear-color reuse: {label}"),
+                )?;
+                full.atlas.clear();
+                retained.atlas.clear();
+                let glyph = retained_glyph_tile(&full)?;
+                assert_eq!(glyph, retained_glyph_tile(&retained)?);
+                let scene = transparent_composite_hover_scene(
+                    None,
+                    fraction,
+                    smoothing,
+                    backing_alpha,
+                    glyph,
+                );
+                assert_retained_rgba(
+                    &mut full,
+                    &mut retained,
+                    &scene,
+                    revision,
+                    "full",
+                    &format!("atlas invalidation: {label}"),
+                )?;
+                assert_retained_rgba(
+                    &mut full,
+                    &mut retained,
+                    &scene,
+                    revision,
+                    "reuse",
+                    &format!("atlas reuse: {label}"),
+                )?;
+            }
         }
         Ok(())
     }

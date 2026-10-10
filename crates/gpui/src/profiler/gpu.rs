@@ -34,6 +34,8 @@ pub struct RendererProfileCapabilities {
     pub windows_keepalive_policy: Option<String>,
     /// Actual swapchain present mode selected by the backend.
     pub present_mode: Option<String>,
+    /// Actual configured swapchain alpha mode; absent when unavailable.
+    pub surface_alpha_mode: Option<String>,
     /// Visually incomplete diagnostic controls implemented by the backend.
     pub implemented_diagnostic_ablations: Vec<String>,
     /// Diagnostic controls active in this renderer.
@@ -93,6 +95,8 @@ pub struct GpuEvent {
     pub diagnostic_ablations: Vec<String>,
     /// Retained-scene result: full, partial, or reuse.
     pub damage_kind: String,
+    /// Why retained drawing fell back to a complete scene, independently of timing status.
+    pub damage_fallback_reason: Option<String>,
     /// Extra retained GPU allocations held by this renderer.
     pub retained_bytes: u64,
     /// Actual quad API draw calls, including damage-clear quads, for this submission.
@@ -273,6 +277,7 @@ impl GpuEvent {
             experiments: Vec::new(),
             diagnostic_ablations: Vec::new(),
             damage_kind: "full".into(),
+            damage_fallback_reason: None,
             retained_bytes: 0,
             quad_draw_calls: 0,
             quad_scissor_splits: 0,

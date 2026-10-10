@@ -50,6 +50,12 @@ fn instance_binding_entries(source: InstanceBindingSource<'_>) -> Vec<wgpu::Bind
 
 pub(super) struct WgpuPipelines {
     pub(super) quads: WgpuRenderPipeline,
+    pub(super) damage_clear_quads: Option<WgpuRenderPipeline>,
+    // Handles already used by the ordinary Quad pipelines; retaining their references
+    // creates no additional GPU allocation or shader compilation at startup.
+    damage_clear_shader: wgpu::ShaderModule,
+    damage_clear_layout: wgpu::PipelineLayout,
+    damage_clear_format: wgpu::TextureFormat,
     pub(super) smoothed_quads: WgpuRenderPipeline,
     pub(super) shadows: WgpuRenderPipeline,
     pub(super) smoothed_shadows: WgpuRenderPipeline,
@@ -327,6 +333,19 @@ impl WgpuBindGroupLayouts {
 }
 
 impl WgpuPipelines {
+    pub(super) fn ensure_damage_clear(&mut self, device: &wgpu::Device) {
+        if self.damage_clear_quads.is_none() {
+            self.damage_clear_quads = Some(create_render_pipeline(
+                device,
+                shader::QUADS,
+                &self.damage_clear_layout,
+                &color_target(self.damage_clear_format, None),
+                1,
+                &self.damage_clear_shader,
+            ));
+        }
+    }
+
     pub(super) fn new(
         device: &wgpu::Device,
         bind_group_layouts: &WgpuBindGroupLayouts,
@@ -425,6 +444,7 @@ impl WgpuPipelines {
 
         Self {
             quads: create(shader::QUADS, &scene_target, 1, &shader_module),
+            damage_clear_quads: None,
             smoothed_quads: create(shader::SMOOTHED_QUADS, &scene_target, 1, &shader_module),
             shadows: create(shader::SHADOWS, &scene_target, 1, &shader_module),
             smoothed_shadows: create(shader::SMOOTHED_SHADOWS, &scene_target, 1, &shader_module),
@@ -480,6 +500,9 @@ impl WgpuPipelines {
                 1,
                 &shader_module,
             ),
+            damage_clear_shader: shader_module,
+            damage_clear_layout: instance_layout,
+            damage_clear_format: surface_format,
         }
     }
 }

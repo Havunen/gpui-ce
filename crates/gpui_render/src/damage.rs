@@ -11,6 +11,7 @@ use std::mem::size_of;
 const MAX_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_REGIONS: usize = 8;
 const MAX_QUAD_EDITS: usize = 8;
+const MAX_GLYPH_EDITS: usize = 128;
 const MAX_COMMUTATIONS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,6 +78,40 @@ pub struct SceneSnapshot {
     atlas_generation: u64,
     width: u32,
     height: u32,
+}
+
+/// A stable reason why a scene cannot safely use retained damage comparison.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SceneSnapshotUnsupportedReason {
+    /// The physical render target has a zero dimension.
+    InvalidTargetSize,
+    /// A surface can change its pixels independently of the scene primitives.
+    Surface,
+    /// A backdrop filter reads pixels beyond local damage bounds.
+    BackdropFilter,
+    /// An element filter introduces an unsupported render-target boundary.
+    FilterBoundary,
+    /// A glyph transform requires a separate conservative coverage proof.
+    TransformedGlyph,
+    /// Geometry is nonfinite or has an invalid negative extent.
+    NonfiniteGeometry,
+    /// Exact primitive copies would exceed the bounded snapshot budget.
+    SnapshotBudget,
+}
+
+impl SceneSnapshotUnsupportedReason {
+    /// Stable diagnostic name used by renderer profiling records.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidTargetSize => "invalid-target-size",
+            Self::Surface => "surface",
+            Self::BackdropFilter => "backdrop-filter",
+            Self::FilterBoundary => "filter-boundary",
+            Self::TransformedGlyph => "transformed-glyph",
+            Self::NonfiniteGeometry => "nonfinite-geometry",
+            Self::SnapshotBudget => "snapshot-budget",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -173,6 +208,10 @@ enum PaintedPrimitive<'a> {
 impl PaintedPrimitive<'_> {
     fn is_quad(self) -> bool {
         matches!(self, Self::Quad(..))
+    }
+
+    fn is_glyph(self) -> bool {
+        matches!(self, Self::Monochrome(..) | Self::Subpixel(..))
     }
 
     fn translated_quad_matches(self, other: Self) -> bool {
@@ -299,6 +338,85 @@ impl PaintedPrimitive<'_> {
     }
 }
 
+// Glyph badges can introduce a whole run, rather than a single primitive. Only
+// identity-transformed, finite glyphs survive capture, and an exact following
+// anchor preserves the unchanged painter sequence. Keep old/new runs separate:
+// a union spanning distant rows could merge both full-width row fills into one
+// unnecessarily large damage rectangle.
+fn glyph_run_to_anchor(
+    sequence: &[PaintedPrimitive<'_>],
+    start: usize,
+    anchor: PaintedPrimitive<'_>,
+) -> Option<usize> {
+    for count in 1..=MAX_GLYPH_EDITS {
+        if !sequence.get(start + count - 1)?.is_glyph() {
+            return None;
+        }
+        if sequence.get(start + count)?.geometry_matches(anchor) {
+            return Some(count);
+        }
+    }
+    None
+}
+
+fn glyph_prefix_len(sequence: &[PaintedPrimitive<'_>], start: usize) -> usize {
+    sequence[start..]
+        .iter()
+        .take(MAX_GLYPH_EDITS)
+        .take_while(|primitive| primitive.is_glyph())
+        .count()
+}
+
+fn paired_glyph_runs(
+    next: &[PaintedPrimitive<'_>],
+    old: &[PaintedPrimitive<'_>],
+    n: usize,
+    o: usize,
+) -> Option<(usize, usize)> {
+    let mut best = None;
+    let mut best_edits = MAX_GLYPH_EDITS + 1;
+    let mut ambiguous = false;
+    let next_len = glyph_prefix_len(next, n);
+    let old_len = glyph_prefix_len(old, o);
+    for next_count in 1..=next_len {
+        if next_count >= best_edits {
+            break;
+        }
+        for old_count in 1..=old_len
+            .min(MAX_GLYPH_EDITS - next_count)
+            .min(best_edits - next_count)
+        {
+            let edits = next_count + old_count;
+            if edits > best_edits {
+                continue;
+            }
+            let anchored = match (next.get(n + next_count), old.get(o + old_count)) {
+                (Some(next), Some(old)) => next.geometry_matches(*old),
+                (None, None) => true,
+                _ => false,
+            };
+            if anchored {
+                if edits < best_edits {
+                    best = Some((next_count, old_count));
+                    best_edits = edits;
+                    ambiguous = false;
+                } else {
+                    ambiguous = true;
+                }
+            }
+        }
+    }
+    if ambiguous { None } else { best }
+}
+
+fn glyph_run_bounds(run: &[PaintedPrimitive<'_>]) -> Bounds<ScaledPixels> {
+    run.iter()
+        .map(|primitive| primitive.bounds())
+        .filter(|bounds| !bounds.is_empty())
+        .reduce(|bounds, next| bounds.union(&next))
+        .unwrap_or_default()
+}
+
 fn disjoint_swap(
     next: &[PaintedPrimitive<'_>],
     old: &[PaintedPrimitive<'_>],
@@ -401,17 +519,50 @@ impl SceneSnapshot {
     }
     /// Capture a finished scene when its geometry is supported and fits the snapshot budget.
     pub fn capture(scene: &Scene, atlas_generation: u64, width: u32, height: u32) -> Option<Self> {
+        Self::capture_checked(scene, atlas_generation, width, height).ok()
+    }
+
+    /// Capture a supported finished scene, retaining a precise reason for full redraw fallback.
+    pub fn capture_checked(
+        scene: &Scene,
+        atlas_generation: u64,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, SceneSnapshotUnsupportedReason> {
+        use SceneSnapshotUnsupportedReason as Unsupported;
         // Surfaces can update without primitive changes. Filters sample outside local bounds.
-        if width == 0
-            || height == 0
-            || !scene.surfaces.is_empty()
-            || !scene.backdrop_filters.is_empty()
-            || !scene.filter_boundaries.is_empty()
-        {
-            return None;
+        if width == 0 || height == 0 {
+            return Err(Unsupported::InvalidTargetSize);
         }
-        snapshot_bytes(scene)?;
+        if !scene.surfaces.is_empty() {
+            return Err(Unsupported::Surface);
+        }
+        if !scene.backdrop_filters.is_empty() {
+            return Err(Unsupported::BackdropFilter);
+        }
+        if !scene.filter_boundaries.is_empty() {
+            return Err(Unsupported::FilterBoundary);
+        }
+        snapshot_bytes(scene).ok_or(Unsupported::SnapshotBudget)?;
         let visible = |bounds, mask| finite_bounds(bounds) && finite_bounds(mask);
+        for (bounds, mask, transformation) in scene
+            .monochrome_sprites
+            .iter()
+            .map(|p| (p.bounds, p.content_mask.bounds, p.transformation))
+            .chain(
+                scene
+                    .subpixel_sprites
+                    .iter()
+                    .map(|p| (p.bounds, p.content_mask.bounds, p.transformation)),
+            )
+        {
+            if transformation != Default::default() {
+                return Err(Unsupported::TransformedGlyph);
+            }
+            if !visible(bounds, mask) {
+                return Err(Unsupported::NonfiniteGeometry);
+            }
+        }
         if scene
             .quads
             .iter()
@@ -425,12 +576,6 @@ impl SceneSnapshot {
                             || !vertex.st_position.y.is_finite()
                             || !finite_bounds(vertex.content_mask.bounds)
                     })
-            })
-            || scene.monochrome_sprites.iter().any(|p| {
-                p.transformation != Default::default() || !visible(p.bounds, p.content_mask.bounds)
-            })
-            || scene.subpixel_sprites.iter().any(|p| {
-                p.transformation != Default::default() || !visible(p.bounds, p.content_mask.bounds)
             })
             || scene.shadows.iter().any(|p| {
                 !visible(p.bounds, p.content_mask.bounds)
@@ -447,9 +592,9 @@ impl SceneSnapshot {
                 .iter()
                 .any(|p| !visible(p.bounds, p.content_mask.bounds))
         {
-            return None;
+            return Err(Unsupported::NonfiniteGeometry);
         }
-        Some(Self {
+        Ok(Self {
             commands: scene.render_commands().to_vec(),
             quads: scene.quads.clone(),
             paths: scene.paths.clone(),
@@ -466,17 +611,28 @@ impl SceneSnapshot {
 
     /// Verify painter order and classify exact reuse or bounded local colour/quad changes.
     pub fn compare(&self, previous: &Self) -> Damage {
-        if self.atlas_generation != previous.atlas_generation
-            || self.width != previous.width
-            || self.height != previous.height
-            || self.paths.len() != previous.paths.len()
-            || self.monochrome_sprites.len() != previous.monochrome_sprites.len()
-            || self.subpixel_sprites.len() != previous.subpixel_sprites.len()
-            || self.shadows.len() != previous.shadows.len()
-            || self.underlines.len() != previous.underlines.len()
-            || self.polychrome_sprites.len() != previous.polychrome_sprites.len()
-        {
-            return Damage::Full;
+        self.compare_checked(previous).unwrap_or(Damage::Full)
+    }
+
+    /// Compare supported scenes, reporting a static reason when full rendering is required.
+    pub fn compare_checked(&self, previous: &Self) -> Result<Damage, &'static str> {
+        if self.atlas_generation != previous.atlas_generation {
+            return Err("atlas-generation-change");
+        }
+        if self.width != previous.width || self.height != previous.height {
+            return Err("target-extent-change");
+        }
+        if self.paths.len() != previous.paths.len() {
+            return Err("path-count-change");
+        }
+        if self.shadows.len() != previous.shadows.len() {
+            return Err("shadow-count-change");
+        }
+        if self.underlines.len() != previous.underlines.len() {
+            return Err("underline-count-change");
+        }
+        if self.polychrome_sprites.len() != previous.polychrome_sprites.len() {
+            return Err("polychrome-count-change");
         }
         let mut regions: Vec<DamageRect> = Vec::new();
         let mut damage = |bounds| -> bool {
@@ -497,17 +653,18 @@ impl SceneSnapshot {
             regions.len() <= MAX_REGIONS
         };
         let (Some(next), Some(old)) = (self.painter_sequence(), previous.painter_sequence()) else {
-            return Damage::Full;
+            return Err("unsupported-painter-sequence");
         };
         let mut n = 0;
         let mut o = 0;
         let mut edits = 0;
+        let mut glyph_edits = 0;
         let mut commutations = 0;
         while n < next.len() || o < old.len() {
             match (next.get(n).copied(), old.get(o).copied()) {
                 (Some(current), Some(prior)) if current.geometry_matches(prior) => {
                     if current.colour_changed(prior) && !damage(current.bounds()) {
-                        return Damage::Full;
+                        return Err("damage-region-budget");
                     }
                     n += 1;
                     o += 1;
@@ -519,15 +676,66 @@ impl SceneSnapshot {
                         if (current.colour_changed(old_b) && !damage(current.bounds()))
                             || (next_b.colour_changed(prior) && !damage(next_b.bounds()))
                         {
-                            return Damage::Full;
+                            return Err("damage-region-budget");
                         }
                         n += 2;
                         o += 2;
                         commutations += 1;
                         if commutations > MAX_COMMUTATIONS {
-                            return Damage::Full;
+                            return Err("commutation-budget");
                         }
                         continue;
+                    }
+                    let inserted_glyphs = current
+                        .is_glyph()
+                        .then(|| glyph_run_to_anchor(&next, n, prior))
+                        .flatten();
+                    let removed_glyphs = prior
+                        .is_glyph()
+                        .then(|| glyph_run_to_anchor(&old, o, current))
+                        .flatten();
+                    if inserted_glyphs.is_some() && removed_glyphs.is_some() {
+                        // An overlapping reorder cannot masquerade as two edits.
+                        return Err("ambiguous-glyph-reorder");
+                    }
+                    if let Some(count) = inserted_glyphs {
+                        glyph_edits += count;
+                        if glyph_edits > MAX_GLYPH_EDITS {
+                            return Err("glyph-edit-budget");
+                        }
+                        if !damage(glyph_run_bounds(&next[n..n + count])) {
+                            return Err("damage-region-budget");
+                        }
+                        n += count;
+                        continue;
+                    }
+                    if let Some(count) = removed_glyphs {
+                        glyph_edits += count;
+                        if glyph_edits > MAX_GLYPH_EDITS {
+                            return Err("glyph-edit-budget");
+                        }
+                        if !damage(glyph_run_bounds(&old[o..o + count])) {
+                            return Err("damage-region-budget");
+                        }
+                        o += count;
+                        continue;
+                    }
+                    if current.is_glyph() && prior.is_glyph() {
+                        if let Some((next_count, old_count)) = paired_glyph_runs(&next, &old, n, o)
+                        {
+                            glyph_edits += next_count + old_count;
+                            if glyph_edits > MAX_GLYPH_EDITS {
+                                return Err("glyph-edit-budget");
+                            }
+                            if !damage(glyph_run_bounds(&next[n..n + next_count]))
+                                || !damage(glyph_run_bounds(&old[o..o + old_count]))
+                            {
+                                return Err("damage-region-budget");
+                            }
+                            n += next_count;
+                            o += old_count;
+                            continue;
+                        }
                     }
                     // Permit one sparse inserted/removed quad only when the immediately
                     // following exact geometry re-establishes the unchanged painter order.
@@ -536,7 +744,7 @@ impl SceneSnapshot {
                     let removed = prior.is_quad()
                         && old.get(o + 1).is_some_and(|p| current.geometry_matches(*p));
                     if inserted && removed {
-                        return Damage::Full;
+                        return Err("ambiguous-quad-reorder");
                     }
                     if !inserted && !removed {
                         // One omitted hover fill may move to another row without any
@@ -556,21 +764,43 @@ impl SceneSnapshot {
                                     self.width,
                                     self.height,
                                 ));
-                        if !paired || !damage(current.bounds()) || !damage(prior.bounds()) {
-                            return Damage::Full;
+                        if !paired {
+                            return Err(match (current, prior) {
+                                (PaintedPrimitive::Path(..), PaintedPrimitive::Path(..)) => {
+                                    "path-geometry-or-group-change"
+                                }
+                                (PaintedPrimitive::Shadow(..), PaintedPrimitive::Shadow(..)) => {
+                                    "shadow-geometry-or-order-change"
+                                }
+                                (
+                                    PaintedPrimitive::Underline(..),
+                                    PaintedPrimitive::Underline(..),
+                                ) => "underline-geometry-or-order-change",
+                                (
+                                    PaintedPrimitive::Polychrome(..),
+                                    PaintedPrimitive::Polychrome(..),
+                                ) => "polychrome-geometry-or-order-change",
+                                _ if current.is_glyph() || prior.is_glyph() => {
+                                    "glyph-run-anchor-change"
+                                }
+                                _ => "quad-geometry-or-painter-order-change",
+                            });
+                        }
+                        if !damage(current.bounds()) || !damage(prior.bounds()) {
+                            return Err("damage-region-budget");
                         }
                         n += 1;
                         o += 1;
                         edits += 2;
                     } else if inserted {
                         if !damage(current.bounds()) {
-                            return Damage::Full;
+                            return Err("damage-region-budget");
                         }
                         n += 1;
                         edits += 1;
                     } else {
                         if !damage(prior.bounds()) {
-                            return Damage::Full;
+                            return Err("damage-region-budget");
                         }
                         o += 1;
                         edits += 1;
@@ -578,35 +808,57 @@ impl SceneSnapshot {
                 }
                 (Some(current), None) if current.is_quad() => {
                     if !damage(current.bounds()) {
-                        return Damage::Full;
+                        return Err("damage-region-budget");
                     }
                     n += 1;
                     edits += 1;
                 }
                 (None, Some(prior)) if prior.is_quad() => {
                     if !damage(prior.bounds()) {
-                        return Damage::Full;
+                        return Err("damage-region-budget");
                     }
                     o += 1;
                     edits += 1;
                 }
-                _ => return Damage::Full,
+                (Some(current), None) if current.is_glyph() => {
+                    let count = glyph_prefix_len(&next, n);
+                    glyph_edits += count;
+                    if glyph_edits > MAX_GLYPH_EDITS {
+                        return Err("glyph-edit-budget");
+                    }
+                    if !damage(glyph_run_bounds(&next[n..n + count])) {
+                        return Err("damage-region-budget");
+                    }
+                    n += count;
+                }
+                (None, Some(prior)) if prior.is_glyph() => {
+                    let count = glyph_prefix_len(&old, o);
+                    glyph_edits += count;
+                    if glyph_edits > MAX_GLYPH_EDITS {
+                        return Err("glyph-edit-budget");
+                    }
+                    if !damage(glyph_run_bounds(&old[o..o + count])) {
+                        return Err("damage-region-budget");
+                    }
+                    o += count;
+                }
+                _ => return Err("unsupported-primitive-tail"),
             }
             if edits > MAX_QUAD_EDITS {
-                return Damage::Full;
+                return Err("quad-edit-budget");
             }
         }
         if regions.is_empty() {
-            return Damage::Reuse;
+            return Ok(Damage::Reuse);
         }
         let damaged: u128 = regions
             .iter()
             .map(|region| region.width as u128 * region.height as u128)
             .sum();
         if damaged * 100 > self.width as u128 * self.height as u128 * 40 {
-            Damage::Full
+            Err("damage-area-budget")
         } else {
-            Damage::Partial(regions)
+            Ok(Damage::Partial(regions))
         }
     }
 }
@@ -686,6 +938,167 @@ mod tests {
     }
     fn snapshot(scene: &Scene) -> SceneSnapshot {
         SceneSnapshot::capture(scene, 1, 200, 200).unwrap()
+    }
+
+    fn glyph(index: u32, x: f32, y: f32, subpixel: bool) -> gpui::Primitive {
+        let tile = gpui::AtlasTile {
+            texture_id: gpui::AtlasTextureId {
+                index: 0,
+                kind: if subpixel {
+                    gpui::AtlasTextureKind::Subpixel
+                } else {
+                    gpui::AtlasTextureKind::Monochrome
+                },
+            },
+            tile_id: gpui::TileId(index),
+            padding: 0,
+            bounds: Bounds::new(
+                point(gpui::DevicePixels(0), gpui::DevicePixels(0)),
+                size(gpui::DevicePixels(8), gpui::DevicePixels(8)),
+            ),
+        };
+        let mask = ContentMask {
+            bounds: bounds(0.0, 0.0, 200.0, 200.0),
+            ..Default::default()
+        };
+        if subpixel {
+            SubpixelSprite {
+                order: 0,
+                padding: 0,
+                bounds: bounds(x, y, 8.0, 10.0),
+                content_mask: mask,
+                color: gpui::white().into(),
+                tile,
+                transformation: Default::default(),
+            }
+            .into()
+        } else {
+            MonochromeSprite {
+                order: 0,
+                padding: 0,
+                bounds: bounds(x, y, 8.0, 10.0),
+                content_mask: mask,
+                color: gpui::white().into(),
+                tile,
+                transformation: Default::default(),
+            }
+            .into()
+        }
+    }
+
+    fn badge_scene(hover: Option<(usize, usize)>, subpixel: bool) -> Scene {
+        let mut scene = Scene::default();
+        for row in 0..2 {
+            let y = if row == 0 { 20.0 } else { 165.0 };
+            scene.push_layer(bounds(0.0, y, 200.0, 14.0));
+            if hover.is_some_and(|(hovered, _)| hovered == row) {
+                scene.insert_primitive(Quad {
+                    bounds: bounds(0.0, y, 200.0, 14.0),
+                    content_mask: ContentMask {
+                        bounds: bounds(0.0, 0.0, 200.0, 200.0),
+                        ..Default::default()
+                    },
+                    background: gpui::rgba(0x55779944).into(),
+                    ..Default::default()
+                });
+            }
+            // A stable graph-node quad and static text anchor remain present in
+            // every actual finished row; hover fills and badges are omitted at rest.
+            scene.insert_primitive(Quad {
+                bounds: bounds(8.0, y + 3.0, 3.0, 3.0),
+                content_mask: ContentMask {
+                    bounds: bounds(0.0, 0.0, 200.0, 200.0),
+                    ..Default::default()
+                },
+                background: gpui::white().into(),
+                ..Default::default()
+            });
+            if let Some((hovered, count)) = hover
+                && hovered == row
+            {
+                for index in 0..count {
+                    scene.insert_primitive(glyph(
+                        index as u32 + 1,
+                        40.0 + index as f32 * 7.0,
+                        y + 1.0,
+                        subpixel,
+                    ));
+                }
+            }
+            scene.insert_primitive(glyph(999, 180.0, y + 1.0, subpixel));
+            scene.pop_layer();
+        }
+        scene.finish();
+        scene
+    }
+
+    #[test]
+    fn hover_badge_glyph_runs_insert_move_erase_with_separate_far_row_damage() {
+        for subpixel in [false, true] {
+            let mut previous = snapshot(&badge_scene(None, subpixel));
+            for hover in [Some((0, 7)), Some((1, 9)), Some((0, 5)), None] {
+                let next = snapshot(&badge_scene(hover, subpixel));
+                let damage = next
+                    .compare_checked(&previous)
+                    .expect("supported badge edit");
+                let Damage::Partial(regions) = damage else {
+                    panic!("badge transition must actually use partial damage: {damage:?}");
+                };
+                assert!(regions.len() <= 2);
+                assert!(
+                    regions.iter().all(|region| region.height <= 17),
+                    "far rows must retain separate damage bands: {regions:?}"
+                );
+                assert_eq!(next.compare_checked(&next), Ok(Damage::Reuse));
+                previous = next;
+            }
+        }
+    }
+
+    #[test]
+    fn glyph_edits_preserve_order_atlas_budget_and_local_coverage_fallbacks() {
+        let mut empty = Scene::default();
+        empty.finish();
+        let empty = snapshot(&empty);
+        let mut excessive = Scene::default();
+        for index in 0..=MAX_GLYPH_EDITS {
+            excessive.insert_primitive(glyph(index as u32, 20.0, 20.0, false));
+        }
+        excessive.finish();
+        assert_eq!(
+            snapshot(&excessive).compare_checked(&empty),
+            Err("glyph-edit-budget")
+        );
+        let first = |reverse: bool| {
+            let mut scene = Scene::default();
+            for index in if reverse { [2, 1] } else { [1, 2] } {
+                scene.insert_primitive(glyph(index, 20.0, 20.0, false));
+            }
+            scene.finish();
+            snapshot(&scene)
+        };
+        assert_eq!(
+            first(true).compare_checked(&first(false)),
+            Err("ambiguous-glyph-reorder")
+        );
+        let badge = badge_scene(Some((0, 7)), false);
+        assert_eq!(
+            SceneSnapshot::capture(&badge, 2, 200, 200)
+                .unwrap()
+                .compare_checked(&snapshot(&badge)),
+            Err("atlas-generation-change")
+        );
+        let mut large = Scene::default();
+        let gpui::Primitive::MonochromeSprite(mut sprite) = glyph(1, 0.0, 0.0, false) else {
+            unreachable!()
+        };
+        sprite.bounds = bounds(0.0, 0.0, 200.0, 100.0);
+        large.insert_primitive(sprite);
+        large.finish();
+        assert_eq!(
+            snapshot(&large).compare_checked(&empty),
+            Err("damage-area-budget")
+        );
     }
 
     #[test]
@@ -984,6 +1397,98 @@ mod tests {
         first.quads = vec![quad; MAX_SNAPSHOT_BYTES / size_of::<Quad>() + 1];
         first.finish();
         assert!(SceneSnapshot::capture(&first, 1, 200, 200).is_none());
+        assert_eq!(
+            SceneSnapshot::capture_checked(&first, 1, 200, 200).unwrap_err(),
+            SceneSnapshotUnsupportedReason::SnapshotBudget
+        );
+    }
+
+    #[test]
+    fn checked_snapshot_capture_reports_stable_conservative_reasons() {
+        use SceneSnapshotUnsupportedReason as Unsupported;
+        let check = |scene: &Scene, expected: Unsupported| {
+            assert_eq!(
+                SceneSnapshot::capture_checked(scene, 1, 200, 200).unwrap_err(),
+                expected
+            );
+            assert!(SceneSnapshot::capture(scene, 1, 200, 200).is_none());
+        };
+        let mut empty = Scene::default();
+        empty.finish();
+        assert_eq!(
+            SceneSnapshot::capture_checked(&empty, 1, 0, 200).unwrap_err(),
+            Unsupported::InvalidTargetSize
+        );
+        let mut surface = Scene::default();
+        surface.surfaces.push(gpui::PaintSurface {
+            order: 0,
+            bounds: bounds(0.0, 0.0, 10.0, 10.0),
+            content_mask: ContentMask::default(),
+            source: gpui::SurfaceSource::Unsupported(size(
+                gpui::DevicePixels(10),
+                gpui::DevicePixels(10),
+            )),
+        });
+        check(&surface, Unsupported::Surface);
+        let mut backdrop = Scene::default();
+        backdrop.backdrop_filters.push(Default::default());
+        check(&backdrop, Unsupported::BackdropFilter);
+        let mut filtered = Scene::default();
+        filtered.filter_boundaries.push(gpui::FilterBoundary {
+            order: 0,
+            bounds: bounds(0.0, 0.0, 10.0, 10.0),
+            content_mask: ContentMask::default(),
+            corner_radii: Default::default(),
+            corner_smoothing: 0.0,
+            filters: Default::default(),
+            opacity: 1.0,
+            is_start: true,
+        });
+        check(&filtered, Unsupported::FilterBoundary);
+        let mut invalid = scene(gpui::white());
+        invalid.quads[0].bounds.origin.x.0 = f32::INFINITY;
+        check(&invalid, Unsupported::NonfiniteGeometry);
+        let mut glyphs = Scene::default();
+        glyphs.insert_primitive(MonochromeSprite {
+            order: 0,
+            padding: 0,
+            bounds: bounds(0.0, 0.0, 8.0, 8.0),
+            content_mask: ContentMask {
+                bounds: bounds(0.0, 0.0, 200.0, 200.0),
+                ..Default::default()
+            },
+            color: gpui::white().into(),
+            tile: gpui::AtlasTile {
+                texture_id: gpui::AtlasTextureId {
+                    index: 0,
+                    kind: gpui::AtlasTextureKind::Monochrome,
+                },
+                tile_id: gpui::TileId(0),
+                padding: 0,
+                bounds: Bounds::new(
+                    point(gpui::DevicePixels(0), gpui::DevicePixels(0)),
+                    size(gpui::DevicePixels(8), gpui::DevicePixels(8)),
+                ),
+            },
+            transformation: gpui::TransformationMatrix::unit()
+                .translate(point(ScaledPixels(1.0), ScaledPixels(0.0))),
+        });
+        glyphs.finish();
+        check(&glyphs, Unsupported::TransformedGlyph);
+        glyphs.monochrome_sprites[0].transformation = Default::default();
+        glyphs.monochrome_sprites[0].bounds.size.width.0 = f32::NAN;
+        check(&glyphs, Unsupported::NonfiniteGeometry);
+        for (reason, name) in [
+            (Unsupported::InvalidTargetSize, "invalid-target-size"),
+            (Unsupported::Surface, "surface"),
+            (Unsupported::BackdropFilter, "backdrop-filter"),
+            (Unsupported::FilterBoundary, "filter-boundary"),
+            (Unsupported::TransformedGlyph, "transformed-glyph"),
+            (Unsupported::NonfiniteGeometry, "nonfinite-geometry"),
+            (Unsupported::SnapshotBudget, "snapshot-budget"),
+        ] {
+            assert_eq!(reason.as_str(), name);
+        }
     }
 
     #[test]

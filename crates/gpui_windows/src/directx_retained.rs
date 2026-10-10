@@ -2,7 +2,7 @@
 use crate::bindings::Windows::Win32::*;
 use crate::directx_gpu_timing::{end_query, query, ready};
 use gpui::profiler::gpu::{self, GpuMemoryReservation};
-use gpui::{PlatformAtlas, Scene};
+use gpui::{PlatformAtlas, Scene, WindowBackgroundAppearance};
 use gpui_render::damage::{Damage, SceneSnapshot};
 use std::cell::RefCell;
 use windows_core::Interface;
@@ -13,6 +13,7 @@ struct Target {
     srv: Option<ID3D11ShaderResourceView>,
     width: u32,
     height: u32,
+    appearance: WindowBackgroundAppearance,
     reservation: GpuMemoryReservation,
 }
 struct Retired {
@@ -62,6 +63,7 @@ pub(super) struct RetainedPlan {
     pub damage: Damage,
     pub snapshot: Option<SceneSnapshot>,
     pub bytes: u64,
+    pub fallback_reason: Option<&'static str>,
     revision: u64,
     atlas: u64,
     reuse_snapshot: bool,
@@ -120,7 +122,8 @@ impl RetainedFrame {
         atlas: &dyn PlatformAtlas,
         width: u32,
         height: u32,
-        opaque: bool,
+        eligible: bool,
+        appearance: WindowBackgroundAppearance,
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
     ) -> anyhow::Result<RetainedPlan> {
@@ -134,11 +137,12 @@ impl RetainedFrame {
                 revision: 0,
                 atlas: 0,
                 reuse_snapshot: false,
+                fallback_reason: None,
             });
         }
         let frame = gpu::gpu_frame_context();
         let generation = atlas.generation();
-        let full = || RetainedPlan {
+        let full = |reason| RetainedPlan {
             rtv: None,
             srv: None,
             damage: Damage::Full,
@@ -147,18 +151,23 @@ impl RetainedFrame {
             revision: frame.scene_revision,
             atlas: generation,
             reuse_snapshot: false,
+            fallback_reason: Some(reason),
         };
         poll_retired();
-        if !opaque || !frame.active {
+        if !eligible || !frame.active {
             self.invalidate();
-            return Ok(full());
+            return Ok(full(if !eligible {
+                "diagnostic-ablation"
+            } else {
+                "inactive-window"
+            }));
         }
         self.devices = Some((device.clone(), context.clone()));
-        if self
-            .target
-            .as_ref()
-            .is_some_and(|target| target.width != width || target.height != height)
-        {
+        let mut target_change = None;
+        if self.target.as_ref().is_some_and(|target| {
+            target.width != width || target.height != height || target.appearance != appearance
+        }) {
+            target_change = Some("target-configuration-change");
             self.invalidate();
         }
         if self.scene_revision == Some(frame.scene_revision)
@@ -175,19 +184,23 @@ impl RetainedFrame {
                     revision: frame.scene_revision,
                     atlas: generation,
                     reuse_snapshot: true,
+                    fallback_reason: None,
                 });
             }
         }
-        let Some(snapshot) = SceneSnapshot::capture(scene, generation, width, height) else {
-            self.invalidate();
-            return Ok(full());
+        let snapshot = match SceneSnapshot::capture_checked(scene, generation, width, height) {
+            Ok(snapshot) => snapshot,
+            Err(reason) => {
+                self.invalidate();
+                return Ok(full(reason.as_str()));
+            }
         };
         if self.target.is_none() {
             let bytes = width as u64 * height as u64 * 4;
             let Some(reservation) =
                 gpu::reserve_retained_bytes("d3d11", device.as_raw() as usize, bytes)
             else {
-                return Ok(full());
+                return Ok(full("retained-device-budget"));
             };
             let desc = D3D11_TEXTURE2D_DESC {
                 Width: width,
@@ -224,14 +237,31 @@ impl RetainedFrame {
                 srv,
                 width,
                 height,
+                appearance,
                 reservation,
             });
         }
-        let damage = self
-            .snapshot
-            .as_ref()
-            .map_or(Damage::Full, |old| snapshot.compare(old));
+        let (damage, comparison_reason) = match self.snapshot.as_ref() {
+            Some(previous) => match snapshot.compare_checked(previous) {
+                Ok(damage) => (damage, None),
+                Err(reason) => (Damage::Full, Some(reason)),
+            },
+            None => (Damage::Full, None),
+        };
         let target = self.target.as_ref().unwrap();
+        let fallback_reason = if damage == Damage::Full {
+            Some(
+                target_change
+                    .or(comparison_reason)
+                    .unwrap_or(if self.snapshot.is_some() {
+                        "scene-change"
+                    } else {
+                        "initial-scene"
+                    }),
+            )
+        } else {
+            None
+        };
         Ok(RetainedPlan {
             rtv: target.rtv.clone(),
             srv: target.srv.clone(),
@@ -241,6 +271,7 @@ impl RetainedFrame {
             revision: frame.scene_revision,
             atlas: generation,
             reuse_snapshot: false,
+            fallback_reason,
         })
     }
     pub fn complete(&mut self, plan: RetainedPlan, success: bool) {

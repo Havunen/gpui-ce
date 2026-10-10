@@ -384,6 +384,20 @@ impl DirectXRenderer {
     }
     pub(crate) fn profile_capabilities(&self) -> gpui::profiler::gpu::RendererProfileCapabilities {
         let mut capabilities = self.timings.capabilities();
+        capabilities.surface_alpha_mode = self.resources.as_ref().and_then(|resources| {
+            let mut description = DXGI_SWAP_CHAIN_DESC1::default();
+            unsafe { resources.swap_chain.GetDesc1(&mut description) }
+                .ok()
+                .ok()?;
+            Some(
+                match description.AlphaMode {
+                    DXGI_ALPHA_MODE_PREMULTIPLIED => "premultiplied",
+                    DXGI_ALPHA_MODE_IGNORE => "ignore",
+                    _ => "unknown",
+                }
+                .into(),
+            )
+        });
         capabilities.present_mode = Some("immediate".into());
         if self.retained.enabled() && !self.timings.diagnostic_ablations.enabled() {
             capabilities
@@ -595,13 +609,15 @@ impl DirectXRenderer {
             self.atlas.as_ref(),
             self.width,
             self.height,
-            background_appearance.is_opaque() && !self.timings.diagnostic_ablations.enabled(),
+            !self.timings.diagnostic_ablations.enabled(),
+            background_appearance,
             &devices.device,
             &devices.device_context,
         )?;
         self.timings.describe_damage(
             plan.damage.kind(),
             plan.bytes,
+            plan.fallback_reason,
             if self.retained.enabled() && !self.timings.diagnostic_ablations.enabled() {
                 vec!["partial-redraw".into()]
             } else {
@@ -784,12 +800,9 @@ impl DirectXRenderer {
                     &ctx,
                     "damage_clear",
                 );
-                let result = self.draw_quads(
-                    instance_range(
-                        &(scene.quads.len() + region_index..scene.quads.len() + region_index + 1),
-                    )?,
-                    false,
-                );
+                let result = self.draw_damage_clear(instance_range(
+                    &(scene.quads.len() + region_index..scene.quads.len() + region_index + 1),
+                )?);
                 self.timings.end_pass(&ctx, clear);
                 result?;
             }
@@ -1221,6 +1234,23 @@ impl DirectXRenderer {
             instances,
             smoothed,
         );
+        if result.is_ok() && !instances.is_empty() {
+            self.timings.record_quad_draws(1, 0);
+        }
+        result
+    }
+
+    fn draw_damage_clear(&mut self, instances: InstanceRange) -> Result<()> {
+        let result = self
+            .pipelines
+            .quad_pipeline
+            .draw_instances_variant_with_blend(
+                &self.frame_bindings()?,
+                None,
+                instances,
+                false,
+                Some(&self.pipelines.blur_blend_replace),
+            );
         if result.is_ok() && !instances.is_empty() {
             self.timings.record_quad_draws(1, 0);
         }
@@ -2220,6 +2250,17 @@ impl<T> PipelineState<T> {
         instances: InstanceRange,
         use_variant: bool,
     ) -> Result<()> {
+        self.draw_instances_variant_with_blend(frame, texture, instances, use_variant, None)
+    }
+
+    fn draw_instances_variant_with_blend(
+        &self,
+        frame: &FrameBindings<'_>,
+        texture: Option<&[Option<ID3D11ShaderResourceView>]>,
+        instances: InstanceRange,
+        use_variant: bool,
+        blend_override: Option<&ID3D11BlendState>,
+    ) -> Result<()> {
         let variant = use_variant.then(|| {
             self.variant
                 .as_ref()
@@ -2232,7 +2273,14 @@ impl<T> PipelineState<T> {
             .vertex_count
             .fixed()
             .with_context(|| format!("{} has no fixed vertex count", self.label))?;
-        self.draw_with_variant(frame, texture, vertex_count, instances, variant)
+        self.draw_with_variant(
+            frame,
+            texture,
+            vertex_count,
+            instances,
+            variant,
+            blend_override,
+        )
     }
 
     /// Draws `vertex_count` vertex-pulled vertices as a single instance.
@@ -2252,7 +2300,7 @@ impl<T> PipelineState<T> {
         vertex_count: u32,
         instances: InstanceRange,
     ) -> Result<()> {
-        self.draw_with_variant(frame, texture, vertex_count, instances, None)
+        self.draw_with_variant(frame, texture, vertex_count, instances, None, None)
     }
 
     fn draw_with_variant(
@@ -2262,6 +2310,7 @@ impl<T> PipelineState<T> {
         vertex_count: u32,
         instances: InstanceRange,
         variant: Option<&PipelineVariant>,
+        blend_override: Option<&ID3D11BlendState>,
     ) -> Result<()> {
         if instances.is_empty() || vertex_count == 0 {
             return Ok(());
@@ -2312,7 +2361,11 @@ impl<T> PipelineState<T> {
             ctx.VSSetConstantBuffers(0, Some(&frame.globals.cbuffers()));
             ctx.PSSetConstantBuffers(0, Some(&frame.globals.cbuffers()));
             ctx.VSSetConstantBuffers(self.draw_constants.register, Some(&draw_constants));
-            ctx.OMSetBlendState(&self.blend_state, None, 0xFFFFFFFF);
+            ctx.OMSetBlendState(
+                blend_override.unwrap_or(&self.blend_state),
+                None,
+                0xFFFFFFFF,
+            );
             if let Some(texture) = texture {
                 ctx.PSSetSamplers(
                     PRIMARY_SAMPLER_REGISTER,
@@ -3537,12 +3590,400 @@ mod tests {
             "full",
             "resize invalidates unchanged revision reuse"
         );
-        // Transparent windows must use the normal complete render, with fresh alpha.
+        // Changing the background invalidates the previous clear/alpha representation.
         let _guard =
             gpui::profiler::gpu::set_gpu_frame_context(Some("retained-test".into()), true, 3, 3);
         assert_eq!(
             renderer.render_to_image(&hovered, WindowBackgroundAppearance::Transparent)?,
             reference.render_to_image(&hovered, WindowBackgroundAppearance::Transparent)?
+        );
+        assert_eq!(renderer.retained.last_damage(), "full");
+        Ok(())
+    }
+
+    fn transparent_retained_scene(hover: Option<usize>, glyph: AtlasTile, fraction: f32) -> Scene {
+        transparent_retained_scene_with_badge(hover, glyph, fraction, None)
+    }
+
+    fn transparent_retained_scene_with_badge(
+        hover: Option<usize>,
+        glyph: AtlasTile,
+        fraction: f32,
+        badge: Option<(AtlasTile, bool)>,
+    ) -> Scene {
+        use gpui::{Path, Shadow, point, px};
+        let mut scene = Scene::default();
+        let canvas = scaled(5.0, 5.0, 190.0, 90.0);
+        scene.insert_primitive(Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(8.0),
+            bounds: scaled(0.0, 0.0, 200.0, 100.0),
+            corner_radii: Corners::all(ScaledPixels(16.0)),
+            content_mask: full_mask(),
+            color: solid_background(hsla(0.0, 0.0, 0.0, 0.3)),
+            element_bounds: canvas,
+            element_corner_radii: Corners::all(ScaledPixels(10.0)),
+            inset: ShaderBool::Disabled,
+            corner_smoothing: 0.0,
+        });
+        scene.insert_primitive(Quad {
+            bounds: canvas,
+            content_mask: full_mask(),
+            background: solid_background(hsla(0.6, 0.2, 0.16, 0.55)),
+            corner_radii: Corners::all(ScaledPixels(10.0)),
+            ..Default::default()
+        });
+        for row in 0..3 {
+            let bounds = scaled(
+                9.0 + fraction,
+                12.0 + row as f32 * 24.0 + fraction,
+                180.0,
+                14.0,
+            );
+            scene.push_layer(bounds);
+            if hover == Some(row) {
+                scene.insert_primitive(Quad {
+                    bounds,
+                    content_mask: ContentMask {
+                        bounds: scaled(10.25, 5.25, 177.5, 89.5),
+                        ..Default::default()
+                    },
+                    background: solid_background(hsla(0.65, 0.8, 0.65, 0.7)),
+                    corner_radii: Corners::all(ScaledPixels(3.0)),
+                    ..Default::default()
+                });
+            }
+            // Unchanged, overlapping glyphs must be replayed after the erased hover fill.
+            scene.insert_primitive(MonochromeSprite {
+                order: 0,
+                padding: 0,
+                bounds: scaled(25.5, bounds.origin.y.0 + 2.0, 8.0, 8.0),
+                content_mask: full_mask(),
+                color: hsla(0.1, 0.6, 0.7, 0.7).into(),
+                tile: glyph,
+                transformation: Default::default(),
+            });
+            let mut path = Path::new(point(px(43.5), px(bounds.origin.y.0 + 2.0)));
+            path.line_to(point(px(49.5), px(bounds.origin.y.0 + 12.0)));
+            path.line_to(point(px(37.5), px(bounds.origin.y.0 + 12.0)));
+            let mut path = path.scale(1.0);
+            path.content_mask = ContentMask {
+                bounds: scaled(37.75, bounds.origin.y.0 + 1.25, 11.5, 11.5),
+                ..Default::default()
+            };
+            for vertex in &mut path.vertices {
+                vertex.content_mask = path.content_mask;
+            }
+            path.color = solid_background(if hover == Some(row) {
+                hsla(0.65, 0.8, 0.65, 0.7)
+            } else {
+                hsla(0.6, 0.2, 0.16, 0.55)
+            });
+            scene.insert_primitive(path);
+            if hover == Some(row)
+                && let Some((tile, subpixel)) = badge
+            {
+                // Real history hover adds a branch-name glyph run to an otherwise
+                // empty ref column. Run lengths differ without changing static text.
+                for index in 0..7 + row {
+                    let bounds = scaled(
+                        100.25 + fraction + index as f32 * 8.0,
+                        bounds.origin.y.0 + 2.0,
+                        8.0,
+                        8.0,
+                    );
+                    let mask = ContentMask {
+                        bounds: scaled(99.5, bounds.origin.y.0 - 1.0, 79.5, 11.0),
+                        ..Default::default()
+                    };
+                    if subpixel {
+                        scene.insert_primitive(gpui::SubpixelSprite {
+                            order: 0,
+                            padding: 0,
+                            bounds,
+                            content_mask: mask,
+                            color: hsla(0.07, 0.6, 0.73, 0.7).into(),
+                            tile,
+                            transformation: Default::default(),
+                        });
+                    } else {
+                        scene.insert_primitive(MonochromeSprite {
+                            order: 0,
+                            padding: 0,
+                            bounds,
+                            content_mask: mask,
+                            color: hsla(0.07, 0.6, 0.73, 0.7).into(),
+                            tile,
+                            transformation: Default::default(),
+                        });
+                    }
+                }
+            }
+            scene.pop_layer();
+        }
+        // Later translucent coverage exercises alpha compositing across both damaged rows.
+        scene.insert_primitive(Quad {
+            bounds: scaled(80.25, 9.5, 12.5, 77.0),
+            content_mask: full_mask(),
+            background: solid_background(hsla(0.03, 0.8, 0.6, 0.3)),
+            corner_radii: Corners::all(ScaledPixels(3.0)),
+            ..Default::default()
+        });
+        scene.finish();
+        scene
+    }
+
+    #[test]
+    fn retained_hover_badge_glyph_runs_match_full_pixels_on_transparent_target() -> Result<()> {
+        use gpui::{
+            FontId, GlyphId, GlyphRenderMode, PreparedRasterStyle, RenderGlyphParams, point, px,
+        };
+        let devices = DirectXDevices::new()?;
+        let window = HiddenWindow::new()?;
+        let reference_window = HiddenWindow::new()?;
+        let mut renderer = DirectXRenderer::new(window.0, &devices, false)?;
+        let mut reference = DirectXRenderer::new(reference_window.0, &devices, false)?;
+        renderer.retained.enable_for_tests();
+        reference.retained.disable_for_tests();
+        for renderer in [&mut renderer, &mut reference] {
+            renderer.resize(Size {
+                width: DevicePixels(200),
+                height: DevicePixels(100),
+            })?;
+        }
+        // Stable glyph-shaped coverage uses the production atlas and both glyph
+        // shaders, independent of locally installed fonts or native raster settings.
+        let coverage: Vec<u8> = (0..64)
+            .map(|index| match (index / 8, index % 8) {
+                (4, 1..=6) | (1..=6, 1 | 6) => 255,
+                (_, 2 | 5) => 96,
+                _ => 0,
+            })
+            .collect();
+        let make_glyph = |renderer: &DirectXRenderer, mode: GlyphRenderMode, glyph: u32| {
+            let key = AtlasKey::Glyph {
+                params: RenderGlyphParams {
+                    font_id: FontId(0),
+                    glyph_id: GlyphId(glyph),
+                    font_size: px(8.0),
+                    subpixel_variant: point(0, 0),
+                    scale_factor: 1.0,
+                    raster_style: PreparedRasterStyle::independent(mode),
+                },
+                format: mode.rasterized_format(),
+            };
+            let bytes = if mode == GlyphRenderMode::Subpixel {
+                coverage
+                    .iter()
+                    .flat_map(|&value| [value / 2, value, value.saturating_add(24), 255])
+                    .collect()
+            } else {
+                coverage.clone()
+            };
+            tile(renderer.sprite_atlas().as_ref(), key, bytes)
+        };
+        let glyph = make_glyph(&renderer, GlyphRenderMode::Grayscale, 65);
+        let reference_glyph = make_glyph(&reference, GlyphRenderMode::Grayscale, 65);
+        for mode in [GlyphRenderMode::Grayscale, GlyphRenderMode::Subpixel] {
+            let badge = make_glyph(&renderer, mode, 66);
+            let reference_badge = make_glyph(&reference, mode, 66);
+            for clipped in [false, true] {
+                renderer.timings.clipped_quads = clipped;
+                for fraction in [0.0, 0.25, 0.5, 0.75] {
+                    renderer.retained.invalidate();
+                    let mut previous = None;
+                    for (revision, hover) in [
+                        (1, None),
+                        (2, Some(0)),
+                        (3, Some(1)),
+                        (4, Some(2)),
+                        (5, None),
+                    ] {
+                        let scene = transparent_retained_scene_with_badge(
+                            hover,
+                            glyph,
+                            fraction,
+                            Some((badge, mode == GlyphRenderMode::Subpixel)),
+                        );
+                        let reference_scene = transparent_retained_scene_with_badge(
+                            hover,
+                            reference_glyph,
+                            fraction,
+                            Some((reference_badge, mode == GlyphRenderMode::Subpixel)),
+                        );
+                        let _scope = gpui::profiler::gpu::set_gpu_frame_context(
+                            Some("hover-badge-native".into()),
+                            true,
+                            revision,
+                            revision,
+                        );
+                        let actual = renderer
+                            .render_to_image(&scene, WindowBackgroundAppearance::Transparent)?;
+                        let expected = reference.render_to_image(
+                            &reference_scene,
+                            WindowBackgroundAppearance::Transparent,
+                        )?;
+                        assert_eq!(
+                            actual, expected,
+                            "glyph badge mode={mode:?} fraction={fraction} clipped={clipped} hover={hover:?}"
+                        );
+                        assert_eq!(
+                            renderer.retained.last_damage(),
+                            if revision == 1 { "full" } else { "partial" },
+                            "glyph badge must qualify for actual Partial"
+                        );
+                        if let Some(previous) = &previous {
+                            assert_ne!(&actual, previous, "badge pixels must visibly change");
+                        }
+                        previous = Some(actual);
+                        assert_eq!(
+                            renderer
+                                .render_to_image(&scene, WindowBackgroundAppearance::Transparent)?,
+                            expected
+                        );
+                        assert_eq!(renderer.retained.last_damage(), "reuse");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn retained_transparent_regions_erase_alpha_and_preserve_shadow_glyph_corners() -> Result<()> {
+        let devices = DirectXDevices::new()?;
+        let window = HiddenWindow::new()?;
+        let reference_window = HiddenWindow::new()?;
+        let mut renderer = DirectXRenderer::new(window.0, &devices, false)?;
+        let mut reference = DirectXRenderer::new(reference_window.0, &devices, false)?;
+        assert_eq!(
+            renderer
+                .profile_capabilities()
+                .surface_alpha_mode
+                .as_deref(),
+            Some("premultiplied")
+        );
+        renderer.retained.enable_for_tests();
+        reference.retained.disable_for_tests();
+        for renderer in [&mut renderer, &mut reference] {
+            renderer.resize(Size {
+                width: DevicePixels(200),
+                height: DevicePixels(100),
+            })?;
+        }
+        let make_tile = |renderer: &DirectXRenderer| {
+            tile(
+                renderer.sprite_atlas().as_ref(),
+                AtlasKey::Svg(RenderSvgParams {
+                    path: "retained-transparent-glyph".into(),
+                    size: Size {
+                        width: DevicePixels(8),
+                        height: DevicePixels(8),
+                    },
+                }),
+                (0..64)
+                    .map(|index| if index % 3 == 0 { 128 } else { 255 })
+                    .collect(),
+            )
+        };
+        let glyph = make_tile(&renderer);
+        let reference_glyph = make_tile(&reference);
+        for clipped in [false, true] {
+            renderer.timings.clipped_quads = clipped;
+            renderer.retained.invalidate();
+            for fraction in [0.0, 0.25, 0.5, 0.75] {
+                renderer.retained.invalidate();
+                let mut previous = None;
+                for (revision, hover) in [
+                    (1, None),
+                    (2, Some(0)),
+                    (3, Some(1)),
+                    (4, Some(2)),
+                    (5, None),
+                ] {
+                    let scene = transparent_retained_scene(hover, glyph, fraction);
+                    let reference_scene =
+                        transparent_retained_scene(hover, reference_glyph, fraction);
+                    let _scope = gpui::profiler::gpu::set_gpu_frame_context(
+                        Some("transparent-native".into()),
+                        true,
+                        revision,
+                        revision,
+                    );
+                    let actual = renderer
+                        .render_to_image(&scene, WindowBackgroundAppearance::Transparent)?;
+                    let expected = reference.render_to_image(
+                        &reference_scene,
+                        WindowBackgroundAppearance::Transparent,
+                    )?;
+                    assert_eq!(
+                        actual, expected,
+                        "transparent fraction={fraction} clipped={clipped} hover={hover:?}"
+                    );
+                    assert_eq!(
+                        renderer.retained.last_damage(),
+                        if revision == 1 { "full" } else { "partial" }
+                    );
+                    assert!(
+                        actual
+                            .pixels()
+                            .any(|pixel| pixel.0[3] > 0 && pixel.0[3] < 255),
+                        "fixture must contain fractional alpha"
+                    );
+                    if let Some(previous) = &previous {
+                        assert_ne!(&actual, previous, "fixture must change visible pixels");
+                    }
+                    previous = Some(actual.clone());
+                    assert_eq!(
+                        renderer
+                            .render_to_image(&scene, WindowBackgroundAppearance::Transparent)?,
+                        expected
+                    );
+                    assert_eq!(renderer.retained.last_damage(), "reuse");
+                }
+            }
+        }
+        let scene = transparent_retained_scene(None, glyph, 0.25);
+        let reference_scene = transparent_retained_scene(None, reference_glyph, 0.25);
+        let _scope = gpui::profiler::gpu::set_gpu_frame_context(
+            Some("transparent-native".into()),
+            true,
+            5,
+            5,
+        );
+        for appearance in [
+            WindowBackgroundAppearance::Opaque,
+            WindowBackgroundAppearance::Transparent,
+        ] {
+            assert_eq!(
+                renderer.render_to_image(&scene, appearance)?,
+                reference.render_to_image(&reference_scene, appearance)?
+            );
+            assert_eq!(
+                renderer.retained.last_damage(),
+                "full",
+                "appearance invalidates unchanged revision"
+            );
+            assert_eq!(
+                renderer.render_to_image(&scene, appearance)?,
+                reference.render_to_image(&reference_scene, appearance)?
+            );
+            assert_eq!(renderer.retained.last_damage(), "reuse");
+        }
+        for renderer in [&mut renderer, &mut reference] {
+            renderer.resize(Size {
+                width: DevicePixels(190),
+                height: DevicePixels(100),
+            })?;
+        }
+        assert_eq!(
+            renderer.render_to_image(&scene, WindowBackgroundAppearance::Transparent)?,
+            reference.render_to_image(&reference_scene, WindowBackgroundAppearance::Transparent)?
+        );
+        assert_eq!(
+            renderer.retained.last_damage(),
+            "full",
+            "resize invalidates unchanged revision"
         );
         Ok(())
     }

@@ -39,11 +39,12 @@ pub(super) fn render_to_view(
         atlas_generation,
         renderer.target.width(),
         renderer.target.height(),
-        renderer.target.configuration().alpha_mode == wgpu::CompositeAlphaMode::Opaque
-            && !renderer.timings.diagnostic_ablations.enabled(),
+        !renderer.timings.diagnostic_ablations.enabled(),
         &device,
         &queue,
         renderer.target.format(),
+        renderer.target.configuration().alpha_mode,
+        renderer.target.clear_color(),
     );
     if let Some(view) = &retained.view {
         targets.active = view.clone();
@@ -68,11 +69,19 @@ pub(super) fn render_to_view(
     if renderer.retained.enabled() && !renderer.timings.diagnostic_ablations.enabled() {
         experiments.push("partial-redraw".into());
     }
-    renderer
-        .timings
-        .describe_damage(retained.damage.kind(), retained.bytes, experiments);
+    renderer.timings.describe_damage(
+        retained.damage.kind(),
+        retained.bytes,
+        retained.fallback_reason,
+        experiments,
+    );
     // Partial regions replay batches independently. Reserve bounded duplicate uploads and clear quads.
     if let Damage::Partial(regions) = &retained.damage {
+        let device = renderer.resources().device.clone();
+        renderer
+            .resources_mut()
+            .pipelines
+            .ensure_damage_clear(&device);
         let transport = renderer.resources().instances.transport();
         let requirements = FrameRequirements::for_scene(scene, transport);
         let alignment = transport.batch_alignment(std::mem::size_of::<Quad>() as u64);
@@ -619,12 +628,10 @@ impl<'a> FrameEncoder<'a> {
                 clear.b as f32,
                 clear.a as f32,
             ));
-            self.renderer.draw_quads(
+            self.renderer.draw_damage_clear(
                 &[clear_quad(region, colour)],
-                false,
                 &mut self.instances,
                 &mut pass,
-                Some(region),
             )?;
         }
 
