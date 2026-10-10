@@ -856,6 +856,310 @@ mod path_target_tests {
             .ok_or_else(|| anyhow::anyhow!("retained glyph fixture must produce an atlas tile"))
     }
 
+    fn retained_tiled_glyph(
+        renderer: &WgpuRenderer,
+        mode: GlyphRenderMode,
+    ) -> anyhow::Result<AtlasTile> {
+        let key = AtlasKey::Glyph {
+            params: RenderGlyphParams {
+                font_id: FontId(0),
+                glyph_id: GlyphId(90),
+                font_size: px(8.0),
+                subpixel_variant: point(0, 0),
+                scale_factor: 1.0,
+                raster_style: PreparedRasterStyle::independent(mode),
+            },
+            format: mode.rasterized_format(),
+        };
+        let coverage: Vec<u8> = (0..64)
+            .map(|index| match (index / 8, index % 8) {
+                (4, 1..=6) | (1..=6, 1 | 6) => 255,
+                (_, 2 | 5) => 96,
+                _ => 0,
+            })
+            .collect();
+        let bytes = if mode == GlyphRenderMode::Subpixel {
+            coverage
+                .iter()
+                .flat_map(|&value| [value / 2, value, value.saturating_add(24), 255])
+                .collect()
+        } else {
+            coverage
+        };
+        renderer
+            .atlas
+            .get_or_insert_with(&key, &mut || {
+                Ok(Some((
+                    size(DevicePixels(8), DevicePixels(8)),
+                    Cow::Borrowed(&bytes),
+                )))
+            })?
+            .ok_or_else(|| anyhow::anyhow!("tiled glyph fixture must allocate an atlas tile"))
+    }
+
+    fn tiled_history_scene(
+        hover: Option<usize>,
+        fraction: f32,
+        glyph: AtlasTile,
+        mode: GlyphRenderMode,
+    ) -> Scene {
+        let mut scene = Scene::default();
+        let pane = scaled(20.0, 12.0, 460.0, 840.0);
+        let mask = ContentMask {
+            bounds: pane,
+            ..Default::default()
+        };
+        scene.insert_primitive(Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(2.25),
+            bounds: pane,
+            corner_radii: gpui::Corners::all(ScaledPixels(8.25)),
+            content_mask: ContentMask {
+                bounds: scaled(0.0, 0.0, 512.0, 1024.0),
+                ..Default::default()
+            },
+            color: gpui::rgba(0x17243850).into(),
+            element_bounds: pane,
+            element_corner_radii: gpui::Corners::all(ScaledPixels(8.25)),
+            inset: false.into(),
+            corner_smoothing: 0.65,
+        });
+        scene.insert_primitive(Quad {
+            bounds: pane,
+            content_mask: mask,
+            background: gpui::rgba(0x223344bb).into(),
+            corner_radii: gpui::Corners::all(ScaledPixels(8.25)),
+            corner_smoothing: 0.65,
+            ..Default::default()
+        });
+        // Stable graph raster groups precede ordinary bounds-tree row paints.
+        // No per-row push_layer/raise_order_floor masks the live rank permutation.
+        for row in [0, 5, 10, 19] {
+            scene.insert_primitive(triangle(
+                24.25 + fraction,
+                18.25 + row as f32 * 40.0,
+                10.5,
+                mask,
+            ));
+        }
+        let paint_glyph = |scene: &mut Scene, x: f32, y: f32, color: gpui::Hsla| {
+            if mode == GlyphRenderMode::Subpixel {
+                scene.insert_primitive(gpui::SubpixelSprite {
+                    order: 0,
+                    padding: 0,
+                    bounds: scaled(x, y, 8.5, 10.25),
+                    content_mask: mask,
+                    color: color.into(),
+                    tile: glyph,
+                    transformation: Default::default(),
+                });
+            } else {
+                scene.insert_primitive(MonochromeSprite {
+                    order: 0,
+                    padding: 0,
+                    bounds: scaled(x, y, 8.5, 10.25),
+                    content_mask: mask,
+                    color: color.into(),
+                    tile: glyph,
+                    transformation: Default::default(),
+                });
+            }
+        };
+        for row in 0..20 {
+            let y = 16.25 + fraction + row as f32 * 40.0;
+            if hover == Some(row) {
+                scene.insert_primitive(Quad {
+                    bounds: scaled(20.0, y, 460.0, 28.5),
+                    content_mask: mask,
+                    background: gpui::rgba(0x55779944).into(),
+                    ..Default::default()
+                });
+            }
+            // Live graph cutouts have unchanged geometry but hover-dependent
+            // backing colors. Color changes must not consume structural edits.
+            for (x, width) in [(134.0, 66.0), (200.0, 4.0), (410.0, 24.0)] {
+                scene.insert_primitive(Quad {
+                    bounds: scaled(x, y, width, 28.5),
+                    content_mask: mask,
+                    background: if hover == Some(row) {
+                        gpui::rgba(0x55779999)
+                    } else {
+                        gpui::rgba(0x22334499)
+                    }
+                    .into(),
+                    ..Default::default()
+                });
+            }
+            for index in 0..20 {
+                paint_glyph(
+                    &mut scene,
+                    32.25 + fraction + index as f32 * 18.5,
+                    y + 3.25,
+                    gpui::hsla(0.12, 0.6, 0.65, 0.85),
+                );
+            }
+            if hover == Some(row) {
+                for index in 0..7 + row % 3 {
+                    paint_glyph(
+                        &mut scene,
+                        282.25 + fraction + index as f32 * 7.0,
+                        y + 15.0,
+                        gpui::hsla(0.6, 0.4, 0.6, 0.6),
+                    );
+                }
+            }
+        }
+        scene.insert_primitive(Quad {
+            bounds: scaled(250.25 + fraction, 14.5, 8.5, 832.25),
+            content_mask: mask,
+            background: gpui::rgba(0xda624d60).into(),
+            ..Default::default()
+        });
+        scene.finish();
+        scene
+    }
+
+    #[test]
+    fn retained_tiled_history_bounds_tree_matches_exact_rgba_for_rank_permutations()
+    -> anyhow::Result<()> {
+        let _gpu_test_guard = crate::test_gpu::guard();
+        let context = WgpuContext::new_headless(None)?;
+        for mode in [GlyphRenderMode::Grayscale, GlyphRenderMode::Subpixel] {
+            for (transparent, fraction, clipped) in
+                [(false, 0.0, false), (true, 0.25, false), (true, 0.75, true)]
+            {
+                let target = size(DevicePixels(512), DevicePixels(1024));
+                let mut full = WgpuRenderer::new_headless(&context, target)?;
+                let mut retained = WgpuRenderer::new_headless(&context, target)?;
+                full.retained.disable_for_tests();
+                retained.retained.enable_for_tests();
+                full.update_transparency(transparent);
+                retained.update_transparency(transparent);
+                full.timings.clipped_quads = clipped;
+                retained.timings.clipped_quads = clipped;
+                full.timings.diagnostic_ablations = Default::default();
+                retained.timings.diagnostic_ablations = Default::default();
+                let glyph = retained_tiled_glyph(&full, mode)?;
+                assert_eq!(glyph, retained_tiled_glyph(&retained, mode)?);
+                let first = tiled_history_scene(Some(0), fraction, glyph, mode);
+                let last = tiled_history_scene(Some(19), fraction, glyph, mode);
+                let first_snapshot =
+                    gpui_render::damage::SceneSnapshot::capture(&first, 1, 512, 1024).unwrap();
+                let last_snapshot =
+                    gpui_render::damage::SceneSnapshot::capture(&last, 1, 512, 1024).unwrap();
+                assert!(
+                    last_snapshot.compare_checked(&first_snapshot).is_err(),
+                    "fixture must exercise strict global rank rejection"
+                );
+                assert!(
+                    matches!(
+                        last_snapshot.compare_tiled_checked(&first_snapshot),
+                        Ok(gpui_render::damage::Damage::Partial(_))
+                    ),
+                    "fixture must qualify by exact tile-local painter order"
+                );
+                let mut previous = None;
+                let mut revision = 0;
+                for (index, row) in [
+                    None,
+                    None,
+                    Some(0),
+                    Some(0),
+                    Some(19),
+                    Some(18),
+                    Some(1),
+                    Some(1),
+                    None,
+                    None,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    if index == 0 || row != previous {
+                        revision += 1;
+                    }
+                    let scene = tiled_history_scene(row, fraction, glyph, mode);
+                    assert_retained_rgba(
+                        &mut full,
+                        &mut retained,
+                        &scene,
+                        revision,
+                        if index == 0 {
+                            "full"
+                        } else if row == previous {
+                            "reuse"
+                        } else {
+                            "partial"
+                        },
+                        &format!(
+                            "tiled history mode={mode:?}, transparent={transparent}, fraction={fraction}, clipped={clipped}, step={index}, row={row:?}"
+                        ),
+                    )?;
+                    previous = row;
+                }
+
+                // Identical overlapping descriptors around a third translucent
+                // paint must change pixels, rather than being mistaken for Reuse.
+                let mask = ContentMask {
+                    bounds: scaled(0.0, 0.0, 512.0, 1024.0),
+                    ..Default::default()
+                };
+                let a = Quad {
+                    bounds: scaled(62.25, 62.25, 24.5, 24.5),
+                    content_mask: mask,
+                    background: gpui::rgba(0xff000080).into(),
+                    ..Default::default()
+                };
+                let b = Quad {
+                    background: gpui::rgba(0x0000ff80).into(),
+                    ..a
+                };
+                let mut overlap = Scene::default();
+                for quad in [a, a, b] {
+                    overlap.insert_primitive(quad);
+                }
+                overlap.finish();
+                // Recreate targets to ensure this independent order proof starts
+                // with an initial Full rather than an unrelated previous scene.
+                let queue = retained.resources().queue.clone();
+                retained.retained.invalidate(&queue);
+                revision += 1;
+                let original = assert_retained_rgba(
+                    &mut full,
+                    &mut retained,
+                    &overlap,
+                    revision,
+                    "full",
+                    "tiled overlap initial",
+                )?;
+                overlap.quads.swap(1, 2); // Counts/pipelines stay unchanged.
+                revision += 1;
+                let changed = assert_retained_rgba(
+                    &mut full,
+                    &mut retained,
+                    &overlap,
+                    revision,
+                    "partial",
+                    "tiled overlap reordered",
+                )?;
+                assert_ne!(
+                    original.as_raw(),
+                    changed.as_raw(),
+                    "overlapping painter reorder must visibly change RGBA"
+                );
+                assert_retained_rgba(
+                    &mut full,
+                    &mut retained,
+                    &overlap,
+                    revision,
+                    "reuse",
+                    "tiled overlap repeated",
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn transparent_composite_hover_scene(
         row: Option<usize>,
         fraction: f32,

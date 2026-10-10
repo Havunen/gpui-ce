@@ -18,6 +18,12 @@ const MAX_REGIONS: usize = 8;
 const MAX_QUAD_EDITS: usize = 8;
 const MAX_GLYPH_EDITS: usize = 128;
 const MAX_COMMUTATIONS: usize = 8;
+// Prototype fallback budgets. The original strict comparer remains the fast path.
+const DAMAGE_TILE_SIZE: u32 = 64;
+const MAX_DAMAGE_TILES: usize = 4096;
+const MAX_TILE_PRIMITIVES: usize = 8192;
+const MAX_TILE_REFERENCES: usize = 65536;
+const MAX_TILE_COMPARISONS: usize = 131072;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// A clipped damage rectangle in physical target pixels.
@@ -406,6 +412,202 @@ impl PaintedPrimitive<'_> {
             // coverage proof. Missing bounds must never prove that two paints are disjoint.
             _ => None,
         }
+    }
+
+    fn exact_matches(self, other: Self) -> bool {
+        self.geometry_matches(other) && !self.colour_changed(other)
+    }
+
+    fn comparison_cost(self, other: Self) -> usize {
+        match (self, other) {
+            (Self::Path(next, ..), Self::Path(old, ..)) => {
+                1 + next.vertices.len() + old.vertices.len()
+            }
+            _ => 1,
+        }
+    }
+
+    fn tile_coverage(self, width: u32, height: u32) -> Result<DamageRect, &'static str> {
+        let (bounds, mask) = match self {
+            Self::Quad(p, _) => (p.bounds, p.content_mask.bounds),
+            Self::Path(p, ..) => (p.bounds, p.content_mask.bounds),
+            Self::Monochrome(p, _) => (p.bounds, p.content_mask.bounds),
+            Self::Subpixel(p, _) => (p.bounds, p.content_mask.bounds),
+            Self::Shadow(p, _) => (
+                if p.inset.is_enabled() {
+                    p.element_bounds
+                } else {
+                    p.bounds.dilate(ScaledPixels(p.blur_radius.0 * 4.0))
+                },
+                p.content_mask.bounds,
+            ),
+            Self::Underline(p) => (
+                p.bounds.dilate(ScaledPixels(p.thickness.0 * 4.0)),
+                p.content_mask.bounds,
+            ),
+            Self::Polychrome(p, ..) => (p.bounds, p.content_mask.bounds),
+        };
+        if !finite_bounds(bounds) || !finite_bounds(mask) {
+            return Err("tile-nonfinite-coverage");
+        }
+        Ok(rectangle(bounds.intersect(&mask), width, height))
+    }
+
+    // A key narrows exact comparisons; it never establishes descriptor equality.
+    // Canonicalize signed zero because typed float equality treats both as equal.
+    fn descriptor_key(self) -> (u8, [u32; 4], u32, u32) {
+        let (kind, bounds, texture, tile) = match self {
+            Self::Quad(p, _) => (0, p.bounds, 0, 0),
+            Self::Shadow(p, _) => (1, p.bounds, 0, 0),
+            Self::Path(p, ..) => (2, p.bounds, 0, 0),
+            Self::Underline(p) => (3, p.bounds, 0, 0),
+            Self::Monochrome(p, t) => (4, p.bounds, t.index, p.tile.tile_id.0),
+            Self::Subpixel(p, t) => (5, p.bounds, t.index, p.tile.tile_id.0),
+            Self::Polychrome(p, _, t) => (6, p.bounds, t.index, p.tile.tile_id.0),
+        };
+        let bits = |value: f32| if value == 0.0 { 0 } else { value.to_bits() };
+        (
+            kind,
+            [
+                bits(bounds.origin.x.0),
+                bits(bounds.origin.y.0),
+                bits(bounds.size.width.0),
+                bits(bounds.size.height.0),
+            ],
+            texture,
+            tile,
+        )
+    }
+}
+
+struct TileReferences {
+    offsets: Vec<usize>,
+    ids: Vec<u32>,
+}
+
+fn tile_spans(region: DamageRect, columns: u32) -> impl Iterator<Item = usize> {
+    let left = region.x / DAMAGE_TILE_SIZE;
+    let top = region.y / DAMAGE_TILE_SIZE;
+    let right = region
+        .x
+        .saturating_add(region.width)
+        .div_ceil(DAMAGE_TILE_SIZE);
+    let bottom = region
+        .y
+        .saturating_add(region.height)
+        .div_ceil(DAMAGE_TILE_SIZE);
+    (top..bottom).flat_map(move |y| (left..right).map(move |x| (y * columns + x) as usize))
+}
+
+fn tile_coverages(
+    sequence: &[PaintedPrimitive<'_>],
+    width: u32,
+    height: u32,
+    references_left: &mut usize,
+) -> Result<Vec<DamageRect>, &'static str> {
+    let mut coverage = Vec::with_capacity(sequence.len());
+    for primitive in sequence {
+        let region = primitive.tile_coverage(width, height)?;
+        if region.width != 0 && region.height != 0 {
+            let columns =
+                (region.x + region.width).div_ceil(DAMAGE_TILE_SIZE) - region.x / DAMAGE_TILE_SIZE;
+            let rows =
+                (region.y + region.height).div_ceil(DAMAGE_TILE_SIZE) - region.y / DAMAGE_TILE_SIZE;
+            *references_left = references_left
+                .checked_sub(columns as usize * rows as usize)
+                .ok_or("tile-reference-budget")?;
+        }
+        coverage.push(region);
+    }
+    Ok(coverage)
+}
+
+fn tile_references(
+    coverage: &[DamageRect],
+    ids: &[u32],
+    columns: u32,
+    tiles: usize,
+) -> TileReferences {
+    let mut counts = vec![0usize; tiles];
+    for &region in coverage {
+        if region.width != 0 && region.height != 0 {
+            for tile in tile_spans(region, columns) {
+                counts[tile] += 1;
+            }
+        }
+    }
+    let mut offsets = Vec::with_capacity(tiles + 1);
+    offsets.push(0);
+    for count in counts {
+        offsets.push(offsets.last().copied().unwrap() + count);
+    }
+    let mut cursor = offsets[..tiles].to_vec();
+    let mut references = vec![0; offsets[tiles]];
+    // Fill in original painter order. No global rank or primitive-kind sort is used.
+    for (&region, id) in coverage.iter().zip(ids) {
+        if region.width != 0 && region.height != 0 {
+            for tile in tile_spans(region, columns) {
+                references[cursor[tile]] = *id;
+                cursor[tile] += 1;
+            }
+        }
+    }
+    TileReferences {
+        offsets,
+        ids: references,
+    }
+}
+
+fn tile_regions(
+    dirty: &[bool],
+    columns: u32,
+    width: u32,
+    height: u32,
+) -> Result<Damage, &'static str> {
+    let mut regions: Vec<DamageRect> = Vec::new();
+    let rows = height.div_ceil(DAMAGE_TILE_SIZE);
+    for y in 0..rows {
+        let mut x = 0;
+        while x < columns {
+            if !dirty[(y * columns + x) as usize] {
+                x += 1;
+                continue;
+            }
+            let start = x;
+            while x < columns && dirty[(y * columns + x) as usize] {
+                x += 1;
+            }
+            let region = DamageRect {
+                x: start * DAMAGE_TILE_SIZE,
+                y: y * DAMAGE_TILE_SIZE,
+                width: (x * DAMAGE_TILE_SIZE).min(width) - start * DAMAGE_TILE_SIZE,
+                height: DAMAGE_TILE_SIZE.min(height - y * DAMAGE_TILE_SIZE),
+            };
+            if let Some(previous) = regions.iter_mut().find(|previous| {
+                previous.x == region.x
+                    && previous.width == region.width
+                    && previous.y + previous.height == region.y
+            }) {
+                previous.height += region.height;
+            } else {
+                regions.push(region);
+                if regions.len() > MAX_REGIONS {
+                    return Err("tile-region-budget");
+                }
+            }
+        }
+    }
+    if regions.is_empty() {
+        return Ok(Damage::Reuse);
+    }
+    let area: u128 = regions
+        .iter()
+        .map(|r| r.width as u128 * r.height as u128)
+        .sum();
+    if area * 100 > width as u128 * height as u128 * 40 {
+        Err("tile-damage-area-budget")
+    } else {
+        Ok(Damage::Partial(regions))
     }
 }
 
@@ -810,6 +1012,179 @@ impl SceneSnapshot {
     /// Compare supported scenes, reporting a static reason when full rendering is required.
     pub fn compare_checked(&self, previous: &Self) -> Result<Damage, &'static str> {
         self.compare_impl(previous, false, &mut (0, 0))
+    }
+
+    /// Prototype fallback that proves equality of exact local painter sequences.
+    ///
+    /// Global numeric painter ranks may differ, but unchanged descriptors remain
+    /// exact and path rasterization groups retain their geometry and membership.
+    /// Every tile with a different painted sequence is cleared and replayed.
+    /// Explicit budgets bound temporary memory, matching effort and damage area.
+    pub fn compare_tiled_checked(&self, previous: &Self) -> Result<Damage, &'static str> {
+        if self.atlas_generation != previous.atlas_generation {
+            return Err("atlas-generation-change");
+        }
+        if self.width != previous.width || self.height != previous.height {
+            return Err("target-extent-change");
+        }
+        let columns = self.width.div_ceil(DAMAGE_TILE_SIZE);
+        let rows = self.height.div_ceil(DAMAGE_TILE_SIZE);
+        let tiles = (columns as usize)
+            .checked_mul(rows as usize)
+            .filter(|count| *count > 0 && *count <= MAX_DAMAGE_TILES)
+            .ok_or("tile-count-budget")?;
+        let count = |snapshot: &Self| {
+            snapshot.quads.len()
+                + snapshot.paths.len()
+                + snapshot.shadows.len()
+                + snapshot.underlines.len()
+                + snapshot.monochrome_sprites.len()
+                + snapshot.subpixel_sprites.len()
+                + snapshot.polychrome_sprites.len()
+        };
+        if count(self) > MAX_TILE_PRIMITIVES || count(previous) > MAX_TILE_PRIMITIVES {
+            return Err("tile-primitive-budget");
+        }
+        let (Some(next), Some(old)) = (self.painter_sequence(), previous.painter_sequence()) else {
+            return Err("unsupported-painter-sequence");
+        };
+        if next.len() > MAX_TILE_PRIMITIVES || old.len() > MAX_TILE_PRIMITIVES {
+            return Err("tile-primitive-budget");
+        }
+        let mut comparisons_left = MAX_TILE_COMPARISONS;
+        let mut compare = |next: PaintedPrimitive<'_>,
+                           old: PaintedPrimitive<'_>,
+                           exact: bool|
+         -> Result<bool, &'static str> {
+            comparisons_left = comparisons_left
+                .checked_sub(next.comparison_cost(old))
+                .ok_or("tile-comparison-budget")?;
+            Ok(if exact {
+                next.exact_matches(old)
+            } else {
+                next.geometry_matches(old)
+            })
+        };
+        // Path coverage depends on rasterization groups, not only on its individual
+        // triangles. Preserve exact group membership/counts and geometry in path
+        // order; local sequence comparison still detects relative non-path order.
+        let next_paths: Vec<_> = next
+            .iter()
+            .copied()
+            .filter(|p| matches!(p, PaintedPrimitive::Path(..)))
+            .collect();
+        let old_paths: Vec<_> = old
+            .iter()
+            .copied()
+            .filter(|p| matches!(p, PaintedPrimitive::Path(..)))
+            .collect();
+        if next_paths.len() != old_paths.len() {
+            return Err("tile-path-count-change");
+        }
+        for (next, old) in next_paths.into_iter().zip(old_paths) {
+            if !compare(next, old, false)? {
+                return Err("tile-path-geometry-or-group-change");
+            }
+        }
+
+        let mut indexed_old: Vec<_> = old
+            .iter()
+            .enumerate()
+            .map(|(index, p)| (p.descriptor_key(), index))
+            .collect();
+        indexed_old.sort_unstable();
+        let mut matched_old = vec![false; old.len()];
+        let old_ids: Vec<u32> = (0..old.len() as u32).collect();
+        let mut next_ids = Vec::with_capacity(next.len());
+        let mut quad_edits = 0;
+        let mut glyph_edits = 0;
+        let mut unmatched = |primitive: PaintedPrimitive<'_>| -> Result<(), &'static str> {
+            match primitive {
+                PaintedPrimitive::Quad(..) => {
+                    quad_edits += 1;
+                    if quad_edits > MAX_QUAD_EDITS {
+                        return Err("tile-quad-edit-budget");
+                    }
+                }
+                PaintedPrimitive::Monochrome(..) | PaintedPrimitive::Subpixel(..) => {
+                    glyph_edits += 1;
+                    if glyph_edits > MAX_GLYPH_EDITS {
+                        return Err("tile-glyph-edit-budget");
+                    }
+                }
+                // Geometry/group equality was proven above. Different path paint
+                // colors receive distinct IDs and dirty every covered tile.
+                PaintedPrimitive::Path(..) => {}
+                _ => return Err("tile-static-descriptor-change"),
+            }
+            Ok(())
+        };
+        for (next_index, current) in next.iter().copied().enumerate() {
+            let key = current.descriptor_key();
+            let start = indexed_old.partition_point(|(old_key, _)| old_key < &key);
+            let end = indexed_old.partition_point(|(old_key, _)| old_key <= &key);
+            let mut matched = None;
+            let mut recolored = None;
+            for &(_, old_index) in &indexed_old[start..end] {
+                // Count every candidate, including consumed duplicates. Repeated
+                // descriptors cannot cause an unbounded quadratic bucket scan.
+                if compare(current, old[old_index], true)? && !matched_old[old_index] {
+                    matched = Some(old_index);
+                    break;
+                }
+            }
+            if matched.is_none() {
+                for &(_, old_index) in &indexed_old[start..end] {
+                    if compare(current, old[old_index], false)? && !matched_old[old_index] {
+                        recolored = Some(old_index);
+                        break;
+                    }
+                }
+            }
+            if let Some(old_index) = matched {
+                matched_old[old_index] = true;
+                next_ids.push(old_index as u32);
+            } else if let Some(old_index) = recolored {
+                // Existing strict comparison does not count local color changes as
+                // structural edits. Consume the same geometry but use a fresh paint
+                // token so every affected tile is still cleared and replayed.
+                matched_old[old_index] = true;
+                next_ids.push((old.len() + next_index) as u32);
+            } else {
+                unmatched(current)?;
+                next_ids.push((old.len() + next_index) as u32);
+            }
+        }
+        for (index, primitive) in old.iter().copied().enumerate() {
+            if !matched_old[index] {
+                unmatched(primitive)?;
+            }
+        }
+        let mut references_left = MAX_TILE_REFERENCES;
+        // Prove the combined reference budget before either CSR index allocation.
+        let old_coverage = tile_coverages(&old, self.width, self.height, &mut references_left)?;
+        let next_coverage = tile_coverages(&next, self.width, self.height, &mut references_left)?;
+        let old_tiles = tile_references(&old_coverage, &old_ids, columns, tiles);
+        let next_tiles = tile_references(&next_coverage, &next_ids, columns, tiles);
+        let mut dirty = vec![false; tiles];
+        for tile in 0..tiles {
+            let old_ids = &old_tiles.ids[old_tiles.offsets[tile]..old_tiles.offsets[tile + 1]];
+            let next_ids = &next_tiles.ids[next_tiles.offsets[tile]..next_tiles.offsets[tile + 1]];
+            if old_ids.len() != next_ids.len() {
+                dirty[tile] = true;
+                continue;
+            }
+            for (next, old) in next_ids.iter().zip(old_ids) {
+                comparisons_left = comparisons_left
+                    .checked_sub(1)
+                    .ok_or("tile-comparison-budget")?;
+                if next != old {
+                    dirty[tile] = true;
+                    break;
+                }
+            }
+        }
+        tile_regions(&dirty, columns, self.width, self.height)
     }
 
     /// Compare while optionally recording a bounded failing painter-sequence witness.
@@ -1387,6 +1762,372 @@ mod tests {
         }
         scene.finish();
         scene
+    }
+
+    fn tiled_row_scene(hover: Option<usize>, subpixel: bool) -> Scene {
+        let mut scene = Scene::default();
+        let mask = ContentMask {
+            bounds: bounds(0.0, 0.0, 512.0, 1024.0),
+            ..Default::default()
+        };
+        scene.insert_primitive(Quad {
+            bounds: mask.bounds,
+            content_mask: mask,
+            background: gpui::rgba(0x22334488).into(),
+            ..Default::default()
+        });
+        for row in 0..20 {
+            let y = 16.25 + 40.0 * row as f32;
+            // Match ordinary history rows: no explicit per-row painter layer.
+            if hover == Some(row) {
+                scene.insert_primitive(Quad {
+                    bounds: bounds(0.0, y, 512.0, 18.5),
+                    content_mask: ContentMask {
+                        bounds: bounds(0.5, y + 0.25, 511.0, 18.0),
+                        fade_out: gpui::Edges::all(ScaledPixels(0.75)),
+                    },
+                    background: gpui::rgba(0x55779944).into(),
+                    corner_radii: gpui::Corners::all(ScaledPixels(2.25)),
+                    ..Default::default()
+                });
+            }
+            // Reproduce the live multi-Quad row blocks (66px/4px/24px), rather
+            // than a single small node that the strict anchor path can accept.
+            for (x, width) in [(134.0, 66.0), (200.0, 4.0), (410.0, 24.0)] {
+                scene.insert_primitive(Quad {
+                    bounds: bounds(x, y, width, 18.5),
+                    content_mask: mask,
+                    background: if hover == Some(row) {
+                        gpui::rgba(0x55779999)
+                    } else {
+                        gpui::rgba(0x22334499)
+                    }
+                    .into(),
+                    ..Default::default()
+                });
+            }
+            for index in 0..20 {
+                let mut primitive = glyph(index + 1, 12.0 + index as f32 * 19.0, y + 2.0, subpixel);
+                match &mut primitive {
+                    gpui::Primitive::MonochromeSprite(p) => p.content_mask = mask,
+                    gpui::Primitive::SubpixelSprite(p) => p.content_mask = mask,
+                    _ => unreachable!(),
+                }
+                scene.insert_primitive(primitive);
+            }
+        }
+        scene.finish();
+        scene
+    }
+
+    fn tiled_snapshot(scene: &Scene) -> SceneSnapshot {
+        SceneSnapshot::capture(scene, 1, 512, 1024).unwrap()
+    }
+
+    #[test]
+    fn tiled_normal_bounds_tree_rows_preserve_local_painter_order_and_sparse_damage() {
+        let mut strict_rejection_observed = false;
+        for subpixel in [false, true] {
+            let first = tiled_snapshot(&tiled_row_scene(Some(0), subpixel));
+            let last = tiled_snapshot(&tiled_row_scene(Some(19), subpixel));
+            strict_rejection_observed |= last.compare_checked(&first).is_err();
+            let tiled = last.compare_tiled_checked(&first);
+            let Ok(Damage::Partial(regions)) = tiled else {
+                panic!(
+                    "old=0 current=19 subpixel={subpixel}: local exact painter sequence must qualify, got {tiled:?}"
+                );
+            };
+            assert_eq!(regions.len(), 2);
+            assert!(
+                regions
+                    .iter()
+                    .any(|r| r.intersects(bounds(0.0, 16.25, 512.0, 18.5)))
+            );
+            assert!(
+                regions
+                    .iter()
+                    .any(|r| r.intersects(bounds(0.0, 776.25, 512.0, 18.5)))
+            );
+            assert!(regions.iter().all(|r| r.height <= 128));
+            assert_eq!(last.compare_tiled_checked(&last), Ok(Damage::Reuse));
+            let empty_hover = tiled_snapshot(&tiled_row_scene(None, subpixel));
+            assert!(
+                matches!(
+                    empty_hover.compare_tiled_checked(&last),
+                    Ok(Damage::Partial(_))
+                ),
+                "old=19 current=None subpixel={subpixel}"
+            );
+        }
+        assert!(
+            strict_rejection_observed,
+            "old=0 current=19: at least one complete multi-Quad no-layer scene must expose the strict convergence gate"
+        );
+    }
+
+    #[test]
+    fn tiled_overlapping_order_and_duplicate_descriptors_require_actual_repainting() {
+        let mut source = Scene::default();
+        let a = Quad {
+            bounds: bounds(10.0, 10.0, 16.0, 16.0),
+            content_mask: ContentMask {
+                bounds: bounds(0.0, 0.0, 512.0, 1024.0),
+                ..Default::default()
+            },
+            background: gpui::rgba(0xff000080).into(),
+            ..Default::default()
+        };
+        let b = Quad {
+            background: gpui::rgba(0x0000ff80).into(),
+            ..a
+        };
+        source.insert_primitive(a);
+        source.insert_primitive(a);
+        source.insert_primitive(b);
+        source.finish();
+        let first = tiled_snapshot(&source);
+        let mut reordered = first.clone();
+        reordered.quads.swap(1, 2);
+        let Damage::Partial(regions) = reordered.compare_tiled_checked(&first).unwrap() else {
+            panic!("interleaving identical overlapping copies changes composited pixels");
+        };
+        assert_eq!(
+            regions,
+            vec![DamageRect {
+                x: 0,
+                y: 0,
+                width: 64,
+                height: 64
+            }]
+        );
+
+        let mut disjoint = first.clone();
+        disjoint.quads[2].bounds.origin.x.0 = 150.0;
+        let mut swapped = disjoint.clone();
+        swapped.quads.swap(1, 2);
+        assert_eq!(swapped.compare_tiled_checked(&disjoint), Ok(Damage::Reuse));
+        swapped.quads[0].bounds.origin.x.0 = -0.0;
+        let mut signed_zero = swapped.clone();
+        signed_zero.quads[0].bounds.origin.x.0 = 0.0;
+        assert_eq!(
+            signed_zero.compare_tiled_checked(&swapped),
+            Ok(Damage::Reuse)
+        );
+    }
+
+    #[test]
+    fn tiled_path_color_tokens_and_raster_group_guards_are_exact() {
+        let mut scene = Scene::default();
+        let mut path = Path::new(point(gpui::px(8.25), gpui::px(8.25)));
+        path.line_to(point(gpui::px(28.25), gpui::px(8.25)));
+        path.line_to(point(gpui::px(8.25), gpui::px(28.25)));
+        path.line_to(point(gpui::px(8.25), gpui::px(8.25)));
+        let mut path = path.scale(1.0);
+        path.content_mask = ContentMask {
+            bounds: bounds(0.0, 0.0, 512.0, 1024.0),
+            ..Default::default()
+        };
+        path.color = gpui::white().into();
+        scene.insert_primitive(path);
+        scene.finish();
+        let first = tiled_snapshot(&scene);
+        let mut changed = first.clone();
+        changed.paths[0].color = gpui::black().into();
+        assert!(
+            matches!(
+                changed.compare_tiled_checked(&first),
+                Ok(Damage::Partial(_))
+            ),
+            "same pathID with changed paint must receive a different local token"
+        );
+        let RenderCommand::Batch(PrimitiveBatch::Paths { sprite_count, .. }) =
+            &mut changed.commands[0]
+        else {
+            panic!("path fixture")
+        };
+        *sprite_count += 1;
+        assert_eq!(
+            changed.compare_tiled_checked(&first),
+            Err("tile-path-geometry-or-group-change")
+        );
+        let mut changed = first.clone();
+        changed.paths[0].vertices[0].xy_position.x.0 += 0.25;
+        assert_eq!(
+            changed.compare_tiled_checked(&first),
+            Err("tile-path-geometry-or-group-change")
+        );
+    }
+
+    #[test]
+    fn tiled_fractional_masks_cover_both_sides_of_tile_edges_and_clip_target_edges() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            bounds: bounds(62.25, 62.25, 20.5, 20.5),
+            content_mask: ContentMask {
+                bounds: bounds(63.75, 63.75, 12.5, 12.5),
+                fade_out: gpui::Edges::all(ScaledPixels(1.25)),
+            },
+            background: gpui::rgba(0xff112280).into(),
+            corner_radii: gpui::Corners::all(ScaledPixels(2.25)),
+            ..Default::default()
+        });
+        scene.finish();
+        let first = tiled_snapshot(&scene);
+        let mut changed = first.clone();
+        changed.quads[0].content_mask.fade_out.top.0 += 0.25;
+        assert_eq!(
+            changed.compare_tiled_checked(&first),
+            Ok(Damage::Partial(vec![DamageRect {
+                x: 0,
+                y: 0,
+                width: 128,
+                height: 128
+            }]))
+        );
+        let mut edge = first.clone();
+        edge.width = 501;
+        edge.height = 999;
+        edge.quads[0].bounds = bounds(495.0, 992.0, 20.0, 20.0);
+        edge.quads[0].content_mask.bounds = bounds(0.0, 0.0, 501.0, 999.0);
+        let mut changed = edge.clone();
+        changed.quads[0].background = gpui::black().into();
+        assert_eq!(
+            changed.compare_tiled_checked(&edge),
+            Ok(Damage::Partial(vec![DamageRect {
+                x: 448,
+                y: 960,
+                width: 53,
+                height: 39
+            }]))
+        );
+    }
+
+    #[test]
+    fn tiled_matching_reference_and_edit_budgets_fail_closed() {
+        let first = tiled_snapshot(&tiled_row_scene(None, false));
+        let mut changed = first.clone();
+        changed.atlas_generation += 1;
+        assert_eq!(
+            changed.compare_tiled_checked(&first),
+            Err("atlas-generation-change")
+        );
+        changed = first.clone();
+        changed.width += 1;
+        assert_eq!(
+            changed.compare_tiled_checked(&first),
+            Err("target-extent-change")
+        );
+        changed = first.clone();
+        changed.width = 5000;
+        changed.height = 5000;
+        assert_eq!(
+            changed.compare_tiled_checked(&changed),
+            Err("tile-count-budget")
+        );
+        changed = first.clone();
+        changed
+            .quads
+            .resize(MAX_TILE_PRIMITIVES + 1, changed.quads[0]);
+        assert_eq!(
+            changed.compare_tiled_checked(&changed),
+            Err("tile-primitive-budget")
+        );
+
+        let mut duplicates = tiled_snapshot(&scene(gpui::white()));
+        duplicates.quads[0].bounds = bounds(10.0, 10.0, 4.0, 4.0);
+        duplicates.quads.resize(1024, duplicates.quads[0]);
+        duplicates.commands = vec![RenderCommand::Batch(PrimitiveBatch::Quads {
+            range: 0..1024,
+            smoothed: false,
+        })];
+        assert_eq!(
+            duplicates.compare_tiled_checked(&duplicates),
+            Err("tile-comparison-budget")
+        );
+        duplicates.width = 4096;
+        duplicates.height = 4096;
+        duplicates.quads.resize(17, duplicates.quads[0]);
+        for quad in &mut duplicates.quads {
+            quad.bounds = bounds(0.0, 0.0, 4096.0, 4096.0);
+            quad.content_mask.bounds = quad.bounds;
+        }
+        duplicates.commands = vec![RenderCommand::Batch(PrimitiveBatch::Quads {
+            range: 0..17,
+            smoothed: false,
+        })];
+        assert_eq!(
+            duplicates.compare_tiled_checked(&duplicates),
+            Err("tile-reference-budget")
+        );
+
+        let mut changed = first.clone();
+        for quad in &mut changed.quads[1..6] {
+            quad.background = gpui::black().into();
+        }
+        assert!(
+            matches!(
+                changed.compare_tiled_checked(&first),
+                Ok(Damage::Partial(_))
+            ),
+            "local cutout recolors do not consume structural edit budget"
+        );
+        for quad in &mut changed.quads[1..6] {
+            quad.bounds.size.width.0 += 0.25;
+        }
+        assert_eq!(
+            changed.compare_tiled_checked(&first),
+            Err("tile-quad-edit-budget")
+        );
+        let mut glyphs = Scene::default();
+        for index in 0..MAX_GLYPH_EDITS + 1 {
+            glyphs.insert_primitive(glyph(index as u32, 10.0, 10.0, false));
+        }
+        glyphs.finish();
+        let mut empty = Scene::default();
+        empty.finish();
+        assert_eq!(
+            tiled_snapshot(&glyphs).compare_tiled_checked(&tiled_snapshot(&empty)),
+            Err("tile-glyph-edit-budget")
+        );
+    }
+
+    #[test]
+    fn tiled_region_and_actual_replay_area_budgets_fail_closed() {
+        let columns = 16;
+        let mut dirty = vec![false; columns * columns];
+        for y in (0..columns).step_by(2).take(8) {
+            dirty[y * columns] = true;
+        }
+        dirty[2] = true;
+        assert_eq!(
+            tile_regions(&dirty, columns as u32, 1024, 1024),
+            Err("tile-region-budget")
+        );
+        let mut dirty = vec![false; 8 * 16];
+        for value in &mut dirty[..8 * 8] {
+            *value = true;
+        }
+        assert_eq!(
+            tile_regions(&dirty, 8, 512, 1024),
+            Err("tile-damage-area-budget")
+        );
+        // Horizontal tiles form one replay run, then vertically merge before the
+        // region cap. The actual rectangle area is the final budget authority.
+        let mut dirty = vec![false; 16 * 16];
+        for y in 0..4 {
+            for x in 0..16 {
+                dirty[y * 16 + x] = true;
+            }
+        }
+        assert_eq!(
+            tile_regions(&dirty, 16, 1024, 1024),
+            Ok(Damage::Partial(vec![DamageRect {
+                x: 0,
+                y: 0,
+                width: 1024,
+                height: 256
+            }]))
+        );
     }
 
     #[test]

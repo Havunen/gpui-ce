@@ -4032,6 +4032,249 @@ mod tests {
     }
 
     #[test]
+    fn retained_normal_bounds_tree_rows_match_full_pixels_without_paint_layers() -> Result<()> {
+        use gpui::{
+            FontId, GlyphId, GlyphRenderMode, Path, PreparedRasterStyle, RenderGlyphParams, Shadow,
+            point, px,
+        };
+        use gpui_render::damage::{Damage, SceneSnapshot};
+
+        let mask = ContentMask {
+            bounds: scaled(0.0, 0.0, 512.0, 1024.0),
+            ..Default::default()
+        };
+        let make_scene =
+            |hover: Option<usize>, glyph: AtlasTile, badge: AtlasTile, subpixel, fraction| {
+                let mut scene = Scene::default();
+                let canvas = scaled(2.0, 2.0, 508.0, 1020.0);
+                scene.insert_primitive(Shadow {
+                    order: 0,
+                    blur_radius: ScaledPixels(10.0),
+                    bounds: canvas,
+                    corner_radii: Corners::all(ScaledPixels(12.0)),
+                    content_mask: mask,
+                    color: solid_background(hsla(0.0, 0.0, 0.0, 0.35)),
+                    element_bounds: canvas,
+                    element_corner_radii: Corners::all(ScaledPixels(12.0)),
+                    inset: ShaderBool::Disabled,
+                    corner_smoothing: 0.0,
+                });
+                scene.insert_primitive(Quad {
+                    bounds: canvas,
+                    content_mask: mask,
+                    background: solid_background(hsla(0.62, 0.2, 0.16, 0.75)),
+                    corner_radii: Corners::all(ScaledPixels(12.0)),
+                    ..Default::default()
+                });
+                // Keep the graph raster group exact while ordinary row primitives
+                // change global ranks around it. No layer/order-floor shortcuts.
+                for index in 0..4 {
+                    let x = 8.0 + index as f32 * 3.0;
+                    let mut path = Path::new(point(px(x), px(6.0)));
+                    path.line_to(point(px(x + 4.0), px(1018.0)));
+                    path.line_to(point(px(x), px(1018.0)));
+                    path.line_to(point(px(x), px(6.0)));
+                    let mut path = path.scale(1.0);
+                    path.content_mask = mask;
+                    for vertex in &mut path.vertices {
+                        vertex.content_mask = mask;
+                    }
+                    path.color = solid_background(hsla(0.1 + index as f32 * 0.17, 0.7, 0.65, 0.55));
+                    scene.insert_primitive(path);
+                }
+                for row in 0..20 {
+                    let y = 16.25 + 40.0 * row as f32 + fraction;
+                    if hover == Some(row) {
+                        scene.insert_primitive(Quad {
+                            bounds: scaled(0.0, y, 512.0, 18.5),
+                            content_mask: ContentMask {
+                                bounds: scaled(0.5, y + 0.25, 511.0, 18.0),
+                                fade_out: Edges::all(ScaledPixels(0.75)),
+                            },
+                            background: solid_background(hsla(0.62, 0.65, 0.62, 0.35)),
+                            corner_radii: Corners::all(ScaledPixels(2.25)),
+                            ..Default::default()
+                        });
+                    }
+                    // Different unchanged Quad shapes expose the actual global-rank
+                    // failure: a moved row fill changes their flattened positions.
+                    for (x, w, h) in [
+                        (4.0, 3.0, 3.0),
+                        (25.0, 7.0, 5.0),
+                        (402.0, 4.0, 12.0),
+                        (411.0, 8.0, 8.0),
+                    ] {
+                        scene.insert_primitive(Quad {
+                            bounds: scaled(x, y + 4.0, w, h),
+                            content_mask: mask,
+                            background: solid_background(hsla(0.12, 0.55, 0.72, 0.6)),
+                            ..Default::default()
+                        });
+                    }
+                    for index in 0..20 {
+                        scene.insert_primitive(MonochromeSprite {
+                            order: 0,
+                            padding: 0,
+                            bounds: scaled(40.0 + index as f32 * 18.0, y + 2.0, 8.0, 8.0),
+                            content_mask: mask,
+                            color: hsla(0.12, 0.25, 0.8, 0.85).into(),
+                            tile: glyph,
+                            transformation: Default::default(),
+                        });
+                    }
+                    if hover == Some(row) {
+                        for index in 0..7 + row % 3 {
+                            let bounds = scaled(432.0 + index as f32 * 8.0, y + 2.0, 8.0, 8.0);
+                            if subpixel {
+                                scene.insert_primitive(gpui::SubpixelSprite {
+                                    order: 0,
+                                    padding: 0,
+                                    bounds,
+                                    content_mask: mask,
+                                    color: hsla(0.07, 0.6, 0.73, 0.7).into(),
+                                    tile: badge,
+                                    transformation: Default::default(),
+                                });
+                            } else {
+                                scene.insert_primitive(MonochromeSprite {
+                                    order: 0,
+                                    padding: 0,
+                                    bounds,
+                                    content_mask: mask,
+                                    color: hsla(0.07, 0.6, 0.73, 0.7).into(),
+                                    tile: badge,
+                                    transformation: Default::default(),
+                                });
+                            }
+                        }
+                    }
+                }
+                scene.finish();
+                scene
+            };
+        let devices = DirectXDevices::new()?;
+        let window = HiddenWindow::new()?;
+        let reference_window = HiddenWindow::new()?;
+        let mut renderer = DirectXRenderer::new(window.0, &devices, false)?;
+        let mut reference = DirectXRenderer::new(reference_window.0, &devices, false)?;
+        renderer.retained.enable_for_tests();
+        reference.retained.disable_for_tests();
+        for renderer in [&mut renderer, &mut reference] {
+            renderer.resize(Size {
+                width: DevicePixels(512),
+                height: DevicePixels(1024),
+            })?;
+        }
+        let make_glyph = |renderer: &DirectXRenderer, mode: GlyphRenderMode, glyph: u32| {
+            let key = AtlasKey::Glyph {
+                params: RenderGlyphParams {
+                    font_id: FontId(0),
+                    glyph_id: GlyphId(glyph),
+                    font_size: px(8.0),
+                    subpixel_variant: point(0, 0),
+                    scale_factor: 1.0,
+                    raster_style: PreparedRasterStyle::independent(mode),
+                },
+                format: mode.rasterized_format(),
+            };
+            let coverage: Vec<u8> = (0..64)
+                .map(|index| match (index / 8, index % 8) {
+                    (4, 1..=6) | (1..=6, 1 | 6) => 255,
+                    (_, 2 | 5) => 96,
+                    _ => 0,
+                })
+                .collect();
+            let bytes = if mode == GlyphRenderMode::Subpixel {
+                coverage
+                    .iter()
+                    .flat_map(|&value| [value / 2, value, value.saturating_add(24), 255])
+                    .collect()
+            } else {
+                coverage
+            };
+            tile(renderer.sprite_atlas().as_ref(), key, bytes)
+        };
+        let glyph = make_glyph(&renderer, GlyphRenderMode::Grayscale, 65);
+        let reference_glyph = make_glyph(&reference, GlyphRenderMode::Grayscale, 65);
+        for mode in [GlyphRenderMode::Grayscale, GlyphRenderMode::Subpixel] {
+            let badge = make_glyph(&renderer, mode, 66);
+            let reference_badge = make_glyph(&reference, mode, 66);
+            for clipped in [false, true] {
+                renderer.timings.clipped_quads = clipped;
+                for fraction in [0.0, 0.25, 0.75] {
+                    for appearance in [
+                        WindowBackgroundAppearance::Transparent,
+                        WindowBackgroundAppearance::Opaque,
+                    ] {
+                        renderer.retained.invalidate();
+                        let mut previous = None;
+                        let mut snapshot = None;
+                        for (revision, hover) in [
+                            (1, None),
+                            (2, Some(0)),
+                            (3, Some(19)),
+                            (4, Some(9)),
+                            (5, None),
+                        ] {
+                            let scene = make_scene(
+                                hover,
+                                glyph,
+                                badge,
+                                mode == GlyphRenderMode::Subpixel,
+                                fraction,
+                            );
+                            let reference_scene = make_scene(
+                                hover,
+                                reference_glyph,
+                                reference_badge,
+                                mode == GlyphRenderMode::Subpixel,
+                                fraction,
+                            );
+                            let next = SceneSnapshot::capture(&scene, 1, 512, 1024).unwrap();
+                            if revision == 3 {
+                                let old = snapshot.as_ref().unwrap();
+                                assert!(
+                                    next.compare_checked(old).is_err(),
+                                    "real bounds-tree fixture must need the tile fallback"
+                                );
+                                assert!(matches!(
+                                    next.compare_tiled_checked(old),
+                                    Ok(Damage::Partial(_))
+                                ));
+                            }
+                            snapshot = Some(next);
+                            let _scope = gpui::profiler::gpu::set_gpu_frame_context(
+                                Some("bounds-tree-native".into()),
+                                true,
+                                revision,
+                                revision,
+                            );
+                            let actual = renderer.render_to_image(&scene, appearance)?;
+                            let expected =
+                                reference.render_to_image(&reference_scene, appearance)?;
+                            assert_eq!(
+                                actual, expected,
+                                "normal ranks mode={mode:?} fraction={fraction} clipped={clipped} appearance={appearance:?} hover={hover:?}"
+                            );
+                            assert_eq!(
+                                renderer.retained.last_damage(),
+                                if revision == 1 { "full" } else { "partial" }
+                            );
+                            if let Some(previous) = &previous {
+                                assert_ne!(&actual, previous, "hover pixels must visibly change");
+                            }
+                            previous = Some(actual);
+                            assert_eq!(renderer.render_to_image(&scene, appearance)?, expected);
+                            assert_eq!(renderer.retained.last_damage(), "reuse");
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn retained_inset_shadow_outside_shifted_hole_matches_full_pixels() -> Result<()> {
         let scene = |hover: Option<usize>| {
             let mut scene = Scene::default();

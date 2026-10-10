@@ -220,7 +220,12 @@ impl RetainedFrame {
                 };
                 match comparison {
                     Ok(damage) => (damage, None, detail),
-                    Err(reason) => (Damage::Full, Some(reason), detail),
+                    // Exact local painter sequences handle disjoint global-rank
+                    // permutations without weakening the strict fast path.
+                    Err(_) => match snapshot.compare_tiled_checked(previous) {
+                        Ok(damage) => (damage, None, detail),
+                        Err(reason) => (Damage::Full, Some(reason), detail),
+                    },
                 }
             }
             None => (Damage::Full, None, None),
