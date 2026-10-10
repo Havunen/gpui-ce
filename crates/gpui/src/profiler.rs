@@ -1,3 +1,5 @@
+//! Opt-in CPU frame, input, task, and asynchronous renderer profiling.
+
 #[cfg(feature = "profiler")]
 use hdrhistogram::Histogram;
 use itertools::Itertools;
@@ -17,6 +19,7 @@ use std::{
 };
 
 mod actions;
+pub mod gpu;
 #[cfg(feature = "profiler")]
 pub mod hang;
 #[cfg(feature = "profiler")]
@@ -806,6 +809,8 @@ fn clear_trace_buffers() {
 pub struct FrameTiming {
     /// The window that was drawn.
     pub window_id: WindowId,
+    /// Revision of the scene produced by this draw.
+    pub scene_revision: u64,
     /// When the frame first became dirty (its first invalidation). `None` if
     /// profiler tracing was not yet enabled when the invalidation occurred.
     pub dirty_at: Option<Instant>,
@@ -863,6 +868,77 @@ pub enum FrameEvent {
     Draw(FrameTiming),
     /// A newly drawn window frame was presented.
     Present(PresentTiming),
+    /// Every platform render submission, including an unchanged scene.
+    Submission(SubmissionTiming),
+    /// Arrival of a tagged native input at the application dispatcher.
+    NativeInput(NativeInputTiming),
+}
+
+/// Why GPUI submitted a scene to the platform renderer.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum PresentationReason {
+    /// The window has a newly painted dirty scene.
+    Dirty,
+    /// The platform explicitly forced a redraw.
+    Forced,
+    /// The platform requires presentation even without scene changes.
+    Required,
+    /// A painted scene has not yet been submitted.
+    Pending,
+    /// The high-input-rate policy keeps submitting the most recent scene.
+    InputRateKeepalive,
+    /// A synchronous benchmark explicitly submits the painted scene.
+    Benchmark,
+}
+
+impl PresentationReason {
+    /// Stable diagnostic name of the presentation reason.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dirty => "dirty",
+            Self::Forced => "forced",
+            Self::Required => "required",
+            Self::Pending => "pending",
+            Self::InputRateKeepalive => "input_rate_keepalive",
+            Self::Benchmark => "benchmark",
+        }
+    }
+}
+
+/// CPU timing and identity of every renderer submission. This is not display completion.
+#[cfg(feature = "profiler")]
+#[derive(Debug, Copy, Clone)]
+pub struct SubmissionTiming {
+    /// Window that submitted the scene.
+    pub window_id: WindowId,
+    /// Monotonically increasing submission identity within this window.
+    pub submission_id: u64,
+    /// Painted scene revision handed to the renderer.
+    pub scene_revision: u64,
+    /// When the CPU began handing the scene to the platform renderer.
+    pub present_start: Instant,
+    /// When CPU renderer submission returned; GPU completion can happen later.
+    pub present_end: Instant,
+    /// Scheduling decision that caused the submission.
+    pub reason: PresentationReason,
+    /// Whether this submission reused the previously submitted scene revision.
+    pub reused_scene: bool,
+}
+
+/// Native tagged pointer arrival correlated with a monotonic Windows clock.
+#[cfg(feature = "profiler")]
+#[derive(Debug, Copy, Clone)]
+pub struct NativeInputTiming {
+    /// Window whose dispatcher received the input.
+    pub window_id: WindowId,
+    /// Sequence carried by the profiling SendInput marker.
+    pub sequence: u64,
+    /// Earliest native pointer arrival in QueryPerformanceCounter ticks.
+    pub arrival_qpc: u64,
+    /// QueryPerformanceCounter ticks per second.
+    pub qpc_frequency: u64,
+    /// When GPUI application dispatch began, in the scheduler's clock domain.
+    pub dispatch_start: Instant,
 }
 
 /// A point-in-time snapshot of the frame-duration histograms for a window,
@@ -912,6 +988,7 @@ enum WindowActivity {
 #[cfg(feature = "profiler")]
 pub struct WindowProfiler {
     window_id: WindowId,
+    scene_revision: u64,
     active_activities: SmallVec<[WindowActivity; 4]>,
     active_actions: SmallVec<[(&'static str, Instant); 2]>,
     dirty_to_present_histogram: Histogram<u64>,
@@ -933,6 +1010,7 @@ impl WindowProfiler {
     pub fn new(window_id: WindowId) -> anyhow::Result<Self> {
         let profiler = Self {
             window_id,
+            scene_revision: 0,
             active_activities: SmallVec::new(),
             active_actions: SmallVec::new(),
             dirty_to_present_histogram: Histogram::new(3).map_err(|error| {
@@ -1038,6 +1116,31 @@ impl WindowProfiler {
             .push(WindowActivity::Draw { started_at });
     }
 
+    /// Associate the current draw with its window scene revision.
+    pub fn set_scene_revision(&mut self, scene_revision: u64) {
+        self.scene_revision = scene_revision;
+    }
+
+    /// Record every CPU renderer submission, including submissions without a new draw.
+    pub fn record_submission(
+        &mut self,
+        submission_id: u64,
+        scene_revision: u64,
+        reason: PresentationReason,
+        present_start: Instant,
+        present_end: Instant,
+    ) {
+        record_frame_event(FrameEvent::Submission(SubmissionTiming {
+            window_id: self.window_id,
+            submission_id,
+            scene_revision,
+            present_start,
+            present_end,
+            reason,
+            reused_scene: self.pending_frame.is_none(),
+        }));
+    }
+
     /// Records the end of a window draw and returns the draw duration.
     pub fn end_draw(&mut self, dirty_at: Option<Instant>, invalidations: u64) -> Duration {
         let Some(WindowActivity::Draw {
@@ -1052,6 +1155,7 @@ impl WindowProfiler {
         let draw_end = Instant::now();
         let frame_timing = FrameTiming {
             window_id: self.window_id,
+            scene_revision: self.scene_revision,
             dirty_at,
             invalidations,
             draw_start,
@@ -1660,6 +1764,40 @@ mod tests {
     }
 
     #[test]
+    fn records_submissions_for_both_new_and_unchanged_scenes() {
+        let _trace_test_guard = TraceTestGuard::new();
+        set_trace_enabled(true);
+        let window_id = WindowId::from(0xA115);
+        let mut profiler = WindowProfiler::new(window_id).unwrap();
+        let mut collector = FrameTimingCollector::new();
+        let at = Instant::now();
+        profiler.set_scene_revision(7);
+        profiler.begin_draw();
+        profiler.end_draw(Some(at), 2);
+        profiler.record_submission(1, 7, PresentationReason::Dirty, at, at);
+        profiler.record_present_at(at, at, true, false);
+        profiler.record_submission(2, 7, PresentationReason::InputRateKeepalive, at, at);
+        profiler.record_present_at(at, at, true, false);
+        let submissions = collector
+            .collect_unseen()
+            .into_iter()
+            .filter_map(|event| match event {
+                FrameEvent::Submission(timing) if timing.window_id == window_id => Some(timing),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(submissions.len(), 2);
+        assert!(!submissions[0].reused_scene);
+        assert!(submissions[1].reused_scene);
+        assert_eq!(submissions[1].scene_revision, 7);
+        assert_eq!(submissions[1].submission_id, 2);
+        assert_eq!(
+            submissions[1].reason,
+            PresentationReason::InputRateKeepalive
+        );
+    }
+
+    #[test]
     fn disabling_tracing_clears_frame_events() {
         let _trace_test_guard = TraceTestGuard::new();
         set_trace_enabled(true);
@@ -1876,6 +2014,8 @@ mod tests {
         match event {
             FrameEvent::Draw(timing) => timing.window_id == window_id,
             FrameEvent::Present(timing) => timing.window_id == window_id,
+            FrameEvent::Submission(timing) => timing.window_id == window_id,
+            FrameEvent::NativeInput(timing) => timing.window_id == window_id,
         }
     }
 
@@ -1907,6 +2047,7 @@ mod tests {
     fn record_test_draw(window_profiler: &mut WindowProfiler, draw_end: Instant) {
         window_profiler.record_draw_timing(FrameTiming {
             window_id: window_profiler.window_id,
+            scene_revision: 0,
             dirty_at: Some(draw_end - Duration::from_millis(4)),
             invalidations: 1,
             draw_start: draw_end - Duration::from_millis(2),

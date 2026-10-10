@@ -550,6 +550,7 @@ mod tests {
         };
         let frame = FrameTiming {
             window_id,
+            scene_revision: 0,
             dirty_at: Some(at(100)),
             invalidations: 3,
             draw_start: at(350),
@@ -758,6 +759,7 @@ mod tests {
             boundary: IntervalBoundary::Presented(PresentedFrame {
                 frame: FrameTiming {
                     window_id,
+                    scene_revision: 0,
                     dirty_at: Some(at(0)),
                     invalidations: 1,
                     draw_start: at(140),
@@ -844,6 +846,7 @@ mod tests {
             boundary: IntervalBoundary::Presented(PresentedFrame {
                 frame: FrameTiming {
                     window_id,
+                    scene_revision: 0,
                     dirty_at: Some(at(0)),
                     invalidations: 1,
                     draw_start: at(145),
@@ -915,6 +918,7 @@ mod tests {
                 }),
                 ForegroundEvent::Draw(FrameTiming {
                     window_id,
+                    scene_revision: 0,
                     dirty_at: Some(at(0)),
                     invalidations: 1,
                     draw_start: at(1),
@@ -958,6 +962,7 @@ mod tests {
             boundary: IntervalBoundary::Presented(PresentedFrame {
                 frame: FrameTiming {
                     window_id,
+                    scene_revision: 0,
                     dirty_at: Some(at(0)),
                     invalidations: 1,
                     draw_start: at(148),
@@ -1335,6 +1340,7 @@ mod tests {
     fn frame(window_id: WindowId, draw_end: Instant) -> FrameTiming {
         FrameTiming {
             window_id,
+            scene_revision: 0,
             dirty_at: Some(draw_end - Duration::from_millis(2)),
             invalidations: 1,
             draw_start: draw_end - Duration::from_millis(1),

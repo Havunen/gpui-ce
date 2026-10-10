@@ -55,6 +55,7 @@ pub struct WindowsWindowState {
     pub last_reported_modifiers: Cell<Option<Modifiers>>,
     pub last_reported_capslock: Cell<Option<Capslock>>,
     pub hovered: Cell<bool>,
+    pub native_input_diagnostic: Cell<Option<NativeInputDiagnostic>>,
     pub direct_manipulation: DirectManipulationHandler,
 
     pub renderer: RefCell<WindowRenderer>,
@@ -172,6 +173,7 @@ impl WindowsWindowState {
             last_reported_modifiers: Cell::new(last_reported_modifiers),
             last_reported_capslock: Cell::new(last_reported_capslock),
             hovered: Cell::new(hovered),
+            native_input_diagnostic: Cell::new(None),
             renderer: RefCell::new(renderer),
             force_render_pending: Cell::new(false),
             click_state,
@@ -1146,6 +1148,46 @@ impl PlatformWindow for WindowsWindow {
             .borrow_mut()
             .draw(scene, self.state.background_appearance.get())
             .log_err();
+    }
+
+    fn needs_input_rate_keepalive(&self) -> bool {
+        static POLICY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        crate::input_diagnostics::input_rate_keepalive(
+            POLICY
+                .get_or_init(|| std::env::var("GPUI_WINDOWS_INPUT_RATE_KEEPALIVE").ok())
+                .as_deref(),
+            self.has_fixed_refresh_rate(),
+        )
+    }
+
+    fn native_input_diagnostic(&self) -> Option<NativeInputDiagnostic> {
+        self.state.native_input_diagnostic.get()
+    }
+
+    fn native_pointer_target(&self, position: Point<Pixels>) -> Option<(u64, i32, i32)> {
+        let scale = self.state.scale_factor.get();
+        let x = f32::from(position.x) * scale;
+        let y = f32::from(position.y) * scale;
+        if !x.is_finite() || !y.is_finite() {
+            return None;
+        }
+        let (x, y) = crate::input_diagnostics::screen_point(
+            self.hwnd.0,
+            crate::input_diagnostics::ScreenPoint {
+                x: x.round() as i32,
+                y: y.round() as i32,
+            },
+        )?;
+        Some((self.hwnd.0 as usize as u64, x, y))
+    }
+
+    fn renderer_profile_capabilities(&self) -> gpui::profiler::gpu::RendererProfileCapabilities {
+        let mut capabilities = self.state.renderer.borrow().profile_capabilities();
+        capabilities.windows_input_rate_keepalive = Some(self.needs_input_rate_keepalive());
+        capabilities.windows_keepalive_policy = Some(
+            std::env::var("GPUI_WINDOWS_INPUT_RATE_KEEPALIVE").unwrap_or_else(|_| "auto".into()),
+        );
+        capabilities
     }
 
     #[cfg(any(test, feature = "test-support"))]

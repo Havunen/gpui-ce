@@ -1111,6 +1111,7 @@ mod tests {
         };
         let frame = FrameTiming {
             window_id: WindowId::from(1),
+            scene_revision: 0,
             dirty_at: Some(input.start),
             invalidations: 1,
             draw_start: start + Duration::from_millis(3),
@@ -2728,6 +2729,7 @@ mod tests {
     fn frame_timing(window_id: WindowId, dirty_at: Instant, draw_end: Instant) -> FrameTiming {
         FrameTiming {
             window_id,
+            scene_revision: 0,
             dirty_at: Some(dirty_at),
             invalidations: 1,
             draw_start: draw_end,

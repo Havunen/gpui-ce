@@ -236,8 +236,12 @@ impl WgpuRenderer {
             (path_intermediate_view, None)
         };
 
+        let timestamp = self.timings.pass("path_rasterization_pass");
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("path_rasterization_pass"),
+            timestamp_writes: timestamp
+                .as_ref()
+                .map(super::gpu_timing::TimestampPass::writes),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: target_view,
                 resolve_target,

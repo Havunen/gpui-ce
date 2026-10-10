@@ -154,6 +154,7 @@ impl BenchReport {
                             .ok();
                     }
                 }
+                FrameEvent::Submission(_) | FrameEvent::NativeInput(_) => {}
             }
         }
     }
@@ -773,6 +774,8 @@ impl<'a, 'measurement> BenchAppContext<'a, 'measurement> {
             .record_frame_timings(events.frame_events.iter().filter(|event| match event {
                 FrameEvent::Draw(timing) => timing.window_id == window_id,
                 FrameEvent::Present(timing) => timing.window_id == window_id,
+                FrameEvent::Submission(timing) => timing.window_id == window_id,
+                FrameEvent::NativeInput(timing) => timing.window_id == window_id,
             }));
         // Foreground work isn't attributed to a window, so unlike frame
         // timings above it isn't filtered by `window_id`. A benchmark app

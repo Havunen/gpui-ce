@@ -17,7 +17,6 @@ use std::path::PathBuf;
 use crate::DebugFrameOverlayMode;
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::Inspector;
-#[cfg(feature = "profiler")]
 use crate::profiler;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
@@ -1340,6 +1339,8 @@ pub struct Window {
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
     #[cfg(feature = "profiler")]
     window_profiler: profiler::WindowProfiler,
+    scene_revision: u64,
+    submission_id: u64,
     last_input_modality: InputModality,
     touch_gestures: TouchGestureRecognizer,
     touch_prediction_enabled: bool,
@@ -1843,27 +1844,37 @@ impl Window {
                                     window.refresh();
                                 }
                                 let arena_clear_needed = window.draw(cx);
-                                window.present();
+                                window.present_with_reason(if force_render {
+                                    profiler::PresentationReason::Forced
+                                } else {
+                                    profiler::PresentationReason::Dirty
+                                });
                                 arena_clear_needed.clear(cx);
                             })
                             .log_err();
                     })
                 } else if request_frame_options.require_presentation
                     || needs_present.get()
-                    // Keep presenting if input was recently arriving at a high rate
-                    // (>= 60fps). Once high-rate input is detected, we sustain
-                    // presentation for 1 second to prevent display underclocking
-                    // during active input. A fixed-rate display cannot underclock,
-                    // and each present renders the whole frame again, so it skips this.
+                    // The platform controls whether unchanged scenes need input-rate
+                    // keepalive. A nominal display refresh rate is not a VRR policy.
                     || (input_rate_tracker.borrow_mut().is_high_rate()
-                        && !handle
+                        && handle
                             .update(&mut cx, |_, window, _| {
-                                window.platform_window.has_fixed_refresh_rate()
+                                window.platform_window.needs_input_rate_keepalive()
                             })
-                            .unwrap_or(false))
+                            .unwrap_or(true))
                 {
                     handle
-                        .update(&mut cx, |_, window, _| window.present())
+                        .update(&mut cx, |_, window, _| {
+                            let reason = if request_frame_options.require_presentation {
+                                profiler::PresentationReason::Required
+                            } else if needs_present.get() {
+                                profiler::PresentationReason::Pending
+                            } else {
+                                profiler::PresentationReason::InputRateKeepalive
+                            };
+                            window.present_with_reason(reason);
+                        })
                         .log_err();
                 }
 
@@ -2101,6 +2112,8 @@ impl Window {
             input_rate_tracker,
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
+            scene_revision: 0,
+            submission_id: 0,
             last_input_modality: InputModality::Mouse,
             touch_gestures: TouchGestureRecognizer::new(
                 cx.platform
@@ -3263,6 +3276,9 @@ impl Window {
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        self.scene_revision = self.scene_revision.wrapping_add(1);
+        #[cfg(feature = "profiler")]
+        self.window_profiler.set_scene_revision(self.scene_revision);
         // Drain every draw in profiler builds so a previous frame's
         // first-invalidation timestamp can't be attributed to this one.
         #[cfg(feature = "profiler")]
@@ -3444,6 +3460,12 @@ impl Window {
 
     #[profiling::function]
     fn present(&mut self) {
+        self.present_with_reason(profiler::PresentationReason::Pending);
+    }
+
+    fn present_with_reason(&mut self, reason: profiler::PresentationReason) {
+        #[cfg(not(feature = "profiler"))]
+        let _ = reason;
         if self.rendered_frame_atlas_is_stale() {
             self.invalidator.set_dirty(true);
             self.needs_present.set(true);
@@ -3455,16 +3477,61 @@ impl Window {
         let _foreground_turn = profiler::journal::foreground_turn();
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
+        self.submission_id = self.submission_id.wrapping_add(1);
+        let _gpu_context = profiler::gpu::frame_context_enabled().then(|| {
+            profiler::gpu::set_gpu_frame_context(
+                Some(format!("{:?}", self.handle.window_id())),
+                self.active.get(),
+                self.submission_id,
+                self.scene_revision,
+            )
+        });
         self.platform_window.draw(&self.rendered_frame.scene);
+        #[cfg(feature = "profiler")]
+        let present_end = Instant::now();
+        #[cfg(feature = "profiler")]
+        self.window_profiler.record_submission(
+            self.submission_id,
+            self.scene_revision,
+            reason,
+            present_start,
+            present_end,
+        );
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
             present_start,
-            Instant::now(),
+            present_end,
             self.active.get(),
             !self.next_frame_callbacks.borrow().is_empty(),
         );
         self.needs_present.set(false);
         profiling::finish_frame!();
+    }
+
+    /// Revision currently being painted, or the most recently completed scene.
+    pub fn scene_revision(&self) -> u64 {
+        self.scene_revision
+    }
+
+    /// Identity of the most recent platform render submission.
+    pub fn last_submission_id(&self) -> u64 {
+        self.submission_id
+    }
+
+    /// Tagged native pointer metadata scoped to the input currently being dispatched.
+    pub fn native_input_diagnostic(&self) -> Option<crate::NativeInputDiagnostic> {
+        self.platform_window.native_input_diagnostic()
+    }
+
+    /// Convert a logical client point to a native window handle and physical screen coordinates.
+    /// Returns `None` when the platform does not support native diagnostic replay.
+    pub fn native_pointer_target(&self, position: Point<Pixels>) -> Option<(u64, i32, i32)> {
+        self.platform_window.native_pointer_target(position)
+    }
+
+    /// Report the selected renderer's profiling and experiment capabilities.
+    pub fn renderer_profile_capabilities(&self) -> profiler::gpu::RendererProfileCapabilities {
+        self.platform_window.renderer_profile_capabilities()
     }
 
     /// Presents the most recently drawn frame if it hasn't been presented yet.
@@ -3475,7 +3542,7 @@ impl Window {
     #[cfg(any(feature = "bench-support", all(test, feature = "profiler")))]
     pub fn present_if_needed(&mut self) {
         if self.needs_present.get() {
-            self.present();
+            self.present_with_reason(profiler::PresentationReason::Benchmark);
         }
     }
 
@@ -5976,6 +6043,18 @@ impl Window {
     /// Dispatch a mouse, keyboard, or touch event on the window.
     #[profiling::function]
     pub fn dispatch_event(&mut self, event: PlatformInput, cx: &mut App) -> DispatchEventResult {
+        #[cfg(feature = "profiler")]
+        if let Some(native) = self.platform_window.native_input_diagnostic() {
+            profiler::record_frame_event(profiler::FrameEvent::NativeInput(
+                profiler::NativeInputTiming {
+                    window_id: self.handle.window_id(),
+                    sequence: native.sequence,
+                    arrival_qpc: native.arrival_qpc,
+                    qpc_frequency: native.qpc_frequency,
+                    dispatch_start: Instant::now(),
+                },
+            ));
+        }
         #[cfg(feature = "profiler")]
         self.window_profiler.begin_input(event.kind_name());
         let update_count_before = self.invalidator.update_count();

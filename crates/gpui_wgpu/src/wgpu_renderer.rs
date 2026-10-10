@@ -18,6 +18,7 @@ mod buffers;
 mod drawing;
 mod filters;
 mod frame;
+mod gpu_timing;
 #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
 mod headless;
 mod path_types;
@@ -25,6 +26,7 @@ mod pipelines;
 mod platform;
 pub use platform::RecoveryPending;
 mod resources;
+mod retained;
 mod settings;
 mod surfaces;
 mod target;
@@ -74,6 +76,8 @@ pub struct WgpuRenderer {
     adapter_info: wgpu::AdapterInfo,
     uploaded_globals: Option<frame::GlobalUniformState>,
     faults: GpuFaultState,
+    timings: gpu_timing::GpuTimings,
+    retained: retained::RetainedFrame,
 }
 
 impl WgpuRenderer {
@@ -119,6 +123,11 @@ impl WgpuRenderer {
             last_error,
         } = metadata;
 
+        let timings = gpu_timing::GpuTimings::new(
+            context.device.clone(),
+            context.queue.clone(),
+            format!("wgpu-{:?}", adapter_info.backend).to_ascii_lowercase(),
+        );
         Ok(Self {
             context: gpu_context,
             #[cfg(not(target_family = "wasm"))]
@@ -135,6 +144,8 @@ impl WgpuRenderer {
             dual_source_blending,
             adapter_info,
             uploaded_globals: None,
+            timings,
+            retained: retained::RetainedFrame::new(),
             faults: GpuFaultState {
                 pending_error: last_error,
                 consecutive_failed_frames: 0,
@@ -172,6 +183,9 @@ impl WgpuRenderer {
         if !self.target.resize(size) {
             return;
         }
+        if let Some(resources) = &self.resources {
+            self.retained.invalidate(&resources.queue);
+        }
         let config = self.target.configuration().clone();
         let Some(resources) = self.resources.as_mut() else {
             return;
@@ -184,11 +198,19 @@ impl WgpuRenderer {
 
     /// Selects the physical LCD component order used by subpixel glyph correction.
     pub fn set_subpixel_order(&mut self, order: SubpixelOrder) {
+        if order != self.subpixel_order {
+            if let Some(resources) = &self.resources {
+                self.retained.invalidate(&resources.queue);
+            }
+        }
         self.subpixel_order = order;
     }
 
     /// Updates platform-specific text rasterization parameters.
     pub fn set_font_rasterization_settings(&mut self, settings: FontRasterizationSettings) {
+        if let Some(resources) = &self.resources {
+            self.retained.invalidate(&resources.queue);
+        }
         self.rendering_params.font_rasterization = settings;
         self.subpixel_order = settings.subpixel_order;
     }
@@ -205,6 +227,9 @@ impl WgpuRenderer {
     pub fn update_transparency(&mut self, transparent: bool) {
         if !self.target.set_transparent(transparent) {
             return;
+        }
+        if let Some(resources) = &self.resources {
+            self.retained.invalidate(&resources.queue);
         }
         let config = self.target.configuration().clone();
         if let Some(resources) = self.resources.as_ref() {
@@ -282,6 +307,22 @@ impl WgpuRenderer {
             driver_info: self.adapter_info.driver_info.clone(),
         }
     }
+    pub fn profile_capabilities(&self) -> gpui::profiler::gpu::RendererProfileCapabilities {
+        let mut capabilities = self.timings.capabilities();
+        capabilities.present_mode =
+            Some(format!("{:?}", self.target.configuration().present_mode).to_ascii_lowercase());
+        capabilities
+    }
+    /// Release the experimental retained frame when a window is deactivated.
+    pub fn release_retained_frame(&mut self) {
+        if let Some(resources) = &self.resources {
+            self.retained.invalidate(&resources.queue);
+        }
+    }
+    /// Explain a platform draw skipped before surface acquisition when timings are enabled.
+    pub fn record_skipped_gpu_submission(&self, reason: &str) {
+        self.timings.skipped(reason);
+    }
 
     pub fn max_texture_size(&self) -> u32 {
         self.target.maximum_dimension()
@@ -327,11 +368,13 @@ fn cropped_path_targets_for_experiments(experiments: Option<&str>, default_enabl
 }
 
 fn begin_color_render_pass<'encoder>(
+    timings: &gpu_timing::GpuTimings,
     encoder: &'encoder mut wgpu::CommandEncoder,
     label: &'encoder str,
     target: &'encoder wgpu::TextureView,
     load: wgpu::LoadOp<wgpu::Color>,
 ) -> wgpu::RenderPass<'encoder> {
+    let timestamp = timings.pass(label);
     encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some(label),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -344,6 +387,7 @@ fn begin_color_render_pass<'encoder>(
             depth_slice: None,
         })],
         depth_stencil_attachment: None,
+        timestamp_writes: timestamp.as_ref().map(gpu_timing::TimestampPass::writes),
         ..Default::default()
     })
 }

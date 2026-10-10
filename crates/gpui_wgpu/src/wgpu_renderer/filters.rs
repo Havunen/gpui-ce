@@ -44,6 +44,7 @@ impl WgpuRenderer {
         let (bind_group, uniform_offset) = self.make_blur_bind_group(uniforms, source);
         let resources = self.resources();
         let mut pass = begin_color_render_pass(
+            &self.timings,
             encoder,
             label,
             target,
@@ -153,8 +154,13 @@ impl WgpuRenderer {
         } else {
             &resources.pipelines.blur_composite
         };
-        let mut pass =
-            begin_color_render_pass(encoder, "blur_composite", target, wgpu::LoadOp::Load);
+        let mut pass = begin_color_render_pass(
+            &self.timings,
+            encoder,
+            "blur_composite",
+            target,
+            wgpu::LoadOp::Load,
+        );
         pass.set_pipeline(pipeline);
         pass.set_bind_group(
             shader_interface::GLOBAL_BIND_GROUP,
@@ -202,6 +208,7 @@ impl WgpuRenderer {
             self.make_blur_bind_group(BlurUniforms::copy(size), source);
         let resources = self.resources();
         let mut pass = begin_color_render_pass(
+            &self.timings,
             encoder,
             "scene_blit",
             frame_view,

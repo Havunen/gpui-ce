@@ -13,6 +13,7 @@ use gpui_render::{
         BlurAxis, BlurKernel, BlurUniforms, FilterCompositeClip,
         GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS, downsampled_dimension,
     },
+    damage::{Damage, DamageRect, batch_intersects, clear_quad},
     path_types::{PathRasterizationVertex, PathSprite},
     shaders::{
         common::{FontRasterizationUniforms, GlobalUniforms, ShaderBool, SurfaceColorFormat},
@@ -30,7 +31,7 @@ use crate::*;
 use gpui::*;
 
 pub(crate) const DISABLE_DIRECT_COMPOSITION: &str = "GPUI_DISABLE_DIRECT_COMPOSITION";
-const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
+pub(super) const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 // This configuration is used for MSAA rendering on paths only, and it's guaranteed to be supported by DirectX 11.
 const PATH_MULTISAMPLE_COUNT: u32 = 4;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
@@ -77,6 +78,8 @@ pub(crate) struct DirectXRenderer {
     active_render_target: Option<ID3D11RenderTargetView>,
     path_rasterization_vertices: Vec<PathRasterizationVertex>,
     path_sprites: Vec<PathSprite>,
+    timings: crate::directx_gpu_timing::GpuTimings,
+    retained: crate::directx_retained::RetainedFrame,
 }
 
 /// Direct3D objects
@@ -371,14 +374,32 @@ impl DirectXRenderer {
             active_render_target: None,
             path_rasterization_vertices: Vec::new(),
             path_sprites: Vec::new(),
+            timings: crate::directx_gpu_timing::GpuTimings::new(),
+            retained: crate::directx_retained::RetainedFrame::new(),
         })
     }
 
     pub(crate) fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.atlas.clone()
     }
+    pub(crate) fn profile_capabilities(&self) -> gpui::profiler::gpu::RendererProfileCapabilities {
+        let mut capabilities = self.timings.capabilities();
+        capabilities.present_mode = Some("immediate".into());
+        capabilities
+    }
+    pub(crate) fn release_retained_frame(&mut self) {
+        self.retained.invalidate();
+    }
+    pub(crate) fn poll_gpu_timings(&self) {
+        if let Some(devices) = &self.devices {
+            self.timings.poll(&devices.device_context);
+        }
+        if self.retained.enabled() {
+            crate::directx_retained::poll_retired();
+        }
+    }
 
-    fn pre_draw(&self, clear_color: &[f32; 4]) -> Result<()> {
+    fn pre_draw(&self, clear_color: &[f32; 4], clear_swapchain: bool) -> Result<()> {
         let resources = self.resources.as_ref().expect("resources missing");
         let device_context = &self
             .devices
@@ -413,16 +434,27 @@ impl DirectXRenderer {
             }],
         )?;
         unsafe {
-            device_context.ClearRenderTargetView(
-                resources
-                    .render_target_view
-                    .as_ref()
-                    .context("missing render target view")?,
-                clear_color,
-            );
+            if clear_swapchain {
+                device_context.ClearRenderTargetView(
+                    resources
+                        .render_target_view
+                        .as_ref()
+                        .context("missing render target view")?,
+                    clear_color,
+                );
+            }
             device_context
                 .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
             device_context.RSSetViewports(Some(slice::from_ref(&resources.viewport)));
+            set_scissor(
+                device_context,
+                DamageRect {
+                    x: 0,
+                    y: 0,
+                    width: self.width,
+                    height: self.height,
+                },
+            );
         }
         Ok(())
     }
@@ -447,6 +479,9 @@ impl DirectXRenderer {
     }
 
     fn handle_device_lost_impl(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
+        self.timings
+            .discard("Device recovery invalidated timestamp queries");
+        self.retained.device_lost();
         let disable_direct_composition = self.direct_composition.is_none();
 
         unsafe {
@@ -519,10 +554,26 @@ impl DirectXRenderer {
         if self.skip_draws {
             // skip drawing this frame, we just recovered from a device lost event
             // and so likely do not have the textures anymore that are required for drawing
+            self.timings
+                .skipped("Device recovery discarded the current frame");
             return Ok(());
         }
-        self.render(scene, background_appearance)?;
-        self.present()
+        let devices = self.devices.as_ref().context("devices missing")?;
+        self.timings.begin(&devices.device, &devices.device_context);
+        let result = self.render(scene, background_appearance);
+        if let Some(devices) = &self.devices {
+            self.timings.end(&devices.device_context, result.is_ok());
+        }
+        result?;
+        // Present flushes the immediate context, including the final timestamps.
+        // Ending queries afterward would leave the last frame unresolved while idle.
+        let result = self.present();
+        if result.is_err() {
+            self.timings
+                .fail_latest_submission("Swapchain present failed");
+            self.retained.invalidate();
+        }
+        result
     }
 
     /// Encodes a complete frame without presenting it. Window drawing and test readback share
@@ -532,12 +583,87 @@ impl DirectXRenderer {
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
-        self.pre_draw(&match background_appearance {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let plan = self.retained.prepare(
+            scene,
+            self.atlas.as_ref(),
+            self.width,
+            self.height,
+            background_appearance.is_opaque() && !self.timings.diagnostic_ablations.enabled(),
+            &devices.device,
+            &devices.device_context,
+        )?;
+        self.timings.describe_damage(
+            plan.damage.kind(),
+            plan.bytes,
+            if self.retained.enabled() && !self.timings.diagnostic_ablations.enabled() {
+                vec!["partial-redraw".into()]
+            } else {
+                Vec::new()
+            },
+        );
+        let result = self.render_scene(scene, background_appearance, &plan);
+        self.retained.complete(plan, result.is_ok());
+        result
+    }
+
+    fn render_scene(
+        &mut self,
+        scene: &Scene,
+        background_appearance: WindowBackgroundAppearance,
+        retained: &crate::directx_retained::RetainedPlan,
+    ) -> Result<()> {
+        let clear_color = match background_appearance {
             appearance if appearance.is_opaque() => [1.0f32; 4],
             _ => [0.0f32; 4],
-        })?;
+        };
+        let devices = self.devices.as_ref().unwrap();
+        let preparation = self.timings.begin_pass(
+            &devices.device,
+            &devices.device_context,
+            if self.timings.diagnostic_ablations.clear_only() {
+                "clear_only"
+            } else {
+                "globals_and_swapchain_clear"
+            },
+        );
+        let prepared = self.pre_draw(&clear_color, retained.rtv.is_none());
+        self.timings.end_pass(&devices.device_context, preparation);
+        prepared?;
+        if self.timings.diagnostic_ablations.clear_only() {
+            // Diagnostic clear-only still ends frame queries and presents through draw().
+            return Ok(());
+        }
+        if retained.damage == Damage::Reuse {
+            let devices = self.devices.as_ref().unwrap();
+            let pass =
+                self.timings
+                    .begin_pass(&devices.device, &devices.device_context, "retained_blit");
+            let result = self.dx_blit(
+                &retained.srv,
+                &self.resources.as_ref().unwrap().render_target_view,
+            );
+            self.timings.end_pass(&devices.device_context, pass);
+            return result;
+        }
 
         self.upload_scene_buffers(scene)?;
+        if let Damage::Partial(regions) = &retained.damage {
+            let mut quads = scene.quads.clone();
+            let colour = rgb_to_hsla(Rgba::new(
+                clear_color[0],
+                clear_color[1],
+                clear_color[2],
+                clear_color[3],
+            ));
+            quads.extend(regions.iter().map(|region| clear_quad(*region, colour)));
+            let devices = self.devices.as_ref().unwrap();
+            self.pipelines.quad_pipeline.update_buffer(
+                &devices.device,
+                &devices.device_context,
+                &quads,
+            )?;
+        }
 
         // Only route through the offscreen scene texture when the scene contains blur filters;
         // otherwise render straight to the swapchain exactly as before.
@@ -589,7 +715,21 @@ impl DirectXRenderer {
             .device_context
             .clone();
 
-        if use_offscreen {
+        if retained.rtv.is_some() {
+            let clear = self.timings.begin_pass(
+                &self.devices.as_ref().unwrap().device,
+                &ctx,
+                "retained_target_clear",
+            );
+            unsafe {
+                if retained.damage == Damage::Full {
+                    ctx.ClearRenderTargetView(retained.rtv.as_ref().unwrap(), &clear_color);
+                }
+                ctx.OMSetRenderTargets(Some(slice::from_ref(&retained.rtv)), None);
+            }
+            self.timings.end_pass(&ctx, clear);
+            self.active_render_target = retained.rtv.clone();
+        } else if use_offscreen {
             unsafe {
                 if let Some(rtv) = scene_rtv.as_ref() {
                     ctx.ClearRenderTargetView(rtv, &[0.0; 4]);
@@ -620,135 +760,208 @@ impl DirectXRenderer {
             .as_ref()
             .and_then(|devices| devices.annotation.clone())
             .filter(|annotation| unsafe { annotation.GetStatus().as_bool() });
-        for command in scene.render_commands() {
-            let _annotation = annotation
-                .as_ref()
-                .map(|annotation| Annotation::new(annotation, HSTRING::from(command.label())));
-            match command {
-                RenderCommand::Batch(PrimitiveBatch::Shadows { range, smoothed }) => {
-                    self.draw_shadows(instance_range(range)?, *smoothed)
+        let regions: SmallVec<[Option<DamageRect>; 8]> = match &retained.damage {
+            Damage::Partial(regions) => regions.iter().copied().map(Some).collect(),
+            _ => smallvec::smallvec![None],
+        };
+        for (region_index, region) in regions.into_iter().enumerate() {
+            let scissor = region.unwrap_or(DamageRect {
+                x: 0,
+                y: 0,
+                width: self.width,
+                height: self.height,
+            });
+            set_scissor(&ctx, scissor);
+            if region.is_some() {
+                let clear = self.timings.begin_pass(
+                    &self.devices.as_ref().unwrap().device,
+                    &ctx,
+                    "damage_clear",
+                );
+                let result = self.draw_quads(
+                    instance_range(
+                        &(scene.quads.len() + region_index..scene.quads.len() + region_index + 1),
+                    )?,
+                    false,
+                );
+                self.timings.end_pass(&ctx, clear);
+                result?;
+            }
+            for command in scene.render_commands() {
+                if self.timings.diagnostic_ablations.enabled()
+                    && self.timings.diagnostic_ablations.skips_command(command)
+                {
+                    continue;
                 }
-                RenderCommand::Batch(PrimitiveBatch::Quads { range, smoothed }) => {
-                    self.draw_quads(instance_range(range)?, *smoothed)
-                }
-                RenderCommand::Batch(PrimitiveBatch::Paths {
-                    range,
-                    rasterization_vertex_count,
-                    sprite_count,
-                }) => {
-                    if *rasterization_vertex_count == 0 {
+                if let (Some(region), RenderCommand::Batch(batch)) = (region, command) {
+                    if !batch_intersects(scene, batch, region) {
                         continue;
                     }
-                    let paths = &scene.paths[range.clone()];
-                    self.draw_paths_to_intermediate(paths, *rasterization_vertex_count)?;
-                    self.draw_paths_from_intermediate(paths, *sprite_count)
                 }
-                RenderCommand::Batch(PrimitiveBatch::Underlines(range)) => {
-                    self.draw_underlines(instance_range(range)?)
+                if matches!(
+                    command,
+                    RenderCommand::Batch(PrimitiveBatch::Paths {
+                        rasterization_vertex_count: 0,
+                        ..
+                    })
+                ) {
+                    continue;
                 }
-                RenderCommand::Batch(PrimitiveBatch::MonochromeSprites {
-                    texture_id,
-                    range,
-                }) => self.draw_monochrome_sprites(*texture_id, instance_range(range)?),
-                RenderCommand::Batch(PrimitiveBatch::SubpixelSprites {
-                    texture_id,
-                    range,
-                }) => self.draw_subpixel_sprites(*texture_id, instance_range(range)?),
-                RenderCommand::Batch(PrimitiveBatch::PolychromeSprites {
-                    texture_id,
-                    range,
-                    smoothed,
-                }) => self.draw_polychrome_sprites(
-                    *texture_id,
-                    instance_range(range)?,
-                    *smoothed,
-                ),
-                RenderCommand::Batch(PrimitiveBatch::Surfaces(range)) => {
-                    self.draw_surfaces(
+                let timing_pass =
+                    if matches!(command, RenderCommand::Batch(PrimitiveBatch::Paths { .. })) {
+                        None
+                    } else {
+                        self.timings.begin_pass(
+                            &self.devices.as_ref().unwrap().device,
+                            &ctx,
+                            gpu_command_label(command),
+                        )
+                    };
+                let _annotation = annotation
+                    .as_ref()
+                    .map(|annotation| Annotation::new(annotation, HSTRING::from(command.label())));
+                let command_result = match command {
+                    RenderCommand::Batch(PrimitiveBatch::Shadows { range, smoothed }) => {
+                        self.draw_shadows(instance_range(range)?, *smoothed)
+                    }
+                    RenderCommand::Batch(PrimitiveBatch::Quads { range, smoothed }) => {
+                        self.draw_quads(instance_range(range)?, *smoothed)
+                    }
+                    RenderCommand::Batch(PrimitiveBatch::Paths {
+                        range,
+                        rasterization_vertex_count,
+                        sprite_count,
+                    }) => {
+                        let paths = &scene.paths[range.clone()];
+                        set_scissor(
+                            &ctx,
+                            DamageRect {
+                                x: 0,
+                                y: 0,
+                                width: self.width,
+                                height: self.height,
+                            },
+                        );
+                        let raster = self.timings.begin_pass(
+                            &self.devices.as_ref().unwrap().device,
+                            &ctx,
+                            "path_rasterization_and_resolve",
+                        );
+                        let result =
+                            self.draw_paths_to_intermediate(paths, *rasterization_vertex_count);
+                        self.timings.end_pass(&ctx, raster);
+                        result?;
+                        set_scissor(&ctx, scissor);
+                        let composite = self.timings.begin_pass(
+                            &self.devices.as_ref().unwrap().device,
+                            &ctx,
+                            "path_composite",
+                        );
+                        let result = self.draw_paths_from_intermediate(paths, *sprite_count);
+                        self.timings.end_pass(&ctx, composite);
+                        result
+                    }
+                    RenderCommand::Batch(PrimitiveBatch::Underlines(range)) => {
+                        self.draw_underlines(instance_range(range)?)
+                    }
+                    RenderCommand::Batch(PrimitiveBatch::MonochromeSprites {
+                        texture_id,
+                        range,
+                    }) => self.draw_monochrome_sprites(*texture_id, instance_range(range)?),
+                    RenderCommand::Batch(PrimitiveBatch::SubpixelSprites { texture_id, range }) => {
+                        self.draw_subpixel_sprites(*texture_id, instance_range(range)?)
+                    }
+                    RenderCommand::Batch(PrimitiveBatch::PolychromeSprites {
+                        texture_id,
+                        range,
+                        smoothed,
+                    }) => {
+                        self.draw_polychrome_sprites(*texture_id, instance_range(range)?, *smoothed)
+                    }
+                    RenderCommand::Batch(PrimitiveBatch::Surfaces(range)) => self.draw_surfaces(
                         &scene.surfaces[range.clone()],
                         &scene.surface_opacities()[range.clone()],
-                    )
-                }
-                RenderCommand::Batch(PrimitiveBatch::BackdropFilters(range)) => {
-                    let result = (|| {
-                        for filter in &scene.backdrop_filters[range.clone()] {
-                            self.dx_blur_and_composite(
-                                &current_srv,
-                                &current_rtv,
-                                filter.bounds,
-                                filter.content_mask.bounds,
-                                filter.corner_radii,
-                                filter.corner_smoothing,
-                                filter.max_blur_radius(),
-                                filter.opacity,
-                                true,
-                            )?;
+                    ),
+                    RenderCommand::Batch(PrimitiveBatch::BackdropFilters(range)) => {
+                        let result = (|| {
+                            for filter in &scene.backdrop_filters[range.clone()] {
+                                self.dx_blur_and_composite(
+                                    &current_srv,
+                                    &current_rtv,
+                                    filter.bounds,
+                                    filter.content_mask.bounds,
+                                    filter.corner_radii,
+                                    filter.corner_smoothing,
+                                    filter.max_blur_radius(),
+                                    filter.opacity,
+                                    true,
+                                )?;
+                            }
+                            Ok::<(), anyhow::Error>(())
+                        })();
+                        // Restore the current target for subsequent batches.
+                        unsafe {
+                            ctx.OMSetRenderTargets(Some(slice::from_ref(&current_rtv)), None);
                         }
-                        Ok::<(), anyhow::Error>(())
-                    })();
-                    // Restore the current target for subsequent batches.
-                    unsafe {
-                        ctx.OMSetRenderTargets(Some(slice::from_ref(&current_rtv)), None);
+                        result
                     }
-                    result
-                }
-                RenderCommand::BeginFilter {
-                    target: FilterRenderTarget::Isolated(target_index),
-                    ..
-                } => {
-                    filter_stack.push((current_rtv.clone(), current_srv.clone()));
-                    current_rtv = group_rtvs[target_index.as_usize()].clone();
-                    current_srv = group_srvs[target_index.as_usize()].clone();
-                    self.active_render_target = current_rtv.clone();
-                    unsafe {
-                        if let Some(rtv) = current_rtv.as_ref() {
-                            ctx.ClearRenderTargetView(rtv, &[0.0; 4]);
+                    RenderCommand::BeginFilter {
+                        target: FilterRenderTarget::Isolated(target_index),
+                        ..
+                    } => {
+                        filter_stack.push((current_rtv.clone(), current_srv.clone()));
+                        current_rtv = group_rtvs[target_index.as_usize()].clone();
+                        current_srv = group_srvs[target_index.as_usize()].clone();
+                        self.active_render_target = current_rtv.clone();
+                        unsafe {
+                            if let Some(rtv) = current_rtv.as_ref() {
+                                ctx.ClearRenderTargetView(rtv, &[0.0; 4]);
+                            }
+                            ctx.OMSetRenderTargets(Some(slice::from_ref(&current_rtv)), None);
                         }
-                        ctx.OMSetRenderTargets(Some(slice::from_ref(&current_rtv)), None);
+                        Ok(())
                     }
-                    Ok(())
-                }
-                RenderCommand::EndFilter {
-                    boundary_index,
-                    target: FilterRenderTarget::Isolated(_),
-                    ..
-                } => {
-                    let boundary = &scene.filter_boundaries[*boundary_index];
-                    let (parent_rtv, parent_srv) = filter_stack
-                        .pop()
-                        .expect("render plan emitted an unmatched isolated filter end");
-                    let result = self.dx_blur_and_composite(
-                        &current_srv,
-                        &parent_rtv,
-                        boundary.bounds,
-                        boundary.content_mask.bounds,
-                        boundary.corner_radii,
-                        boundary.corner_smoothing,
-                        boundary.max_blur_radius(),
-                        boundary.opacity,
-                        false,
-                    );
-                    current_rtv = parent_rtv;
-                    current_srv = parent_srv;
-                    self.active_render_target = current_rtv.clone();
-                    unsafe {
-                        ctx.OMSetRenderTargets(Some(slice::from_ref(&current_rtv)), None);
+                    RenderCommand::EndFilter {
+                        boundary_index,
+                        target: FilterRenderTarget::Isolated(_),
+                        ..
+                    } => {
+                        let boundary = &scene.filter_boundaries[*boundary_index];
+                        let (parent_rtv, parent_srv) = filter_stack
+                            .pop()
+                            .expect("render plan emitted an unmatched isolated filter end");
+                        let result = self.dx_blur_and_composite(
+                            &current_srv,
+                            &parent_rtv,
+                            boundary.bounds,
+                            boundary.content_mask.bounds,
+                            boundary.corner_radii,
+                            boundary.corner_smoothing,
+                            boundary.max_blur_radius(),
+                            boundary.opacity,
+                            false,
+                        );
+                        current_rtv = parent_rtv;
+                        current_srv = parent_srv;
+                        self.active_render_target = current_rtv.clone();
+                        unsafe {
+                            ctx.OMSetRenderTargets(Some(slice::from_ref(&current_rtv)), None);
+                        }
+                        result
                     }
-                    result
-                }
-                RenderCommand::BeginFilter {
-                    target: FilterRenderTarget::Inline,
-                    ..
-                }
-                | RenderCommand::EndFilter {
-                    target: FilterRenderTarget::Inline,
-                    ..
-                } => Ok(()),
-                RenderCommand::Batch(PrimitiveBatch::FilterBoundary(_)) => {
-                    unreachable!("filter boundaries are resolved by the render plan")
-                }
-            }
-            .with_context(|| {
+                    RenderCommand::BeginFilter {
+                        target: FilterRenderTarget::Inline,
+                        ..
+                    }
+                    | RenderCommand::EndFilter {
+                        target: FilterRenderTarget::Inline,
+                        ..
+                    } => Ok(()),
+                    RenderCommand::Batch(PrimitiveBatch::FilterBoundary(_)) => {
+                        unreachable!("filter boundaries are resolved by the render plan")
+                    }
+                };
+                let command_result=command_result.with_context(|| {
                 format!(
                     "scene too large:\
                     {} paths, {} shadows, {} quads, {} underlines, {} mono, {} subpixel, {} poly, {} surfaces",
@@ -761,11 +974,32 @@ impl DirectXRenderer {
                     scene.polychrome_sprites.len(),
                     scene.surfaces.len(),
                 )
-            })?;
+            });
+                self.timings.end_pass(&ctx, timing_pass);
+                command_result?;
+            }
         }
+        set_scissor(
+            &ctx,
+            DamageRect {
+                x: 0,
+                y: 0,
+                width: self.width,
+                height: self.height,
+            },
+        );
 
         // Present the offscreen scene by blitting it into the swapchain.
-        if use_offscreen {
+        if retained.rtv.is_some() {
+            let pass = self.timings.begin_pass(
+                &self.devices.as_ref().unwrap().device,
+                &ctx,
+                "retained_blit",
+            );
+            let result = self.dx_blit(&retained.srv, &swapchain_rtv);
+            self.timings.end_pass(&ctx, pass);
+            result?;
+        } else if use_offscreen {
             self.dx_blit(&scene_srv, &swapchain_rtv)?;
         }
         self.active_render_target = None;
@@ -858,6 +1092,7 @@ impl DirectXRenderer {
         }
         self.width = width;
         self.height = height;
+        self.retained.invalidate();
 
         // Clear the render target before resizing
         let devices = self.devices.as_ref().context("devices missing")?;
@@ -2302,7 +2537,7 @@ fn set_rasterizer_state(device: &ID3D11Device, device_context: &ID3D11DeviceCont
         DepthBiasClamp: 0.0,
         SlopeScaledDepthBias: 0.0,
         DepthClipEnable: true.into(),
-        ScissorEnable: false.into(),
+        ScissorEnable: true.into(),
         MultisampleEnable: true.into(),
         AntialiasedLineEnable: false.into(),
     };
@@ -2313,6 +2548,41 @@ fn set_rasterizer_state(device: &ID3D11Device, device_context: &ID3D11DeviceCont
     };
     unsafe { device_context.RSSetState(&rasterizer_state) };
     Ok(())
+}
+
+fn set_scissor(context: &ID3D11DeviceContext, rect: DamageRect) {
+    // The generated bindings omit RSSetScissorRects (immediate-context slot 45).
+    unsafe {
+        type Set = unsafe extern "system" fn(*mut std::ffi::c_void, u32, *const RECT);
+        let table = Interface::vtable(context) as *const _ as *const *const std::ffi::c_void;
+        let set: Set = std::mem::transmute(*table.add(45));
+        let native = RECT {
+            left: rect.x as i32,
+            top: rect.y as i32,
+            right: (rect.x + rect.width) as i32,
+            bottom: (rect.y + rect.height) as i32,
+        };
+        set(context.as_raw(), 1, &native);
+    }
+}
+
+fn gpu_command_label(command: &RenderCommand) -> &'static str {
+    match command {
+        RenderCommand::Batch(batch) => match batch {
+            PrimitiveBatch::Shadows { .. } => "shadows",
+            PrimitiveBatch::Quads { .. } => "quads",
+            PrimitiveBatch::Paths { .. } => "paths",
+            PrimitiveBatch::Underlines(_) => "underlines",
+            PrimitiveBatch::MonochromeSprites { .. } => "monochrome_sprites",
+            PrimitiveBatch::SubpixelSprites { .. } => "subpixel_sprites",
+            PrimitiveBatch::PolychromeSprites { .. } => "polychrome_sprites",
+            PrimitiveBatch::Surfaces(_) => "surfaces",
+            PrimitiveBatch::BackdropFilters(_) => "backdrop_filters",
+            PrimitiveBatch::FilterBoundary(_) => "filter_boundary",
+        },
+        RenderCommand::BeginFilter { .. } => "begin_filter",
+        RenderCommand::EndFilter { .. } => "end_filter",
+    }
 }
 
 // https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ns-d3d11-d3d11_blend_desc
@@ -2899,6 +3169,228 @@ mod tests {
         right: u32,
     ) -> bool {
         (4..16).any(|y| (left..right).any(|x| first.get_pixel(x, y) != second.get_pixel(x, y)))
+    }
+
+    fn retained_scene(hover: bool, resting_fills: bool) -> Scene {
+        let mut scene = Scene::default();
+        let dark = rgb_to_hsla(rgb(0x18212b));
+        scene.insert_primitive(Quad {
+            bounds: scaled(0.0, 0.0, 200.0, 100.0),
+            content_mask: full_mask(),
+            background: solid_background(dark),
+            ..Default::default()
+        });
+        for row in 0..3 {
+            if !resting_fills && !((row == 0 && !hover) || (row == 1 && hover)) {
+                continue;
+            }
+            scene.insert_primitive(Quad {
+                bounds: scaled(0.0, 10.0 + row as f32 * 25.0, 200.0, 14.0),
+                content_mask: full_mask(),
+                background: solid_background(if (row == 0 && !hover) || (row == 1 && hover) {
+                    hsla(0.6, 0.4, 0.4, 0.7)
+                } else {
+                    dark
+                }),
+                ..Default::default()
+            });
+        }
+        let mut path = gpui::Path::new(gpui::point(gpui::px(22.0), gpui::px(8.0)));
+        path.line_to(gpui::point(gpui::px(40.0), gpui::px(24.0)));
+        path.line_to(gpui::point(gpui::px(20.0), gpui::px(24.0)));
+        let mut path = path.scale(1.0);
+        path.content_mask = ContentMask {
+            bounds: scaled(20.0, 10.0, 18.0, 14.0),
+            ..Default::default()
+        };
+        for vertex in &mut path.vertices {
+            vertex.content_mask = path.content_mask;
+        }
+        path.color = solid_background(if hover {
+            dark
+        } else {
+            hsla(0.6, 0.4, 0.4, 0.7)
+        });
+        scene.insert_primitive(path);
+        // A translucent later primitive crosses both old/new hover rows. It must be
+        // repainted in the original order even though its own color is unchanged.
+        scene.insert_primitive(Quad {
+            bounds: scaled(80.0, 5.0, 15.0, 70.0),
+            content_mask: ContentMask {
+                bounds: scaled(82.0, 0.0, 10.0, 100.0),
+                ..Default::default()
+            },
+            background: solid_background(hsla(0.02, 0.8, 0.6, 0.4)),
+            corner_radii: Corners::all(ScaledPixels(4.0)),
+            ..Default::default()
+        });
+        scene.finish();
+        scene
+    }
+
+    #[test]
+    fn diagnostic_ablation_clears_and_batch_omissions_match_empty_frame() -> Result<()> {
+        let devices = DirectXDevices::new()?;
+        let window = HiddenWindow::new()?;
+        let mut renderer = DirectXRenderer::new(window.0, &devices, true)?;
+        renderer.resize(Size {
+            width: DevicePixels(200),
+            height: DevicePixels(100),
+        })?;
+        renderer.retained.enable_for_tests();
+        let _scope = gpui::profiler::gpu::set_gpu_frame_context(
+            Some("diagnostic-dx11-test".into()),
+            true,
+            1,
+            1,
+        );
+        let mut empty = Scene::default();
+        empty.finish();
+        let expected = renderer.render_to_image(&empty, WindowBackgroundAppearance::Opaque)?;
+        let scene = retained_scene(false, true);
+        let _scope = gpui::profiler::gpu::set_gpu_frame_context(
+            Some("diagnostic-dx11-test".into()),
+            true,
+            2,
+            2,
+        );
+        assert_ne!(
+            renderer.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?,
+            expected
+        );
+        for name in ["clear-only", "no-quads,no-paths"] {
+            renderer.timings.diagnostic_ablations =
+                gpui::profiler::gpu::DiagnosticAblations::parse(name)
+                    .map_err(anyhow::Error::msg)?;
+            assert_eq!(
+                renderer.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?,
+                expected,
+                "diagnostic {name}"
+            );
+            assert_eq!(renderer.retained.last_damage(), "full");
+            assert_eq!(
+                renderer.profile_capabilities().active_diagnostic_ablations,
+                renderer.timings.diagnostic_ablations.active_names()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn retained_hover_damage_matches_full_render_and_reuses_keepalive() -> Result<()> {
+        let devices = DirectXDevices::new()?;
+        let window = HiddenWindow::new()?;
+        let reference_window = HiddenWindow::new()?;
+        let mut renderer = DirectXRenderer::new(window.0, &devices, true)?;
+        let mut reference = DirectXRenderer::new(reference_window.0, &devices, true)?;
+        reference.retained.disable_for_tests();
+        for renderer in [&mut renderer, &mut reference] {
+            renderer.resize(Size {
+                width: DevicePixels(200),
+                height: DevicePixels(100),
+            })?;
+        }
+        renderer.retained.enable_for_tests();
+        let render = |renderer: &mut DirectXRenderer, scene: &Scene, revision: u64| {
+            let _guard = gpui::profiler::gpu::set_gpu_frame_context(
+                Some("retained-test".into()),
+                true,
+                revision,
+                revision,
+            );
+            renderer.render_to_image(scene, WindowBackgroundAppearance::Opaque)
+        };
+        let initial = retained_scene(false, true);
+        assert_eq!(
+            render(&mut renderer, &initial, 1)?,
+            render(&mut reference, &initial, 1)?
+        );
+        let hovered = retained_scene(true, true);
+        let actual = render(&mut renderer, &hovered, 2)?;
+        assert_eq!(
+            renderer.retained.last_damage(),
+            "partial",
+            "fixture must exercise sparse replay"
+        );
+        let expected = render(&mut reference, &hovered, 2)?;
+        assert_eq!(
+            actual, expected,
+            "partial old/new row repaint must preserve alpha, dark backing, clipping and painter order"
+        );
+        assert_eq!(
+            render(&mut renderer, &hovered, 2)?,
+            expected,
+            "unchanged scene revision must reuse the completed frame"
+        );
+        assert_eq!(renderer.retained.last_damage(), "reuse");
+        renderer
+            .atlas
+            .handle_device_lost(&devices.device, &devices.device_context);
+        assert_eq!(render(&mut renderer, &hovered, 2)?, expected);
+        assert_eq!(
+            renderer.retained.last_damage(),
+            "full",
+            "atlas generation invalidates unchanged revision reuse"
+        );
+        for renderer in [&mut renderer, &mut reference] {
+            renderer.resize(Size {
+                width: DevicePixels(190),
+                height: DevicePixels(100),
+            })?;
+        }
+        assert_eq!(
+            render(&mut renderer, &hovered, 2)?,
+            render(&mut reference, &hovered, 2)?
+        );
+        assert_eq!(
+            renderer.retained.last_damage(),
+            "full",
+            "resize invalidates unchanged revision reuse"
+        );
+        // Transparent windows must use the normal complete render, with fresh alpha.
+        let _guard =
+            gpui::profiler::gpu::set_gpu_frame_context(Some("retained-test".into()), true, 3, 3);
+        assert_eq!(
+            renderer.render_to_image(&hovered, WindowBackgroundAppearance::Transparent)?,
+            reference.render_to_image(&hovered, WindowBackgroundAppearance::Transparent)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retained_inserted_hover_fill_matches_full_frame() -> Result<()> {
+        let devices = DirectXDevices::new()?;
+        let window = HiddenWindow::new()?;
+        let reference_window = HiddenWindow::new()?;
+        let mut renderer = DirectXRenderer::new(window.0, &devices, true)?;
+        let mut reference = DirectXRenderer::new(reference_window.0, &devices, true)?;
+        renderer.retained.enable_for_tests();
+        reference.retained.disable_for_tests();
+        for renderer in [&mut renderer, &mut reference] {
+            renderer.resize(Size {
+                width: DevicePixels(200),
+                height: DevicePixels(100),
+            })?;
+        }
+        for (revision, hover) in [(1, false), (2, true), (3, false)] {
+            let scene = retained_scene(hover, false);
+            let _scope = gpui::profiler::gpu::set_gpu_frame_context(
+                Some("retained-insert-test".into()),
+                true,
+                revision,
+                revision,
+            );
+            assert_eq!(
+                renderer.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?,
+                reference.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?
+            );
+            assert_eq!(
+                renderer.retained.last_damage(),
+                if revision == 1 { "full" } else { "partial" },
+                "actual hover fill omission must use sparse repaint"
+            );
+        }
+        Ok(())
     }
 
     fn tile(atlas: &dyn PlatformAtlas, key: AtlasKey, bytes: Vec<u8>) -> AtlasTile {

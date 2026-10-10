@@ -263,6 +263,202 @@ mod path_target_tests {
         path
     }
 
+    fn hover_scene(row: usize, resting_fills: bool) -> Scene {
+        let mask = ContentMask {
+            bounds: Bounds::new(
+                point(ScaledPixels(0.0), ScaledPixels(0.0)),
+                size(ScaledPixels(200.0), ScaledPixels(100.0)),
+            ),
+            ..Default::default()
+        };
+        let mut scene = Scene::default();
+        // The headless target clears to black. Leave uncovered pixels around each
+        // translucent row so a wrong retained clear color is observable.
+        for index in 0..3 {
+            if !resting_fills && index != row {
+                continue;
+            }
+            scene.insert_primitive(Quad {
+                bounds: Bounds::new(
+                    point(ScaledPixels(4.0), ScaledPixels(10.0 + index as f32 * 25.0)),
+                    size(ScaledPixels(192.0), ScaledPixels(14.0)),
+                ),
+                content_mask: mask,
+                background: solid_background(if row == index {
+                    gpui::hsla(0.6, 0.4, 0.4, 0.7)
+                } else {
+                    gpui::hsla(0.6, 0.1, 0.15, 0.7)
+                }),
+                ..Default::default()
+            });
+        }
+        let mut graph = triangle(
+            20.0,
+            8.0,
+            18.0,
+            ContentMask {
+                bounds: Bounds::new(
+                    point(ScaledPixels(20.0), ScaledPixels(10.0)),
+                    size(ScaledPixels(18.0), ScaledPixels(14.0)),
+                ),
+                ..Default::default()
+            },
+        );
+        graph.color = solid_background(if row == 0 {
+            gpui::hsla(0.6, 0.4, 0.4, 0.7)
+        } else {
+            gpui::black()
+        });
+        scene.insert_primitive(graph);
+        scene.insert_primitive(Quad {
+            bounds: Bounds::new(
+                point(ScaledPixels(80.0), ScaledPixels(5.0)),
+                size(ScaledPixels(15.0), ScaledPixels(70.0)),
+            ),
+            content_mask: ContentMask {
+                bounds: Bounds::new(
+                    point(ScaledPixels(82.0), ScaledPixels(0.0)),
+                    size(ScaledPixels(10.0), ScaledPixels(100.0)),
+                ),
+                ..Default::default()
+            },
+            background: solid_background(gpui::hsla(0.02, 0.8, 0.6, 0.4)),
+            corner_radii: gpui::Corners::all(ScaledPixels(4.0)),
+            ..Default::default()
+        });
+        scene.finish();
+        scene
+    }
+
+    #[test]
+    fn diagnostic_ablation_clears_and_batch_omissions_match_empty_frame() -> anyhow::Result<()> {
+        let _gpu_test_guard = crate::test_gpu::guard();
+        let context = WgpuContext::new_headless(None)?;
+        let target = size(DevicePixels(200), DevicePixels(100));
+        let mut renderer = WgpuRenderer::new_headless(&context, target)?;
+        renderer.retained.enable_for_tests();
+        let mut reference = WgpuRenderer::new_headless(&context, target)?;
+        reference.retained.disable_for_tests();
+        let mut empty = Scene::default();
+        empty.finish();
+        let expected = reference.render_to_image(&empty)?;
+        let scene = hover_scene(0, true);
+        let _scope = gpui::profiler::gpu::set_gpu_frame_context(
+            Some("diagnostic-wgpu-test".into()),
+            true,
+            1,
+            1,
+        );
+        assert_ne!(renderer.render_to_image(&scene)?, expected);
+        for name in ["clear-only", "no-quads,no-paths"] {
+            renderer.timings.diagnostic_ablations =
+                gpui::profiler::gpu::DiagnosticAblations::parse(name)
+                    .map_err(anyhow::Error::msg)?;
+            assert_eq!(
+                renderer.render_to_image(&scene)?,
+                expected,
+                "diagnostic {name}"
+            );
+            assert_eq!(renderer.retained.last_damage(), "full");
+            assert_eq!(
+                renderer.profile_capabilities().active_diagnostic_ablations,
+                renderer.timings.diagnostic_ablations.active_names()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn retained_hover_matches_full_pixels_for_rows_graph_clip_and_invalidation()
+    -> anyhow::Result<()> {
+        let _gpu_test_guard = crate::test_gpu::guard();
+        let context = WgpuContext::new_headless(None)?;
+        for (crop_paths, resting_fills) in
+            [(false, true), (true, true), (false, false), (true, false)]
+        {
+            let target = size(DevicePixels(200), DevicePixels(100));
+            let mut full = WgpuRenderer::new_headless(&context, target)?;
+            full.retained.disable_for_tests();
+            let mut retained = WgpuRenderer::new_headless(&context, target)?;
+            full.crop_path_targets = crop_paths;
+            retained.crop_path_targets = crop_paths;
+            retained.retained.enable_for_tests();
+            let mut revision = 0;
+            let mut previous = None;
+            for row in [0, 0, 1, 2, 0] {
+                if previous != Some(row) {
+                    revision += 1;
+                }
+                let scene = hover_scene(row, resting_fills);
+                let _scope = gpui::profiler::gpu::set_gpu_frame_context(
+                    Some("retained-wgpu-test".into()),
+                    true,
+                    revision,
+                    revision,
+                );
+                let expected = full.render_to_image(&scene)?;
+                let actual = retained.render_to_image(&scene)?;
+                assert_eq!(
+                    actual, expected,
+                    "retained pixels differ for row {row}, revision {revision}, cropped paths {crop_paths}"
+                );
+                assert_eq!(
+                    retained.retained.last_damage(),
+                    if previous.is_none() {
+                        "full"
+                    } else if previous == Some(row) {
+                        "reuse"
+                    } else {
+                        "partial"
+                    },
+                    "damage selection for row {row}, previous {previous:?}, revision {revision}, cropped paths {crop_paths}, resting fills {resting_fills}"
+                );
+                previous = Some(row);
+            }
+            let scene = hover_scene(0, resting_fills);
+            let _scope = gpui::profiler::gpu::set_gpu_frame_context(
+                Some("retained-wgpu-test".into()),
+                true,
+                revision,
+                revision,
+            );
+            retained.atlas.clear();
+            assert_eq!(
+                retained.render_to_image(&scene)?,
+                full.render_to_image(&scene)?
+            );
+            assert_eq!(
+                retained.retained.last_damage(),
+                "full",
+                "atlas invalidates unchanged scene revision"
+            );
+            let target = size(DevicePixels(190), DevicePixels(100));
+            retained.update_drawable_size(target);
+            full.update_drawable_size(target);
+            assert_eq!(
+                retained.render_to_image(&scene)?,
+                full.render_to_image(&scene)?
+            );
+            assert_eq!(
+                retained.retained.last_damage(),
+                "full",
+                "resize invalidates unchanged scene revision"
+            );
+            retained.update_transparency(true);
+            full.update_transparency(true);
+            assert_eq!(
+                retained.render_to_image(&scene)?,
+                full.render_to_image(&scene)?
+            );
+            assert_eq!(
+                retained.retained.last_damage(),
+                "full",
+                "transparent alpha uses full rendering"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn cropped_path_targets_match_full_viewport_pixels_when_growing_and_resizing() {
         let _gpu_test_guard = crate::test_gpu::guard();
