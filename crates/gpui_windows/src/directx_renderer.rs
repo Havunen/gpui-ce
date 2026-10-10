@@ -385,6 +385,12 @@ impl DirectXRenderer {
     pub(crate) fn profile_capabilities(&self) -> gpui::profiler::gpu::RendererProfileCapabilities {
         let mut capabilities = self.timings.capabilities();
         capabilities.present_mode = Some("immediate".into());
+        if self.retained.enabled() && !self.timings.diagnostic_ablations.enabled() {
+            capabilities
+                .active_experiments
+                .push("partial-redraw".into());
+        }
+        capabilities.active_experiments.sort_unstable();
         capabilities
     }
     pub(crate) fn release_retained_frame(&mut self) {
@@ -824,9 +830,13 @@ impl DirectXRenderer {
                     RenderCommand::Batch(PrimitiveBatch::Shadows { range, smoothed }) => {
                         self.draw_shadows(instance_range(range)?, *smoothed)
                     }
-                    RenderCommand::Batch(PrimitiveBatch::Quads { range, smoothed }) => {
-                        self.draw_quads(instance_range(range)?, *smoothed)
-                    }
+                    RenderCommand::Batch(PrimitiveBatch::Quads { range, smoothed }) => self
+                        .draw_clipped_quads(
+                            &scene.quads[range.clone()],
+                            instance_range(range)?,
+                            *smoothed,
+                            scissor,
+                        ),
                     RenderCommand::Batch(PrimitiveBatch::Paths {
                         range,
                         rasterization_vertex_count,
@@ -1205,12 +1215,52 @@ impl DirectXRenderer {
     }
 
     fn draw_quads(&mut self, instances: InstanceRange, smoothed: bool) -> Result<()> {
-        self.pipelines.quad_pipeline.draw_instances_variant(
+        let result = self.pipelines.quad_pipeline.draw_instances_variant(
             &self.frame_bindings()?,
             None,
             instances,
             smoothed,
-        )
+        );
+        if result.is_ok() && !instances.is_empty() {
+            self.timings.record_quad_draws(1, 0);
+        }
+        result
+    }
+
+    fn draw_clipped_quads(
+        &mut self,
+        quads: &[Quad],
+        instances: InstanceRange,
+        smoothed: bool,
+        active: DamageRect,
+    ) -> Result<()> {
+        if !self.timings.clipped_quads {
+            return self.draw_quads(instances, smoothed);
+        }
+        let context = self
+            .devices
+            .as_ref()
+            .context("devices missing")?
+            .device_context
+            .clone();
+        let mut draws = 0u64;
+        let result = (|| {
+            for run in gpui_render::quad_clipping::quad_scissor_runs(quads, active) {
+                if run.scissor.width == 0 || run.scissor.height == 0 {
+                    continue;
+                }
+                set_scissor(&context, run.scissor);
+                let first = instances.first() as usize;
+                let range = InstanceRange::new(first + run.range.start..first + run.range.end)
+                    .context("quad scissor range exceeds GPU indices")?;
+                self.draw_quads(range, smoothed)?;
+                draws += 1;
+            }
+            Ok(())
+        })();
+        set_scissor(&context, active);
+        self.timings.record_quad_draws(0, draws.saturating_sub(1));
+        result
     }
 
     fn draw_paths_to_intermediate(
@@ -3133,6 +3183,146 @@ mod tests {
             bounds: scaled(0.0, 0.0, 200.0, 100.0),
             ..Default::default()
         }
+    }
+
+    fn clipped_quad_scene(fraction: f32, smoothing: f32, paint: usize) -> Scene {
+        let bounds = scaled(7.25 + fraction, 8.5 + fraction, 180.25, 83.25);
+        let x = bounds.origin.x.0;
+        let y = bounds.origin.y.0;
+        let w = bounds.size.width.0;
+        let h = bounds.size.height.0;
+        let gradient = gpui::linear_gradient(
+            37.0,
+            gpui::linear_color_stop(gpui::hsla(0.01, 0.85, 0.62, 0.8), 0.0),
+            gpui::linear_color_stop(gpui::hsla(0.62, 0.7, 0.35, 0.55), 1.0),
+        );
+        let background = match paint {
+            0 => gpui::Background::default(), // Actual border-only split shape.
+            1 => gradient.color_space(gpui::ColorSpace::Srgb),
+            2 => gradient.color_space(gpui::ColorSpace::Oklab),
+            _ => gpui::pattern_slash(gpui::hsla(0.6, 0.8, 0.6, 0.7), 1.5, 4.25),
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            bounds: scaled(0.0, 0.0, 200.0, 100.0),
+            content_mask: full_mask(),
+            background: solid_background(gpui::rgb(0x18212b)),
+            ..Default::default()
+        });
+        for (index, clip) in [
+            scaled(x, y, w, 2.5),
+            scaled(x + w - 3.0, y, 3.0, h),
+            scaled(x, y + h - 4.0, w, 4.0),
+            scaled(x, y, 1.5, h),
+            scaled(x + 45.25, y + 25.5, 8.75, 7.25),
+            scaled(x + 250.0, y + 140.0, 1.0, 1.0), // Empty intersection.
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            scene.insert_primitive(Quad {
+                bounds,
+                content_mask: ContentMask {
+                    bounds: clip,
+                    fade_out: if index == 4 {
+                        gpui::Edges::all(ScaledPixels(1.25))
+                    } else {
+                        gpui::Edges::default()
+                    },
+                },
+                background,
+                border_color: gradient,
+                border_style: if paint % 2 == 0 {
+                    gpui::BorderStyle::Solid
+                } else {
+                    gpui::BorderStyle::Dashed
+                },
+                border_dashed_length: 3.75,
+                border_dashed_gap: 1.25,
+                corner_radii: gpui::Corners {
+                    top_left: ScaledPixels(11.5),
+                    top_right: ScaledPixels(16.25),
+                    bottom_right: ScaledPixels(8.75),
+                    bottom_left: ScaledPixels(14.5),
+                },
+                border_widths: gpui::Edges {
+                    top: ScaledPixels(2.5),
+                    right: ScaledPixels(3.0),
+                    bottom: ScaledPixels(4.0),
+                    left: ScaledPixels(1.5),
+                },
+                corner_smoothing: smoothing,
+                ..Default::default()
+            });
+        }
+        // Later translucent paint makes accidental clear/reordering visible.
+        scene.insert_primitive(Quad {
+            bounds: scaled(40.5, 9.5, 18.5, 70.5),
+            content_mask: full_mask(),
+            background: solid_background(gpui::hsla(0.02, 0.8, 0.6, 0.4)),
+            corner_radii: gpui::Corners::all(ScaledPixels(4.25)),
+            ..Default::default()
+        });
+        scene.finish();
+        scene
+    }
+
+    #[test]
+    fn clipped_quads_match_full_pixels_for_fractional_masks_borders_gradients_fades() -> Result<()>
+    {
+        let devices = DirectXDevices::new()?;
+        let window = HiddenWindow::new()?;
+        let mut renderer = DirectXRenderer::new(window.0, &devices, true)?;
+        renderer.resize(Size {
+            width: DevicePixels(200),
+            height: DevicePixels(100),
+        })?;
+        renderer.retained.disable_for_tests();
+        renderer.timings.diagnostic_ablations = gpui::profiler::gpu::DiagnosticAblations::default();
+        assert!(
+            renderer
+                .profile_capabilities()
+                .implemented_experiments
+                .iter()
+                .any(|name| name == "clipped-quads")
+        );
+        for fraction in [0.0, 0.25, 0.5, 0.75] {
+            for smoothing in [0.0, 0.65] {
+                for paint in 0..4 {
+                    let scene = clipped_quad_scene(fraction, smoothing, paint);
+                    renderer.timings.clipped_quads = false;
+                    assert!(
+                        !renderer
+                            .profile_capabilities()
+                            .active_experiments
+                            .iter()
+                            .any(|name| name == "clipped-quads")
+                    );
+                    let full =
+                        renderer.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?;
+                    renderer.timings.clipped_quads = true;
+                    assert!(
+                        renderer
+                            .profile_capabilities()
+                            .active_experiments
+                            .iter()
+                            .any(|name| name == "clipped-quads")
+                    );
+                    let clipped =
+                        renderer.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?;
+                    let difference = full
+                        .pixels()
+                        .zip(clipped.pixels())
+                        .enumerate()
+                        .find(|(_, (a, b))| a != b);
+                    assert!(
+                        difference.is_none(),
+                        "fraction={fraction} smoothing={smoothing} paint={paint} first differing pixel={difference:?}"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     fn dashed_border_scene(dash_length: f32, dash_gap: f32) -> Scene {

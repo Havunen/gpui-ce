@@ -20,8 +20,12 @@ unsafe extern "system" {
 }
 
 pub(crate) fn tagged_input_sequence(extra: u64) -> Option<u64> {
-    let sequence = extra & 0x0000_ffff_ffff_ffff;
-    (extra >> 48 == 0x4743 && sequence != 0).then_some(sequence)
+    // SendInput accepts ULONG_PTR, but the mouse input path on Windows can
+    // truncate dwExtraInfo to DWORD before WM_MOUSEMOVE. Keep the complete tag
+    // in those preserved bits; reject high bits rather than silently aliasing
+    // a different protocol or a sequence above this capture's bounded range.
+    let sequence = extra & 0xffff;
+    (extra >> 16 == 0x4743 && sequence != 0).then_some(sequence)
 }
 
 pub(crate) fn current_native_input() -> Option<NativeInputDiagnostic> {
@@ -93,8 +97,12 @@ mod tests {
     fn native_input_tag_does_not_accept_ordinary_or_zero_extra_info() {
         assert_eq!(tagged_input_sequence(0), None);
         assert_eq!(tagged_input_sequence(123), None);
-        assert_eq!(tagged_input_sequence(0x4743_0000_0000_0000), None);
-        assert_eq!(tagged_input_sequence(0x4743_0000_0000_1234), Some(0x1234));
+        assert_eq!(tagged_input_sequence(0x4743_0000), None);
+        assert_eq!(tagged_input_sequence(0x4743_1234), Some(0x1234));
+        assert_eq!(tagged_input_sequence(0x4743_ffff), Some(0xffff));
+        assert_eq!(tagged_input_sequence(0x4743_0000_0000_1234), None);
+        assert_eq!(tagged_input_sequence(0x0001_4743_1234), None);
+        assert_eq!(tagged_input_sequence(0x4744_1234), None);
     }
     #[test]
     fn keepalive_override_preserves_auto_and_can_disable_unknown_refresh() {

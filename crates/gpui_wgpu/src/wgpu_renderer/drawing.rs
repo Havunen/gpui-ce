@@ -19,6 +19,7 @@ impl WgpuRenderer {
         smoothed: bool,
         instances: &mut InstanceUpload,
         pass: &mut wgpu::RenderPass<'_>,
+        region: Option<gpui_render::damage::DamageRect>,
     ) -> frame::DrawResult {
         let pipelines = &self.resources().pipelines;
         let pipeline = if smoothed {
@@ -26,7 +27,46 @@ impl WgpuRenderer {
         } else {
             &pipelines.quads
         };
-        self.draw_instances(quads, pipeline, instances, pass)
+        if !self.timings.clipped_quads {
+            let result = self.draw_instances(quads, pipeline, instances, pass);
+            if result.is_ok() && !quads.is_empty() {
+                self.timings.record_quad_draws(1, 0);
+            }
+            return result;
+        }
+        let Some(slice) = instances.write(quads) else {
+            return Err(frame::DrawError::CapacityPlanningInvariant);
+        };
+        pass.set_pipeline(pipeline);
+        slice.set_data_bind_group(pass, self.resources().instances.bind_group());
+        let active = region.unwrap_or(gpui_render::damage::DamageRect {
+            x: 0,
+            y: 0,
+            width: self.target.width(),
+            height: self.target.height(),
+        });
+        let first = slice.range().start;
+        let mut draws = 0u64;
+        for run in gpui_render::quad_clipping::quad_scissor_runs(quads, active) {
+            if run.scissor.width == 0 || run.scissor.height == 0 {
+                continue;
+            }
+            pass.set_scissor_rect(
+                run.scissor.x,
+                run.scissor.y,
+                run.scissor.width,
+                run.scissor.height,
+            );
+            pass.draw(
+                0..pipeline.fixed_vertex_count(),
+                first + run.range.start as u32..first + run.range.end as u32,
+            );
+            draws += 1;
+        }
+        pass.set_scissor_rect(active.x, active.y, active.width, active.height);
+        self.timings
+            .record_quad_draws(draws, draws.saturating_sub(1));
+        Ok(())
     }
 
     pub(super) fn draw_shadows(

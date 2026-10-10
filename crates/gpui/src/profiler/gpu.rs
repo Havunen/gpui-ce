@@ -17,6 +17,9 @@ pub struct RendererProfileCapabilities {
     pub backend: String,
     /// Experiment flags implemented by this backend, regardless of whether enabled.
     pub implemented_experiments: Vec<String>,
+    /// Experiment flags resolved and enabled in this renderer, including when queries are off.
+    /// Scene eligibility and actual partial rendering remain recorded per frame.
+    pub active_experiments: Vec<String>,
     /// Whether native whole-frame timestamp queries are supported.
     pub gpu_timestamps: bool,
     /// Whether native per-pass timestamp queries are supported.
@@ -92,6 +95,10 @@ pub struct GpuEvent {
     pub damage_kind: String,
     /// Extra retained GPU allocations held by this renderer.
     pub retained_bytes: u64,
+    /// Actual quad API draw calls, including damage-clear quads, for this submission.
+    pub quad_draw_calls: u64,
+    /// Additional ordered quad draw calls introduced by hardware scissor runs.
+    pub quad_scissor_splits: u64,
 }
 
 /// Window identity and scene revision passed to the platform renderer on this thread.
@@ -267,6 +274,8 @@ impl GpuEvent {
             diagnostic_ablations: Vec::new(),
             damage_kind: "full".into(),
             retained_bytes: 0,
+            quad_draw_calls: 0,
+            quad_scissor_splits: 0,
         }
     }
     /// Set an explicit unavailable or failed sample outcome.

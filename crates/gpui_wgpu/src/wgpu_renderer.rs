@@ -127,6 +127,7 @@ impl WgpuRenderer {
             context.device.clone(),
             context.queue.clone(),
             format!("wgpu-{:?}", adapter_info.backend).to_ascii_lowercase(),
+            resources.instances.transport() == buffers::InstanceTransport::StorageBuffer,
         );
         Ok(Self {
             context: gpu_context,
@@ -311,6 +312,15 @@ impl WgpuRenderer {
         let mut capabilities = self.timings.capabilities();
         capabilities.present_mode =
             Some(format!("{:?}", self.target.configuration().present_mode).to_ascii_lowercase());
+        if self.crop_path_targets {
+            capabilities.active_experiments.push("cropped-paths".into());
+        }
+        if self.retained.enabled() && !self.timings.diagnostic_ablations.enabled() {
+            capabilities
+                .active_experiments
+                .push("partial-redraw".into());
+        }
+        capabilities.active_experiments.sort_unstable();
         capabilities
     }
     /// Release the experimental retained frame when a window is deactivated.

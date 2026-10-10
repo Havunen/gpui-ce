@@ -40,6 +40,8 @@ struct Pending {
 pub(super) struct GpuTimings {
     pub renderer_id: u64,
     pub diagnostic_ablations: gpu::DiagnosticAblations,
+    pub clipped_quads: bool,
+    quad_scissor_supported: bool,
     enabled: bool,
     supported: bool,
     backend: String,
@@ -50,7 +52,12 @@ pub(super) struct GpuTimings {
 }
 
 impl GpuTimings {
-    pub fn new(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>, backend: String) -> Self {
+    pub fn new(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        backend: String,
+        quad_scissor_supported: bool,
+    ) -> Self {
         let enabled = gpu::timings_enabled();
         let supported = device.features().contains(wgpu::Features::TIMESTAMP_QUERY)
             && !cfg!(target_family = "wasm")
@@ -140,6 +147,8 @@ impl GpuTimings {
         Self {
             renderer_id: gpu::next_renderer_id(),
             diagnostic_ablations: gpu::DiagnosticAblations::from_environment(),
+            clipped_quads: quad_scissor_supported && gpu::experiment_enabled("clipped-quads"),
+            quad_scissor_supported,
             enabled,
             supported,
             backend,
@@ -152,6 +161,9 @@ impl GpuTimings {
 
     pub fn capabilities(&self) -> RendererProfileCapabilities {
         let mut experiments = vec!["cropped-paths".into()];
+        if self.quad_scissor_supported {
+            experiments.push("clipped-quads".into());
+        }
         if cfg!(target_os = "windows") {
             experiments.push("partial-redraw".into());
         }
@@ -159,6 +171,11 @@ impl GpuTimings {
         RendererProfileCapabilities {
             backend: self.backend.clone(),
             implemented_experiments: experiments,
+            active_experiments: if self.clipped_quads {
+                vec!["clipped-quads".into()]
+            } else {
+                Vec::new()
+            },
             gpu_timestamps: available,
             per_pass_timestamps: available,
             timing_enabled: self.enabled,
@@ -187,6 +204,9 @@ impl GpuTimings {
     fn new_event(&self) -> GpuEvent {
         let mut event = GpuEvent::new(&self.backend, self.renderer_id);
         event.diagnostic_ablations = self.diagnostic_ablations.active_names();
+        if self.clipped_quads {
+            event.experiments.push("clipped-quads".into());
+        }
         event
     }
     pub fn begin(&self, device: &wgpu::Device) {
@@ -259,11 +279,25 @@ impl GpuTimings {
             last: index * 2 + 1,
         })
     }
-    pub fn describe_damage(&self, kind: &str, retained_bytes: u64, experiments: Vec<String>) {
+    pub fn describe_damage(&self, kind: &str, retained_bytes: u64, mut experiments: Vec<String>) {
+        if self.clipped_quads {
+            experiments.push("clipped-quads".into());
+        }
         if let Some(frame) = self.current.borrow_mut().as_mut() {
             frame.event.damage_kind = kind.into();
             frame.event.retained_bytes = retained_bytes;
             frame.event.experiments = experiments;
+        }
+    }
+
+    pub fn record_quad_draws(&self, draws: u64, splits: u64) {
+        if !self.enabled {
+            return;
+        }
+        if let Some(frame) = self.current.borrow_mut().as_mut() {
+            frame.event.quad_draw_calls = frame.event.quad_draw_calls.saturating_add(draws);
+            frame.event.quad_scissor_splits =
+                frame.event.quad_scissor_splits.saturating_add(splits);
         }
     }
     pub fn resolve(&self, encoder: &mut wgpu::CommandEncoder) {

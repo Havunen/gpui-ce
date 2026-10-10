@@ -90,6 +90,7 @@ struct Frame {
 }
 pub(super) struct GpuTimings {
     pub diagnostic_ablations: gpu::DiagnosticAblations,
+    pub clipped_quads: bool,
     enabled: bool,
     supported: Cell<bool>,
     reason: RefCell<Option<String>>,
@@ -101,6 +102,7 @@ impl GpuTimings {
     pub fn new() -> Self {
         Self {
             diagnostic_ablations: gpu::DiagnosticAblations::from_environment(),
+            clipped_quads: gpu::experiment_enabled("clipped-quads"),
             enabled: gpu::timings_enabled(),
             supported: Cell::new(true),
             reason: RefCell::new(None),
@@ -112,7 +114,12 @@ impl GpuTimings {
     pub fn capabilities(&self) -> RendererProfileCapabilities {
         RendererProfileCapabilities {
             backend: "d3d11".into(),
-            implemented_experiments: vec!["partial-redraw".into()],
+            implemented_experiments: vec!["partial-redraw".into(), "clipped-quads".into()],
+            active_experiments: if self.clipped_quads {
+                vec!["clipped-quads".into()]
+            } else {
+                Vec::new()
+            },
             gpu_timestamps: self.supported.get(),
             per_pass_timestamps: self.supported.get(),
             timing_enabled: self.enabled,
@@ -125,6 +132,9 @@ impl GpuTimings {
     fn new_event(&self) -> GpuEvent {
         let mut event = GpuEvent::new("d3d11", self.renderer_id);
         event.diagnostic_ablations = self.diagnostic_ablations.active_names();
+        if self.clipped_quads {
+            event.experiments.push("clipped-quads".into());
+        }
         event
     }
     pub fn begin(&self, device: &ID3D11Device, context: &ID3D11DeviceContext) {
@@ -204,11 +214,25 @@ impl GpuTimings {
             }
         }
     }
-    pub fn describe_damage(&self, kind: &str, bytes: u64, experiments: Vec<String>) {
+    pub fn describe_damage(&self, kind: &str, bytes: u64, mut experiments: Vec<String>) {
+        if self.clipped_quads {
+            experiments.push("clipped-quads".into());
+        }
         if let Some(frame) = self.current.borrow_mut().as_mut() {
             frame.event.damage_kind = kind.into();
             frame.event.retained_bytes = bytes;
             frame.event.experiments = experiments;
+        }
+    }
+
+    pub fn record_quad_draws(&self, draws: u64, splits: u64) {
+        if !self.enabled {
+            return;
+        }
+        if let Some(frame) = self.current.borrow_mut().as_mut() {
+            frame.event.quad_draw_calls = frame.event.quad_draw_calls.saturating_add(draws);
+            frame.event.quad_scissor_splits =
+                frame.event.quad_scissor_splits.saturating_add(splits);
         }
     }
     pub fn end(&self, context: &ID3D11DeviceContext, success: bool) {

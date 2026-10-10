@@ -624,6 +624,7 @@ impl<'a> FrameEncoder<'a> {
                 false,
                 &mut self.instances,
                 &mut pass,
+                Some(region),
             )?;
         }
 
@@ -700,6 +701,7 @@ impl<'a> FrameEncoder<'a> {
                     batch,
                     &mut self.instances,
                     &mut pass,
+                    region,
                 )?,
                 RenderCommand::BeginFilter {
                     target: FilterRenderTarget::Isolated(index),
@@ -839,11 +841,16 @@ fn encode_inline_batch(
     batch: &PrimitiveBatch,
     instances: &mut InstanceUpload,
     pass: &mut wgpu::RenderPass<'_>,
+    region: Option<DamageRect>,
 ) -> DrawResult {
     match batch {
-        PrimitiveBatch::Quads { range, smoothed } => {
-            renderer.draw_quads(&scene.quads[range.clone()], *smoothed, instances, pass)
-        }
+        PrimitiveBatch::Quads { range, smoothed } => renderer.draw_quads(
+            &scene.quads[range.clone()],
+            *smoothed,
+            instances,
+            pass,
+            region,
+        ),
         PrimitiveBatch::Shadows { range, smoothed } => {
             renderer.draw_shadows(&scene.shadows[range.clone()], *smoothed, instances, pass)
         }
