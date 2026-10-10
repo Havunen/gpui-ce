@@ -32,6 +32,7 @@ pub(super) struct RetainedPlan {
     pub atlas_generation: u64,
     pub reuse_snapshot: bool,
     pub fallback_reason: Option<&'static str>,
+    pub diff_detail: Option<String>,
 }
 impl RetainedFrame {
     pub fn new() -> Self {
@@ -94,6 +95,7 @@ impl RetainedFrame {
                 atlas_generation: 0,
                 reuse_snapshot: false,
                 fallback_reason: None,
+                diff_detail: None,
             };
         }
         let context = gpu::gpu_frame_context();
@@ -106,6 +108,7 @@ impl RetainedFrame {
             atlas_generation: atlas,
             reuse_snapshot: false,
             fallback_reason: Some(reason),
+            diff_detail: None,
         };
         if !eligible || !context.active {
             self.invalidate(queue);
@@ -121,6 +124,13 @@ impl RetainedFrame {
         ) {
             self.invalidate(queue);
             return full("unsupported-alpha-mode");
+        }
+        // The damage-clear Quad must reproduce the raw target clear exactly.
+        // Colored translucent clears would be premultiplied again by its shader;
+        // arbitrary opaque colors also lack an exact HSL round-trip proof.
+        if !retained_clear_supported(clear_color) {
+            self.invalidate(queue);
+            return full("unsupported-clear-color");
         }
         if retained_bytes(format, width, height).is_none() {
             self.invalidate(queue);
@@ -154,6 +164,7 @@ impl RetainedFrame {
                     atlas_generation: atlas,
                     reuse_snapshot: true,
                     fallback_reason: None,
+                    diff_detail: None,
                 };
             }
         }
@@ -200,12 +211,19 @@ impl RetainedFrame {
                 reservation,
             });
         }
-        let (damage, comparison_reason) = match self.snapshot.as_ref() {
-            Some(previous) => match snapshot.compare_checked(previous) {
-                Ok(damage) => (damage, None),
-                Err(reason) => (Damage::Full, Some(reason)),
-            },
-            None => (Damage::Full, None),
+        let (damage, comparison_reason, diff_detail) = match self.snapshot.as_ref() {
+            Some(previous) => {
+                let (comparison, detail) = if gpu::timings_enabled() {
+                    snapshot.compare_checked_diagnostic(previous)
+                } else {
+                    (snapshot.compare_checked(previous), None)
+                };
+                match comparison {
+                    Ok(damage) => (damage, None, detail),
+                    Err(reason) => (Damage::Full, Some(reason), detail),
+                }
+            }
+            None => (Damage::Full, None, None),
         };
         let fallback_reason = if damage == Damage::Full {
             Some(
@@ -230,6 +248,7 @@ impl RetainedFrame {
             atlas_generation: atlas,
             reuse_snapshot: false,
             fallback_reason,
+            diff_detail,
         }
     }
     pub fn complete(
@@ -267,6 +286,14 @@ impl Drop for RetainedFrame {
     }
 }
 
+fn retained_clear_supported(clear: wgpu::Color) -> bool {
+    // Both linear and sRGB targets preserve the black/white endpoints exactly.
+    // Black RGB stays black through either premultiplied or straight-alpha output.
+    let black = clear.r == 0.0 && clear.g == 0.0 && clear.b == 0.0;
+    let opaque_white = clear.r == 1.0 && clear.g == 1.0 && clear.b == 1.0 && clear.a == 1.0;
+    (black && clear.a.is_finite() && (0.0..=1.0).contains(&clear.a)) || opaque_white
+}
+
 fn retained_bytes(format: wgpu::TextureFormat, width: u32, height: u32) -> Option<u64> {
     if width == 0
         || height == 0
@@ -286,6 +313,33 @@ fn retained_bytes(format: wgpu::TextureFormat, width: u32, height: u32) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_clear_requires_exact_shader_endpoint_representation() {
+        assert!(retained_clear_supported(wgpu::Color::TRANSPARENT));
+        assert!(retained_clear_supported(wgpu::Color::BLACK));
+        assert!(retained_clear_supported(wgpu::Color::WHITE));
+        assert!(retained_clear_supported(wgpu::Color {
+            a: 0.25,
+            ..wgpu::Color::BLACK
+        }));
+        for alpha in [0.0, 0.25, 1.0] {
+            assert!(!retained_clear_supported(wgpu::Color {
+                r: 0.04,
+                g: 0.03,
+                b: 0.02,
+                a: alpha,
+            }));
+        }
+        assert!(!retained_clear_supported(wgpu::Color {
+            a: f64::NAN,
+            ..wgpu::Color::BLACK
+        }));
+        assert!(!retained_clear_supported(wgpu::Color {
+            a: -0.25,
+            ..wgpu::Color::BLACK
+        }));
+    }
 
     #[test]
     fn retained_budget_rejects_hdr_unknown_formats_zero_extent_and_overflow() {

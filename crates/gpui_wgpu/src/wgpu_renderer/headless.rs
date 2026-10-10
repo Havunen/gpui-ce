@@ -124,9 +124,14 @@ impl WgpuRenderer {
     /// Renders through the normal scene path and reads back without presenting.
     pub fn render_to_image(&mut self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
         let target = self.create_offscreen_target();
+        // Frame preparation can consume an asynchronous validation error.
+        // Retain its text for test diagnostics without changing retry policy.
+        let pending_before = self.faults.pending_error.lock().unwrap().clone();
         let submission = self
             .render_to_view_with_readback(scene, &target.view, target.readback_copy())
-            .ok_or_else(|| anyhow::anyhow!("failed to render scene into the offscreen target"))?;
+            .ok_or_else(|| anyhow::anyhow!(
+                "failed to render scene into the offscreen target; pending_before={pending_before:?}; pending_after={:?}; terminal={:?}; failed_frames={}",
+                self.faults.pending_error.lock().unwrap(), self.terminal_error(), self.faults.consecutive_failed_frames))?;
         self.read_offscreen_target(&target, submission)
     }
 }
@@ -630,8 +635,12 @@ mod path_target_tests {
             revision,
             revision,
         );
-        let expected = full.render_to_image(scene)?;
-        let actual = retained.render_to_image(scene)?;
+        let expected = full
+            .render_to_image(scene)
+            .map_err(|error| anyhow::anyhow!("{context}: full renderer: {error:#}"))?;
+        let actual = retained
+            .render_to_image(scene)
+            .map_err(|error| anyhow::anyhow!("{context}: retained renderer: {error:#}"))?;
         assert_eq!(actual.dimensions(), expected.dimensions(), "{context}");
         let first_difference = actual
             .as_raw()
@@ -723,6 +732,99 @@ mod path_target_tests {
         Ok(())
     }
 
+    #[test]
+    fn retained_raw_clear_endpoints_and_colored_fallback_match_full_rgba() -> anyhow::Result<()> {
+        let _gpu_test_guard = crate::test_gpu::guard();
+        let context = WgpuContext::new_headless(None)?;
+        let target = size(DevicePixels(200), DevicePixels(100));
+        let mut full = WgpuRenderer::new_headless(&context, target)?;
+        let mut retained = WgpuRenderer::new_headless(&context, target)?;
+        full.retained.disable_for_tests();
+        retained.retained.enable_for_tests();
+        full.timings.diagnostic_ablations = Default::default();
+        retained.timings.diagnostic_ablations = Default::default();
+        for transparent in [false, true] {
+            full.update_transparency(transparent);
+            retained.update_transparency(transparent);
+            for (clear, supported, label) in [
+                (wgpu::Color::TRANSPARENT, true, "transparent black"),
+                (
+                    wgpu::Color {
+                        a: 0.25,
+                        ..wgpu::Color::BLACK
+                    },
+                    true,
+                    "translucent black",
+                ),
+                (wgpu::Color::BLACK, true, "opaque black"),
+                (wgpu::Color::WHITE, true, "opaque white"),
+                (
+                    wgpu::Color {
+                        r: 0.04,
+                        g: 0.03,
+                        b: 0.02,
+                        a: 0.25,
+                    },
+                    false,
+                    "translucent colored clear",
+                ),
+                (
+                    wgpu::Color {
+                        r: 0.04,
+                        g: 0.03,
+                        b: 0.02,
+                        a: 0.0,
+                    },
+                    false,
+                    "zero-alpha colored raw clear",
+                ),
+                (
+                    wgpu::Color {
+                        r: 0.04,
+                        g: 0.03,
+                        b: 0.02,
+                        a: 1.0,
+                    },
+                    false,
+                    "opaque colored raw clear",
+                ),
+            ] {
+                full.target.clear_color = clear;
+                retained.target.clear_color = clear;
+                let queue = retained.resources().queue.clone();
+                retained.retained.invalidate(&queue);
+                for (index, row) in [None, Some(0), Some(1), None].into_iter().enumerate() {
+                    let scene = empty_transparent_hover_scene(row);
+                    let revision = index as u64 + 1;
+                    let label = format!("alpha={transparent}, clear={label}, step={index}");
+                    assert_retained_rgba(
+                        &mut full,
+                        &mut retained,
+                        &scene,
+                        revision,
+                        if supported && index != 0 {
+                            "partial"
+                        } else {
+                            "full"
+                        },
+                        &label,
+                    )?;
+                    // Unsupported clears must never retain faulty pixels, including
+                    // an unchanged repeat immediately after an inserted/erased fill.
+                    assert_retained_rgba(
+                        &mut full,
+                        &mut retained,
+                        &scene,
+                        revision,
+                        if supported { "reuse" } else { "full" },
+                        &format!("repeat: {label}"),
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn retained_glyph_tile(renderer: &WgpuRenderer) -> anyhow::Result<AtlasTile> {
         let key = AtlasKey::Glyph {
             params: RenderGlyphParams {
@@ -760,6 +862,7 @@ mod path_target_tests {
         smoothing: f32,
         backing_alpha: f32,
         glyph: AtlasTile,
+        badge_before_graph: Option<bool>,
     ) -> Scene {
         let mut scene = Scene::default();
         let backing_bounds = scaled(4.25 + fraction, 3.5 + fraction, 190.5, 90.25);
@@ -786,11 +889,37 @@ mod path_target_tests {
             ..Default::default()
         });
         scene.raise_order_floor();
+        // A shifted/shrunk inset hole is far from the first hovered row. Its
+        // actual raster geometry is the whole element, so pruning by the hole
+        // bounds would lose static inset pixels when that row is damage-cleared.
+        scene.insert_primitive(Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(0.5),
+            bounds: scaled(140.25 + fraction, 62.5, 26.5, 14.0),
+            corner_radii: gpui::Corners::all(ScaledPixels(2.0)),
+            content_mask: full_mask(),
+            color: gpui::rgba(0x10172870).into(),
+            element_bounds: backing_bounds,
+            element_corner_radii: radii,
+            inset: true.into(),
+            corner_smoothing: smoothing,
+        });
+        scene.raise_order_floor();
         if let Some(row) = row {
             scene.insert_primitive(Quad {
-                bounds: scaled(10.25 + fraction, 12.5 + row as f32 * 24.0, 165.5, 13.25),
+                bounds: scaled(
+                    10.25 + fraction,
+                    12.5 + row as f32 * 24.0,
+                    165.5 - row as f32 * 0.75,
+                    13.25,
+                ),
                 content_mask: ContentMask {
-                    bounds: scaled(11.5 + fraction, 8.25, 162.5, 78.5),
+                    bounds: scaled(
+                        11.5 + fraction,
+                        12.75 + row as f32 * 24.0,
+                        162.5 - row as f32 * 0.25,
+                        12.5,
+                    ),
                     fade_out: gpui::Edges {
                         left: ScaledPixels(1.25),
                         right: ScaledPixels(1.75),
@@ -798,12 +927,39 @@ mod path_target_tests {
                     },
                 },
                 background: gpui::rgba(0x4f98df70).into(),
-                corner_radii: gpui::Corners::all(ScaledPixels(3.5)),
+                corner_radii: gpui::Corners::all(ScaledPixels(3.5 + row as f32 * 0.25)),
                 corner_smoothing: smoothing,
                 ..Default::default()
             });
         }
+        let paint_badge = |scene: &mut Scene| {
+            if let Some(row) = row {
+                // The live history row adds an entire lane-name badge only while
+                // hovered. Variable run lengths and distant row moves must repaint
+                // both the old and new badge without losing the static text anchor.
+                for index in 0..7 + row {
+                    scene.insert_primitive(MonochromeSprite {
+                        order: 0,
+                        padding: 0,
+                        bounds: scaled(
+                            112.25 + fraction + index as f32 * 6.5,
+                            14.5 + row as f32 * 24.0,
+                            6.5,
+                            10.75,
+                        ),
+                        content_mask: full_mask(),
+                        color: gpui::hsla(0.6, 0.4, 0.6, 0.6).into(),
+                        tile: glyph,
+                        transformation: Default::default(),
+                    });
+                }
+            }
+        };
         scene.raise_order_floor();
+        if badge_before_graph == Some(true) {
+            paint_badge(&mut scene);
+            scene.raise_order_floor();
+        }
         scene.insert_primitive(triangle(
             17.25 + fraction,
             10.5,
@@ -814,26 +970,8 @@ mod path_target_tests {
             },
         ));
         scene.raise_order_floor();
-        if let Some(row) = row {
-            // The live history row adds an entire lane-name badge only while
-            // hovered. Variable run lengths and distant row moves must repaint
-            // both the old and new badge without losing the static text anchor.
-            for index in 0..7 + row {
-                scene.insert_primitive(MonochromeSprite {
-                    order: 0,
-                    padding: 0,
-                    bounds: scaled(
-                        112.25 + fraction + index as f32 * 6.5,
-                        14.5 + row as f32 * 24.0,
-                        6.5,
-                        10.75,
-                    ),
-                    content_mask: full_mask(),
-                    color: gpui::hsla(0.6, 0.4, 0.6, 0.6).into(),
-                    tile: glyph,
-                    transformation: Default::default(),
-                });
-            }
+        if badge_before_graph == Some(false) {
+            paint_badge(&mut scene);
         }
         scene.raise_order_floor();
         scene.insert_primitive(MonochromeSprite {
@@ -866,7 +1004,14 @@ mod path_target_tests {
     -> anyhow::Result<()> {
         let _gpu_test_guard = crate::test_gpu::guard();
         let context = WgpuContext::new_headless(None)?;
-        for crop_paths in [false, true] {
+        for (crop_paths, badge_before_graph) in [
+            (false, None),
+            (true, None),
+            (false, Some(false)),
+            (true, Some(false)),
+            (false, Some(true)),
+            (true, Some(true)),
+        ] {
             for (fraction, smoothing, backing_alpha) in [
                 (0.0, 0.0, 0.45),
                 (0.25, 0.65, 1.0),
@@ -887,7 +1032,7 @@ mod path_target_tests {
                 let glyph = retained_glyph_tile(&full)?;
                 assert_eq!(glyph, retained_glyph_tile(&retained)?);
                 let label = format!(
-                    "fraction={fraction}, smoothing={smoothing}, backing={backing_alpha}, crop={crop_paths}"
+                    "fraction={fraction}, smoothing={smoothing}, backing={backing_alpha}, crop={crop_paths}, badge_before_graph={badge_before_graph:?}"
                 );
                 let mut revision = 0;
                 let mut previous = None;
@@ -897,6 +1042,7 @@ mod path_target_tests {
                     smoothing,
                     backing_alpha,
                     glyph,
+                    badge_before_graph,
                 );
                 let mut resting_pixels = None;
                 for (index, row) in [
@@ -923,7 +1069,18 @@ mod path_target_tests {
                         smoothing,
                         backing_alpha,
                         glyph,
+                        badge_before_graph,
                     );
+                    if badge_before_graph == Some(true)
+                        && let Some(row) = row
+                    {
+                        assert!(scene.render_commands().windows(2).any(|commands|
+                            matches!((&commands[0], &commands[1]),
+                                (gpui::RenderCommand::Batch(gpui::PrimitiveBatch::Quads { range: quad, .. }),
+                                 gpui::RenderCommand::Batch(gpui::PrimitiveBatch::MonochromeSprites { range: glyphs, .. }))
+                                if quad.len() == 1 && glyphs.len() == 7 + row)),
+                            "fixture must prove fill directly precedes the changed badge: {label}");
+                    }
                     let image = assert_retained_rgba(
                         &mut full,
                         &mut retained,
@@ -1026,9 +1183,13 @@ mod path_target_tests {
                     &mut retained,
                     &resting,
                     revision,
-                    "reuse",
-                    &format!("clear-color reuse: {label}"),
+                    "full",
+                    &format!("unsupported clear-color fallback: {label}"),
                 )?;
+                // Restore an exact endpoint so atlas invalidation still tests
+                // a qualified retained target rather than the unsupported clear.
+                full.target.clear_color = wgpu::Color::TRANSPARENT;
+                retained.target.clear_color = full.target.clear_color;
                 full.atlas.clear();
                 retained.atlas.clear();
                 let glyph = retained_glyph_tile(&full)?;
@@ -1039,6 +1200,7 @@ mod path_target_tests {
                     smoothing,
                     backing_alpha,
                     glyph,
+                    badge_before_graph,
                 );
                 assert_retained_rgba(
                     &mut full,

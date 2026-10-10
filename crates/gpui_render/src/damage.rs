@@ -6,7 +6,12 @@ use gpui::{
     PrimitiveBatch, Quad, RenderCommand, ScaledPixels, Scene, SceneHsla, Shadow, SubpixelSprite,
     Underline, point, size,
 };
+use std::fmt::Write;
 use std::mem::size_of;
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicUsize, Ordering},
+};
 
 const MAX_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_REGIONS: usize = 8;
@@ -206,6 +211,65 @@ enum PaintedPrimitive<'a> {
 }
 
 impl PaintedPrimitive<'_> {
+    fn write_diagnostic(self, out: &mut String) {
+        match self {
+            Self::Quad(p, smoothed) => {
+                let _ = write!(
+                    out,
+                    "quad(bounds={:?},mask={:?},smoothed={smoothed},corners={:?},smoothing={},border={:?},style={:?})",
+                    p.bounds,
+                    p.content_mask,
+                    p.corner_radii,
+                    p.corner_smoothing,
+                    p.border_widths,
+                    p.border_style
+                );
+            }
+            Self::Path(p, start, end, vertices, sprites) => {
+                let _ = write!(
+                    out,
+                    "path(id={},bounds={:?},mask={:?},group={start}..{end},vertices={vertices},sprites={sprites})",
+                    p.id.0, p.bounds, p.content_mask
+                );
+            }
+            Self::Monochrome(p, texture) => {
+                let _ = write!(
+                    out,
+                    "mono(bounds={:?},mask={:?},texture={texture:?},tile={:?})",
+                    p.bounds, p.content_mask, p.tile
+                );
+            }
+            Self::Subpixel(p, texture) => {
+                let _ = write!(
+                    out,
+                    "subpixel(bounds={:?},mask={:?},texture={texture:?},tile={:?})",
+                    p.bounds, p.content_mask, p.tile
+                );
+            }
+            Self::Shadow(p, smoothed) => {
+                let _ = write!(
+                    out,
+                    "shadow(bounds={:?},mask={:?},blur={},smoothed={smoothed})",
+                    p.bounds, p.content_mask, p.blur_radius.0
+                );
+            }
+            Self::Underline(p) => {
+                let _ = write!(
+                    out,
+                    "underline(bounds={:?},mask={:?},thickness={})",
+                    p.bounds, p.content_mask, p.thickness.0
+                );
+            }
+            Self::Polychrome(p, smoothed, texture) => {
+                let _ = write!(
+                    out,
+                    "polychrome(bounds={:?},mask={:?},smoothed={smoothed},texture={texture:?},tile={:?})",
+                    p.bounds, p.content_mask, p.tile
+                );
+            }
+        }
+    }
+
     fn is_quad(self) -> bool {
         matches!(self, Self::Quad(..))
     }
@@ -214,21 +278,28 @@ impl PaintedPrimitive<'_> {
         matches!(self, Self::Monochrome(..) | Self::Subpixel(..))
     }
 
-    fn translated_quad_matches(self, other: Self) -> bool {
+    fn quad_mismatch_reason(self, other: Self) -> &'static str {
         let (Self::Quad(next, n_smoothing), Self::Quad(old, o_smoothing)) = (self, other) else {
-            return false;
+            return "quad-geometry-or-painter-order-change";
         };
-        let mut next = *next;
-        let mut old = *old;
-        next.order = 0;
-        old.order = 0;
-        next.bounds.origin = Default::default();
-        old.bounds.origin = Default::default();
-        next.background = Default::default();
-        old.background = Default::default();
-        next.border_color = Default::default();
-        old.border_color = Default::default();
-        n_smoothing == o_smoothing && next == old
+        if n_smoothing != o_smoothing {
+            "quad-pipeline-change"
+        } else if next.bounds.size != old.bounds.size {
+            "quad-extent-change"
+        } else if next.content_mask != old.content_mask {
+            "quad-content-mask-change"
+        } else if next.corner_radii != old.corner_radii
+            || next.corner_smoothing != old.corner_smoothing
+            || next.border_widths != old.border_widths
+            || next.border_style != old.border_style
+            || next.border_dashed_length != old.border_dashed_length
+            || next.border_dashed_gap != old.border_dashed_gap
+            || next.padding != old.padding
+        {
+            "quad-shape-change"
+        } else {
+            "quad-painter-convergence-change"
+        }
     }
 
     fn geometry_matches(self, other: Self) -> bool {
@@ -409,6 +480,71 @@ fn paired_glyph_runs(
     if ambiguous { None } else { best }
 }
 
+// A parent hover fill and its canvas badge can be adjacent in the finished
+// painter sequence. Neither edit has an immediate unchanged anchor on its own.
+// Skip only one quad followed by a bounded glyph prefix, and require the exact
+// next primitive to re-establish convergence. All later paints are still
+// checked by the main comparison; paths, shadows and extra quads cannot be
+// hidden in this prefix. Replacing a quad is conservative because both its old
+// and new clipped raster coverage are damaged, and current batches are replayed
+// in full painter order. Capture already excludes nonfinite bounds and filters.
+fn quad_glyph_run_to_anchor(
+    sequence: &[PaintedPrimitive<'_>],
+    start: usize,
+    anchor: PaintedPrimitive<'_>,
+) -> Option<usize> {
+    if !sequence.get(start)?.is_quad() {
+        return None;
+    }
+    glyph_run_to_anchor(sequence, start + 1, anchor)
+}
+
+fn paired_quad_glyph_runs(
+    next: &[PaintedPrimitive<'_>],
+    old: &[PaintedPrimitive<'_>],
+    n: usize,
+    o: usize,
+) -> Option<(usize, usize)> {
+    if !next.get(n)?.is_quad() || !old.get(o)?.is_quad() {
+        return None;
+    }
+    let next_len = glyph_prefix_len(next, n + 1);
+    let old_len = glyph_prefix_len(old, o + 1);
+    let mut best = None;
+    let mut best_edits = MAX_GLYPH_EDITS + 1;
+    let mut ambiguous = false;
+    for next_count in 0..=next_len {
+        if next_count > best_edits {
+            break;
+        }
+        for old_count in 0..=old_len
+            .min(MAX_GLYPH_EDITS - next_count)
+            .min(best_edits - next_count)
+        {
+            let edits = next_count + old_count;
+            if edits == 0 || edits > best_edits {
+                continue;
+            }
+            // Unlike a pure glyph tail, a translated quad still needs a real
+            // unchanged anchor. End-of-scene is not proof of painter convergence.
+            let anchored = next
+                .get(n + 1 + next_count)
+                .zip(old.get(o + 1 + old_count))
+                .is_some_and(|(next, old)| next.geometry_matches(*old));
+            if anchored {
+                if edits < best_edits {
+                    best = Some((next_count, old_count));
+                    best_edits = edits;
+                    ambiguous = false;
+                } else {
+                    ambiguous = true;
+                }
+            }
+        }
+    }
+    if ambiguous { None } else { best }
+}
+
 fn glyph_run_bounds(run: &[PaintedPrimitive<'_>]) -> Bounds<ScaledPixels> {
     run.iter()
         .map(|primitive| primitive.bounds())
@@ -441,6 +577,62 @@ fn disjoint_swap(
     // The exact geometry/pipeline matches above give the old pair the same coverage.
     // Expand both by the AA fringe before permitting an adjacent painter-order swap.
     !a.intersects(b.bounds())
+}
+
+fn scene_diff_diagnostics_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("GPUI_GPU_DIAGNOSTIC_SCENE_DIFF").is_ok_and(|value| value == "1")
+    })
+}
+
+fn scene_diff_diagnostic(
+    next_snapshot: &SceneSnapshot,
+    old_snapshot: &SceneSnapshot,
+    reason: &'static str,
+    n: usize,
+    o: usize,
+) -> Option<String> {
+    static EMITTED: AtomicUsize = AtomicUsize::new(0);
+    EMITTED
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            (count < 32).then_some(count + 1)
+        })
+        .ok()?;
+    // This extra traversal and bounded formatting are exclusive to explicit
+    // diagnostic captures. Never format an entire scene or path vertex buffer.
+    let next = next_snapshot.painter_sequence();
+    let old = old_snapshot.painter_sequence();
+    let mut out = format!(
+        "reason={reason};next_index={n};old_index={o};next_counts=q{}p{}m{}s{};old_counts=q{}p{}m{}s{};next=[",
+        next_snapshot.quads.len(),
+        next_snapshot.paths.len(),
+        next_snapshot.monochrome_sprites.len(),
+        next_snapshot.subpixel_sprites.len(),
+        old_snapshot.quads.len(),
+        old_snapshot.paths.len(),
+        old_snapshot.monochrome_sprites.len(),
+        old_snapshot.subpixel_sprites.len()
+    );
+    for (name, sequence, start) in [("next", next, n), ("old", old, o)] {
+        if name == "old" {
+            out.push_str("];old=[");
+        }
+        if let Some(sequence) = sequence {
+            // Four entries on either side: eight primitive signatures total.
+            for (offset, primitive) in sequence.iter().skip(start).take(4).enumerate() {
+                if offset > 0 {
+                    out.push(',');
+                }
+                let _ = write!(out, "{}:", start + offset);
+                primitive.write_diagnostic(&mut out);
+            }
+        } else {
+            out.push_str("unsupported-command");
+        }
+    }
+    out.push(']');
+    Some(out)
 }
 
 impl SceneSnapshot {
@@ -579,6 +771,7 @@ impl SceneSnapshot {
             })
             || scene.shadows.iter().any(|p| {
                 !visible(p.bounds, p.content_mask.bounds)
+                    || (p.inset.is_enabled() && !finite_bounds(p.element_bounds))
                     || !p.blur_radius.0.is_finite()
                     || p.blur_radius.0 < 0.0
             })
@@ -616,6 +809,37 @@ impl SceneSnapshot {
 
     /// Compare supported scenes, reporting a static reason when full rendering is required.
     pub fn compare_checked(&self, previous: &Self) -> Result<Damage, &'static str> {
+        self.compare_impl(previous, false, &mut (0, 0))
+    }
+
+    /// Compare while optionally recording a bounded failing painter-sequence witness.
+    ///
+    /// Intended for query-enabled diagnostic captures. Formatting requires
+    /// `GPUI_GPU_DIAGNOSTIC_SCENE_DIFF=1` and is capped at 32 failures per process.
+    /// Ordinary comparison remains independent of this diagnostic switch.
+    pub fn compare_checked_diagnostic(
+        &self,
+        previous: &Self,
+    ) -> (Result<Damage, &'static str>, Option<String>) {
+        let enabled = scene_diff_diagnostics_enabled();
+        let mut position = (0, 0);
+        let result = self.compare_impl(previous, enabled, &mut position);
+        let detail = if enabled {
+            result.as_ref().err().and_then(|reason| {
+                scene_diff_diagnostic(self, previous, reason, position.0, position.1)
+            })
+        } else {
+            None
+        };
+        (result, detail)
+    }
+
+    fn compare_impl(
+        &self,
+        previous: &Self,
+        diagnostic: bool,
+        position: &mut (usize, usize),
+    ) -> Result<Damage, &'static str> {
         if self.atlas_generation != previous.atlas_generation {
             return Err("atlas-generation-change");
         }
@@ -661,6 +885,9 @@ impl SceneSnapshot {
         let mut glyph_edits = 0;
         let mut commutations = 0;
         while n < next.len() || o < old.len() {
+            if diagnostic {
+                *position = (n, o);
+            }
             match (next.get(n).copied(), old.get(o).copied()) {
                 (Some(current), Some(prior)) if current.geometry_matches(prior) => {
                     if current.colour_changed(prior) && !damage(current.bounds()) {
@@ -684,6 +911,59 @@ impl SceneSnapshot {
                         if commutations > MAX_COMMUTATIONS {
                             return Err("commutation-budget");
                         }
+                        continue;
+                    }
+                    let inserted_quad_glyphs = current
+                        .is_quad()
+                        .then(|| quad_glyph_run_to_anchor(&next, n, prior))
+                        .flatten();
+                    let removed_quad_glyphs = prior
+                        .is_quad()
+                        .then(|| quad_glyph_run_to_anchor(&old, o, current))
+                        .flatten();
+                    if inserted_quad_glyphs.is_some() && removed_quad_glyphs.is_some() {
+                        return Err("ambiguous-quad-glyph-reorder");
+                    }
+                    let paired_quad_glyphs = paired_quad_glyph_runs(&next, &old, n, o);
+                    if paired_quad_glyphs.is_some()
+                        && (inserted_quad_glyphs.is_some() || removed_quad_glyphs.is_some())
+                    {
+                        return Err("ambiguous-quad-glyph-edit");
+                    }
+                    if inserted_quad_glyphs.is_some()
+                        || removed_quad_glyphs.is_some()
+                        || paired_quad_glyphs.is_some()
+                    {
+                        let (next_quad, next_glyphs, old_quad, old_glyphs) =
+                            if let Some(count) = inserted_quad_glyphs {
+                                (true, count, false, 0)
+                            } else if let Some(count) = removed_quad_glyphs {
+                                (false, 0, true, count)
+                            } else {
+                                let (next_count, old_count) = paired_quad_glyphs.unwrap();
+                                (true, next_count, true, old_count)
+                            };
+                        edits += usize::from(next_quad) + usize::from(old_quad);
+                        glyph_edits += next_glyphs + old_glyphs;
+                        if edits > MAX_QUAD_EDITS {
+                            return Err("quad-edit-budget");
+                        }
+                        if glyph_edits > MAX_GLYPH_EDITS {
+                            return Err("glyph-edit-budget");
+                        }
+                        // Damage each old/new fill and badge separately. In particular,
+                        // no bounding union spans the space between distant hovered rows.
+                        if (next_quad && !damage(current.bounds()))
+                            || (old_quad && !damage(prior.bounds()))
+                            || (next_glyphs > 0
+                                && !damage(glyph_run_bounds(&next[n + 1..n + 1 + next_glyphs])))
+                            || (old_glyphs > 0
+                                && !damage(glyph_run_bounds(&old[o + 1..o + 1 + old_glyphs])))
+                        {
+                            return Err("damage-region-budget");
+                        }
+                        n += usize::from(next_quad) + next_glyphs;
+                        o += usize::from(old_quad) + old_glyphs;
                         continue;
                     }
                     let inserted_glyphs = current
@@ -747,11 +1027,13 @@ impl SceneSnapshot {
                         return Err("ambiguous-quad-reorder");
                     }
                     if !inserted && !removed {
-                        // One omitted hover fill may move to another row without any
-                        // intervening primitive. Require identical quad shape/pipeline and
-                        // an exact following anchor, possibly two disjoint paints whose
-                        // adjacent swap is verified on the next loop iteration.
-                        let paired = current.translated_quad_matches(prior)
+                        // A changed/moved quad affects only its old and new clipped
+                        // raster coverage. Keep a strict unchanged following anchor,
+                        // possibly two disjoint paints whose adjacent swap is verified
+                        // on the next iteration. This also supports inherited row masks
+                        // and rounded/bordered shapes without assuming they are equal.
+                        let paired = current.is_quad()
+                            && prior.is_quad()
                             && (next
                                 .get(n + 1)
                                 .zip(old.get(o + 1))
@@ -783,7 +1065,7 @@ impl SceneSnapshot {
                                 _ if current.is_glyph() || prior.is_glyph() => {
                                     "glyph-run-anchor-change"
                                 }
-                                _ => "quad-geometry-or-painter-order-change",
+                                _ => current.quad_mismatch_reason(prior),
                             });
                         }
                         if !damage(current.bounds()) || !damage(prior.bounds()) {
@@ -874,7 +1156,13 @@ pub fn batch_intersects(scene: &Scene, batch: &PrimitiveBatch, region: DamageRec
             .any(|p| visible(p.bounds, p.content_mask.bounds)),
         PrimitiveBatch::Shadows { range, .. } => scene.shadows[range.clone()].iter().any(|p| {
             visible(
-                p.bounds.dilate(ScaledPixels(p.blur_radius.0 * 4.0)),
+                if p.inset.is_enabled() {
+                    // Inset shadows rasterize the full element, not the
+                    // shifted/shrunk hole stored in bounds (see shadow_geometry).
+                    p.element_bounds
+                } else {
+                    p.bounds.dilate(ScaledPixels(p.blur_radius.0 * 4.0))
+                },
                 p.content_mask.bounds,
             )
         }),
@@ -1030,6 +1318,179 @@ mod tests {
         }
         scene.finish();
         scene
+    }
+
+    fn joint_badge_scene(
+        hover: Option<(usize, usize)>,
+        subpixel: bool,
+        interleaved_graph: bool,
+        anchor: bool,
+    ) -> Scene {
+        let mut scene = Scene::default();
+        let mask = ContentMask {
+            bounds: bounds(0.0, 0.0, 200.0, 200.0),
+            ..Default::default()
+        };
+        scene.insert_primitive(Quad {
+            bounds: bounds(0.0, 0.0, 200.0, 200.0),
+            content_mask: mask,
+            background: gpui::rgba(0x22334477).into(),
+            ..Default::default()
+        });
+        scene.raise_order_floor();
+        if let Some((row, _)) = hover {
+            let y = if row == 0 { 20.0 } else { 165.0 };
+            scene.insert_primitive(Quad {
+                bounds: bounds(0.0, y, 200.0, 14.0),
+                // Actual element masks may change with the hovered row, not
+                // merely its bounds origin. Both old/new masks need coverage.
+                content_mask: ContentMask {
+                    bounds: bounds(2.0, y + 0.25, 194.0, 13.25),
+                    fade_out: gpui::Edges::all(ScaledPixels(0.75)),
+                },
+                background: gpui::rgba(0x55779944).into(),
+                corner_radii: gpui::Corners::all(ScaledPixels(2.5)),
+                ..Default::default()
+            });
+        }
+        scene.raise_order_floor();
+        if interleaved_graph {
+            let mut path = Path::new(point(gpui::px(8.0), gpui::px(20.0)));
+            path.line_to(point(gpui::px(18.0), gpui::px(20.0)));
+            path.line_to(point(gpui::px(8.0), gpui::px(30.0)));
+            path.line_to(point(gpui::px(8.0), gpui::px(20.0)));
+            let mut path = path.scale(1.0);
+            path.content_mask = mask;
+            path.color = gpui::white().into();
+            scene.insert_primitive(path);
+            scene.raise_order_floor();
+        }
+        if let Some((row, count)) = hover {
+            let y = if row == 0 { 20.0 } else { 165.0 };
+            for index in 0..count {
+                scene.insert_primitive(glyph(
+                    index as u32 + 1,
+                    40.0 + index as f32 * 7.0,
+                    y + 1.0,
+                    subpixel,
+                ));
+            }
+        }
+        if anchor {
+            scene.raise_order_floor();
+            scene.insert_primitive(Quad {
+                bounds: bounds(10.0, 6.0, 100.0, 5.0),
+                content_mask: mask,
+                background: gpui::rgba(0xee884466).into(),
+                ..Default::default()
+            });
+        }
+        scene.finish();
+        scene
+    }
+
+    #[test]
+    fn combined_hover_quad_and_badge_converge_without_an_immediate_fill_anchor() {
+        for subpixel in [false, true] {
+            for interleaved_graph in [false, true] {
+                let mut previous =
+                    snapshot(&joint_badge_scene(None, subpixel, interleaved_graph, true));
+                for hover in [Some((0, 7)), Some((1, 9)), Some((0, 5)), None] {
+                    let next =
+                        snapshot(&joint_badge_scene(hover, subpixel, interleaved_graph, true));
+                    if hover.is_some() && !interleaved_graph {
+                        let sequence = next.painter_sequence().unwrap();
+                        assert!(
+                            sequence
+                                .windows(2)
+                                .any(|pair| pair[0].is_quad() && pair[1].is_glyph()),
+                            "fixture must place the whole badge immediately after its fill"
+                        );
+                    }
+                    let Damage::Partial(regions) = next
+                        .compare_checked(&previous)
+                        .expect("bounded combined edit")
+                    else {
+                        panic!("combined hover edits must actually be partial");
+                    };
+                    assert!(regions.len() <= 2);
+                    assert!(
+                        regions.iter().all(|region| region.height <= 17),
+                        "far old/new fills and badges need separate damage: {regions:?}"
+                    );
+                    assert_eq!(next.compare_checked(&next), Ok(Damage::Reuse));
+                    previous = next;
+                }
+            }
+        }
+        let first = snapshot(&joint_badge_scene(Some((0, 7)), false, false, false));
+        let next = snapshot(&joint_badge_scene(Some((1, 9)), false, false, false));
+        assert_eq!(
+            next.compare(&first),
+            Damage::Full,
+            "translated quad and badge without real painter convergence stay conservative"
+        );
+    }
+
+    #[test]
+    fn normal_bounds_tree_row_hover_keeps_unproven_glyph_rank_permutations_conservative() {
+        let row_scene = |hovered: usize| {
+            let mut scene = Scene::default();
+            let mask = ContentMask {
+                bounds: bounds(0.0, 0.0, 200.0, 200.0),
+                ..Default::default()
+            };
+            scene.insert_primitive(Quad {
+                bounds: bounds(0.0, 0.0, 200.0, 200.0),
+                content_mask: mask,
+                background: gpui::rgba(0x223344ff).into(),
+                ..Default::default()
+            });
+            for row in 0..2 {
+                let y = 20.0 + row as f32 * 140.0;
+                if hovered == row {
+                    scene.insert_primitive(Quad {
+                        bounds: bounds(0.0, y, 200.0, 14.0),
+                        content_mask: mask,
+                        background: gpui::rgba(0x55779944).into(),
+                        ..Default::default()
+                    });
+                }
+                for index in 0..3 {
+                    scene.insert_primitive(glyph(
+                        (row * 3 + index) as u32 + 1,
+                        40.0 + index as f32 * 10.0,
+                        y + 1.0,
+                        false,
+                    ));
+                }
+            }
+            // Deliberately use ordinary bounds-tree insertion, not per-row
+            // layers or artificial order floors. A hovered row's unchanged
+            // text moves to a later rank relative to the other row.
+            scene.finish();
+            snapshot(&scene)
+        };
+        let old = row_scene(0);
+        let next = row_scene(1);
+        let mut position = (0, 0);
+        assert_eq!(
+            next.compare_impl(&old, true, &mut position),
+            Err("quad-painter-convergence-change")
+        );
+        let detail = scene_diff_diagnostic(
+            &next,
+            &old,
+            "quad-painter-convergence-change",
+            position.0,
+            position.1,
+        )
+        .unwrap();
+        assert!(detail.contains("next_index=1;old_index=1"));
+        assert!(detail.contains("next_counts=q2p0m6s0;old_counts=q2p0m6s0"));
+        assert!(detail.matches("quad(").count() + detail.matches("mono(").count() <= 8);
+        assert!(!detail.contains("vertices: ["));
+        assert!(detail.len() < 8192, "diagnostic signatures remain bounded");
     }
 
     #[test]
@@ -1275,6 +1736,46 @@ mod tests {
     }
 
     #[test]
+    fn inset_shadow_replay_covers_the_element_outside_its_offset_hole() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(0.5),
+            bounds: bounds(140.0, 140.0, 20.0, 20.0),
+            corner_radii: Default::default(),
+            content_mask: ContentMask {
+                bounds: bounds(0.0, 0.0, 200.0, 200.0),
+                ..Default::default()
+            },
+            color: gpui::black().into(),
+            element_bounds: bounds(10.0, 10.0, 180.0, 180.0),
+            element_corner_radii: Default::default(),
+            inset: true.into(),
+            corner_smoothing: 0.0,
+        });
+        scene.finish();
+        let batch = PrimitiveBatch::Shadows {
+            range: 0..1,
+            smoothed: false,
+        };
+        let outside_hole = DamageRect {
+            x: 20,
+            y: 20,
+            width: 8,
+            height: 8,
+        };
+        assert!(batch_intersects(&scene, &batch, outside_hole));
+        scene.shadows[0].inset = false.into();
+        assert!(!batch_intersects(&scene, &batch, outside_hole));
+        scene.shadows[0].inset = true.into();
+        scene.shadows[0].element_bounds.origin.x.0 = f32::INFINITY;
+        assert!(matches!(
+            SceneSnapshot::capture_checked(&scene, 1, 200, 200),
+            Err(SceneSnapshotUnsupportedReason::NonfiniteGeometry)
+        ));
+    }
+
+    #[test]
     fn headless_row_fixture_allows_disjoint_path_overlay_reordering() {
         let rows = |hovered: usize| {
             let mut scene = Scene::default();
@@ -1331,7 +1832,7 @@ mod tests {
     }
 
     #[test]
-    fn paired_hover_fill_translation_requires_an_unchanged_following_anchor() {
+    fn paired_quad_replacement_requires_an_unchanged_following_anchor() {
         let mut original = scene(gpui::white());
         let mut anchor = original.quads[0];
         anchor.bounds = bounds(5.0, 90.0, 5.0, 5.0);
@@ -1346,7 +1847,35 @@ mod tests {
         next.quads[0].bounds.origin.y.0 += 40.0;
         assert!(matches!(next.compare(&first), Damage::Partial(_)));
         next.quads[0].bounds.size.width.0 -= 1.0;
-        assert_eq!(next.compare(&first), Damage::Full);
+        next.quads[0].content_mask.bounds = bounds(2.0, 49.0, 190.0, 23.0);
+        next.quads[0].content_mask.fade_out = gpui::Edges::all(ScaledPixels(0.5));
+        next.quads[0].corner_radii = gpui::Corners::all(ScaledPixels(3.5));
+        let Damage::Partial(regions) = next.compare_checked(&first).unwrap() else {
+            panic!("anchored finite quad changes must damage old and new coverage");
+        };
+        assert!(
+            regions
+                .iter()
+                .any(|region| region.intersects(first.quads[0].bounds))
+        );
+        assert!(regions.iter().any(|region| {
+            region.intersects(
+                next.quads[0]
+                    .bounds
+                    .intersect(&next.quads[0].content_mask.bounds),
+            )
+        }));
+
+        first.commands = vec![RenderCommand::Batch(PrimitiveBatch::Quads {
+            range: 0..1,
+            smoothed: false,
+        })];
+        next.commands = first.commands.clone();
+        assert_eq!(
+            next.compare_checked(&first),
+            Err("quad-extent-change"),
+            "without convergence a changed extent still falls back with its precise mismatch"
+        );
     }
 
     #[test]

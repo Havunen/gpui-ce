@@ -34,7 +34,7 @@ pub(super) fn render_to_view(
         } else {
             0
         };
-    let retained = renderer.retained.prepare(
+    let mut retained = renderer.retained.prepare(
         scene,
         atlas_generation,
         renderer.target.width(),
@@ -73,6 +73,7 @@ pub(super) fn render_to_view(
         retained.damage.kind(),
         retained.bytes,
         retained.fallback_reason,
+        retained.diff_detail.take(),
         experiments,
     );
     // Partial regions replay batches independently. Reserve bounded duplicate uploads and clear quads.
@@ -83,13 +84,9 @@ pub(super) fn render_to_view(
             .pipelines
             .ensure_damage_clear(&device);
         let transport = renderer.resources().instances.transport();
-        let requirements = FrameRequirements::for_scene(scene, transport);
-        let alignment = transport.batch_alignment(std::mem::size_of::<Quad>() as u64);
-        let bytes = requirements
-            .storage_bytes
-            .saturating_add(std::mem::size_of::<Quad>() as u64 + alignment)
-            .saturating_mul(regions.len() as u64);
-        let batches = (requirements.instance_batches + 1) * regions.len() as u64;
+        let requirements = FrameRequirements::for_partial_scene(scene, regions, transport);
+        let bytes = requirements.storage_bytes;
+        let batches = requirements.instance_batches;
         let device = renderer.resources().device.clone();
         let resources = renderer.resources_mut();
         if !resources.instances.ensure_capacity(
@@ -439,62 +436,25 @@ pub(super) struct FrameRequirements {
 impl FrameRequirements {
     pub(super) fn for_scene(scene: &Scene, transport: InstanceTransport) -> Self {
         let planned = scene.render_plan().requirements();
-        let mut storage_bytes = 0_u64;
-        let mut instance_batches = 0_u64;
-        let mut reserve = |element_size: usize, count: usize| {
-            if count > 0 {
-                let stride = element_size as u64;
-                storage_bytes = storage_bytes.next_multiple_of(transport.batch_alignment(stride));
-                storage_bytes = storage_bytes.saturating_add(stride.saturating_mul(count as u64));
-                instance_batches += 1;
-            }
-        };
+        let mut requirements = Self::scene_metadata(scene);
 
         for command in scene.render_commands() {
             let RenderCommand::Batch(batch) = command else {
                 continue;
             };
-            match batch {
-                PrimitiveBatch::Shadows { range, .. } => {
-                    reserve(std::mem::size_of::<Shadow>(), range.len())
-                }
-                PrimitiveBatch::Quads { range, .. } => {
-                    reserve(std::mem::size_of::<Quad>(), range.len())
-                }
-                PrimitiveBatch::Paths {
-                    rasterization_vertex_count,
-                    sprite_count,
-                    ..
-                } if *rasterization_vertex_count > 0 => {
-                    reserve(
-                        std::mem::size_of::<path_types::PathRasterizationVertex>(),
-                        *rasterization_vertex_count,
-                    );
-                    reserve(std::mem::size_of::<path_types::PathSprite>(), *sprite_count);
-                }
-                PrimitiveBatch::Underlines(range) => {
-                    reserve(std::mem::size_of::<Underline>(), range.len())
-                }
-                PrimitiveBatch::MonochromeSprites { range, .. } => {
-                    reserve(std::mem::size_of::<MonochromeSprite>(), range.len())
-                }
-                PrimitiveBatch::SubpixelSprites { range, .. } => {
-                    reserve(std::mem::size_of::<SubpixelSprite>(), range.len())
-                }
-                PrimitiveBatch::PolychromeSprites { range, .. } => {
-                    reserve(std::mem::size_of::<PolychromeSprite>(), range.len())
-                }
-                PrimitiveBatch::Paths { .. }
-                | PrimitiveBatch::Surfaces(_)
-                | PrimitiveBatch::BackdropFilters(_)
-                | PrimitiveBatch::FilterBoundary(_) => {}
-            }
+            requirements.reserve_batch(batch, transport);
         }
-        debug_assert_eq!(instance_batches as usize, planned.instance_batch_count);
+        debug_assert_eq!(
+            requirements.instance_batches as usize,
+            planned.instance_batch_count
+        );
 
+        requirements
+    }
+
+    fn scene_metadata(scene: &Scene) -> Self {
+        let planned = scene.render_plan().requirements();
         Self {
-            storage_bytes,
-            instance_batches,
             uniforms: FrameUniformRequirements {
                 filter_count: FILTER_UNIFORMS_PER_COMPOSITE
                     * (planned.backdrop_filter_count + planned.isolated_filter_count) as u64
@@ -504,6 +464,202 @@ impl FrameRequirements {
             isolated_target_count: planned.isolated_target_count,
             uses_path_target: planned.uses_path_target,
             uses_offscreen_target: planned.uses_offscreen_target,
+            ..Default::default()
+        }
+    }
+
+    fn for_partial_scene(
+        scene: &Scene,
+        regions: &[DamageRect],
+        transport: InstanceTransport,
+    ) -> Self {
+        let mut requirements = Self::scene_metadata(scene);
+        // Encoding prepends a clear and skips nonintersecting batches. Either
+        // change alters the alignment of every following type, and regions share
+        // one arena cursor. An origin-zero full-frame estimate cannot be scaled.
+        for &region in regions {
+            requirements.reserve(std::mem::size_of::<Quad>(), 1, transport);
+            for command in scene.render_commands() {
+                if let RenderCommand::Batch(batch) = command
+                    && batch_intersects(scene, batch, region)
+                {
+                    requirements.reserve_batch(batch, transport);
+                }
+            }
+        }
+        requirements
+    }
+
+    fn reserve(&mut self, element_size: usize, count: usize, transport: InstanceTransport) {
+        if count > 0 {
+            let stride = element_size as u64;
+            self.storage_bytes = self
+                .storage_bytes
+                .next_multiple_of(transport.batch_alignment(stride));
+            self.storage_bytes = self
+                .storage_bytes
+                .saturating_add(stride.saturating_mul(count as u64));
+            self.instance_batches += 1;
+        }
+    }
+
+    fn reserve_batch(&mut self, batch: &PrimitiveBatch, transport: InstanceTransport) {
+        match batch {
+            PrimitiveBatch::Shadows { range, .. } => {
+                self.reserve(std::mem::size_of::<Shadow>(), range.len(), transport)
+            }
+            PrimitiveBatch::Quads { range, .. } => {
+                self.reserve(std::mem::size_of::<Quad>(), range.len(), transport)
+            }
+            PrimitiveBatch::Paths {
+                rasterization_vertex_count,
+                sprite_count,
+                ..
+            } if *rasterization_vertex_count > 0 => {
+                self.reserve(
+                    std::mem::size_of::<path_types::PathRasterizationVertex>(),
+                    *rasterization_vertex_count,
+                    transport,
+                );
+                self.reserve(
+                    std::mem::size_of::<path_types::PathSprite>(),
+                    *sprite_count,
+                    transport,
+                );
+            }
+            PrimitiveBatch::Underlines(range) => {
+                self.reserve(std::mem::size_of::<Underline>(), range.len(), transport)
+            }
+            PrimitiveBatch::MonochromeSprites { range, .. } => self.reserve(
+                std::mem::size_of::<MonochromeSprite>(),
+                range.len(),
+                transport,
+            ),
+            PrimitiveBatch::SubpixelSprites { range, .. } => self.reserve(
+                std::mem::size_of::<SubpixelSprite>(),
+                range.len(),
+                transport,
+            ),
+            PrimitiveBatch::PolychromeSprites { range, .. } => self.reserve(
+                std::mem::size_of::<PolychromeSprite>(),
+                range.len(),
+                transport,
+            ),
+            PrimitiveBatch::Paths { .. }
+            | PrimitiveBatch::Surfaces(_)
+            | PrimitiveBatch::BackdropFilters(_)
+            | PrimitiveBatch::FilterBoundary(_) => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod planning_tests {
+    use super::*;
+
+    #[test]
+    fn partial_alignment_includes_clear_and_shared_region_cursor() {
+        let transport = InstanceTransport::StorageBuffer;
+        let sequence = [
+            (std::mem::size_of::<Shadow>(), 1),
+            (std::mem::size_of::<Quad>(), 1),
+            (std::mem::size_of::<Shadow>(), 1),
+            (std::mem::size_of::<Quad>(), 1),
+            (
+                std::mem::size_of::<path_types::PathRasterizationVertex>(),
+                3,
+            ),
+            (std::mem::size_of::<path_types::PathSprite>(), 1),
+            (std::mem::size_of::<MonochromeSprite>(), 1),
+            (std::mem::size_of::<Quad>(), 1),
+        ];
+        let mut full = FrameRequirements::default();
+        for &(stride, count) in &sequence {
+            full.reserve(stride, count, transport);
+        }
+        assert_eq!(full.storage_bytes, 1984);
+        let old_estimate = full.storage_bytes + 2 * std::mem::size_of::<Quad>() as u64;
+        assert_eq!(old_estimate, 2480);
+        let mut partial = FrameRequirements::default();
+        partial.reserve(std::mem::size_of::<Quad>(), 1, transport);
+        for &(stride, count) in &sequence {
+            partial.reserve(stride, count, transport);
+        }
+        assert_eq!(partial.storage_bytes, 2728);
+        assert_eq!(partial.instance_batches, 9);
+        assert!(partial.storage_bytes > old_estimate);
+        // A second region starts at the first region's actual ending offset.
+        // It cannot restart an origin-zero estimate or merely double it.
+        partial.reserve(std::mem::size_of::<Quad>(), 1, transport);
+        for &(stride, count) in &sequence {
+            partial.reserve(stride, count, transport);
+        }
+        assert_eq!(partial.instance_batches, 18);
+        assert_eq!(partial.storage_bytes, 5456);
+    }
+
+    #[test]
+    fn partial_planner_counts_only_intersecting_batches_and_clear_slots() {
+        use gpui::{Bounds, ContentMask, ScaledPixels, point, size};
+        let bounds = |x, y| {
+            Bounds::new(
+                point(ScaledPixels(x), ScaledPixels(y)),
+                size(ScaledPixels(10.0), ScaledPixels(10.0)),
+            )
+        };
+        let mask = ContentMask {
+            bounds: Bounds::new(
+                point(ScaledPixels(0.0), ScaledPixels(0.0)),
+                size(ScaledPixels(100.0), ScaledPixels(100.0)),
+            ),
+            ..Default::default()
+        };
+        let mut scene = Scene::default();
+        for (index, (x, y)) in [(0.0, 0.0), (20.0, 20.0)].into_iter().enumerate() {
+            scene.insert_primitive(Quad {
+                bounds: bounds(x, y),
+                content_mask: mask,
+                corner_smoothing: if index == 0 { 0.0 } else { 0.65 },
+                ..Default::default()
+            });
+        }
+        scene.finish();
+        let regions = [
+            DamageRect {
+                x: 0,
+                y: 0,
+                width: 5,
+                height: 5,
+            },
+            DamageRect {
+                x: 24,
+                y: 24,
+                width: 5,
+                height: 5,
+            },
+            DamageRect {
+                x: 60,
+                y: 60,
+                width: 5,
+                height: 5,
+            },
+        ];
+        for transport in [
+            InstanceTransport::StorageBuffer,
+            InstanceTransport::DataTexture,
+        ] {
+            let requirements = FrameRequirements::for_partial_scene(&scene, &regions, transport);
+            assert_eq!(
+                requirements.instance_batches, 5,
+                "three clears plus two intersecting batches"
+            );
+            let expected_bytes = match transport {
+                InstanceTransport::StorageBuffer => 1240,
+                InstanceTransport::DataTexture => 1272,
+            };
+            assert_eq!(requirements.storage_bytes, expected_bytes);
+            assert!(!requirements.uses_path_target);
+            assert!(!requirements.uses_offscreen_target);
         }
     }
 }

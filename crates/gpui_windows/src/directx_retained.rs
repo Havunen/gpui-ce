@@ -64,6 +64,7 @@ pub(super) struct RetainedPlan {
     pub snapshot: Option<SceneSnapshot>,
     pub bytes: u64,
     pub fallback_reason: Option<&'static str>,
+    pub diff_detail: Option<String>,
     revision: u64,
     atlas: u64,
     reuse_snapshot: bool,
@@ -138,6 +139,7 @@ impl RetainedFrame {
                 atlas: 0,
                 reuse_snapshot: false,
                 fallback_reason: None,
+                diff_detail: None,
             });
         }
         let frame = gpu::gpu_frame_context();
@@ -152,6 +154,7 @@ impl RetainedFrame {
             atlas: generation,
             reuse_snapshot: false,
             fallback_reason: Some(reason),
+            diff_detail: None,
         };
         poll_retired();
         if !eligible || !frame.active {
@@ -185,6 +188,7 @@ impl RetainedFrame {
                     atlas: generation,
                     reuse_snapshot: true,
                     fallback_reason: None,
+                    diff_detail: None,
                 });
             }
         }
@@ -241,12 +245,19 @@ impl RetainedFrame {
                 reservation,
             });
         }
-        let (damage, comparison_reason) = match self.snapshot.as_ref() {
-            Some(previous) => match snapshot.compare_checked(previous) {
-                Ok(damage) => (damage, None),
-                Err(reason) => (Damage::Full, Some(reason)),
-            },
-            None => (Damage::Full, None),
+        let (damage, comparison_reason, diff_detail) = match self.snapshot.as_ref() {
+            Some(previous) => {
+                let (comparison, detail) = if gpu::timings_enabled() {
+                    snapshot.compare_checked_diagnostic(previous)
+                } else {
+                    (snapshot.compare_checked(previous), None)
+                };
+                match comparison {
+                    Ok(damage) => (damage, None, detail),
+                    Err(reason) => (Damage::Full, Some(reason), detail),
+                }
+            }
+            None => (Damage::Full, None, None),
         };
         let target = self.target.as_ref().unwrap();
         let fallback_reason = if damage == Damage::Full {
@@ -272,6 +283,7 @@ impl RetainedFrame {
             atlas: generation,
             reuse_snapshot: false,
             fallback_reason,
+            diff_detail,
         })
     }
     pub fn complete(&mut self, plan: RetainedPlan, success: bool) {

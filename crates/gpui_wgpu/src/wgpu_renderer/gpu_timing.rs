@@ -284,6 +284,7 @@ impl GpuTimings {
         kind: &str,
         retained_bytes: u64,
         fallback_reason: Option<&str>,
+        diff_detail: Option<String>,
         mut experiments: Vec<String>,
     ) {
         if self.clipped_quads {
@@ -292,6 +293,7 @@ impl GpuTimings {
         if let Some(frame) = self.current.borrow_mut().as_mut() {
             frame.event.damage_kind = kind.into();
             frame.event.damage_fallback_reason = fallback_reason.map(str::to_owned);
+            frame.event.damage_diff_detail = diff_detail;
             frame.event.retained_bytes = retained_bytes;
             frame.event.experiments = experiments;
         }

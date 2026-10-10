@@ -97,6 +97,8 @@ pub struct GpuEvent {
     pub damage_kind: String,
     /// Why retained drawing fell back to a complete scene, independently of timing status.
     pub damage_fallback_reason: Option<String>,
+    /// Bounded, explicitly requested scene-diff diagnostics; absent on ordinary frames.
+    pub damage_diff_detail: Option<String>,
     /// Extra retained GPU allocations held by this renderer.
     pub retained_bytes: u64,
     /// Actual quad API draw calls, including damage-clear quads, for this submission.
@@ -278,6 +280,7 @@ impl GpuEvent {
             diagnostic_ablations: Vec::new(),
             damage_kind: "full".into(),
             damage_fallback_reason: None,
+            damage_diff_detail: None,
             retained_bytes: 0,
             quad_draw_calls: 0,
             quad_scissor_splits: 0,

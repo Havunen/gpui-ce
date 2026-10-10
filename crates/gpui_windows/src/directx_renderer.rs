@@ -604,7 +604,7 @@ impl DirectXRenderer {
         background_appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
         let devices = self.devices.as_ref().context("devices missing")?;
-        let plan = self.retained.prepare(
+        let mut plan = self.retained.prepare(
             scene,
             self.atlas.as_ref(),
             self.width,
@@ -618,6 +618,7 @@ impl DirectXRenderer {
             plan.damage.kind(),
             plan.bytes,
             plan.fallback_reason,
+            plan.diff_detail.take(),
             if self.retained.enabled() && !self.timings.diagnostic_ablations.enabled() {
                 vec!["partial-redraw".into()]
             } else {
@@ -3733,6 +3734,179 @@ mod tests {
         scene
     }
 
+    fn combined_hover_badge_scene(
+        hover: Option<usize>,
+        glyph: AtlasTile,
+        badge: AtlasTile,
+        subpixel: bool,
+        fraction: f32,
+        changing_quad: bool,
+    ) -> Scene {
+        use gpui::{Path, Shadow, point, px};
+        let mut scene = Scene::default();
+        let canvas = scaled(5.0, 5.0, 190.0, 90.0);
+        scene.insert_primitive(Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(8.0),
+            bounds: scaled(0.0, 0.0, 200.0, 100.0),
+            corner_radii: Corners::all(ScaledPixels(16.0)),
+            content_mask: full_mask(),
+            color: solid_background(hsla(0.0, 0.0, 0.0, 0.3)),
+            element_bounds: canvas,
+            element_corner_radii: Corners::all(ScaledPixels(10.0)),
+            inset: ShaderBool::Disabled,
+            corner_smoothing: 0.0,
+        });
+        scene.insert_primitive(Quad {
+            bounds: canvas,
+            content_mask: full_mask(),
+            background: solid_background(hsla(0.6, 0.2, 0.16, 0.55)),
+            corner_radii: Corners::all(ScaledPixels(10.0)),
+            ..Default::default()
+        });
+        // Static graph and labels precede the dynamic block in the painter
+        // sequence. No unchanged primitive separates its hover fill and badge.
+        scene.push_layer(canvas);
+        for row in 0..3 {
+            let y = 12.0 + row as f32 * 24.0 + fraction;
+            scene.insert_primitive(MonochromeSprite {
+                order: 0,
+                padding: 0,
+                bounds: scaled(25.5, y + 2.0, 8.0, 8.0),
+                content_mask: full_mask(),
+                color: hsla(0.1, 0.6, 0.7, 0.7).into(),
+                tile: glyph,
+                transformation: Default::default(),
+            });
+            let mut path = Path::new(point(px(43.5), px(y + 2.0)));
+            path.line_to(point(px(49.5), px(y + 12.0)));
+            path.line_to(point(px(37.5), px(y + 12.0)));
+            let mut path = path.scale(1.0);
+            path.content_mask = full_mask();
+            for vertex in &mut path.vertices {
+                vertex.content_mask = path.content_mask;
+            }
+            path.color = solid_background(hsla(0.7, 0.7, 0.65, 0.75));
+            scene.insert_primitive(path);
+        }
+        scene.pop_layer();
+        if let Some(row) = hover {
+            let bounds = scaled(
+                9.0 + fraction,
+                12.0 + row as f32 * 24.0 + fraction,
+                if changing_quad {
+                    180.0 - row as f32 * 8.0
+                } else {
+                    180.0
+                },
+                if changing_quad {
+                    14.0 + row as f32
+                } else {
+                    14.0
+                },
+            );
+            scene.push_layer(bounds);
+            scene.insert_primitive(Quad {
+                bounds,
+                content_mask: if changing_quad {
+                    ContentMask {
+                        bounds: scaled(
+                            bounds.origin.x.0 + 0.75,
+                            bounds.origin.y.0 + 0.5,
+                            bounds.size.width.0 - 1.5,
+                            bounds.size.height.0 - 1.0,
+                        ),
+                        fade_out: Edges {
+                            top: ScaledPixels(1.5 + row as f32 * 0.25),
+                            right: ScaledPixels(2.0),
+                            bottom: ScaledPixels(1.0),
+                            left: ScaledPixels(2.5),
+                        },
+                    }
+                } else {
+                    full_mask()
+                },
+                background: solid_background(hsla(0.65, 0.8, 0.65, 0.7)),
+                corner_radii: Corners::all(ScaledPixels(if changing_quad {
+                    2.0 + row as f32
+                } else {
+                    3.0
+                })),
+                border_widths: if changing_quad {
+                    Edges::all(ScaledPixels(0.5 + row as f32 * 0.25))
+                } else {
+                    Default::default()
+                },
+                border_color: if changing_quad {
+                    solid_background(hsla(0.1, 0.65, 0.7, 0.65))
+                } else {
+                    Default::default()
+                },
+                corner_smoothing: if changing_quad && row == 1 { 0.65 } else { 0.0 },
+                ..Default::default()
+            });
+            for index in 0..7 + row {
+                let bounds = scaled(
+                    100.25 + fraction + index as f32 * 8.0,
+                    bounds.origin.y.0 + 2.0,
+                    8.0,
+                    8.0,
+                );
+                if subpixel {
+                    scene.insert_primitive(gpui::SubpixelSprite {
+                        order: 0,
+                        padding: 0,
+                        bounds,
+                        content_mask: full_mask(),
+                        color: hsla(0.07, 0.6, 0.73, 0.7).into(),
+                        tile: badge,
+                        transformation: Default::default(),
+                    });
+                } else {
+                    scene.insert_primitive(MonochromeSprite {
+                        order: 0,
+                        padding: 0,
+                        bounds,
+                        content_mask: full_mask(),
+                        color: hsla(0.07, 0.6, 0.73, 0.7).into(),
+                        tile: badge,
+                        transformation: Default::default(),
+                    });
+                }
+            }
+            scene.pop_layer();
+        }
+        // This is the first exact anchor after the entire changed block.
+        // Its translucent coverage crosses both distant damaged row regions.
+        scene.insert_primitive(Quad {
+            bounds: scaled(80.25, 9.5, 12.5, 77.0),
+            content_mask: full_mask(),
+            background: solid_background(hsla(0.03, 0.8, 0.6, 0.3)),
+            corner_radii: Corners::all(ScaledPixels(3.0)),
+            ..Default::default()
+        });
+        scene.finish();
+        if hover.is_some() {
+            let commands = scene.render_commands();
+            let suffix = &commands[commands.len() - 3..];
+            assert!(matches!(
+                &suffix[0],
+                RenderCommand::Batch(PrimitiveBatch::Quads { range, .. }) if range.len() == 1
+            ));
+            assert!(matches!(
+                &suffix[1],
+                RenderCommand::Batch(PrimitiveBatch::MonochromeSprites { range, .. })
+                    | RenderCommand::Batch(PrimitiveBatch::SubpixelSprites { range, .. })
+                    if range.len() >= 7
+            ));
+            assert!(matches!(
+                &suffix[2],
+                RenderCommand::Batch(PrimitiveBatch::Quads { range, .. }) if range.len() == 1
+            ));
+        }
+        scene
+    }
+
     #[test]
     fn retained_hover_badge_glyph_runs_match_full_pixels_on_transparent_target() -> Result<()> {
         use gpui::{
@@ -3790,59 +3964,161 @@ mod tests {
             for clipped in [false, true] {
                 renderer.timings.clipped_quads = clipped;
                 for fraction in [0.0, 0.25, 0.5, 0.75] {
-                    renderer.retained.invalidate();
-                    let mut previous = None;
-                    for (revision, hover) in [
-                        (1, None),
-                        (2, Some(0)),
-                        (3, Some(1)),
-                        (4, Some(2)),
-                        (5, None),
-                    ] {
-                        let scene = transparent_retained_scene_with_badge(
-                            hover,
-                            glyph,
-                            fraction,
-                            Some((badge, mode == GlyphRenderMode::Subpixel)),
-                        );
-                        let reference_scene = transparent_retained_scene_with_badge(
-                            hover,
-                            reference_glyph,
-                            fraction,
-                            Some((reference_badge, mode == GlyphRenderMode::Subpixel)),
-                        );
-                        let _scope = gpui::profiler::gpu::set_gpu_frame_context(
-                            Some("hover-badge-native".into()),
-                            true,
-                            revision,
-                            revision,
-                        );
-                        let actual = renderer
-                            .render_to_image(&scene, WindowBackgroundAppearance::Transparent)?;
-                        let expected = reference.render_to_image(
-                            &reference_scene,
-                            WindowBackgroundAppearance::Transparent,
-                        )?;
-                        assert_eq!(
-                            actual, expected,
-                            "glyph badge mode={mode:?} fraction={fraction} clipped={clipped} hover={hover:?}"
-                        );
-                        assert_eq!(
-                            renderer.retained.last_damage(),
-                            if revision == 1 { "full" } else { "partial" },
-                            "glyph badge must qualify for actual Partial"
-                        );
-                        if let Some(previous) = &previous {
-                            assert_ne!(&actual, previous, "badge pixels must visibly change");
+                    for changing_quad in [false, true] {
+                        renderer.retained.invalidate();
+                        let mut previous = None;
+                        for (revision, hover) in [
+                            (1, None),
+                            (2, Some(0)),
+                            (3, Some(2)),
+                            (4, Some(1)),
+                            (5, None),
+                        ] {
+                            let scene = combined_hover_badge_scene(
+                                hover,
+                                glyph,
+                                badge,
+                                mode == GlyphRenderMode::Subpixel,
+                                fraction,
+                                changing_quad,
+                            );
+                            let reference_scene = combined_hover_badge_scene(
+                                hover,
+                                reference_glyph,
+                                reference_badge,
+                                mode == GlyphRenderMode::Subpixel,
+                                fraction,
+                                changing_quad,
+                            );
+                            let _scope = gpui::profiler::gpu::set_gpu_frame_context(
+                                Some("hover-badge-native".into()),
+                                true,
+                                revision,
+                                revision,
+                            );
+                            let actual = renderer
+                                .render_to_image(&scene, WindowBackgroundAppearance::Transparent)?;
+                            let expected = reference.render_to_image(
+                                &reference_scene,
+                                WindowBackgroundAppearance::Transparent,
+                            )?;
+                            assert_eq!(
+                                actual, expected,
+                                "glyph badge mode={mode:?} fraction={fraction} clipped={clipped} changing_quad={changing_quad} hover={hover:?}"
+                            );
+                            assert_eq!(
+                                renderer.retained.last_damage(),
+                                if revision == 1 { "full" } else { "partial" },
+                                "glyph badge must qualify for actual Partial"
+                            );
+                            if let Some(previous) = &previous {
+                                assert_ne!(&actual, previous, "badge pixels must visibly change");
+                            }
+                            previous = Some(actual);
+                            assert_eq!(
+                                renderer.render_to_image(
+                                    &scene,
+                                    WindowBackgroundAppearance::Transparent
+                                )?,
+                                expected
+                            );
+                            assert_eq!(renderer.retained.last_damage(), "reuse");
                         }
-                        previous = Some(actual);
-                        assert_eq!(
-                            renderer
-                                .render_to_image(&scene, WindowBackgroundAppearance::Transparent)?,
-                            expected
-                        );
-                        assert_eq!(renderer.retained.last_damage(), "reuse");
                     }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn retained_inset_shadow_outside_shifted_hole_matches_full_pixels() -> Result<()> {
+        let scene = |hover: Option<usize>| {
+            let mut scene = Scene::default();
+            let element = scaled(8.0, 8.0, 184.0, 84.0);
+            scene.insert_primitive(Quad {
+                bounds: element,
+                content_mask: full_mask(),
+                background: solid_background(hsla(0.61, 0.35, 0.21, 0.4)),
+                corner_radii: Corners::all(ScaledPixels(12.0)),
+                ..Default::default()
+            });
+            // Positive spread20 and offset(70,6) shift/shrink the inset hole.
+            // The actual shadow still covers element_bounds. Both hover rows
+            // lie outside hole bounds dilated by4*blur, exposing incorrect culling.
+            scene.insert_primitive(gpui::Shadow {
+                order: 0,
+                blur_radius: ScaledPixels(0.5),
+                bounds: scaled(98.0, 34.0, 144.0, 44.0),
+                corner_radii: Corners::all(ScaledPixels(0.0)),
+                content_mask: full_mask(),
+                color: solid_background(hsla(0.08, 0.7, 0.5, 0.65)),
+                element_bounds: element,
+                element_corner_radii: Corners::all(ScaledPixels(12.0)),
+                inset: ShaderBool::Enabled,
+                corner_smoothing: 0.65,
+            });
+            if let Some(row) = hover {
+                scene.push_layer(element);
+                scene.insert_primitive(Quad {
+                    bounds: scaled(14.25, 14.25 + row as f32 * 52.0, 56.0, 14.0),
+                    content_mask: full_mask(),
+                    background: solid_background(hsla(0.7, 0.65, 0.7, 0.6)),
+                    corner_radii: Corners::all(ScaledPixels(3.0)),
+                    ..Default::default()
+                });
+                scene.pop_layer();
+            }
+            scene.insert_primitive(Quad {
+                bounds: element,
+                content_mask: full_mask(),
+                background: solid_background(hsla(0.4, 0.5, 0.4, 0.08)),
+                corner_radii: Corners::all(ScaledPixels(12.0)),
+                ..Default::default()
+            });
+            scene.finish();
+            scene
+        };
+        let devices = DirectXDevices::new()?;
+        let window = HiddenWindow::new()?;
+        let reference_window = HiddenWindow::new()?;
+        let mut renderer = DirectXRenderer::new(window.0, &devices, false)?;
+        let mut reference = DirectXRenderer::new(reference_window.0, &devices, false)?;
+        renderer.retained.enable_for_tests();
+        reference.retained.disable_for_tests();
+        for renderer in [&mut renderer, &mut reference] {
+            renderer.resize(Size {
+                width: DevicePixels(200),
+                height: DevicePixels(100),
+            })?;
+        }
+        for clipped in [false, true] {
+            renderer.timings.clipped_quads = clipped;
+            for appearance in [
+                WindowBackgroundAppearance::Transparent,
+                WindowBackgroundAppearance::Opaque,
+            ] {
+                renderer.retained.invalidate();
+                for (revision, hover) in [(1, None), (2, Some(0)), (3, Some(1)), (4, None)] {
+                    let scene = scene(hover);
+                    let _scope = gpui::profiler::gpu::set_gpu_frame_context(
+                        Some("inset-shadow-native".into()),
+                        true,
+                        revision,
+                        revision,
+                    );
+                    let actual = renderer.render_to_image(&scene, appearance)?;
+                    let expected = reference.render_to_image(&scene, appearance)?;
+                    assert_eq!(
+                        actual, expected,
+                        "inset shadow clipped={clipped} appearance={appearance:?} hover={hover:?}"
+                    );
+                    assert_eq!(
+                        renderer.retained.last_damage(),
+                        if revision == 1 { "full" } else { "partial" }
+                    );
+                    assert_eq!(renderer.render_to_image(&scene, appearance)?, expected);
+                    assert_eq!(renderer.retained.last_damage(), "reuse");
                 }
             }
         }
