@@ -24,7 +24,6 @@ pub(super) fn render_to_view(
 ) -> Option<wgpu::SubmissionIndex> {
     let mut targets = PreparedTargets::prepare(renderer, scene, frame_view)?;
     let device = renderer.resources().device.clone();
-    let queue = renderer.resources().queue.clone();
     let atlas_generation = if renderer.retained.enabled() {
         gpui::PlatformAtlas::generation(renderer.atlas.as_ref())
     } else {
@@ -37,7 +36,6 @@ pub(super) fn render_to_view(
         renderer.target.height(),
         renderer.target.retained_copy_enabled(),
         &device,
-        &queue,
         renderer.target.format(),
         renderer.target.configuration().alpha_mode,
         renderer.target.clear_color(),
@@ -71,7 +69,7 @@ pub(super) fn render_to_view(
                     .uniforms;
             uniforms.filter_count = uniforms.filter_count.saturating_add(1);
             if !renderer.ensure_uniform_capacity(uniforms) {
-                renderer.retained.invalidate(&queue);
+                renderer.retained.invalidate();
                 return None;
             }
         }
@@ -143,7 +141,6 @@ pub(super) fn render_to_view(
         retained.atlas_generation,
         damage_kind,
         result.is_ok(),
-        &queue,
     );
     match result {
         Ok(command_buffer) => {

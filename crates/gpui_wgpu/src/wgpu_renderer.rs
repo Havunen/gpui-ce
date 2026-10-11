@@ -193,9 +193,7 @@ impl WgpuRenderer {
         if !self.target.resize(size) {
             return;
         }
-        if let Some(resources) = &self.resources {
-            self.retained.invalidate(&resources.queue);
-        }
+        self.retained.invalidate();
         let config = self.target.configuration().clone();
         let Some(resources) = self.resources.as_mut() else {
             return;
@@ -209,18 +207,14 @@ impl WgpuRenderer {
     /// Selects the physical LCD component order used by subpixel glyph correction.
     pub fn set_subpixel_order(&mut self, order: SubpixelOrder) {
         if order != self.subpixel_order {
-            if let Some(resources) = &self.resources {
-                self.retained.invalidate(&resources.queue);
-            }
+            self.retained.invalidate();
         }
         self.subpixel_order = order;
     }
 
     /// Updates platform-specific text rasterization parameters.
     pub fn set_font_rasterization_settings(&mut self, settings: FontRasterizationSettings) {
-        if let Some(resources) = &self.resources {
-            self.retained.invalidate(&resources.queue);
-        }
+        self.retained.invalidate();
         self.rendering_params.font_rasterization = settings;
         self.subpixel_order = settings.subpixel_order;
     }
@@ -238,9 +232,7 @@ impl WgpuRenderer {
         if !self.target.set_transparent(transparent) {
             return;
         }
-        if let Some(resources) = &self.resources {
-            self.retained.invalidate(&resources.queue);
-        }
+        self.retained.invalidate();
         let config = self.target.configuration().clone();
         if let Some(resources) = self.resources.as_ref() {
             if let Some(surface) = resources.surface.as_ref() {
@@ -319,9 +311,7 @@ impl WgpuRenderer {
     }
     /// Release the experimental retained frame when a window is deactivated.
     pub fn release_retained_frame(&mut self) {
-        if let Some(resources) = &self.resources {
-            self.retained.invalidate(&resources.queue);
-        }
+        self.retained.invalidate();
     }
 
     pub fn max_texture_size(&self) -> u32 {

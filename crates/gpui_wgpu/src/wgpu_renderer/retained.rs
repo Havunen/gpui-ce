@@ -8,7 +8,6 @@ pub(super) struct RetainedFrame {
     enabled: bool,
     target: Option<Target>,
     scene: RetainedScene,
-    queue: Option<Arc<wgpu::Queue>>,
     #[cfg(test)]
     last_damage: &'static str,
 }
@@ -38,7 +37,6 @@ impl RetainedFrame {
             enabled: gpu::experiment_enabled("partial-redraw"),
             target: None,
             scene: RetainedScene::default(),
-            queue: None,
             #[cfg(test)]
             last_damage: "full",
         }
@@ -53,19 +51,18 @@ impl RetainedFrame {
     #[cfg(test)]
     pub fn disable_for_tests(&mut self) {
         self.enabled = false;
-        if let Some(queue) = self.queue.clone() {
-            self.invalidate(&queue);
-        }
+        self.invalidate();
     }
     #[cfg(test)]
     pub fn last_damage(&self) -> &'static str {
         self.last_damage
     }
-    pub fn invalidate(&mut self, queue: &wgpu::Queue) {
+    /// Forget the retained frame and free its target and budget at once: wgpu
+    /// keeps a texture alive while submitted work uses it, and an idle or closed
+    /// window would never poll a completion callback.
+    pub fn invalidate(&mut self) {
         self.scene.forget();
-        if let Some(target) = self.target.take() {
-            queue.on_submitted_work_done(move || drop(target));
-        }
+        self.target = None;
     }
     pub fn prepare(
         &mut self,
@@ -75,7 +72,6 @@ impl RetainedFrame {
         height: u32,
         copy_source: bool,
         device: &Arc<wgpu::Device>,
-        queue: &Arc<wgpu::Queue>,
         format: wgpu::TextureFormat,
         alpha_mode: wgpu::CompositeAlphaMode,
         clear_color: wgpu::Color,
@@ -104,10 +100,9 @@ impl RetainedFrame {
             || !retained_clear_supported(clear_color)
             || bytes.is_none()
         {
-            self.invalidate(queue);
+            self.invalidate();
             return full();
         }
-        self.queue = Some(queue.clone());
         if self.target.as_ref().is_some_and(|target| {
             target.width != width
                 || target.height != height
@@ -116,20 +111,20 @@ impl RetainedFrame {
                 || target.clear_color != clear_color
                 || target.copy_source != copy_source
         }) {
-            self.invalidate(queue);
+            self.invalidate();
         }
         let Some((mut damage, snapshot)) =
             self.scene
                 .plan(scene, context.scene_revision, atlas, width, height)
         else {
-            self.invalidate(queue);
+            self.invalidate();
             return full();
         };
         if self.target.is_none() {
             let Some(reservation) = bytes.and_then(|bytes| {
                 reserve_retained_bytes("wgpu", Arc::as_ptr(device) as usize, bytes)
             }) else {
-                self.invalidate(queue);
+                self.invalidate();
                 return full();
             };
             let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -184,7 +179,6 @@ impl RetainedFrame {
         atlas: u64,
         damage_kind: &'static str,
         success: bool,
-        queue: &wgpu::Queue,
     ) {
         #[cfg(test)]
         {
@@ -195,14 +189,7 @@ impl RetainedFrame {
         if success {
             self.scene.complete(snapshot, revision, atlas);
         } else {
-            self.invalidate(queue);
-        }
-    }
-}
-impl Drop for RetainedFrame {
-    fn drop(&mut self) {
-        if let Some(queue) = self.queue.clone() {
-            self.invalidate(&queue);
+            self.invalidate();
         }
     }
 }

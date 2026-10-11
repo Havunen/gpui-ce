@@ -967,6 +967,42 @@ mod path_target_tests {
         Ok(())
     }
 
+    #[test]
+    fn released_and_dropped_retained_targets_return_their_budget_at_once() -> anyhow::Result<()> {
+        use gpui_render::retained::{RETAINED_DEVICE_LIMIT, reserve_retained_bytes};
+
+        let _gpu_test_guard = crate::test_gpu::guard();
+        let context = WgpuContext::new_headless(None)?;
+        let device_key = Arc::as_ptr(&context.device) as usize;
+        let mut scene = Scene::default();
+        scene.finish();
+        let _scope = gpui::profiler::gpu::set_gpu_frame_context(true, 1);
+        let target_bytes = 64 * 64 * 4;
+        for close_window in [false, true] {
+            let mut renderer =
+                WgpuRenderer::new_headless(&context, size(DevicePixels(64), DevicePixels(64)))?;
+            renderer.retained.enable_for_tests();
+            let target = renderer.create_offscreen_target();
+            assert!(renderer.render_to_texture(&scene, &target.texture, &target.view));
+            // Other windows hold the rest of the device budget.
+            let _others =
+                reserve_retained_bytes("wgpu", device_key, RETAINED_DEVICE_LIMIT - target_bytes)
+                    .expect("the retained target fits beside the other windows");
+            assert!(reserve_retained_bytes("wgpu", device_key, 1).is_none());
+            if close_window {
+                drop(renderer);
+            } else {
+                renderer.release_retained_frame();
+            }
+            // An idle or closed window renders and polls nothing more.
+            assert!(
+                reserve_retained_bytes("wgpu", device_key, target_bytes).is_some(),
+                "close={close_window}"
+            );
+        }
+        Ok(())
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn retained_copy_full_partial_reuse_preserves_exact_rgba_and_odd_extents() -> anyhow::Result<()>
@@ -1218,8 +1254,7 @@ mod path_target_tests {
             ] {
                 full.target.clear_color = clear;
                 retained.target.clear_color = clear;
-                let queue = retained.resources().queue.clone();
-                retained.retained.invalidate(&queue);
+                retained.retained.invalidate();
                 for (index, row) in [None, Some(0), Some(1), None].into_iter().enumerate() {
                     let scene = empty_transparent_hover_scene(row);
                     let revision = index as u64 + 1;
@@ -1538,8 +1573,7 @@ mod path_target_tests {
                 overlap.finish();
                 // Recreate targets to ensure this independent order proof starts
                 // with an initial Full rather than an unrelated previous scene.
-                let queue = retained.resources().queue.clone();
-                retained.retained.invalidate(&queue);
+                retained.retained.invalidate();
                 revision += 1;
                 let original = assert_retained_rgba(
                     &mut full,

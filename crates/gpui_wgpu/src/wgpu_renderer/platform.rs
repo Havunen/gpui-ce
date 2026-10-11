@@ -298,9 +298,7 @@ impl WgpuRenderer {
     }
 
     pub fn destroy(&mut self) {
-        if let Some(resources) = self.resources.as_ref() {
-            self.retained.invalidate(&resources.queue);
-        }
+        self.retained.invalidate();
         self.resources.take();
     }
 
