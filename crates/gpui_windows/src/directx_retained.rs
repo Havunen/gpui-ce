@@ -3,7 +3,7 @@ use crate::bindings::Windows::Win32::*;
 use gpui::profiler::gpu;
 use gpui::{PlatformAtlas, Scene, WindowBackgroundAppearance};
 use gpui_render::damage::{Damage, SceneSnapshot};
-use gpui_render::retained::{GpuMemoryReservation, reserve_retained_bytes};
+use gpui_render::retained::{GpuMemoryReservation, RetainedScene, reserve_retained_bytes};
 use std::{cell::RefCell, ffi::c_void};
 use windows_core::Interface;
 
@@ -101,9 +101,7 @@ fn fence_passed(context: &ID3D11DeviceContext, fence: &ID3D11Asynchronous) -> bo
 pub(super) struct RetainedFrame {
     enabled: bool,
     target: Option<Target>,
-    snapshot: Option<SceneSnapshot>,
-    scene_revision: Option<u64>,
-    atlas_generation: u64,
+    scene: RetainedScene,
     devices: Option<(ID3D11Device, ID3D11DeviceContext)>,
     #[cfg(test)]
     last_damage: &'static str,
@@ -115,16 +113,13 @@ pub(super) struct RetainedPlan {
     pub snapshot: Option<SceneSnapshot>,
     revision: u64,
     atlas: u64,
-    reuse_snapshot: bool,
 }
 impl RetainedFrame {
     pub fn new() -> Self {
         Self {
             enabled: gpu::experiment_enabled("partial-redraw"),
             target: None,
-            snapshot: None,
-            scene_revision: None,
-            atlas_generation: 0,
+            scene: RetainedScene::default(),
             devices: None,
             #[cfg(test)]
             last_damage: "full",
@@ -147,8 +142,7 @@ impl RetainedFrame {
         self.last_damage
     }
     pub fn invalidate(&mut self) {
-        self.snapshot = None;
-        self.scene_revision = None;
+        self.scene.forget();
         if let Some(target) = self.target.take() {
             if let Some((device, context)) = &self.devices {
                 retire(target, device, context);
@@ -157,8 +151,7 @@ impl RetainedFrame {
     }
     pub fn device_lost(&mut self) {
         self.target = None;
-        self.snapshot = None;
-        self.scene_revision = None;
+        self.scene.forget();
         if let Some((device, _)) = &self.devices {
             let key = device.as_raw() as usize;
             RETIRED.with(|pending| pending.borrow_mut().retain(|item| item.device_key != key));
@@ -175,17 +168,6 @@ impl RetainedFrame {
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
     ) -> anyhow::Result<RetainedPlan> {
-        if !self.enabled {
-            return Ok(RetainedPlan {
-                rtv: None,
-                srv: None,
-                damage: Damage::Full,
-                snapshot: None,
-                revision: 0,
-                atlas: 0,
-                reuse_snapshot: false,
-            });
-        }
         let frame = gpu::gpu_frame_context();
         let generation = atlas.generation();
         let full = || RetainedPlan {
@@ -195,8 +177,10 @@ impl RetainedFrame {
             snapshot: None,
             revision: frame.scene_revision,
             atlas: generation,
-            reuse_snapshot: false,
         };
+        if !self.enabled {
+            return Ok(full());
+        }
         poll_retired();
         if !frame.active {
             self.invalidate();
@@ -208,34 +192,19 @@ impl RetainedFrame {
         }) {
             self.invalidate();
         }
-        if self.scene_revision == Some(frame.scene_revision)
-            && self.atlas_generation == generation
-            && self.snapshot.is_some()
-        {
-            if let Some(target) = &self.target {
-                return Ok(RetainedPlan {
-                    rtv: target.rtv.clone(),
-                    srv: target.srv.clone(),
-                    damage: Damage::Reuse,
-                    snapshot: None,
-                    revision: frame.scene_revision,
-                    atlas: generation,
-                    reuse_snapshot: true,
-                });
-            }
-        }
-        let snapshot = match SceneSnapshot::capture_checked(scene, generation, width, height) {
-            Ok(snapshot) => snapshot,
-            Err(_) => {
-                self.invalidate();
-                return Ok(full());
-            }
+        let Some((mut damage, snapshot)) =
+            self.scene
+                .plan(scene, frame.scene_revision, generation, width, height)
+        else {
+            self.invalidate();
+            return Ok(full());
         };
         if self.target.is_none() {
             let bytes = width as u64 * height as u64 * 4;
             let Some(reservation) =
                 reserve_retained_bytes("d3d11", device.as_raw() as usize, bytes)
             else {
+                self.invalidate();
                 return Ok(full());
             };
             let desc = D3D11_TEXTURE2D_DESC {
@@ -276,25 +245,17 @@ impl RetainedFrame {
                 appearance,
                 _reservation: reservation,
             });
+            // A new target holds nothing yet.
+            damage = Damage::Full;
         }
-        let damage = match self.snapshot.as_ref() {
-            // Exact local painter sequences handle disjoint global-rank
-            // permutations without weakening the strict fast path.
-            Some(previous) => snapshot
-                .compare_checked(previous)
-                .or_else(|_| snapshot.compare_tiled_checked(previous))
-                .unwrap_or(Damage::Full),
-            None => Damage::Full,
-        };
         let target = self.target.as_ref().unwrap();
         Ok(RetainedPlan {
             rtv: target.rtv.clone(),
             srv: target.srv.clone(),
             damage,
-            snapshot: Some(snapshot),
+            snapshot,
             revision: frame.scene_revision,
             atlas: generation,
-            reuse_snapshot: false,
         })
     }
     pub fn complete(&mut self, plan: RetainedPlan, success: bool) {
@@ -302,15 +263,12 @@ impl RetainedFrame {
         {
             self.last_damage = plan.damage.kind();
         }
-        if !success {
+        if success {
+            self.scene
+                .complete(plan.snapshot, plan.revision, plan.atlas);
+        } else {
             self.invalidate();
-            return;
         }
-        if !plan.reuse_snapshot {
-            self.snapshot = plan.snapshot;
-        }
-        self.scene_revision = Some(plan.revision);
-        self.atlas_generation = plan.atlas;
     }
 }
 impl Drop for RetainedFrame {

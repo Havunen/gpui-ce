@@ -1,4 +1,6 @@
-//! Device memory budget for retained frame targets.
+//! Retained frame state shared by the renderers, and its device memory budget.
+use crate::damage::{Damage, SceneSnapshot};
+use gpui::Scene;
 use std::{
     collections::HashMap,
     sync::{
@@ -6,6 +8,68 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
+
+/// The last frame a retained target holds, which decides how much of the next
+/// frame to repaint. The renderer owns the target itself.
+#[derive(Default)]
+pub struct RetainedScene {
+    snapshot: Option<SceneSnapshot>,
+    revision: Option<u64>,
+    atlas_generation: u64,
+}
+
+impl RetainedScene {
+    /// Forget the retained frame, so the next one repaints everything.
+    pub fn forget(&mut self) {
+        self.snapshot = None;
+        self.revision = None;
+    }
+
+    /// The damage for drawing `scene` over the retained frame, and the snapshot
+    /// to keep once it succeeds: none when the frame repeats the retained scene.
+    /// `None` when the scene can't be retained.
+    pub fn plan(
+        &self,
+        scene: &Scene,
+        revision: u64,
+        atlas_generation: u64,
+        width: u32,
+        height: u32,
+    ) -> Option<(Damage, Option<SceneSnapshot>)> {
+        if self.revision == Some(revision)
+            && self.atlas_generation == atlas_generation
+            && self.snapshot.is_some()
+        {
+            return Some((Damage::Reuse, None));
+        }
+        let snapshot =
+            SceneSnapshot::capture_checked(scene, atlas_generation, width, height).ok()?;
+        let damage = match &self.snapshot {
+            // Exact local painter sequences handle disjoint global-rank
+            // permutations without weakening the strict fast path.
+            Some(previous) => snapshot
+                .compare_checked(previous)
+                .or_else(|_| snapshot.compare_tiled_checked(previous))
+                .unwrap_or(Damage::Full),
+            None => Damage::Full,
+        };
+        Some((damage, Some(snapshot)))
+    }
+
+    /// Record a frame drawn from [`Self::plan`] as the retained one.
+    pub fn complete(
+        &mut self,
+        snapshot: Option<SceneSnapshot>,
+        revision: u64,
+        atlas_generation: u64,
+    ) {
+        if snapshot.is_some() {
+            self.snapshot = snapshot;
+        }
+        self.revision = Some(revision);
+        self.atlas_generation = atlas_generation;
+    }
+}
 
 /// Retained targets on one device share this limit: two 4K BGRA8 targets, so a
 /// second window or a resize keeps retaining.
@@ -57,6 +121,63 @@ pub fn reserve_retained_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{Bounds, ContentMask, Hsla, Quad, ScaledPixels, point, size};
+
+    fn scene(color: Hsla) -> Scene {
+        let bounds = |x, y, width, height| Bounds {
+            origin: point(ScaledPixels(x), ScaledPixels(y)),
+            size: size(ScaledPixels(width), ScaledPixels(height)),
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(Quad {
+            bounds: bounds(0.0, 10.0, 200.0, 20.0),
+            content_mask: ContentMask {
+                bounds: bounds(0.0, 0.0, 200.0, 200.0),
+                ..Default::default()
+            },
+            background: color.into(),
+            ..Default::default()
+        });
+        scene.finish();
+        scene
+    }
+
+    #[test]
+    fn repeated_revisions_reuse_and_changed_scenes_repaint_their_damage() {
+        let mut retained = RetainedScene::default();
+        let red = scene(gpui::red());
+        let (damage, snapshot) = retained.plan(&red, 1, 1, 200, 200).unwrap();
+        assert_eq!(damage, Damage::Full);
+        retained.complete(snapshot, 1, 1);
+        // The same revision reuses the target without capturing the scene again.
+        assert!(matches!(
+            retained.plan(&red, 1, 1, 200, 200),
+            Some((Damage::Reuse, None))
+        ));
+        // A new revision is compared, so only the changed quad repaints.
+        let (damage, snapshot) = retained.plan(&scene(gpui::blue()), 2, 1, 200, 200).unwrap();
+        assert!(matches!(damage, Damage::Partial(_)));
+        assert!(snapshot.is_some());
+        // An atlas change, a scene that can't be captured, or forgetting all repaint in full.
+        assert_eq!(retained.plan(&red, 1, 2, 200, 200).unwrap().0, Damage::Full);
+        assert!(retained.plan(&red, 3, 1, 0, 200).is_none());
+        retained.forget();
+        assert_eq!(retained.plan(&red, 1, 1, 200, 200).unwrap().0, Damage::Full);
+    }
+
+    #[test]
+    fn a_reused_frame_keeps_the_retained_snapshot() {
+        let mut retained = RetainedScene::default();
+        let red = scene(gpui::red());
+        let (_, snapshot) = retained.plan(&red, 1, 1, 200, 200).unwrap();
+        retained.complete(snapshot, 1, 1);
+        retained.complete(None, 1, 1);
+        // An identical scene under a new revision still matches the kept snapshot.
+        assert!(matches!(
+            retained.plan(&red, 2, 1, 200, 200),
+            Some((Damage::Reuse, Some(_)))
+        ));
+    }
 
     #[test]
     fn retained_budget_is_device_wide_and_released() {

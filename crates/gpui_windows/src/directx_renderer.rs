@@ -595,13 +595,11 @@ impl DirectXRenderer {
         self.upload_scene_buffers(scene)?;
         if let Damage::Partial(regions) = &retained.damage {
             let mut quads = scene.quads.clone();
-            let colour = rgb_to_hsla(Rgba::new(
-                clear_color[0],
-                clear_color[1],
-                clear_color[2],
-                clear_color[3],
-            ));
-            quads.extend(regions.iter().map(|region| clear_quad(*region, colour)));
+            quads.extend(
+                regions
+                    .iter()
+                    .map(|region| clear_quad(*region, clear_color)),
+            );
             let devices = self.devices.as_ref().unwrap();
             self.pipelines.quad_pipeline.update_buffer(
                 &devices.device,

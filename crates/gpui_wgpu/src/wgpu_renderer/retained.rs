@@ -1,15 +1,13 @@
 use gpui::Scene;
 use gpui::profiler::gpu;
 use gpui_render::damage::{Damage, SceneSnapshot};
-use gpui_render::retained::{GpuMemoryReservation, reserve_retained_bytes};
+use gpui_render::retained::{GpuMemoryReservation, RetainedScene, reserve_retained_bytes};
 use std::sync::Arc;
 
 pub(super) struct RetainedFrame {
     enabled: bool,
     target: Option<Target>,
-    snapshot: Option<SceneSnapshot>,
-    scene_revision: Option<u64>,
-    atlas_generation: u64,
+    scene: RetainedScene,
     queue: Option<Arc<wgpu::Queue>>,
     #[cfg(test)]
     last_damage: &'static str,
@@ -33,16 +31,13 @@ pub(super) struct RetainedPlan {
     pub snapshot: Option<SceneSnapshot>,
     pub scene_revision: u64,
     pub atlas_generation: u64,
-    pub reuse_snapshot: bool,
 }
 impl RetainedFrame {
     pub fn new() -> Self {
         Self {
             enabled: cfg!(target_os = "windows") && gpu::experiment_enabled("partial-redraw"),
             target: None,
-            snapshot: None,
-            scene_revision: None,
-            atlas_generation: 0,
+            scene: RetainedScene::default(),
             queue: None,
             #[cfg(test)]
             last_damage: "full",
@@ -67,8 +62,7 @@ impl RetainedFrame {
         self.last_damage
     }
     pub fn invalidate(&mut self, queue: &wgpu::Queue) {
-        self.snapshot = None;
-        self.scene_revision = None;
+        self.scene.forget();
         if let Some(target) = self.target.take() {
             queue.on_submitted_work_done(move || drop(target));
         }
@@ -86,17 +80,6 @@ impl RetainedFrame {
         alpha_mode: wgpu::CompositeAlphaMode,
         clear_color: wgpu::Color,
     ) -> RetainedPlan {
-        if !self.enabled {
-            return RetainedPlan {
-                view: None,
-                copy_texture: None,
-                damage: Damage::Full,
-                snapshot: None,
-                scene_revision: 0,
-                atlas_generation: 0,
-                reuse_snapshot: false,
-            };
-        }
         let context = gpu::gpu_frame_context();
         let full = || RetainedPlan {
             view: None,
@@ -105,27 +88,22 @@ impl RetainedFrame {
             snapshot: None,
             scene_revision: context.scene_revision,
             atlas_generation: atlas,
-            reuse_snapshot: false,
         };
-        if !context.active {
-            self.invalidate(queue);
+        if !self.enabled {
             return full();
         }
-        if !matches!(
-            alpha_mode,
-            wgpu::CompositeAlphaMode::Opaque | wgpu::CompositeAlphaMode::PreMultiplied
-        ) {
-            self.invalidate(queue);
-            return full();
-        }
-        // The damage-clear Quad must reproduce the raw target clear exactly.
-        // Colored translucent clears would be premultiplied again by its shader;
-        // arbitrary opaque colors also lack an exact HSL round-trip proof.
-        if !retained_clear_supported(clear_color) {
-            self.invalidate(queue);
-            return full();
-        }
-        if retained_bytes(format, width, height).is_none() {
+        let bytes = retained_bytes(format, width, height);
+        if !context.active
+            || !matches!(
+                alpha_mode,
+                wgpu::CompositeAlphaMode::Opaque | wgpu::CompositeAlphaMode::PreMultiplied
+            )
+            // The damage-clear Quad must reproduce the raw target clear exactly.
+            // Colored translucent clears would be premultiplied again by its shader;
+            // arbitrary opaque colors also lack an exact HSL round-trip proof.
+            || !retained_clear_supported(clear_color)
+            || bytes.is_none()
+        {
             self.invalidate(queue);
             return full();
         }
@@ -140,38 +118,18 @@ impl RetainedFrame {
         }) {
             self.invalidate(queue);
         }
-        // Keepalive submissions reuse the same finished scene. Avoid cloning or comparing
-        // primitives on that path; atlas changes still invalidate it independently.
-        if self.scene_revision == Some(context.scene_revision)
-            && self.atlas_generation == atlas
-            && self.snapshot.is_some()
-        {
-            if let Some(target) = &self.target {
-                return RetainedPlan {
-                    view: Some(target.view.clone()),
-                    copy_texture: copy_source.then(|| target.texture.clone()),
-                    damage: Damage::Reuse,
-                    snapshot: None,
-                    scene_revision: context.scene_revision,
-                    atlas_generation: atlas,
-                    reuse_snapshot: true,
-                };
-            }
-        }
-        let snapshot = match SceneSnapshot::capture_checked(scene, atlas, width, height) {
-            Ok(snapshot) => snapshot,
-            Err(_) => {
-                self.invalidate(queue);
-                return full();
-            }
+        let Some((mut damage, snapshot)) =
+            self.scene
+                .plan(scene, context.scene_revision, atlas, width, height)
+        else {
+            self.invalidate(queue);
+            return full();
         };
         if self.target.is_none() {
-            let Some(bytes) = retained_bytes(format, width, height) else {
-                return full();
-            };
-            let Some(reservation) =
+            let Some(reservation) = bytes.and_then(|bytes| {
                 reserve_retained_bytes("wgpu", Arc::as_ptr(device) as usize, bytes)
-            else {
+            }) else {
+                self.invalidate(queue);
                 return full();
             };
             let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -206,25 +164,17 @@ impl RetainedFrame {
                 copy_source,
                 _reservation: reservation,
             });
+            // A new target holds nothing yet.
+            damage = Damage::Full;
         }
-        let damage = match self.snapshot.as_ref() {
-            // Exact local painter sequences handle disjoint global-rank
-            // permutations without weakening the strict fast path.
-            Some(previous) => snapshot
-                .compare_checked(previous)
-                .or_else(|_| snapshot.compare_tiled_checked(previous))
-                .unwrap_or(Damage::Full),
-            None => Damage::Full,
-        };
         let target = self.target.as_ref().unwrap();
         RetainedPlan {
             view: Some(target.view.clone()),
             copy_texture: copy_source.then(|| target.texture.clone()),
             damage,
-            snapshot: Some(snapshot),
+            snapshot,
             scene_revision: context.scene_revision,
             atlas_generation: atlas,
-            reuse_snapshot: false,
         }
     }
     pub fn complete(
@@ -232,7 +182,6 @@ impl RetainedFrame {
         snapshot: Option<SceneSnapshot>,
         revision: u64,
         atlas: u64,
-        reuse_snapshot: bool,
         damage_kind: &'static str,
         success: bool,
         queue: &wgpu::Queue,
@@ -244,11 +193,7 @@ impl RetainedFrame {
         #[cfg(not(test))]
         let _ = damage_kind;
         if success {
-            if !reuse_snapshot {
-                self.snapshot = snapshot;
-            }
-            self.scene_revision = Some(revision);
-            self.atlas_generation = atlas;
+            self.scene.complete(snapshot, revision, atlas);
         } else {
             self.invalidate(queue);
         }

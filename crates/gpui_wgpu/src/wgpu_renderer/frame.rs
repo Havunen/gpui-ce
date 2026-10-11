@@ -141,7 +141,6 @@ pub(super) fn render_to_view(
         retained.snapshot,
         retained.scene_revision,
         retained.atlas_generation,
-        retained.reuse_snapshot,
         damage_kind,
         result.is_ok(),
         &queue,
@@ -796,14 +795,9 @@ impl<'a> FrameEncoder<'a> {
         );
         if let Some(region) = region {
             let clear = self.renderer.target.clear_color();
-            let colour = gpui::rgb_to_hsla(gpui::Rgba::new(
-                clear.r as f32,
-                clear.g as f32,
-                clear.b as f32,
-                clear.a as f32,
-            ));
+            let clear = [clear.r, clear.g, clear.b, clear.a].map(|channel| channel as f32);
             self.renderer.draw_damage_clear(
-                &[clear_quad(region, colour)],
+                &[clear_quad(region, clear)],
                 &mut self.instances,
                 &mut pass,
             )?;

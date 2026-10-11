@@ -2,9 +2,9 @@
 //! Exact typed comparisons avoid formatting, hashing padding, or trusting a hash collision.
 //! Local colour/quad changes and bounded disjoint painter swaps can reuse the target.
 use gpui::{
-    Bounds, ContentMask, Hsla, MonochromeSprite, Path, PathVertex, PolychromeSprite,
-    PrimitiveBatch, Quad, RenderCommand, ScaledPixels, Scene, SceneHsla, Shadow, SubpixelSprite,
-    Underline, point, size,
+    Bounds, ContentMask, MonochromeSprite, Path, PathVertex, PolychromeSprite, PrimitiveBatch,
+    Quad, RenderCommand, ScaledPixels, Scene, SceneHsla, Shadow, SubpixelSprite, Underline, point,
+    size,
 };
 use std::mem::size_of;
 
@@ -1413,15 +1413,17 @@ pub fn batch_intersects(scene: &Scene, batch: &PrimitiveBatch, region: DamageRec
     }
 }
 
-/// Make the opaque clear fill used before replaying the intersecting current painter batches.
-pub fn clear_quad(region: DamageRect, clear_color: Hsla) -> Quad {
+/// Make the fill that resets `region` to the target's raw RGBA clear colour
+/// before the intersecting painter batches replay.
+pub fn clear_quad(region: DamageRect, clear_color: [f32; 4]) -> Quad {
+    let [r, g, b, a] = clear_color;
     Quad {
         bounds: region.bounds(),
         content_mask: ContentMask {
             bounds: region.bounds(),
             ..Default::default()
         },
-        background: clear_color.into(),
+        background: gpui::rgb_to_hsla(gpui::Rgba::new(r, g, b, a)).into(),
         ..Default::default()
     }
 }
@@ -1429,6 +1431,7 @@ pub fn clear_quad(region: DamageRect, clear_color: Hsla) -> Quad {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::Hsla;
     fn bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
         Bounds {
             origin: point(ScaledPixels(x), ScaledPixels(y)),
@@ -2612,7 +2615,7 @@ mod tests {
             height: 4,
         };
         assert_eq!(
-            clear_quad(region, gpui::black()).background,
+            clear_quad(region, [0.0, 0.0, 0.0, 1.0]).background,
             gpui::black().into()
         );
     }
