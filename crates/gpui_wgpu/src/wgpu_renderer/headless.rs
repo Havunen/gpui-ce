@@ -411,6 +411,119 @@ mod path_target_tests {
         Ok(())
     }
 
+    /// Vertex clipping to the content mask must draw exactly what fragment
+    /// masking alone draws: every pixel centered inside the mask matches the
+    /// unmasked frame and every pixel centered outside it is untouched. A
+    /// center exactly on a mask edge may go either way. Fragment masking
+    /// compares an interpolated distance with zero there, and the rasterizer
+    /// drops centers on a rectangle's right and bottom edges. Mask edges land
+    /// on pixel centers whenever an odd logical coordinate is scaled by 1.5.
+    #[test]
+    fn vertex_clipping_matches_fragment_masking_on_pixel_center_edges() -> anyhow::Result<()> {
+        let _gpu_test_guard = crate::test_gpu::guard();
+        let context = WgpuContext::new_headless(None)?;
+        let mut renderer =
+            WgpuRenderer::new_headless(&context, size(DevicePixels(200), DevicePixels(100)))?;
+        renderer.retained.disable_for_tests();
+        let element = scaled(40.0, 30.0, 100.0, 40.0);
+        let radii = gpui::Corners::all(ScaledPixels(8.0));
+        let scene = |kind: usize, content_mask: Option<ContentMask<ScaledPixels>>| {
+            let mut scene = Scene::default();
+            scene.insert_primitive(Quad {
+                bounds: scaled(0.0, 0.0, 200.0, 100.0),
+                content_mask: full_mask(),
+                background: solid_background(gpui::rgb(0x18212b)),
+                ..Default::default()
+            });
+            if let Some(content_mask) = content_mask {
+                let shadow = Shadow {
+                    order: 0,
+                    blur_radius: ScaledPixels(6.0),
+                    bounds: element,
+                    corner_radii: radii,
+                    content_mask,
+                    color: gpui::hsla(0.6, 0.5, 0.1, 0.7).into(),
+                    element_bounds: element,
+                    element_corner_radii: radii,
+                    inset: Default::default(),
+                    corner_smoothing: 0.0,
+                };
+                match kind {
+                    0 => scene.insert_primitive(Quad {
+                        bounds: scaled(4.0, 3.0, 190.0, 92.0),
+                        content_mask,
+                        background: solid_background(gpui::hsla(0.33, 0.7, 0.55, 0.8)),
+                        corner_radii: radii,
+                        ..Default::default()
+                    }),
+                    1 => scene.insert_primitive(shadow),
+                    2 => scene.insert_primitive(Shadow {
+                        blur_radius: ScaledPixels(0.0),
+                        ..shadow
+                    }),
+                    // A 1px inset ring, as interaction outlines paint.
+                    3 => scene.insert_primitive(Shadow {
+                        blur_radius: ScaledPixels(0.0),
+                        bounds: scaled(41.0, 31.0, 98.0, 38.0),
+                        inset: true.into(),
+                        ..shadow
+                    }),
+                    _ => scene.insert_primitive(Shadow {
+                        blur_radius: ScaledPixels(3.0),
+                        bounds: scaled(44.0, 34.0, 92.0, 32.0),
+                        inset: true.into(),
+                        ..shadow
+                    }),
+                }
+            }
+            scene.finish();
+            scene
+        };
+        let background = renderer.render_to_image(&scene(0, None))?;
+        let mut failures = Vec::new();
+        for kind in 0..5 {
+            let full = renderer.render_to_image(&scene(kind, Some(full_mask())))?;
+            // Both frames share the shader, so check its blur reaches past the
+            // shadow's bounds, 3px left of the element here.
+            if kind == 1 {
+                assert_ne!(full.get_pixel(37, 50), background.get_pixel(37, 50));
+            }
+            for mask in [
+                scaled(10.5, 10.5, 100.0, 50.0),
+                scaled(52.5, 37.5, 30.0, 21.0),
+                scaled(36.0, 26.0, 40.5, 50.5),
+                scaled(37.25, 27.75, 60.0, 30.0),
+                scaled(250.0, 140.0, 1.0, 1.0),
+            ] {
+                let masked = renderer.render_to_image(&scene(
+                    kind,
+                    Some(ContentMask {
+                        bounds: mask,
+                        ..Default::default()
+                    }),
+                ))?;
+                let (left, top) = (mask.origin.x.0, mask.origin.y.0);
+                let (right, bottom) = (left + mask.size.width.0, top + mask.size.height.0);
+                let difference = masked.enumerate_pixels().find(|(x, y, pixel)| {
+                    let (cx, cy) = (*x as f32 + 0.5, *y as f32 + 0.5);
+                    let inside = cx >= left && cx <= right && cy >= top && cy <= bottom;
+                    let on_edge = cx == left || cx == right || cy == top || cy == bottom;
+                    let (full, background) = (full.get_pixel(*x, *y), background.get_pixel(*x, *y));
+                    match (inside, on_edge) {
+                        (true, true) => *pixel != full && *pixel != background,
+                        (true, false) => *pixel != full,
+                        (false, _) => *pixel != background,
+                    }
+                });
+                if let Some((x, y, _)) = difference {
+                    failures.push(format!("kind={kind} mask={mask:?} first pixel=({x}, {y})"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+        Ok(())
+    }
+
     fn triangle(
         x: f32,
         y: f32,
