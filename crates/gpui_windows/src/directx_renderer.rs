@@ -738,7 +738,7 @@ impl DirectXRenderer {
             .device_context
             .clone();
 
-        if retained.rtv.is_some() {
+        if let Some(rtv) = &retained.rtv {
             let clear = self.timings.begin_pass(
                 &self.devices.as_ref().unwrap().device,
                 &ctx,
@@ -746,7 +746,7 @@ impl DirectXRenderer {
             );
             unsafe {
                 if retained.damage == Damage::Full {
-                    ctx.ClearRenderTargetView(retained.rtv.as_ref().unwrap(), &clear_color);
+                    ctx.ClearRenderTargetView(rtv, &clear_color);
                 }
                 ctx.OMSetRenderTargets(Some(slice::from_ref(&retained.rtv)), None);
             }
@@ -3286,7 +3286,7 @@ mod tests {
                 },
                 background,
                 border_color: gradient,
-                border_style: if paint % 2 == 0 {
+                border_style: if paint.is_multiple_of(2) {
                     gpui::BorderStyle::Solid
                 } else {
                     gpui::BorderStyle::Dashed

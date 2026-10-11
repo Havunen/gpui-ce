@@ -281,8 +281,10 @@ impl WindowRenderer {
         }
     }
     pub(crate) fn poll_gpu_timings(&self) {
-        if let Self::Dx11(renderer) = self {
-            renderer.poll_gpu_timings();
+        match self {
+            Self::Dx11(renderer) => renderer.poll_gpu_timings(),
+            #[cfg(feature = "windows-wgpu")]
+            Self::Dx12(_) => {}
         }
     }
     pub(crate) fn new(
@@ -628,7 +630,6 @@ mod tests {
         );
         assert_eq!(
             context
-                .clone()
                 .create_with(
                     || panic!("repeated probe"),
                     || panic!("repeated DX12"),

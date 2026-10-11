@@ -177,7 +177,7 @@ impl RenderTarget {
         self.refresh_copy_usage();
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "windows"))]
     pub(super) fn enable_retained_copy_for_tests(&mut self) {
         assert!(
             self.retained_copy_supported(),
@@ -187,13 +187,13 @@ impl RenderTarget {
         self.refresh_copy_usage();
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "windows"))]
     pub(super) fn disable_retained_copy_for_tests(&mut self) {
         self.copy_requested = false;
         self.refresh_copy_usage();
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "windows"))]
     pub(super) fn set_format_for_tests(&mut self, format: wgpu::TextureFormat) {
         self.config.format = format;
         self.refresh_copy_usage();

@@ -215,6 +215,8 @@ fn windows_default_renderer_has_no_wgpu_path() {
     let root = workspace_root();
     // Inspect Cargo's feature definitions rather than rejecting the optional
     // dependency's name. This also works when the audit runs on macOS or Linux.
+    // A test may block on cargo metadata.
+    #[allow(clippy::disallowed_methods)]
     let output = Command::new(env!("CARGO"))
         .current_dir(&root)
         .args([

@@ -797,7 +797,7 @@ fn scene_diff_diagnostic(
 ) -> Option<String> {
     static EMITTED: AtomicUsize = AtomicUsize::new(0);
     EMITTED
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
             (count < 32).then_some(count + 1)
         })
         .ok()?;
@@ -1901,7 +1901,7 @@ mod tests {
             }]
         );
 
-        let mut disjoint = first.clone();
+        let mut disjoint = first;
         disjoint.quads[2].bounds.origin.x.0 = 150.0;
         let mut swapped = disjoint.clone();
         swapped.quads.swap(1, 2);
@@ -1984,7 +1984,7 @@ mod tests {
                 height: 128
             }]))
         );
-        let mut edge = first.clone();
+        let mut edge = first;
         edge.width = 501;
         edge.height = 999;
         edge.quads[0].bounds = bounds(495.0, 992.0, 20.0, 20.0);
