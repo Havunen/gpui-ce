@@ -42,15 +42,9 @@ impl RetainedScene {
         {
             return Some((Damage::Reuse, None));
         }
-        let snapshot =
-            SceneSnapshot::capture_checked(scene, atlas_generation, width, height).ok()?;
+        let snapshot = SceneSnapshot::capture(scene, atlas_generation, width, height)?;
         let damage = match &self.snapshot {
-            // Exact local painter sequences handle disjoint global-rank
-            // permutations without weakening the strict fast path.
-            Some(previous) => snapshot
-                .compare_checked(previous)
-                .or_else(|_| snapshot.compare_tiled_checked(previous))
-                .unwrap_or(Damage::Full),
+            Some(previous) => snapshot.compare(previous),
             None => Damage::Full,
         };
         Some((damage, Some(snapshot)))

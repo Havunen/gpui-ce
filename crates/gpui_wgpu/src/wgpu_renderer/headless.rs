@@ -485,7 +485,7 @@ mod path_target_tests {
         for (crop_paths, resting_fills) in
             [(false, true), (true, true), (false, false), (true, false)]
         {
-            let target = size(DevicePixels(200), DevicePixels(100));
+            let target = size(DevicePixels(200), DevicePixels(400));
             let mut full = WgpuRenderer::new_headless(&context, target)?;
             full.retained.disable_for_tests();
             let mut retained = WgpuRenderer::new_headless(&context, target)?;
@@ -716,7 +716,7 @@ mod path_target_tests {
     fn retained_transparent_clear_insert_move_erase_is_exact_rgba() -> anyhow::Result<()> {
         let _gpu_test_guard = crate::test_gpu::guard();
         let context = WgpuContext::new_headless(None)?;
-        let target = size(DevicePixels(200), DevicePixels(100));
+        let target = size(DevicePixels(200), DevicePixels(400));
         let mut full = WgpuRenderer::new_headless(&context, target)?;
         let mut retained = WgpuRenderer::new_headless(&context, target)?;
         full.retained.disable_for_tests();
@@ -1165,7 +1165,7 @@ mod path_target_tests {
     fn retained_raw_clear_endpoints_and_colored_fallback_match_full_rgba() -> anyhow::Result<()> {
         let _gpu_test_guard = crate::test_gpu::guard();
         let context = WgpuContext::new_headless(None)?;
-        let target = size(DevicePixels(200), DevicePixels(100));
+        let target = size(DevicePixels(200), DevicePixels(400));
         let mut full = WgpuRenderer::new_headless(&context, target)?;
         let mut retained = WgpuRenderer::new_headless(&context, target)?;
         full.retained.disable_for_tests();
@@ -1469,15 +1469,11 @@ mod path_target_tests {
                 let last_snapshot =
                     gpui_render::damage::SceneSnapshot::capture(&last, 1, 512, 1024).unwrap();
                 assert!(
-                    last_snapshot.compare_checked(&first_snapshot).is_err(),
-                    "fixture must exercise strict global rank rejection"
-                );
-                assert!(
                     matches!(
-                        last_snapshot.compare_tiled_checked(&first_snapshot),
-                        Ok(gpui_render::damage::Damage::Partial(_))
+                        last_snapshot.compare(&first_snapshot),
+                        gpui_render::damage::Damage::Partial(_)
                     ),
-                    "fixture must qualify by exact tile-local painter order"
+                    "rank permutations must stay partial"
                 );
                 let mut previous = None;
                 let mut revision = 0;
@@ -1743,7 +1739,7 @@ mod path_target_tests {
                 (0.5, 0.0, 1.0),
                 (0.75, 0.65, 0.45),
             ] {
-                let target = size(DevicePixels(200), DevicePixels(100));
+                let target = size(DevicePixels(200), DevicePixels(400));
                 let mut full = WgpuRenderer::new_headless(&context, target)?;
                 let mut retained = WgpuRenderer::new_headless(&context, target)?;
                 full.retained.disable_for_tests();

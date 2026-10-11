@@ -3146,7 +3146,7 @@ mod tests {
         for renderer in [&mut renderer, &mut reference] {
             renderer.resize(Size {
                 width: DevicePixels(200),
-                height: DevicePixels(100),
+                height: DevicePixels(400),
             })?;
         }
         renderer.retained.enable_for_tests();
@@ -3534,7 +3534,7 @@ mod tests {
         for renderer in [&mut renderer, &mut reference] {
             renderer.resize(Size {
                 width: DevicePixels(200),
-                height: DevicePixels(100),
+                height: DevicePixels(400),
             })?;
         }
         // Stable glyph-shaped coverage uses the production atlas and both glyph
@@ -3832,15 +3832,9 @@ mod tests {
                         );
                         let next = SceneSnapshot::capture(&scene, 1, 512, 1024).unwrap();
                         if revision == 3 {
+                            // The hover raises a row's draw order; only its tiles change.
                             let old = snapshot.as_ref().unwrap();
-                            assert!(
-                                next.compare_checked(old).is_err(),
-                                "real bounds-tree fixture must need the tile fallback"
-                            );
-                            assert!(matches!(
-                                next.compare_tiled_checked(old),
-                                Ok(Damage::Partial(_))
-                            ));
+                            assert!(matches!(next.compare(old), Damage::Partial(_)));
                         }
                         snapshot = Some(next);
                         let _scope = gpui::profiler::gpu::set_gpu_frame_context(true, revision);
@@ -3925,7 +3919,7 @@ mod tests {
         for renderer in [&mut renderer, &mut reference] {
             renderer.resize(Size {
                 width: DevicePixels(200),
-                height: DevicePixels(100),
+                height: DevicePixels(400),
             })?;
         }
         for appearance in [
@@ -3976,7 +3970,7 @@ mod tests {
         for renderer in [&mut renderer, &mut reference] {
             renderer.resize(Size {
                 width: DevicePixels(200),
-                height: DevicePixels(100),
+                height: DevicePixels(400),
             })?;
         }
         let make_tile = |renderer: &DirectXRenderer| {
@@ -4091,7 +4085,7 @@ mod tests {
         for renderer in [&mut renderer, &mut reference] {
             renderer.resize(Size {
                 width: DevicePixels(200),
-                height: DevicePixels(100),
+                height: DevicePixels(400),
             })?;
         }
         for (revision, hover) in [(1, false), (2, true), (3, false)] {
