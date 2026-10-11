@@ -767,7 +767,7 @@ mod path_target_tests {
         let context = WgpuContext::new_headless(None)?;
         let adapter = context.adapter.get_info();
         assert_eq!(adapter.backend, wgpu::Backend::Dx12);
-        let target = size(DevicePixels(201), DevicePixels(103));
+        let target = size(DevicePixels(201), DevicePixels(403));
         let mut full = WgpuRenderer::new_headless(&context, target)?;
         let mut retained = WgpuRenderer::new_headless(&context, target)?;
         full.retained.disable_for_tests();
@@ -856,7 +856,7 @@ mod path_target_tests {
             );
         }
         for renderer in [&mut full, &mut retained] {
-            renderer.update_drawable_size(size(DevicePixels(203), DevicePixels(105)));
+            renderer.update_drawable_size(size(DevicePixels(203), DevicePixels(405)));
         }
         assert_retained_rgba(
             &mut full,
@@ -924,7 +924,7 @@ mod path_target_tests {
         let adapter = fresh_context.adapter.get_info();
         assert_eq!(adapter.backend, wgpu::Backend::Dx12);
         let mut recreated =
-            WgpuRenderer::new_headless(&fresh_context, size(DevicePixels(203), DevicePixels(105)))?;
+            WgpuRenderer::new_headless(&fresh_context, size(DevicePixels(203), DevicePixels(405)))?;
         recreated.retained.enable_for_tests();
         recreated.update_transparency(true);
         assert!(
@@ -984,7 +984,7 @@ mod path_target_tests {
             wgpu::TextureFormat::Rgba8Unorm,
         ] {
             for transparent in [false, true] {
-                let target = size(DevicePixels(201), DevicePixels(103));
+                let target = size(DevicePixels(201), DevicePixels(403));
                 let mut full = WgpuRenderer::new_headless(&context, target)?;
                 let mut retained = WgpuRenderer::new_headless(&context, target)?;
                 full.retained.disable_for_tests();
@@ -1042,8 +1042,8 @@ mod path_target_tests {
                 }
                 let scene =
                     transparent_composite_hover_scene(None, 0.25, 0.65, 0.45, glyph, Some(true));
-                full.update_drawable_size(size(DevicePixels(203), DevicePixels(105)));
-                retained.update_drawable_size(size(DevicePixels(203), DevicePixels(105)));
+                full.update_drawable_size(size(DevicePixels(203), DevicePixels(405)));
+                retained.update_drawable_size(size(DevicePixels(203), DevicePixels(405)));
                 for damage in ["full", "reuse"] {
                     assert_retained_rgba(
                         &mut full,
