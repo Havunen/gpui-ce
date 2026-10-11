@@ -1,8 +1,9 @@
 //! Opt-in retained scene target. Retired allocations stay charged until a GPU fence completes.
 use crate::bindings::Windows::Win32::*;
-use gpui::profiler::gpu::{self, GpuMemoryReservation};
+use gpui::profiler::gpu;
 use gpui::{PlatformAtlas, Scene, WindowBackgroundAppearance};
 use gpui_render::damage::{Damage, SceneSnapshot};
+use gpui_render::retained::{GpuMemoryReservation, reserve_retained_bytes};
 use std::{cell::RefCell, ffi::c_void};
 use windows_core::Interface;
 
@@ -233,7 +234,7 @@ impl RetainedFrame {
         if self.target.is_none() {
             let bytes = width as u64 * height as u64 * 4;
             let Some(reservation) =
-                gpu::reserve_retained_bytes("d3d11", device.as_raw() as usize, bytes)
+                reserve_retained_bytes("d3d11", device.as_raw() as usize, bytes)
             else {
                 return Ok(full());
             };

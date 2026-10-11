@@ -1,6 +1,7 @@
 use gpui::Scene;
-use gpui::profiler::gpu::{self, GpuMemoryReservation};
+use gpui::profiler::gpu;
 use gpui_render::damage::{Damage, SceneSnapshot};
+use gpui_render::retained::{GpuMemoryReservation, reserve_retained_bytes};
 use std::sync::Arc;
 
 pub(super) struct RetainedFrame {
@@ -169,7 +170,7 @@ impl RetainedFrame {
                 return full();
             };
             let Some(reservation) =
-                gpu::reserve_retained_bytes("wgpu", Arc::as_ptr(device) as usize, bytes)
+                reserve_retained_bytes("wgpu", Arc::as_ptr(device) as usize, bytes)
             else {
                 return full();
             };
@@ -320,7 +321,7 @@ mod tests {
     fn retained_budget_rejects_hdr_unknown_formats_zero_extent_and_overflow() {
         assert_eq!(
             retained_bytes(wgpu::TextureFormat::Bgra8Unorm, 4096, 2048),
-            Some(gpu::RETAINED_DEVICE_LIMIT)
+            Some(4096 * 2048 * 4)
         );
         assert_eq!(
             retained_bytes(wgpu::TextureFormat::Rgba16Float, 4096, 2048),

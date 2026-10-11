@@ -708,10 +708,10 @@ mod path_target_tests {
             "inactive-window fallback must not prewarm"
         );
         {
-            let _budget = gpui::profiler::gpu::reserve_retained_bytes(
+            let _budget = gpui_render::retained::reserve_retained_bytes(
                 "wgpu",
                 Arc::as_ptr(&context.device) as usize,
-                gpui::profiler::gpu::RETAINED_DEVICE_LIMIT,
+                gpui_render::retained::RETAINED_DEVICE_LIMIT,
             )
             .expect("the private device has no retained textures yet");
             assert_retained_rgba(

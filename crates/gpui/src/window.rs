@@ -3459,9 +3459,8 @@ impl Window {
         let _foreground_turn = profiler::journal::foreground_turn();
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
-        let _frame_context = crate::profiler::gpu::frame_context_enabled().then(|| {
-            crate::profiler::gpu::set_gpu_frame_context(self.active.get(), self.scene_revision)
-        });
+        let _frame_context =
+            crate::profiler::gpu::set_gpu_frame_context(self.active.get(), self.scene_revision);
         self.platform_window.draw(&self.rendered_frame.scene);
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(

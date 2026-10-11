@@ -54,6 +54,7 @@ pub(crate) struct TestWindowState {
     modifiers: crate::Modifiers,
     fixed_refresh_rate: bool,
     presents: usize,
+    last_frame_context: crate::profiler::gpu::GpuFrameContext,
 }
 
 #[derive(Clone)]
@@ -123,6 +124,7 @@ impl TestWindow {
             modifiers: crate::Modifiers::default(),
             fixed_refresh_rate: false,
             presents: 0,
+            last_frame_context: Default::default(),
         })))
     }
 
@@ -135,6 +137,11 @@ impl TestWindow {
     /// re-presented.
     pub fn presents(&self) -> usize {
         self.0.lock().presents
+    }
+
+    /// The frame context the latest present handed to the renderer.
+    pub fn last_frame_context(&self) -> crate::profiler::gpu::GpuFrameContext {
+        self.0.lock().last_frame_context
     }
 
     pub fn simulate_scheduled_frame(&self) -> bool {
@@ -495,6 +502,7 @@ impl PlatformWindow for TestWindow {
         let scale_factor = self.scale_factor();
         let mut state = self.0.lock();
         state.presents += 1;
+        state.last_frame_context = crate::profiler::gpu::gpu_frame_context();
         state.frame_callback_pending = true;
         state.frame_scheduled = true;
         let device_size: Size<DevicePixels> = state.bounds.size.to_device_pixels(scale_factor);

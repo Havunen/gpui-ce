@@ -633,6 +633,28 @@ mod tests {
     }
 
     #[test]
+    fn every_present_hands_the_renderer_the_drawn_scene_revision() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window(|_, _| MoveInvalidator);
+        let platform_window = window.test_window().unwrap();
+        for x in 0..8 {
+            window.simulate_mouse_move(point(px(10. + x as f32), px(10.)));
+        }
+        window.simulate_request_frame(RequestFrameOptions::default());
+        // Published without any experiment flag in the environment.
+        let drawn = platform_window.last_frame_context().scene_revision;
+        assert!(drawn > 0);
+        // Fast input re-presents the unchanged scene, which keeps its revision.
+        let presents = platform_window.presents();
+        window.simulate_request_frame(RequestFrameOptions::default());
+        assert_eq!(platform_window.presents(), presents + 1);
+        assert_eq!(platform_window.last_frame_context().scene_revision, drawn);
+        window.simulate_mouse_move(point(px(30.), px(10.)));
+        window.simulate_request_frame(RequestFrameOptions::default());
+        assert!(platform_window.last_frame_context().scene_revision > drawn);
+    }
+
+    #[test]
     fn force_render_refreshes_cached_views() {
         let mut app = TestApp::new();
         let render_count = Rc::new(Cell::new(0));
