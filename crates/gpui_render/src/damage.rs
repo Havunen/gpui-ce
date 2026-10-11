@@ -51,7 +51,8 @@ impl DamageRect {
         !self.bounds().intersect(&bounds).is_empty()
     }
 
-    fn union(self, other: Self) -> Self {
+    /// The smallest rectangle covering both.
+    pub fn union(self, other: Self) -> Self {
         let x = self.x.min(other.x);
         let y = self.y.min(other.y);
         Self {

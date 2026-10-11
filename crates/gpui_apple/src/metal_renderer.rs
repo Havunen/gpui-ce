@@ -1,13 +1,12 @@
-use crate::damage::{Damage, DamageTracker};
 use crate::metal_atlas::MetalAtlas;
 use anyhow::Result;
 use block::ConcreteBlock;
 use core_graphics::geometry::CGSize;
 use gpui::{
-    AtlasTextureId, Bounds, ContentMask, Corners, DevicePixels, FilterRenderTarget,
-    MAX_FILTER_GROUP_DEPTH, MonochromeSprite, PaintSurface, Path, PlatformAtlas as _,
-    PolychromeSprite, PrimitiveBatch, Quad, RenderCommand, ScaledPixels, Scene, Shadow, Size,
-    SurfaceSource, Underline, hsla, size, solid_background,
+    AtlasTextureId, Bounds, Corners, DevicePixels, FilterRenderTarget, MAX_FILTER_GROUP_DEPTH,
+    MonochromeSprite, PaintSurface, Path, PlatformAtlas as _, PolychromeSprite, PrimitiveBatch,
+    Quad, RenderCommand, ScaledPixels, Scene, Shadow, Size, SurfaceSource, Underline,
+    profiler::gpu, size,
 };
 use gpui_render::{
     artifacts::{NATIVE_SHADERS, NativeShader},
@@ -15,7 +14,9 @@ use gpui_render::{
         BlurAxis, BlurKernel, BlurUniforms, GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS, ScissorRectangle,
         downsampled_dimension,
     },
+    damage::{Damage, DamageRect, clear_quad},
     path_types::{self, PathRasterizationVertex},
+    retained::RetainedScene,
     shaders::{
         common::{FontRasterizationUniforms, GlobalUniforms, ShaderBool, SurfaceColorFormat},
         surface::SurfaceUniforms,
@@ -54,7 +55,7 @@ use std::{cell::Cell, mem, ptr, sync::Arc};
 ///   an opaque interior and blended rims (needs opaque quads).
 /// - partial redraw (`no-partial-redraw`): frames render into a retained
 ///   texture that is copied to the drawable, and repaint only the region whose
-///   primitives changed since the previous frame (see [`crate::damage`]).
+///   primitives changed since the previous frame (see [`gpui_render::damage`]).
 #[derive(Clone, Copy, Debug, Default)]
 struct Experiments {
     path_prepass: bool,
@@ -307,12 +308,7 @@ enum FrameMode {
     Retained,
     /// Only this region is rendered into the retained texture, over the
     /// previous frame, which is then copied.
-    Partial {
-        x: u32,
-        y: u32,
-        width: u32,
-        height: u32,
-    },
+    Partial(DamageRect),
     /// Unchanged since the previous frame: the retained texture is copied.
     Copy,
 }
@@ -565,7 +561,7 @@ pub struct MetalRenderer {
     retained_valid: bool,
     /// The previous frame changed too much to repaint partially.
     previous_change_large: bool,
-    damage: DamageTracker,
+    retained_scene: RetainedScene,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
@@ -848,7 +844,7 @@ impl MetalRenderer {
             retained_texture: None,
             retained_valid: false,
             previous_change_large: false,
-            damage: DamageTracker::default(),
+            retained_scene: RetainedScene::default(),
             #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
             headless_render_target: None,
         }
@@ -1032,7 +1028,7 @@ impl MetalRenderer {
 
     /// Forgets the previous frame, so the next one repaints everything.
     fn forget_previous_frame(&mut self) {
-        self.damage.invalidate();
+        self.retained_scene.forget();
         self.retained_valid = false;
     }
 
@@ -1044,27 +1040,40 @@ impl MetalRenderer {
             self.forget_previous_frame();
             return FrameMode::Direct;
         }
-        let damage = self
-            .damage
-            .update(scene, viewport_size, self.sprite_atlas.generation());
         self.update_intermediate_texture_size(viewport_size);
-        let viewport_area =
-            f64::from(viewport_size.width.0.max(1)) * f64::from(viewport_size.height.0.max(1));
+        let revision = gpu::gpu_frame_context().scene_revision;
+        let atlas_generation = self.sprite_atlas.generation();
+        let (width, height) = (
+            viewport_size.width.0.max(0) as u32,
+            viewport_size.height.0.max(0) as u32,
+        );
+        let plan = self
+            .retained_scene
+            .plan(scene, revision, atlas_generation, width, height);
+        let damage = match plan {
+            Some((damage, snapshot)) => {
+                self.retained_scene
+                    .complete(snapshot, revision, atlas_generation);
+                damage
+            }
+            None => {
+                self.retained_scene.forget();
+                Damage::Full
+            }
+        };
+        let viewport_area = f64::from(width.max(1)) * f64::from(height.max(1));
         let partial = match damage {
             Damage::Full => None,
-            Damage::None => Some(FrameMode::Copy),
-            Damage::Rect {
-                x,
-                y,
-                width,
-                height,
-            } => (f64::from(width) * f64::from(height) <= viewport_area * PARTIAL_REDRAW_MAX_AREA)
-                .then_some(FrameMode::Partial {
-                    x,
-                    y,
-                    width,
-                    height,
-                }),
+            Damage::Reuse => Some(FrameMode::Copy),
+            // One scissor covers every damaged region.
+            Damage::Partial(regions) => regions
+                .into_iter()
+                .reduce(DamageRect::union)
+                .filter(|region| {
+                    f64::from(region.width) * f64::from(region.height)
+                        <= viewport_area * PARTIAL_REDRAW_MAX_AREA
+                })
+                .map(FrameMode::Partial),
         };
         let follows_large_change = mem::replace(&mut self.previous_change_large, partial.is_none());
         match partial {
@@ -1101,16 +1110,11 @@ impl MetalRenderer {
                 );
             }
             FrameMode::Retained | FrameMode::Copy => None,
-            FrameMode::Partial {
-                x,
-                y,
-                width,
-                height,
-            } => Some(ScissorRectangle {
-                x,
-                y,
-                width,
-                height,
+            FrameMode::Partial(region) => Some(ScissorRectangle {
+                x: region.x,
+                y: region.y,
+                width: region.width,
+                height: region.height,
             }),
         };
         self.update_intermediate_texture_size(viewport_size);
@@ -2294,22 +2298,15 @@ impl MetalRenderer {
         scene_uniforms: &SceneUniforms,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
-        let bounds = Bounds {
-            origin: gpui::point(ScaledPixels(region.x as f32), ScaledPixels(region.y as f32)),
-            size: size(
-                ScaledPixels(region.width as f32),
-                ScaledPixels(region.height as f32),
-            ),
-        };
-        let quad = Quad {
-            bounds,
-            content_mask: ContentMask {
-                bounds,
-                ..Default::default()
+        let quad = clear_quad(
+            DamageRect {
+                x: region.x,
+                y: region.y,
+                width: region.width,
+                height: region.height,
             },
-            background: solid_background(hsla(0., 0., 0., alpha)),
-            ..Default::default()
-        };
+            [0., 0., 0., alpha],
+        );
         align_offset(instance_offset);
         let next_offset = *instance_offset + mem::size_of::<Quad>();
         if next_offset > instance_buffer.size {
@@ -4373,9 +4370,11 @@ mod tests {
                     "Partial",
                 ),
             ];
-            for (what, frame, expected) in frames {
+            for (revision, (what, frame, expected)) in (1..).zip(frames) {
                 let scene = partial_redraw_scene(frame, tile);
                 let full = reference.render_scene_to_image(&scene, size).unwrap();
+                // Every frame is a new draw, as `Window::present` publishes it.
+                let _context = gpu::set_gpu_frame_context(true, revision);
                 let (mode, image) = render_frame(&mut renderer, &scene, size);
                 let kind = format!("{mode:?}");
                 assert!(
