@@ -3380,10 +3380,13 @@ mod tests {
         scene.push_layer(canvas);
         for row in 0..3 {
             let y = 12.0 + row as f32 * 24.0 + fraction;
+            // Glyph sprites sit on whole device pixels, as GPUI paints them: a
+            // fractional sprite samples atlas texels beyond its tile, which D3D11
+            // leaves undefined.
             scene.insert_primitive(MonochromeSprite {
                 order: 0,
                 padding: 0,
-                bounds: scaled(25.5, y + 2.0, 8.0, 8.0),
+                bounds: scaled(25.0, (y + 2.0).floor(), 8.0, 8.0),
                 content_mask: full_mask(),
                 color: hsla(0.1, 0.6, 0.7, 0.7).into(),
                 tile: glyph,
@@ -3458,8 +3461,8 @@ mod tests {
             });
             for index in 0..7 + row {
                 let bounds = scaled(
-                    100.25 + fraction + index as f32 * 8.0,
-                    bounds.origin.y.0 + 2.0,
+                    100.0 + index as f32 * 8.0,
+                    (bounds.origin.y.0 + 2.0).floor(),
                     8.0,
                     8.0,
                 );
