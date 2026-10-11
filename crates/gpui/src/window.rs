@@ -385,6 +385,29 @@ thread_local! {
 /// arrive re-entrantly while a draw is already on the stack (e.g. via nested
 /// message pumping in the Windows window procedure), instead of running a
 /// nested draw or panicking on the already-borrowed App.
+/// Diagnostics (`GPUI_TRACE_NOTIFY=1`): log every `Context::notify` with its
+/// caller, and whether it happened during a draw. A notify during a draw
+/// becomes the next frame.
+pub(crate) fn trace_notify_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("GPUI_TRACE_NOTIFY").is_some_and(|value| !value.is_empty() && value != "0")
+    })
+}
+
+pub(crate) fn trace_notify(type_name: &str, location: &std::panic::Location<'_>) {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let start = *START.get_or_init(Instant::now);
+    eprintln!(
+        "gpui-notify t={:.3} during_draw={} {} at {}:{}",
+        start.elapsed().as_secs_f64() * 1000.0,
+        draw_in_progress(),
+        type_name.rsplit("::").next().unwrap_or(type_name),
+        location.file(),
+        location.line(),
+    );
+}
+
 fn draw_in_progress() -> bool {
     CURRENT_ELEMENT_ARENA.with(|current| current.get().is_some())
 }
