@@ -1,10 +1,11 @@
 //! Conservative retained-scene comparison for the opt-in partial-redraw experiment.
 //! Exact typed comparisons avoid formatting, hashing padding, or trusting a hash collision.
 //! Local colour/quad changes and bounded disjoint painter swaps can reuse the target.
+use crate::blur::GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS;
 use gpui::{
     Bounds, ContentMask, MonochromeSprite, Path, PathVertex, PolychromeSprite, PrimitiveBatch,
-    Quad, RenderCommand, ScaledPixels, Scene, SceneHsla, Shadow, SubpixelSprite, Underline, point,
-    size,
+    Quad, RenderCommand, ScaledPixels, Scene, SceneHsla, Shadow, SubpixelSprite,
+    TransformationMatrix, Underline, point, size,
 };
 use std::mem::size_of;
 
@@ -97,8 +98,6 @@ pub enum SceneSnapshotUnsupportedReason {
     BackdropFilter,
     /// An element filter introduces an unsupported render-target boundary.
     FilterBoundary,
-    /// A glyph transform requires a separate conservative coverage proof.
-    TransformedGlyph,
     /// Geometry is nonfinite or has an invalid negative extent.
     NonfiniteGeometry,
     /// Exact primitive copies would exceed the bounded snapshot budget.
@@ -113,7 +112,6 @@ impl SceneSnapshotUnsupportedReason {
             Self::Surface => "surface",
             Self::BackdropFilter => "backdrop-filter",
             Self::FilterBoundary => "filter-boundary",
-            Self::TransformedGlyph => "transformed-glyph",
             Self::NonfiniteGeometry => "nonfinite-geometry",
             Self::SnapshotBudget => "snapshot-budget",
         }
@@ -332,8 +330,12 @@ impl PaintedPrimitive<'_> {
         match self {
             Self::Quad(p, _) => p.bounds.intersect(&p.content_mask.bounds),
             Self::Path(p, ..) => p.clipped_bounds(),
-            Self::Monochrome(p, _) => p.bounds.intersect(&p.content_mask.bounds),
-            Self::Subpixel(p, _) => p.bounds.intersect(&p.content_mask.bounds),
+            Self::Monochrome(p, _) => {
+                transformed(p.bounds, &p.transformation).intersect(&p.content_mask.bounds)
+            }
+            Self::Subpixel(p, _) => {
+                transformed(p.bounds, &p.transformation).intersect(&p.content_mask.bounds)
+            }
             // These primitives never qualify for colour damage or structural edits.
             _ => Bounds::default(),
         }
@@ -367,16 +369,15 @@ impl PaintedPrimitive<'_> {
         let (bounds, mask) = match self {
             Self::Quad(p, _) => (p.bounds, p.content_mask.bounds),
             Self::Path(p, ..) => (p.bounds, p.content_mask.bounds),
-            Self::Monochrome(p, _) => (p.bounds, p.content_mask.bounds),
-            Self::Subpixel(p, _) => (p.bounds, p.content_mask.bounds),
-            Self::Shadow(p, _) => (
-                if p.inset.is_enabled() {
-                    p.element_bounds
-                } else {
-                    p.bounds.dilate(ScaledPixels(p.blur_radius.0 * 4.0))
-                },
+            Self::Monochrome(p, _) => (
+                transformed(p.bounds, &p.transformation),
                 p.content_mask.bounds,
             ),
+            Self::Subpixel(p, _) => (
+                transformed(p.bounds, &p.transformation),
+                p.content_mask.bounds,
+            ),
+            Self::Shadow(p, _) => (shadow_geometry(p), p.content_mask.bounds),
             Self::Underline(p) => (
                 p.bounds.dilate(ScaledPixels(p.thickness.0 * 4.0)),
                 p.content_mask.bounds,
@@ -548,7 +549,7 @@ fn tile_regions(
 }
 
 // Glyph badges can introduce a whole run, rather than a single primitive. Only
-// identity-transformed, finite glyphs survive capture, and an exact following
+// finite glyphs survive capture, and an exact following
 // anchor preserves the unchanged painter sequence. Keep old/new runs separate:
 // a union spanning distant rows could merge both full-width row fills into one
 // unnecessarily large damage rectangle.
@@ -830,10 +831,13 @@ impl SceneSnapshot {
                     .map(|p| (p.bounds, p.content_mask.bounds, p.transformation)),
             )
         {
-            if transformation != Default::default() {
-                return Err(Unsupported::TransformedGlyph);
-            }
-            if !visible(bounds, mask) {
+            // f32::min and max skip NaN, so check what transformed() can't.
+            let matrix = transformation.rotation_scale.iter().flatten();
+            if !visible(bounds, mask)
+                || !matrix
+                    .chain(&transformation.translation)
+                    .all(|value| value.is_finite())
+            {
                 return Err(Unsupported::NonfiniteGeometry);
             }
         }
@@ -945,28 +949,6 @@ impl SceneSnapshot {
                 next.geometry_matches(old)
             })
         };
-        // Path coverage depends on rasterization groups, not only on its individual
-        // triangles. Preserve exact group membership/counts and geometry in path
-        // order; local sequence comparison still detects relative non-path order.
-        let next_paths: Vec<_> = next
-            .iter()
-            .copied()
-            .filter(|p| matches!(p, PaintedPrimitive::Path(..)))
-            .collect();
-        let old_paths: Vec<_> = old
-            .iter()
-            .copied()
-            .filter(|p| matches!(p, PaintedPrimitive::Path(..)))
-            .collect();
-        if next_paths.len() != old_paths.len() {
-            return Err("tile-path-count-change");
-        }
-        for (next, old) in next_paths.into_iter().zip(old_paths) {
-            if !compare(next, old, false)? {
-                return Err("tile-path-geometry-or-group-change");
-            }
-        }
-
         let mut indexed_old: Vec<_> = old
             .iter()
             .enumerate()
@@ -979,23 +961,22 @@ impl SceneSnapshot {
         let mut quad_edits = 0;
         let mut glyph_edits = 0;
         let mut unmatched = |primitive: PaintedPrimitive<'_>| -> Result<(), &'static str> {
+            // An edited primitive gets a fresh ID, so every tile covering its old
+            // or new extent repaints. A path's tiles also replay the rest of its
+            // rasterization group.
             match primitive {
-                PaintedPrimitive::Quad(..) => {
-                    quad_edits += 1;
-                    if quad_edits > MAX_QUAD_EDITS {
-                        return Err("tile-quad-edit-budget");
-                    }
-                }
                 PaintedPrimitive::Monochrome(..) | PaintedPrimitive::Subpixel(..) => {
                     glyph_edits += 1;
                     if glyph_edits > MAX_GLYPH_EDITS {
                         return Err("tile-glyph-edit-budget");
                     }
                 }
-                // Geometry/group equality was proven above. Different path paint
-                // colors receive distinct IDs and dirty every covered tile.
-                PaintedPrimitive::Path(..) => {}
-                _ => return Err("tile-static-descriptor-change"),
+                _ => {
+                    quad_edits += 1;
+                    if quad_edits > MAX_QUAD_EDITS {
+                        return Err("tile-quad-edit-budget");
+                    }
+                }
             }
             Ok(())
         };
@@ -1370,6 +1351,46 @@ impl SceneSnapshot {
     }
 }
 
+/// What a shadow rasterizes, as the shader's `shadow_geometry`: the element for
+/// an inset shadow, otherwise its bounds grown by the blur's cutoff.
+fn shadow_geometry(shadow: &Shadow) -> Bounds<ScaledPixels> {
+    if shadow.inset.is_enabled() {
+        shadow.element_bounds
+    } else {
+        shadow.bounds.dilate(ScaledPixels(
+            GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS * shadow.blur_radius.0,
+        ))
+    }
+}
+
+/// The region a sprite covers after its transformation, which the shader
+/// applies as `rotation_scale * position + translation`.
+fn transformed(
+    bounds: Bounds<ScaledPixels>,
+    matrix: &TransformationMatrix,
+) -> Bounds<ScaledPixels> {
+    if *matrix == TransformationMatrix::unit() {
+        return bounds;
+    }
+    let [[a, b], [c, d]] = matrix.rotation_scale;
+    let [tx, ty] = matrix.translation;
+    let (x0, y0) = (bounds.origin.x.0, bounds.origin.y.0);
+    let (x1, y1) = (x0 + bounds.size.width.0, y0 + bounds.size.height.0);
+    let (mut min_x, mut min_y) = (f32::INFINITY, f32::INFINITY);
+    let (mut max_x, mut max_y) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for (x, y) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)] {
+        let (x, y) = (a * x + b * y + tx, c * x + d * y + ty);
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
+    Bounds::from_corners(
+        point(ScaledPixels(min_x), ScaledPixels(min_y)),
+        point(ScaledPixels(max_x), ScaledPixels(max_y)),
+    )
+}
+
 /// Whether a current painter batch can affect a damage rectangle.
 pub fn batch_intersects(scene: &Scene, batch: &PrimitiveBatch, region: DamageRect) -> bool {
     let visible = |bounds: Bounds<ScaledPixels>, mask: Bounds<ScaledPixels>| {
@@ -1379,18 +1400,9 @@ pub fn batch_intersects(scene: &Scene, batch: &PrimitiveBatch, region: DamageRec
         PrimitiveBatch::Quads { range, .. } => scene.quads[range.clone()]
             .iter()
             .any(|p| visible(p.bounds, p.content_mask.bounds)),
-        PrimitiveBatch::Shadows { range, .. } => scene.shadows[range.clone()].iter().any(|p| {
-            visible(
-                if p.inset.is_enabled() {
-                    // Inset shadows rasterize the full element, not the
-                    // shifted/shrunk hole stored in bounds (see shadow_geometry).
-                    p.element_bounds
-                } else {
-                    p.bounds.dilate(ScaledPixels(p.blur_radius.0 * 4.0))
-                },
-                p.content_mask.bounds,
-            )
-        }),
+        PrimitiveBatch::Shadows { range, .. } => scene.shadows[range.clone()]
+            .iter()
+            .any(|p| visible(shadow_geometry(p), p.content_mask.bounds)),
         PrimitiveBatch::Paths { range, .. } => scene.paths[range.clone()]
             .iter()
             .any(|p| region.intersects(p.clipped_bounds().dilate(ScaledPixels(1.0)))),
@@ -1400,12 +1412,22 @@ pub fn batch_intersects(scene: &Scene, batch: &PrimitiveBatch, region: DamageRec
                 p.content_mask.bounds,
             )
         }),
-        PrimitiveBatch::MonochromeSprites { range, .. } => scene.monochrome_sprites[range.clone()]
-            .iter()
-            .any(|p| visible(p.bounds, p.content_mask.bounds)),
-        PrimitiveBatch::SubpixelSprites { range, .. } => scene.subpixel_sprites[range.clone()]
-            .iter()
-            .any(|p| visible(p.bounds, p.content_mask.bounds)),
+        PrimitiveBatch::MonochromeSprites { range, .. } => {
+            scene.monochrome_sprites[range.clone()].iter().any(|p| {
+                visible(
+                    transformed(p.bounds, &p.transformation),
+                    p.content_mask.bounds,
+                )
+            })
+        }
+        PrimitiveBatch::SubpixelSprites { range, .. } => {
+            scene.subpixel_sprites[range.clone()].iter().any(|p| {
+                visible(
+                    transformed(p.bounds, &p.transformation),
+                    p.content_mask.bounds,
+                )
+            })
+        }
         PrimitiveBatch::PolychromeSprites { range, .. } => scene.polychrome_sprites[range.clone()]
             .iter()
             .any(|p| visible(p.bounds, p.content_mask.bounds)),
@@ -1677,6 +1699,103 @@ mod tests {
         SceneSnapshot::capture(scene, 1, 512, 1024).unwrap()
     }
 
+    fn full_mask() -> ContentMask<ScaledPixels> {
+        ContentMask {
+            bounds: bounds(0.0, 0.0, 512.0, 1024.0),
+            ..Default::default()
+        }
+    }
+
+    fn blurred_shadow(x: f32) -> Shadow {
+        Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(4.0),
+            bounds: bounds(x, 100.0, 20.0, 20.0),
+            corner_radii: Default::default(),
+            content_mask: full_mask(),
+            color: gpui::black().into(),
+            element_bounds: bounds(x, 100.0, 20.0, 20.0),
+            element_corner_radii: Default::default(),
+            inset: Default::default(),
+            corner_smoothing: 0.0,
+        }
+    }
+
+    #[test]
+    fn blurred_shadows_damage_the_shader_blur_extent() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(blurred_shadow(100.0));
+        scene.finish();
+        let batch = scene
+            .render_commands()
+            .iter()
+            .find_map(|command| match command {
+                RenderCommand::Batch(batch @ PrimitiveBatch::Shadows { .. }) => Some(batch.clone()),
+                _ => None,
+            })
+            .unwrap();
+        let column = |x| DamageRect {
+            x,
+            y: 100,
+            width: 1,
+            height: 1,
+        };
+        // The shader draws 3 standard deviations, 12px here, plus the 1px fringe.
+        assert!(batch_intersects(&scene, &batch, column(87)));
+        assert!(!batch_intersects(&scene, &batch, column(85)));
+    }
+
+    #[test]
+    fn transformed_sprites_cover_their_rotated_bounds() {
+        let matrix = TransformationMatrix::unit()
+            .translate(point(ScaledPixels(110.0), ScaledPixels(105.0)))
+            .rotate(gpui::radians(std::f32::consts::FRAC_PI_2))
+            .translate(point(ScaledPixels(-110.0), ScaledPixels(-105.0)));
+        let covered = transformed(bounds(100.0, 100.0, 20.0, 10.0), &matrix);
+        let close = |a: ScaledPixels, b: f32| (a.0 - b).abs() < 1e-3;
+        assert!(close(covered.origin.x, 105.0) && close(covered.origin.y, 95.0));
+        assert!(close(covered.size.width, 10.0) && close(covered.size.height, 20.0));
+    }
+
+    #[test]
+    fn moved_shadows_and_paths_repaint_only_their_tiles() {
+        let path = |x: f32| {
+            let mut path = Path::new(point(gpui::px(x), gpui::px(600.0)));
+            path.line_to(point(gpui::px(x + 20.0), gpui::px(600.0)));
+            path.line_to(point(gpui::px(x), gpui::px(620.0)));
+            let mut path = path.scale(1.0);
+            path.content_mask = full_mask();
+            path.color = gpui::white().into();
+            path
+        };
+        let scene = |x: f32| {
+            let mut scene = Scene::default();
+            scene.insert_primitive(Quad {
+                bounds: bounds(0.0, 0.0, 512.0, 1024.0),
+                content_mask: full_mask(),
+                background: gpui::blue().into(),
+                ..Default::default()
+            });
+            scene.insert_primitive(blurred_shadow(x));
+            scene.insert_primitive(path(x));
+            scene.finish();
+            tiled_snapshot(&scene)
+        };
+        let first = scene(100.0);
+        let Ok(Damage::Partial(regions)) = scene(300.0).compare_tiled_checked(&first) else {
+            panic!("moving a blurred shadow and a path repaints only their tiles");
+        };
+        let covers = |x: u32, y: u32| {
+            regions
+                .iter()
+                .any(|r| r.x <= x && x < r.x + r.width && r.y <= y && y < r.y + r.height)
+        };
+        // Old and new blur extents, and old and new paths.
+        assert!(covers(90, 110) && covers(130, 110) && covers(290, 110) && covers(330, 110));
+        assert!(covers(105, 605) && covers(305, 605));
+        assert!(!covers(500, 1000));
+    }
+
     #[test]
     fn tiled_normal_bounds_tree_rows_preserve_local_painter_order_and_sparse_damage() {
         let mut strict_rejection_observed = false;
@@ -1769,7 +1888,7 @@ mod tests {
     }
 
     #[test]
-    fn tiled_path_color_tokens_and_raster_group_guards_are_exact() {
+    fn tiled_path_paint_group_and_vertex_changes_repaint_the_path() {
         let mut scene = Scene::default();
         let mut path = Path::new(point(gpui::px(8.25), gpui::px(8.25)));
         path.line_to(point(gpui::px(28.25), gpui::px(8.25)));
@@ -1799,16 +1918,20 @@ mod tests {
             panic!("path fixture")
         };
         *sprite_count += 1;
-        assert_eq!(
-            changed.compare_tiled_checked(&first),
-            Err("tile-path-geometry-or-group-change")
+        let Ok(Damage::Partial(regions)) = changed.compare_tiled_checked(&first) else {
+            panic!("a changed rasterization group repaints the path's tiles");
+        };
+        assert!(
+            regions
+                .iter()
+                .any(|region| region.intersects(first.paths[0].bounds))
         );
         let mut changed = first.clone();
         changed.paths[0].vertices[0].xy_position.x.0 += 0.25;
-        assert_eq!(
+        assert!(matches!(
             changed.compare_tiled_checked(&first),
-            Err("tile-path-geometry-or-group-change")
-        );
+            Ok(Damage::Partial(_))
+        ));
     }
 
     #[test]
@@ -2583,8 +2706,8 @@ mod tests {
                 .translate(point(ScaledPixels(1.0), ScaledPixels(0.0))),
         });
         glyphs.finish();
-        check(&glyphs, Unsupported::TransformedGlyph);
-        glyphs.monochrome_sprites[0].transformation = Default::default();
+        // A transformed glyph is captured, covering its transformed bounds.
+        assert!(SceneSnapshot::capture(&glyphs, 1, 200, 200).is_some());
         glyphs.monochrome_sprites[0].bounds.size.width.0 = f32::NAN;
         check(&glyphs, Unsupported::NonfiniteGeometry);
         for (reason, name) in [
@@ -2592,7 +2715,6 @@ mod tests {
             (Unsupported::Surface, "surface"),
             (Unsupported::BackdropFilter, "backdrop-filter"),
             (Unsupported::FilterBoundary, "filter-boundary"),
-            (Unsupported::TransformedGlyph, "transformed-glyph"),
             (Unsupported::NonfiniteGeometry, "nonfinite-geometry"),
             (Unsupported::SnapshotBudget, "snapshot-budget"),
         ] {

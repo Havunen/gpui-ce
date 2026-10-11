@@ -563,6 +563,98 @@ mod path_target_tests {
         Ok(())
     }
 
+    #[test]
+    fn retained_moves_shadows_rings_paths_and_rotated_sprites_exactly() -> anyhow::Result<()> {
+        let _gpu_test_guard = crate::test_gpu::guard();
+        let context = WgpuContext::new_headless(None)?;
+        let target = size(DevicePixels(512), DevicePixels(512));
+        let mut full = WgpuRenderer::new_headless(&context, target)?;
+        let mut retained = WgpuRenderer::new_headless(&context, target)?;
+        full.retained.disable_for_tests();
+        retained.retained.enable_for_tests();
+        let glyph = retained_glyph_tile(&full)?;
+        assert_eq!(glyph, retained_glyph_tile(&retained)?);
+        let mask = ContentMask {
+            bounds: scaled(0.0, 0.0, 512.0, 512.0),
+            ..Default::default()
+        };
+        // Each step moves a blurred shadow, an inset ring and a path by a
+        // fractional offset and rotates a sprite, as floating surfaces, focus
+        // rings, graph edges and spinners do.
+        let scene = |step: usize| {
+            let offset = step as f32 * 3.25;
+            let mut scene = Scene::default();
+            scene.insert_primitive(Quad {
+                bounds: scaled(0.0, 0.0, 512.0, 512.0),
+                content_mask: mask,
+                background: solid_background(gpui::rgb(0x18212b)),
+                ..Default::default()
+            });
+            let card = scaled(100.25 + offset, 100.5, 30.0, 20.0);
+            scene.insert_primitive(Shadow {
+                order: 0,
+                blur_radius: ScaledPixels(4.5),
+                bounds: card,
+                corner_radii: gpui::Corners::all(ScaledPixels(4.0)),
+                content_mask: mask,
+                color: solid_background(gpui::hsla(0.0, 0.0, 0.0, 0.6)),
+                element_bounds: card,
+                element_corner_radii: gpui::Corners::all(ScaledPixels(4.0)),
+                inset: gpui::ShaderBool::Disabled,
+                corner_smoothing: 0.0,
+            });
+            let ring = scaled(100.5, 300.25 + offset, 40.0, 16.0);
+            scene.insert_primitive(Shadow {
+                order: 0,
+                blur_radius: ScaledPixels(0.0),
+                bounds: scaled(101.5, 301.25 + offset, 38.0, 14.0),
+                corner_radii: gpui::Corners::all(ScaledPixels(3.0)),
+                content_mask: mask,
+                color: solid_background(gpui::hsla(0.6, 0.8, 0.6, 1.0)),
+                element_bounds: ring,
+                element_corner_radii: gpui::Corners::all(ScaledPixels(4.0)),
+                inset: gpui::ShaderBool::Enabled,
+                corner_smoothing: 0.0,
+            });
+            let mut path = gpui::Path::new(point(px(300.25 + offset), px(100.5)));
+            path.line_to(point(px(320.5 + offset), px(110.25)));
+            path.line_to(point(px(305.75 + offset), px(125.5)));
+            let mut path = path.scale(1.0);
+            path.content_mask = mask;
+            for vertex in &mut path.vertices {
+                vertex.content_mask = mask;
+            }
+            path.color = solid_background(gpui::hsla(0.3, 0.7, 0.6, 0.8));
+            scene.insert_primitive(path);
+            let center = point(ScaledPixels(304.0), ScaledPixels(304.0));
+            scene.insert_primitive(MonochromeSprite {
+                order: 0,
+                padding: 0,
+                bounds: scaled(300.0, 300.0, 8.0, 8.0),
+                content_mask: mask,
+                color: gpui::hsla(0.1, 0.6, 0.7, 1.0).into(),
+                tile: glyph,
+                transformation: gpui::TransformationMatrix::unit()
+                    .translate(center)
+                    .rotate(gpui::radians(step as f32 * 0.7))
+                    .translate(point(ScaledPixels(-304.0), ScaledPixels(-304.0))),
+            });
+            scene.finish();
+            scene
+        };
+        for step in 0..4 {
+            assert_retained_rgba(
+                &mut full,
+                &mut retained,
+                &scene(step),
+                step as u64 + 1,
+                if step == 0 { "full" } else { "partial" },
+                &format!("step {step}"),
+            )?;
+        }
+        Ok(())
+    }
+
     fn assert_retained_rgba(
         full: &mut WgpuRenderer,
         retained: &mut WgpuRenderer,
