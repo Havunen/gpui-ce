@@ -2099,4 +2099,347 @@ mod path_target_tests {
             }
         }
     }
+
+    /// A seeded xorshift generator, so every fuzz failure reproduces from its seed.
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Self(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1)
+        }
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, count: usize) -> usize {
+            (self.next() % count as u64) as usize
+        }
+        fn unit(&mut self) -> f32 {
+            (self.next() >> 40) as f32 / (1u64 << 24) as f32
+        }
+        fn chance(&mut self, probability: f32) -> bool {
+            self.unit() < probability
+        }
+        /// A quarter-pixel coordinate in `0..max`, as fractional scale factors produce.
+        fn coord(&mut self, max: f32) -> f32 {
+            (self.unit() * max * 4.0).floor() / 4.0
+        }
+        /// A position, often within two pixels of a 64 px damage tile edge.
+        fn position(&mut self, max: f32) -> f32 {
+            if self.chance(0.35) {
+                64.0 * self.below((max / 64.0) as usize + 1) as f32 + self.coord(4.0) - 2.0
+            } else {
+                self.coord(max + 32.0) - 16.0
+            }
+        }
+        fn color(&mut self) -> gpui::Hsla {
+            let alpha = if self.chance(0.5) {
+                1.0
+            } else {
+                0.15 + 0.8 * self.unit()
+            };
+            gpui::hsla(
+                self.unit(),
+                0.2 + 0.7 * self.unit(),
+                0.15 + 0.7 * self.unit(),
+                alpha,
+            )
+        }
+    }
+
+    const FUZZ_WIDTH: f32 = 384.0;
+    const FUZZ_HEIGHT: f32 = 256.0;
+
+    enum FuzzShape {
+        Quad(Quad),
+        Shadow(Shadow),
+        Underline(gpui::Underline),
+        Glyph(MonochromeSprite),
+        Path {
+            points: [(f32, f32); 3],
+            color: gpui::Background,
+            mask: ContentMask<ScaledPixels>,
+        },
+    }
+
+    impl FuzzShape {
+        fn random(rng: &mut Rng, glyph: AtlasTile) -> Self {
+            let (x, y) = (rng.position(FUZZ_WIDTH), rng.position(FUZZ_HEIGHT));
+            let bounds = scaled(x, y, 1.0 + rng.coord(96.0), 1.0 + rng.coord(64.0));
+            let mask = Self::random_mask(rng);
+            match rng.below(6) {
+                0 | 1 => Self::Quad(Quad {
+                    bounds,
+                    content_mask: mask,
+                    background: solid_background(rng.color()),
+                    border_color: solid_background(rng.color()),
+                    border_widths: if rng.chance(0.3) {
+                        gpui::Edges::all(ScaledPixels(1.0 + rng.coord(3.0)))
+                    } else {
+                        Default::default()
+                    },
+                    border_style: if rng.chance(0.15) {
+                        gpui::BorderStyle::Dashed
+                    } else {
+                        gpui::BorderStyle::Solid
+                    },
+                    corner_radii: if rng.chance(0.4) {
+                        gpui::Corners::all(ScaledPixels(rng.coord(10.0)))
+                    } else {
+                        Default::default()
+                    },
+                    corner_smoothing: if rng.chance(0.2) { 0.6 } else { 0.0 },
+                    ..Default::default()
+                }),
+                2 => {
+                    let inset = rng.chance(0.3);
+                    Self::Shadow(Shadow {
+                        order: 0,
+                        blur_radius: ScaledPixels(rng.coord(12.0)),
+                        bounds,
+                        corner_radii: gpui::Corners::all(ScaledPixels(rng.coord(6.0))),
+                        content_mask: mask,
+                        color: solid_background(rng.color()),
+                        element_bounds: if inset {
+                            bounds.dilate(ScaledPixels(2.0))
+                        } else {
+                            bounds
+                        },
+                        element_corner_radii: gpui::Corners::all(ScaledPixels(rng.coord(6.0))),
+                        inset: inset.into(),
+                        corner_smoothing: 0.0,
+                    })
+                }
+                3 => {
+                    let thickness = 1.0 + rng.coord(2.0);
+                    Self::Underline(gpui::Underline {
+                        order: 0,
+                        padding: 0,
+                        bounds: scaled(x, y, bounds.size.width.0, thickness * 3.0),
+                        content_mask: mask,
+                        color: rng.color().into(),
+                        thickness: ScaledPixels(thickness),
+                        wavy: rng.chance(0.5).into(),
+                    })
+                }
+                4 => {
+                    let side = 8.0 + rng.coord(16.0);
+                    let half = side / 2.0;
+                    let center = point(ScaledPixels(x + half), ScaledPixels(y + half));
+                    Self::Glyph(MonochromeSprite {
+                        order: 0,
+                        padding: 0,
+                        bounds: scaled(x, y, side, side),
+                        content_mask: mask,
+                        color: rng.color().into(),
+                        tile: glyph,
+                        transformation: if rng.chance(0.5) {
+                            gpui::TransformationMatrix::unit()
+                                .translate(center)
+                                .rotate(gpui::radians(rng.unit() * std::f32::consts::TAU))
+                                .translate(point(ScaledPixels(-x - half), ScaledPixels(-y - half)))
+                        } else {
+                            gpui::TransformationMatrix::unit()
+                        },
+                    })
+                }
+                _ => {
+                    let mut point_in = || (x + rng.coord(64.0), y + rng.coord(48.0));
+                    Self::Path {
+                        points: [point_in(), point_in(), point_in()],
+                        color: solid_background(rng.color()),
+                        mask,
+                    }
+                }
+            }
+        }
+
+        fn random_mask(rng: &mut Rng) -> ContentMask<ScaledPixels> {
+            if rng.chance(0.6) {
+                return ContentMask {
+                    bounds: scaled(0.0, 0.0, FUZZ_WIDTH, FUZZ_HEIGHT),
+                    ..Default::default()
+                };
+            }
+            ContentMask {
+                bounds: scaled(
+                    rng.coord(FUZZ_WIDTH),
+                    rng.coord(FUZZ_HEIGHT),
+                    1.0 + rng.coord(160.0),
+                    1.0 + rng.coord(120.0),
+                ),
+                fade_out: if rng.chance(0.3) {
+                    gpui::Edges::all(ScaledPixels(rng.coord(4.0)))
+                } else {
+                    Default::default()
+                },
+            }
+        }
+
+        fn edit(&mut self, rng: &mut Rng) {
+            let (dx, dy) = (rng.coord(24.0) - 12.0, rng.coord(24.0) - 12.0);
+            let offset = point(ScaledPixels(dx), ScaledPixels(dy));
+            let recolor = rng.chance(0.5);
+            match self {
+                Self::Quad(quad) if recolor => quad.background = solid_background(rng.color()),
+                Self::Quad(quad) => quad.bounds.origin = quad.bounds.origin + offset,
+                Self::Shadow(shadow) if recolor => {
+                    shadow.blur_radius = ScaledPixels(rng.coord(12.0))
+                }
+                Self::Shadow(shadow) => {
+                    shadow.bounds.origin = shadow.bounds.origin + offset;
+                    shadow.element_bounds.origin = shadow.element_bounds.origin + offset;
+                }
+                Self::Underline(underline) if recolor => underline.color = rng.color().into(),
+                Self::Underline(underline) => {
+                    underline.bounds.origin = underline.bounds.origin + offset
+                }
+                Self::Glyph(glyph) if recolor => glyph.color = rng.color().into(),
+                Self::Glyph(glyph) => {
+                    glyph.bounds.origin = glyph.bounds.origin + offset;
+                    glyph.transformation = glyph.transformation.translate(offset);
+                }
+                Self::Path { color, .. } if recolor => *color = solid_background(rng.color()),
+                Self::Path { points, .. } => {
+                    for point in points {
+                        *point = (point.0 + dx, point.1 + dy);
+                    }
+                }
+            }
+        }
+
+        fn insert_into(&self, scene: &mut Scene) {
+            match self {
+                Self::Quad(quad) => scene.insert_primitive(*quad),
+                Self::Shadow(shadow) => scene.insert_primitive(*shadow),
+                Self::Underline(underline) => scene.insert_primitive(*underline),
+                Self::Glyph(glyph) => scene.insert_primitive(*glyph),
+                Self::Path {
+                    points,
+                    color,
+                    mask,
+                } => {
+                    let mut path = gpui::Path::new(point(px(points[0].0), px(points[0].1)));
+                    path.line_to(point(px(points[1].0), px(points[1].1)));
+                    path.line_to(point(px(points[2].0), px(points[2].1)));
+                    let mut path = path.scale(1.0);
+                    path.content_mask = *mask;
+                    for vertex in &mut path.vertices {
+                        vertex.content_mask = *mask;
+                    }
+                    path.color = *color;
+                    scene.insert_primitive(path);
+                }
+            }
+        }
+    }
+
+    /// Renders random scenes and random edits of them through the retained
+    /// renderer and a full one: every frame, partial or not, must match exactly.
+    fn fuzz_partial_redraw(seeds: std::ops::Range<u64>, steps: usize) -> anyhow::Result<()> {
+        let _gpu_test_guard = crate::test_gpu::guard();
+        let context = WgpuContext::new_headless(None)?;
+        let target = size(
+            DevicePixels(FUZZ_WIDTH as i32),
+            DevicePixels(FUZZ_HEIGHT as i32),
+        );
+        let mut full = WgpuRenderer::new_headless(&context, target)?;
+        let mut retained = WgpuRenderer::new_headless(&context, target)?;
+        full.retained.disable_for_tests();
+        retained.retained.enable_for_tests();
+        let glyph = retained_glyph_tile(&full)?;
+        assert_eq!(glyph, retained_glyph_tile(&retained)?);
+        let (mut revision, mut partial_frames) = (0, 0);
+        for seed in seeds {
+            let mut rng = Rng::new(seed);
+            let transparent = rng.chance(0.5);
+            let crop = rng.chance(0.5);
+            for renderer in [&mut full, &mut retained] {
+                renderer.update_transparency(transparent);
+                renderer.crop_path_targets = crop;
+            }
+            retained.retained.invalidate();
+            let mut shapes: Vec<FuzzShape> = (0..1 + rng.below(16))
+                .map(|_| FuzzShape::random(&mut rng, glyph))
+                .collect();
+            if rng.chance(0.6) {
+                let backdrop = Quad {
+                    bounds: scaled(0.0, 0.0, FUZZ_WIDTH, FUZZ_HEIGHT),
+                    content_mask: FuzzShape::random_mask(&mut rng),
+                    background: solid_background(gpui::rgb(0x18212b)),
+                    ..Default::default()
+                };
+                shapes.insert(0, FuzzShape::Quad(backdrop));
+            }
+            for step in 0..steps {
+                // A present without a draw repeats the scene and its revision.
+                let repeat = step > 0 && rng.chance(0.1);
+                if !repeat {
+                    revision += 1;
+                }
+                if step > 0 && !repeat {
+                    for _ in 0..1 + rng.below(3) {
+                        let index = rng.below(shapes.len());
+                        match rng.below(6) {
+                            0 if shapes.len() > 1 => {
+                                shapes.remove(index);
+                            }
+                            1 => shapes.insert(index, FuzzShape::random(&mut rng, glyph)),
+                            2 => {
+                                let other = rng.below(shapes.len());
+                                shapes.swap(index, other);
+                            }
+                            // Removal keeps one shape, so there is always one to edit.
+                            _ => shapes[index].edit(&mut rng),
+                        }
+                    }
+                }
+                let mut scene = Scene::default();
+                for shape in &shapes {
+                    shape.insert_into(&mut scene);
+                }
+                scene.finish();
+                let _scope = gpui::profiler::gpu::set_gpu_frame_context(true, revision);
+                let expected = full.render_to_image(&scene)?;
+                let actual = retained.render_to_image(&scene)?;
+                let damage = retained.retained.last_damage();
+                if let Some(index) = actual
+                    .as_raw()
+                    .iter()
+                    .zip(expected.as_raw())
+                    .position(|(actual, expected)| actual != expected)
+                {
+                    let pixel = (index / 4) as u32;
+                    let (x, y) = (pixel % actual.width(), pixel / actual.width());
+                    panic!(
+                        "seed {seed} step {step} ({damage}, transparent {transparent}, crop {crop}): \
+                         pixel ({x}, {y}) is {:?}, a full render gives {:?}",
+                        actual.get_pixel(x, y),
+                        expected.get_pixel(x, y)
+                    );
+                }
+                partial_frames += usize::from(damage == "partial");
+            }
+        }
+        assert!(
+            partial_frames > 0,
+            "the fuzzer must exercise partial frames"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fuzzed_scene_edits_render_partially_exactly_as_in_full() -> anyhow::Result<()> {
+        fuzz_partial_redraw(0..24, 10)
+    }
+
+    /// A longer soak for real hardware:
+    /// `cargo test -p gpui_ce_wgpu --features test-support --lib -- --ignored fuzz`.
+    #[test]
+    #[ignore = "long fuzz soak"]
+    fn fuzz_soak_partial_redraw() -> anyhow::Result<()> {
+        fuzz_partial_redraw(24..2024, 16)
+    }
 }
