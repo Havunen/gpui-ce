@@ -273,16 +273,9 @@ impl WindowRenderer {
             Self::Dx12(renderer) => renderer.renderer.release_retained_frame(),
         }
     }
-    pub(crate) fn profile_capabilities(&self) -> gpui::profiler::gpu::RendererProfileCapabilities {
+    pub(crate) fn poll_retired(&self) {
         match self {
-            Self::Dx11(renderer) => renderer.profile_capabilities(),
-            #[cfg(feature = "windows-wgpu")]
-            Self::Dx12(renderer) => renderer.renderer.profile_capabilities(),
-        }
-    }
-    pub(crate) fn poll_gpu_timings(&self) {
-        match self {
-            Self::Dx11(renderer) => renderer.poll_gpu_timings(),
+            Self::Dx11(renderer) => renderer.poll_retired(),
             #[cfg(feature = "windows-wgpu")]
             Self::Dx12(_) => {}
         }
@@ -311,9 +304,6 @@ impl WindowRenderer {
                 if renderer.renderer.device_lost() {
                     // Recovery runs before the next frame's layout/paint, where
                     // rebuilding cached scenes can use the replacement atlas.
-                    renderer
-                        .renderer
-                        .record_skipped_gpu_submission("Device lost; awaiting recovery");
                     return Ok(());
                 }
                 if let Some(error) = renderer.renderer.terminal_error() {

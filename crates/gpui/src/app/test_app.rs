@@ -642,53 +642,17 @@ mod tests {
                 render_count: child_render_count,
             }),
         });
-        window
-            .test_window()
-            .unwrap()
-            .set_input_rate_keepalive(Some(false));
 
         assert_eq!(render_count.get(), 1);
 
         window.draw();
         assert_eq!(render_count.get(), 1);
 
-        let presentations = window.test_window().unwrap().presents();
-        // Windows device recovery requests force_render before consulting keepalive.
         window.simulate_request_frame(RequestFrameOptions {
             require_presentation: false,
             force_render: true,
         });
         assert_eq!(render_count.get(), 2);
-        assert_eq!(window.test_window().unwrap().presents(), presentations + 1);
-    }
-
-    #[test]
-    fn disabling_input_rate_keepalive_preserves_dirty_pending_and_required_frames() {
-        let mut app = TestApp::new();
-        let mut window = app.open_window(|_, _| MoveInvalidator);
-        let platform_window = window.test_window().unwrap();
-        platform_window.set_input_rate_keepalive(Some(false));
-        for x in 0..8 {
-            window.simulate_mouse_move(point(px(10. + x as f32), px(10.)));
-        }
-        let before_dirty = platform_window.presents();
-        window.simulate_request_frame(RequestFrameOptions::default());
-        assert_eq!(platform_window.presents(), before_dirty + 1);
-        let after_dirty = platform_window.presents();
-        for _ in 0..3 {
-            window.simulate_request_frame(RequestFrameOptions::default());
-        }
-        assert_eq!(platform_window.presents(), after_dirty);
-        window.simulate_request_frame(RequestFrameOptions {
-            require_presentation: true,
-            force_render: false,
-        });
-        assert_eq!(platform_window.presents(), after_dirty + 1);
-        // A synchronously produced scene still has to reach the renderer.
-        window.draw();
-        let before_pending = platform_window.presents();
-        window.simulate_request_frame(RequestFrameOptions::default());
-        assert_eq!(platform_window.presents(), before_pending + 1);
     }
 
     #[test]

@@ -651,19 +651,6 @@ impl WgpuContext {
                 .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
 
         let mut required_features = wgpu::Features::empty();
-        if gpui::profiler::gpu::timings_enabled()
-            && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY)
-        {
-            required_features |= wgpu::Features::TIMESTAMP_QUERY;
-            if crate::wgpu_renderer::retained_copy::requested()
-                && adapter.get_info().backend == wgpu::Backend::Dx12
-                && adapter
-                    .features()
-                    .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
-            {
-                required_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
-            }
-        }
         if dual_source_blending {
             required_features |= wgpu::Features::DUAL_SOURCE_BLENDING;
         } else {

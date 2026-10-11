@@ -55,9 +55,6 @@ use std::{cell::Cell, mem, ptr, sync::Arc};
 /// - partial redraw (`no-partial-redraw`): frames render into a retained
 ///   texture that is copied to the drawable, and repaint only the region whose
 ///   primitives changed since the previous frame (see [`crate::damage`]).
-///
-/// Measurement only (render incorrectly): `skip-paths`, `skip-shadows`,
-/// `skip-quads`, `skip-sprites` drop a primitive kind to attribute GPU time.
 #[derive(Clone, Copy, Debug, Default)]
 struct Experiments {
     path_prepass: bool,
@@ -65,14 +62,6 @@ struct Experiments {
     /// Rounded opaque quads draw an opaque interior (needs `opaque_quads`).
     split_rounded: bool,
     partial_redraw: bool,
-    skip_paths: bool,
-    // Measurement only: drop a primitive kind to attribute GPU time, or draw
-    // rounded opaque quads without blending (wrong corners) to bound what
-    // splitting them into an opaque interior would save.
-    opaque_rounded: bool,
-    skip_shadows: bool,
-    skip_quads: bool,
-    skip_sprites: bool,
 }
 
 fn experiments() -> Experiments {
@@ -85,24 +74,8 @@ fn experiments() -> Experiments {
             opaque_quads: !flags.contains(&"no-opaque-quads"),
             split_rounded: !flags.contains(&"no-split-rounded"),
             partial_redraw: !flags.contains(&"no-partial-redraw"),
-            skip_paths: flags.contains(&"skip-paths"),
-            opaque_rounded: flags.contains(&"opaque-rounded"),
-            skip_shadows: flags.contains(&"skip-shadows"),
-            skip_quads: flags.contains(&"skip-quads"),
-            skip_sprites: flags.contains(&"skip-sprites"),
         }
     })
-}
-
-fn dump_frame_prefix() -> Option<&'static std::path::Path> {
-    static PREFIX: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
-    PREFIX
-        .get_or_init(|| {
-            std::env::var_os("GPUI_DUMP_FRAME")
-                .filter(|value| !value.is_empty())
-                .map(std::path::PathBuf::from)
-        })
-        .as_deref()
 }
 
 /// Path batches of one frame are grouped into layers whose sampled regions are
@@ -1018,9 +991,7 @@ impl MetalRenderer {
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
-        let damage_start = std::time::Instant::now();
         let mode = self.frame_mode(scene, viewport_size);
-        let damage_time = damage_start.elapsed();
         let drawable = if let Some(drawable) = layer.next_drawable() {
             drawable
         } else {
@@ -1032,33 +1003,6 @@ impl MetalRenderer {
             return;
         };
 
-        if crate::scene_stats::level() > 0 {
-            crate::scene_stats::log(scene, viewport_size);
-            if self.experiments.partial_redraw {
-                let area = |width: u32, height: u32| {
-                    f64::from(width) * f64::from(height)
-                        / (f64::from(viewport_size.width.0.max(1))
-                            * f64::from(viewport_size.height.0.max(1)))
-                };
-                let repainted = match mode {
-                    FrameMode::Direct | FrameMode::Retained => 1.0,
-                    FrameMode::Copy => 0.0,
-                    FrameMode::Partial { width, height, .. } => area(width, height),
-                };
-                eprintln!(
-                    "gpui-damage mode={mode:?} repainted={repainted:.3} damage_us={}",
-                    damage_time.as_micros()
-                );
-            }
-        }
-        // Diagnostics: the same scene rendered offscreen and read back, so
-        // renderer variants can be compared pixel for pixel without screen
-        // capture. Each frame overwrites the file; the last one remains.
-        let full_render = dump_frame_prefix().and_then(|prefix| {
-            self.dump_scene(scene, viewport_size, prefix)
-                .inspect_err(|error| log::error!("GPUI_DUMP_FRAME: {error}"))
-                .ok()
-        });
         let mut instance_buffer = self.acquire_instance_buffer(scene);
         let command_buffer = match self.draw_frame(
             scene,
@@ -1083,37 +1027,6 @@ impl MetalRenderer {
         } else {
             command_buffer.present_drawable(drawable);
             command_buffer.commit();
-        }
-        if let Some(prefix) = dump_frame_prefix()
-            && let Some(expected) = full_render
-            && mode != FrameMode::Direct
-        {
-            // What the frame left in the retained texture must match the full
-            // render: report every frame, keep the first mismatch.
-            command_buffer.wait_until_completed();
-            match self.read_retained(viewport_size) {
-                Ok(retained) => {
-                    let differing = expected
-                        .pixels()
-                        .zip(retained.pixels())
-                        .filter(|(expected, actual)| expected != actual)
-                        .count();
-                    eprintln!("gpui-damage-check mode={mode:?} differing={differing}");
-                    static SAVED: std::sync::atomic::AtomicBool =
-                        std::sync::atomic::AtomicBool::new(false);
-                    if differing > 0 && !SAVED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        let saved = expected
-                            .save(prefix.with_extension("mismatch.expected.png"))
-                            .and_then(|_| {
-                                retained.save(prefix.with_extension("mismatch.retained.png"))
-                            });
-                        if let Err(error) = saved {
-                            log::error!("GPUI_DUMP_FRAME: {error}");
-                        }
-                    }
-                }
-                Err(error) => log::error!("GPUI_DUMP_FRAME: {error}"),
-            }
         }
     }
 
@@ -1515,14 +1428,12 @@ impl MetalRenderer {
         let mut filter_stack = SmallVec::<[&metal::TextureRef; MAX_FILTER_GROUP_DEPTH]>::new();
 
         let experiments = self.experiments;
-        let path_plan = if experiments.path_prepass
-            && !experiments.skip_paths
-            && scene.render_plan().requirements().uses_path_target
-        {
-            plan_path_prepass(scene, viewport_size)
-        } else {
-            None
-        };
+        let path_plan =
+            if experiments.path_prepass && scene.render_plan().requirements().uses_path_target {
+                plan_path_prepass(scene, viewport_size)
+            } else {
+                None
+            };
         if let Some(plan) = &path_plan {
             self.ensure_path_layer_textures(plan.layers.len(), viewport_size);
             for (layer_index, layer) in plan.layers.iter().enumerate() {
@@ -1572,18 +1483,6 @@ impl MetalRenderer {
         }
 
         for (command_index, command) in scene.render_commands().iter().enumerate() {
-            let skipped = match command {
-                RenderCommand::Batch(PrimitiveBatch::Shadows { .. }) => experiments.skip_shadows,
-                RenderCommand::Batch(PrimitiveBatch::Quads { .. }) => experiments.skip_quads,
-                RenderCommand::Batch(
-                    PrimitiveBatch::MonochromeSprites { .. }
-                    | PrimitiveBatch::PolychromeSprites { .. },
-                ) => experiments.skip_sprites,
-                _ => false,
-            };
-            if skipped {
-                continue;
-            }
             let ok = match command {
                 RenderCommand::Batch(PrimitiveBatch::Shadows { range, smoothed }) => self
                     .draw_shadows(
@@ -1607,7 +1506,7 @@ impl MetalRenderer {
                     rasterization_vertex_count,
                     sprite_count,
                 }) => {
-                    if *rasterization_vertex_count == 0 || experiments.skip_paths {
+                    if *rasterization_vertex_count == 0 {
                         continue;
                     }
                     let paths = &scene.paths[range.clone()];
@@ -2057,126 +1956,6 @@ impl MetalRenderer {
         encoder.end_encoding();
     }
 
-    fn dump_scene(
-        &mut self,
-        scene: &Scene,
-        size: Size<DevicePixels>,
-        prefix: &std::path::Path,
-    ) -> Result<image::RgbaImage> {
-        let descriptor = metal::TextureDescriptor::new();
-        descriptor.set_width(size.width.0.max(1) as u64);
-        descriptor.set_height(size.height.0.max(1) as u64);
-        descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
-        descriptor
-            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
-        descriptor.set_storage_mode(if self.is_unified_memory {
-            metal::MTLStorageMode::Shared
-        } else {
-            metal::MTLStorageMode::Managed
-        });
-        let target = self.device.new_texture(&descriptor);
-        let mut instance_buffer = self.acquire_instance_buffer(scene);
-        let command_buffer =
-            self.draw_primitives_to_texture(scene, &mut instance_buffer, &target, size, None)?;
-        if !self.is_unified_memory {
-            let blit = command_buffer.new_blit_command_encoder();
-            blit.synchronize_resource(&target);
-            blit.end_encoding();
-        }
-        command_buffer.commit();
-        command_buffer.wait_until_completed();
-        self.instance_buffer_pool.lock().release(instance_buffer);
-        let (width, height) = (size.width.0.max(1) as u32, size.height.0.max(1) as u32);
-        let bytes_per_row = width as usize * 4;
-        let mut pixels = vec![0u8; height as usize * bytes_per_row];
-        target.get_bytes(
-            pixels.as_mut_ptr() as *mut std::ffi::c_void,
-            bytes_per_row as u64,
-            metal::MTLRegion {
-                origin: metal::MTLOrigin { x: 0, y: 0, z: 0 },
-                size: metal::MTLSize {
-                    width: width as u64,
-                    height: height as u64,
-                    depth: 1,
-                },
-            },
-            0,
-        );
-        for chunk in pixels.chunks_exact_mut(4) {
-            chunk.swap(0, 2);
-        }
-        let image = image::RgbaImage::from_raw(width, height, pixels)
-            .ok_or_else(|| anyhow::anyhow!("frame buffer size mismatch"))?;
-        let path = prefix.with_extension("png");
-        let partial = prefix.with_extension("partial.png");
-        image.save(&partial)?;
-        std::fs::rename(&partial, &path)?;
-        Ok(image)
-    }
-
-    /// Reads back the retained texture, once the frame's commands completed.
-    fn read_retained(&self, size: Size<DevicePixels>) -> Result<image::RgbaImage> {
-        let retained = self
-            .retained_texture
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("no retained texture"))?;
-        let descriptor = metal::TextureDescriptor::new();
-        descriptor.set_width(size.width.0.max(1) as u64);
-        descriptor.set_height(size.height.0.max(1) as u64);
-        descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
-        descriptor.set_storage_mode(if self.is_unified_memory {
-            metal::MTLStorageMode::Shared
-        } else {
-            metal::MTLStorageMode::Managed
-        });
-        let readable = self.device.new_texture(&descriptor);
-        let (width, height) = (size.width.0.max(1) as u64, size.height.0.max(1) as u64);
-        let command_buffer = self.command_queue.new_command_buffer();
-        let blit = command_buffer.new_blit_command_encoder();
-        let origin = metal::MTLOrigin { x: 0, y: 0, z: 0 };
-        blit.copy_from_texture(
-            retained,
-            0,
-            0,
-            origin,
-            metal::MTLSize {
-                width,
-                height,
-                depth: 1,
-            },
-            &readable,
-            0,
-            0,
-            origin,
-        );
-        if !self.is_unified_memory {
-            blit.synchronize_resource(&readable);
-        }
-        blit.end_encoding();
-        command_buffer.commit();
-        command_buffer.wait_until_completed();
-        let bytes_per_row = width as usize * 4;
-        let mut pixels = vec![0u8; height as usize * bytes_per_row];
-        readable.get_bytes(
-            pixels.as_mut_ptr() as *mut std::ffi::c_void,
-            bytes_per_row as u64,
-            metal::MTLRegion {
-                origin,
-                size: metal::MTLSize {
-                    width,
-                    height,
-                    depth: 1,
-                },
-            },
-            0,
-        );
-        for chunk in pixels.chunks_exact_mut(4) {
-            chunk.swap(0, 2);
-        }
-        image::RgbaImage::from_raw(width as u32, height as u32, pixels)
-            .ok_or_else(|| anyhow::anyhow!("frame buffer size mismatch"))
-    }
-
     /// Full-size resolve targets for prepass layers after the first.
     fn ensure_path_layer_textures(&mut self, layers: usize, size: Size<DevicePixels>) {
         while self.path_layer_textures.len() + 1 < layers {
@@ -2621,14 +2400,11 @@ impl MetalRenderer {
             // Runs of opaque and blended quads, in order. Opaque fragments
             // overwrite instead of blending, which lets the tile hardware drop
             // fragments a later opaque quad hides.
-            let ignore_corners = self.experiments.opaque_rounded;
             let mut start = 0;
             while start < quads.len() {
-                let opaque = quad_is_opaque_with(&quads[start], ignore_corners);
+                let opaque = quad_is_opaque(&quads[start]);
                 let mut end = start + 1;
-                while end < quads.len()
-                    && quad_is_opaque_with(&quads[end], ignore_corners) == opaque
-                {
+                while end < quads.len() && quad_is_opaque(&quads[end]) == opaque {
                     end += 1;
                 }
                 command_encoder.set_render_pipeline_state(if opaque {

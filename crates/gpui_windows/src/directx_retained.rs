@@ -1,10 +1,9 @@
 //! Opt-in retained scene target. Retired allocations stay charged until a GPU fence completes.
 use crate::bindings::Windows::Win32::*;
-use crate::directx_gpu_timing::{end_query, query, ready};
 use gpui::profiler::gpu::{self, GpuMemoryReservation};
 use gpui::{PlatformAtlas, Scene, WindowBackgroundAppearance};
 use gpui_render::damage::{Damage, SceneSnapshot};
-use std::cell::RefCell;
+use std::{cell::RefCell, ffi::c_void};
 use windows_core::Interface;
 
 struct Target {
@@ -14,7 +13,8 @@ struct Target {
     width: u32,
     height: u32,
     appearance: WindowBackgroundAppearance,
-    reservation: GpuMemoryReservation,
+    // Held for its drop, which releases the device budget.
+    _reservation: GpuMemoryReservation,
 }
 struct Retired {
     device_key: usize,
@@ -27,14 +27,15 @@ pub(super) fn poll_retired() {
     RETIRED.with(|pending| {
         pending.borrow_mut().retain(|item| {
             // A query failure keeps its reservation charged until device recovery.
-            !item.fence.as_ref().is_some_and(
-                |fence| matches!(ready::<i32>(&item.context,fence),Ok(Some(value)) if value!=0),
-            )
+            !item
+                .fence
+                .as_ref()
+                .is_some_and(|fence| fence_passed(&item.context, fence))
         })
     });
 }
 fn retire(target: Target, device: &ID3D11Device, context: &ID3D11DeviceContext) {
-    let fence = query(device, 0).ok();
+    let fence = event_query(device).ok();
     if let Some(fence) = &fence {
         end_query(context, fence);
     }
@@ -46,6 +47,55 @@ fn retire(target: Target, device: &ID3D11Device, context: &ID3D11DeviceContext) 
             _target: target,
         })
     });
+}
+// Generated bindings omit these methods. The stable COM ABI uses device slot 24
+// for CreateQuery and immediate-context slot 28 for End. ID3D11Query derives
+// from ID3D11Asynchronous, so its interface pointer is a valid upcast.
+fn event_query(device: &ID3D11Device) -> anyhow::Result<ID3D11Asynchronous> {
+    #[repr(C)]
+    struct QueryDesc {
+        query: i32,
+        misc_flags: u32,
+    }
+    type Create = unsafe extern "system" fn(
+        *mut c_void,
+        *const QueryDesc,
+        *mut *mut c_void,
+    ) -> windows_core::HRESULT;
+    let mut output = std::ptr::null_mut();
+    unsafe {
+        let table = Interface::vtable(device) as *const _ as *const *const c_void;
+        let create: Create = std::mem::transmute(*table.add(24));
+        // D3D11_QUERY_EVENT
+        let desc = QueryDesc {
+            query: 0,
+            misc_flags: 0,
+        };
+        create(device.as_raw(), &desc, &mut output).ok()?;
+        anyhow::ensure!(!output.is_null(), "CreateQuery returned a null interface");
+        Ok(ID3D11Asynchronous::from_raw(output))
+    }
+}
+fn end_query(context: &ID3D11DeviceContext, query: &ID3D11Asynchronous) {
+    type End = unsafe extern "system" fn(*mut c_void, *mut c_void);
+    unsafe {
+        let table = Interface::vtable(context) as *const _ as *const *const c_void;
+        let end: End = std::mem::transmute(*table.add(28));
+        end(context.as_raw(), query.as_raw());
+    }
+}
+/// Whether the GPU has passed `fence`, polled without flushing the context.
+fn fence_passed(context: &ID3D11DeviceContext, fence: &ID3D11Asynchronous) -> bool {
+    let mut passed = 0i32;
+    let result = unsafe {
+        context.GetData(
+            fence,
+            Some(&mut passed as *mut i32 as *mut c_void),
+            std::mem::size_of::<i32>() as u32,
+            1, // D3D11_ASYNC_GETDATA_DONOTFLUSH
+        )
+    };
+    result.0 == 0 && passed != 0
 }
 pub(super) struct RetainedFrame {
     enabled: bool,
@@ -62,9 +112,6 @@ pub(super) struct RetainedPlan {
     pub srv: Option<ID3D11ShaderResourceView>,
     pub damage: Damage,
     pub snapshot: Option<SceneSnapshot>,
-    pub bytes: u64,
-    pub fallback_reason: Option<&'static str>,
-    pub diff_detail: Option<String>,
     revision: u64,
     atlas: u64,
     reuse_snapshot: bool,
@@ -123,7 +170,6 @@ impl RetainedFrame {
         atlas: &dyn PlatformAtlas,
         width: u32,
         height: u32,
-        eligible: bool,
         appearance: WindowBackgroundAppearance,
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
@@ -134,43 +180,31 @@ impl RetainedFrame {
                 srv: None,
                 damage: Damage::Full,
                 snapshot: None,
-                bytes: 0,
                 revision: 0,
                 atlas: 0,
                 reuse_snapshot: false,
-                fallback_reason: None,
-                diff_detail: None,
             });
         }
         let frame = gpu::gpu_frame_context();
         let generation = atlas.generation();
-        let full = |reason| RetainedPlan {
+        let full = || RetainedPlan {
             rtv: None,
             srv: None,
             damage: Damage::Full,
             snapshot: None,
-            bytes: 0,
             revision: frame.scene_revision,
             atlas: generation,
             reuse_snapshot: false,
-            fallback_reason: Some(reason),
-            diff_detail: None,
         };
         poll_retired();
-        if !eligible || !frame.active {
+        if !frame.active {
             self.invalidate();
-            return Ok(full(if !eligible {
-                "diagnostic-ablation"
-            } else {
-                "inactive-window"
-            }));
+            return Ok(full());
         }
         self.devices = Some((device.clone(), context.clone()));
-        let mut target_change = None;
         if self.target.as_ref().is_some_and(|target| {
             target.width != width || target.height != height || target.appearance != appearance
         }) {
-            target_change = Some("target-configuration-change");
             self.invalidate();
         }
         if self.scene_revision == Some(frame.scene_revision)
@@ -183,20 +217,17 @@ impl RetainedFrame {
                     srv: target.srv.clone(),
                     damage: Damage::Reuse,
                     snapshot: None,
-                    bytes: target.reservation.bytes,
                     revision: frame.scene_revision,
                     atlas: generation,
                     reuse_snapshot: true,
-                    fallback_reason: None,
-                    diff_detail: None,
                 });
             }
         }
         let snapshot = match SceneSnapshot::capture_checked(scene, generation, width, height) {
             Ok(snapshot) => snapshot,
-            Err(reason) => {
+            Err(_) => {
                 self.invalidate();
-                return Ok(full(reason.as_str()));
+                return Ok(full());
             }
         };
         if self.target.is_none() {
@@ -204,7 +235,7 @@ impl RetainedFrame {
             let Some(reservation) =
                 gpu::reserve_retained_bytes("d3d11", device.as_raw() as usize, bytes)
             else {
-                return Ok(full("retained-device-budget"));
+                return Ok(full());
             };
             let desc = D3D11_TEXTURE2D_DESC {
                 Width: width,
@@ -242,53 +273,27 @@ impl RetainedFrame {
                 width,
                 height,
                 appearance,
-                reservation,
+                _reservation: reservation,
             });
         }
-        let (damage, comparison_reason, diff_detail) = match self.snapshot.as_ref() {
-            Some(previous) => {
-                let (comparison, detail) = if gpu::timings_enabled() {
-                    snapshot.compare_checked_diagnostic(previous)
-                } else {
-                    (snapshot.compare_checked(previous), None)
-                };
-                match comparison {
-                    Ok(damage) => (damage, None, detail),
-                    // Exact local painter sequences handle disjoint global-rank
-                    // permutations without weakening the strict fast path.
-                    Err(_) => match snapshot.compare_tiled_checked(previous) {
-                        Ok(damage) => (damage, None, detail),
-                        Err(reason) => (Damage::Full, Some(reason), detail),
-                    },
-                }
-            }
-            None => (Damage::Full, None, None),
+        let damage = match self.snapshot.as_ref() {
+            // Exact local painter sequences handle disjoint global-rank
+            // permutations without weakening the strict fast path.
+            Some(previous) => snapshot
+                .compare_checked(previous)
+                .or_else(|_| snapshot.compare_tiled_checked(previous))
+                .unwrap_or(Damage::Full),
+            None => Damage::Full,
         };
         let target = self.target.as_ref().unwrap();
-        let fallback_reason = if damage == Damage::Full {
-            Some(
-                target_change
-                    .or(comparison_reason)
-                    .unwrap_or(if self.snapshot.is_some() {
-                        "scene-change"
-                    } else {
-                        "initial-scene"
-                    }),
-            )
-        } else {
-            None
-        };
         Ok(RetainedPlan {
             rtv: target.rtv.clone(),
             srv: target.srv.clone(),
             damage,
             snapshot: Some(snapshot),
-            bytes: target.reservation.bytes,
             revision: frame.scene_revision,
             atlas: generation,
             reuse_snapshot: false,
-            fallback_reason,
-            diff_detail,
         })
     }
     pub fn complete(&mut self, plan: RetainedPlan, success: bool) {

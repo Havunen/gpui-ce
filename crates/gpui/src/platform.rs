@@ -948,23 +948,6 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn has_fixed_refresh_rate(&self) -> bool {
         false
     }
-    /// Whether high-rate input should submit an otherwise unchanged scene.
-    /// Platforms may opt out without claiming that their display is fixed-rate.
-    fn needs_input_rate_keepalive(&self) -> bool {
-        !self.has_fixed_refresh_rate()
-    }
-    /// Diagnostics for the native pointer input currently being dispatched.
-    fn native_input_diagnostic(&self) -> Option<NativeInputDiagnostic> {
-        None
-    }
-    /// A logical client point converted to a native screen point for input replay.
-    fn native_pointer_target(&self, _position: Point<Pixels>) -> Option<(u64, i32, i32)> {
-        None
-    }
-    /// Runtime support, rather than requested flags, for renderer profiling.
-    fn renderer_profile_capabilities(&self) -> crate::profiler::gpu::RendererProfileCapabilities {
-        crate::profiler::gpu::RendererProfileCapabilities::unsupported("unknown")
-    }
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
 
@@ -1134,17 +1117,6 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn render_to_image(&self, _scene: &Scene) -> Result<RgbaImage> {
         anyhow::bail!("render_to_image not implemented for this platform")
     }
-}
-
-/// Correlation carried by an explicitly tagged profiling mouse input.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct NativeInputDiagnostic {
-    /// Sequence carried by the profiling SendInput marker.
-    pub sequence: u64,
-    /// Earliest native pointer arrival in QueryPerformanceCounter ticks.
-    pub arrival_qpc: u64,
-    /// QueryPerformanceCounter ticks per second.
-    pub qpc_frequency: u64,
 }
 
 /// A renderer for headless windows that can produce real rendered output.

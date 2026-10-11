@@ -6,12 +6,7 @@ use gpui::{
     PrimitiveBatch, Quad, RenderCommand, ScaledPixels, Scene, SceneHsla, Shadow, SubpixelSprite,
     Underline, point, size,
 };
-use std::fmt::Write;
 use std::mem::size_of;
-use std::sync::{
-    OnceLock,
-    atomic::{AtomicUsize, Ordering},
-};
 
 const MAX_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_REGIONS: usize = 8;
@@ -111,7 +106,7 @@ pub enum SceneSnapshotUnsupportedReason {
 }
 
 impl SceneSnapshotUnsupportedReason {
-    /// Stable diagnostic name used by renderer profiling records.
+    /// Stable name of the reason, used as a full-frame fallback reason.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::InvalidTargetSize => "invalid-target-size",
@@ -137,7 +132,7 @@ pub enum Damage {
 }
 
 impl Damage {
-    /// Stable diagnostic name for the selected rendering path.
+    /// Stable name of the selected rendering path.
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Full => "full",
@@ -217,65 +212,6 @@ enum PaintedPrimitive<'a> {
 }
 
 impl PaintedPrimitive<'_> {
-    fn write_diagnostic(self, out: &mut String) {
-        match self {
-            Self::Quad(p, smoothed) => {
-                let _ = write!(
-                    out,
-                    "quad(bounds={:?},mask={:?},smoothed={smoothed},corners={:?},smoothing={},border={:?},style={:?})",
-                    p.bounds,
-                    p.content_mask,
-                    p.corner_radii,
-                    p.corner_smoothing,
-                    p.border_widths,
-                    p.border_style
-                );
-            }
-            Self::Path(p, start, end, vertices, sprites) => {
-                let _ = write!(
-                    out,
-                    "path(id={},bounds={:?},mask={:?},group={start}..{end},vertices={vertices},sprites={sprites})",
-                    p.id.0, p.bounds, p.content_mask
-                );
-            }
-            Self::Monochrome(p, texture) => {
-                let _ = write!(
-                    out,
-                    "mono(bounds={:?},mask={:?},texture={texture:?},tile={:?})",
-                    p.bounds, p.content_mask, p.tile
-                );
-            }
-            Self::Subpixel(p, texture) => {
-                let _ = write!(
-                    out,
-                    "subpixel(bounds={:?},mask={:?},texture={texture:?},tile={:?})",
-                    p.bounds, p.content_mask, p.tile
-                );
-            }
-            Self::Shadow(p, smoothed) => {
-                let _ = write!(
-                    out,
-                    "shadow(bounds={:?},mask={:?},blur={},smoothed={smoothed})",
-                    p.bounds, p.content_mask, p.blur_radius.0
-                );
-            }
-            Self::Underline(p) => {
-                let _ = write!(
-                    out,
-                    "underline(bounds={:?},mask={:?},thickness={})",
-                    p.bounds, p.content_mask, p.thickness.0
-                );
-            }
-            Self::Polychrome(p, smoothed, texture) => {
-                let _ = write!(
-                    out,
-                    "polychrome(bounds={:?},mask={:?},smoothed={smoothed},texture={texture:?},tile={:?})",
-                    p.bounds, p.content_mask, p.tile
-                );
-            }
-        }
-    }
-
     fn is_quad(self) -> bool {
         matches!(self, Self::Quad(..))
     }
@@ -781,62 +717,6 @@ fn disjoint_swap(
     !a.intersects(b.bounds())
 }
 
-fn scene_diff_diagnostics_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("GPUI_GPU_DIAGNOSTIC_SCENE_DIFF").is_ok_and(|value| value == "1")
-    })
-}
-
-fn scene_diff_diagnostic(
-    next_snapshot: &SceneSnapshot,
-    old_snapshot: &SceneSnapshot,
-    reason: &'static str,
-    n: usize,
-    o: usize,
-) -> Option<String> {
-    static EMITTED: AtomicUsize = AtomicUsize::new(0);
-    EMITTED
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
-            (count < 32).then_some(count + 1)
-        })
-        .ok()?;
-    // This extra traversal and bounded formatting are exclusive to explicit
-    // diagnostic captures. Never format an entire scene or path vertex buffer.
-    let next = next_snapshot.painter_sequence();
-    let old = old_snapshot.painter_sequence();
-    let mut out = format!(
-        "reason={reason};next_index={n};old_index={o};next_counts=q{}p{}m{}s{};old_counts=q{}p{}m{}s{};next=[",
-        next_snapshot.quads.len(),
-        next_snapshot.paths.len(),
-        next_snapshot.monochrome_sprites.len(),
-        next_snapshot.subpixel_sprites.len(),
-        old_snapshot.quads.len(),
-        old_snapshot.paths.len(),
-        old_snapshot.monochrome_sprites.len(),
-        old_snapshot.subpixel_sprites.len()
-    );
-    for (name, sequence, start) in [("next", next, n), ("old", old, o)] {
-        if name == "old" {
-            out.push_str("];old=[");
-        }
-        if let Some(sequence) = sequence {
-            // Four entries on either side: eight primitive signatures total.
-            for (offset, primitive) in sequence.iter().skip(start).take(4).enumerate() {
-                if offset > 0 {
-                    out.push(',');
-                }
-                let _ = write!(out, "{}:", start + offset);
-                primitive.write_diagnostic(&mut out);
-            }
-        } else {
-            out.push_str("unsupported-command");
-        }
-    }
-    out.push(']');
-    Some(out)
-}
-
 impl SceneSnapshot {
     fn painter_sequence(&self) -> Option<Vec<PaintedPrimitive<'_>>> {
         let mut sequence = Vec::with_capacity(
@@ -1011,7 +891,7 @@ impl SceneSnapshot {
 
     /// Compare supported scenes, reporting a static reason when full rendering is required.
     pub fn compare_checked(&self, previous: &Self) -> Result<Damage, &'static str> {
-        self.compare_impl(previous, false, &mut (0, 0))
+        self.compare_impl(previous)
     }
 
     /// Prototype fallback that proves equality of exact local painter sequences.
@@ -1187,34 +1067,7 @@ impl SceneSnapshot {
         tile_regions(&dirty, columns, self.width, self.height)
     }
 
-    /// Compare while optionally recording a bounded failing painter-sequence witness.
-    ///
-    /// Intended for query-enabled diagnostic captures. Formatting requires
-    /// `GPUI_GPU_DIAGNOSTIC_SCENE_DIFF=1` and is capped at 32 failures per process.
-    /// Ordinary comparison remains independent of this diagnostic switch.
-    pub fn compare_checked_diagnostic(
-        &self,
-        previous: &Self,
-    ) -> (Result<Damage, &'static str>, Option<String>) {
-        let enabled = scene_diff_diagnostics_enabled();
-        let mut position = (0, 0);
-        let result = self.compare_impl(previous, enabled, &mut position);
-        let detail = if enabled {
-            result.as_ref().err().and_then(|reason| {
-                scene_diff_diagnostic(self, previous, reason, position.0, position.1)
-            })
-        } else {
-            None
-        };
-        (result, detail)
-    }
-
-    fn compare_impl(
-        &self,
-        previous: &Self,
-        diagnostic: bool,
-        position: &mut (usize, usize),
-    ) -> Result<Damage, &'static str> {
+    fn compare_impl(&self, previous: &Self) -> Result<Damage, &'static str> {
         if self.atlas_generation != previous.atlas_generation {
             return Err("atlas-generation-change");
         }
@@ -1260,9 +1113,6 @@ impl SceneSnapshot {
         let mut glyph_edits = 0;
         let mut commutations = 0;
         while n < next.len() || o < old.len() {
-            if diagnostic {
-                *position = (n, o);
-            }
             match (next.get(n).copied(), old.get(o).copied()) {
                 (Some(current), Some(prior)) if current.geometry_matches(prior) => {
                     if current.colour_changed(prior) && !damage(current.bounds()) {
@@ -2214,24 +2064,10 @@ mod tests {
         };
         let old = row_scene(0);
         let next = row_scene(1);
-        let mut position = (0, 0);
         assert_eq!(
-            next.compare_impl(&old, true, &mut position),
+            next.compare_checked(&old),
             Err("quad-painter-convergence-change")
         );
-        let detail = scene_diff_diagnostic(
-            &next,
-            &old,
-            "quad-painter-convergence-change",
-            position.0,
-            position.1,
-        )
-        .unwrap();
-        assert!(detail.contains("next_index=1;old_index=1"));
-        assert!(detail.contains("next_counts=q2p0m6s0;old_counts=q2p0m6s0"));
-        assert!(detail.matches("quad(").count() + detail.matches("mono(").count() <= 8);
-        assert!(!detail.contains("vertices: ["));
-        assert!(detail.len() < 8192, "diagnostic signatures remain bounded");
     }
 
     #[test]

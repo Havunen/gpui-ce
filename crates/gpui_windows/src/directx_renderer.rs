@@ -78,7 +78,6 @@ pub(crate) struct DirectXRenderer {
     active_render_target: Option<ID3D11RenderTargetView>,
     path_rasterization_vertices: Vec<PathRasterizationVertex>,
     path_sprites: Vec<PathSprite>,
-    timings: crate::directx_gpu_timing::GpuTimings,
     retained: crate::directx_retained::RetainedFrame,
 }
 
@@ -374,7 +373,6 @@ impl DirectXRenderer {
             active_render_target: None,
             path_rasterization_vertices: Vec::new(),
             path_sprites: Vec::new(),
-            timings: crate::directx_gpu_timing::GpuTimings::new(),
             retained: crate::directx_retained::RetainedFrame::new(),
         })
     }
@@ -382,38 +380,10 @@ impl DirectXRenderer {
     pub(crate) fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.atlas.clone()
     }
-    pub(crate) fn profile_capabilities(&self) -> gpui::profiler::gpu::RendererProfileCapabilities {
-        let mut capabilities = self.timings.capabilities();
-        capabilities.surface_alpha_mode = self.resources.as_ref().and_then(|resources| {
-            let mut description = DXGI_SWAP_CHAIN_DESC1::default();
-            unsafe { resources.swap_chain.GetDesc1(&mut description) }
-                .ok()
-                .ok()?;
-            Some(
-                match description.AlphaMode {
-                    DXGI_ALPHA_MODE_PREMULTIPLIED => "premultiplied",
-                    DXGI_ALPHA_MODE_IGNORE => "ignore",
-                    _ => "unknown",
-                }
-                .into(),
-            )
-        });
-        capabilities.present_mode = Some("immediate".into());
-        if self.retained.enabled() && !self.timings.diagnostic_ablations.enabled() {
-            capabilities
-                .active_experiments
-                .push("partial-redraw".into());
-        }
-        capabilities.active_experiments.sort_unstable();
-        capabilities
-    }
     pub(crate) fn release_retained_frame(&mut self) {
         self.retained.invalidate();
     }
-    pub(crate) fn poll_gpu_timings(&self) {
-        if let Some(devices) = &self.devices {
-            self.timings.poll(&devices.device_context);
-        }
+    pub(crate) fn poll_retired(&self) {
         if self.retained.enabled() {
             crate::directx_retained::poll_retired();
         }
@@ -499,8 +469,6 @@ impl DirectXRenderer {
     }
 
     fn handle_device_lost_impl(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
-        self.timings
-            .discard("Device recovery invalidated timestamp queries");
         self.retained.device_lost();
         let disable_direct_composition = self.direct_composition.is_none();
 
@@ -574,23 +542,11 @@ impl DirectXRenderer {
         if self.skip_draws {
             // skip drawing this frame, we just recovered from a device lost event
             // and so likely do not have the textures anymore that are required for drawing
-            self.timings
-                .skipped("Device recovery discarded the current frame");
             return Ok(());
         }
-        let devices = self.devices.as_ref().context("devices missing")?;
-        self.timings.begin(&devices.device, &devices.device_context);
-        let result = self.render(scene, background_appearance);
-        if let Some(devices) = &self.devices {
-            self.timings.end(&devices.device_context, result.is_ok());
-        }
-        result?;
-        // Present flushes the immediate context, including the final timestamps.
-        // Ending queries afterward would leave the last frame unresolved while idle.
+        self.render(scene, background_appearance)?;
         let result = self.present();
         if result.is_err() {
-            self.timings
-                .fail_latest_submission("Swapchain present failed");
             self.retained.invalidate();
         }
         result
@@ -604,27 +560,15 @@ impl DirectXRenderer {
         background_appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
         let devices = self.devices.as_ref().context("devices missing")?;
-        let mut plan = self.retained.prepare(
+        let plan = self.retained.prepare(
             scene,
             self.atlas.as_ref(),
             self.width,
             self.height,
-            !self.timings.diagnostic_ablations.enabled(),
             background_appearance,
             &devices.device,
             &devices.device_context,
         )?;
-        self.timings.describe_damage(
-            plan.damage.kind(),
-            plan.bytes,
-            plan.fallback_reason,
-            plan.diff_detail.take(),
-            if self.retained.enabled() && !self.timings.diagnostic_ablations.enabled() {
-                vec!["partial-redraw".into()]
-            } else {
-                Vec::new()
-            },
-        );
         let result = self.render_scene(scene, background_appearance, &plan);
         self.retained.complete(plan, result.is_ok());
         result
@@ -640,34 +584,12 @@ impl DirectXRenderer {
             appearance if appearance.is_opaque() => [1.0f32; 4],
             _ => [0.0f32; 4],
         };
-        let devices = self.devices.as_ref().unwrap();
-        let preparation = self.timings.begin_pass(
-            &devices.device,
-            &devices.device_context,
-            if self.timings.diagnostic_ablations.clear_only() {
-                "clear_only"
-            } else {
-                "globals_and_swapchain_clear"
-            },
-        );
-        let prepared = self.pre_draw(&clear_color, retained.rtv.is_none());
-        self.timings.end_pass(&devices.device_context, preparation);
-        prepared?;
-        if self.timings.diagnostic_ablations.clear_only() {
-            // Diagnostic clear-only still ends frame queries and presents through draw().
-            return Ok(());
-        }
+        self.pre_draw(&clear_color, retained.rtv.is_none())?;
         if retained.damage == Damage::Reuse {
-            let devices = self.devices.as_ref().unwrap();
-            let pass =
-                self.timings
-                    .begin_pass(&devices.device, &devices.device_context, "retained_blit");
-            let result = self.dx_blit(
+            return self.dx_blit(
                 &retained.srv,
                 &self.resources.as_ref().unwrap().render_target_view,
             );
-            self.timings.end_pass(&devices.device_context, pass);
-            return result;
         }
 
         self.upload_scene_buffers(scene)?;
@@ -739,18 +661,12 @@ impl DirectXRenderer {
             .clone();
 
         if let Some(rtv) = &retained.rtv {
-            let clear = self.timings.begin_pass(
-                &self.devices.as_ref().unwrap().device,
-                &ctx,
-                "retained_target_clear",
-            );
             unsafe {
                 if retained.damage == Damage::Full {
                     ctx.ClearRenderTargetView(rtv, &clear_color);
                 }
                 ctx.OMSetRenderTargets(Some(slice::from_ref(&retained.rtv)), None);
             }
-            self.timings.end_pass(&ctx, clear);
             self.active_render_target = retained.rtv.clone();
         } else if use_offscreen {
             unsafe {
@@ -796,23 +712,11 @@ impl DirectXRenderer {
             });
             set_scissor(&ctx, scissor);
             if region.is_some() {
-                let clear = self.timings.begin_pass(
-                    &self.devices.as_ref().unwrap().device,
-                    &ctx,
-                    "damage_clear",
-                );
-                let result = self.draw_damage_clear(instance_range(
+                self.draw_damage_clear(instance_range(
                     &(scene.quads.len() + region_index..scene.quads.len() + region_index + 1),
-                )?);
-                self.timings.end_pass(&ctx, clear);
-                result?;
+                )?)?;
             }
             for command in scene.render_commands() {
-                if self.timings.diagnostic_ablations.enabled()
-                    && self.timings.diagnostic_ablations.skips_command(command)
-                {
-                    continue;
-                }
                 if let (Some(region), RenderCommand::Batch(batch)) = (region, command) {
                     if !batch_intersects(scene, batch, region) {
                         continue;
@@ -827,16 +731,6 @@ impl DirectXRenderer {
                 ) {
                     continue;
                 }
-                let timing_pass =
-                    if matches!(command, RenderCommand::Batch(PrimitiveBatch::Paths { .. })) {
-                        None
-                    } else {
-                        self.timings.begin_pass(
-                            &self.devices.as_ref().unwrap().device,
-                            &ctx,
-                            gpu_command_label(command),
-                        )
-                    };
                 let _annotation = annotation
                     .as_ref()
                     .map(|annotation| Annotation::new(annotation, HSTRING::from(command.label())));
@@ -844,13 +738,9 @@ impl DirectXRenderer {
                     RenderCommand::Batch(PrimitiveBatch::Shadows { range, smoothed }) => {
                         self.draw_shadows(instance_range(range)?, *smoothed)
                     }
-                    RenderCommand::Batch(PrimitiveBatch::Quads { range, smoothed }) => self
-                        .draw_clipped_quads(
-                            &scene.quads[range.clone()],
-                            instance_range(range)?,
-                            *smoothed,
-                            scissor,
-                        ),
+                    RenderCommand::Batch(PrimitiveBatch::Quads { range, smoothed }) => {
+                        self.draw_quads(instance_range(range)?, *smoothed)
+                    }
                     RenderCommand::Batch(PrimitiveBatch::Paths {
                         range,
                         rasterization_vertex_count,
@@ -866,24 +756,9 @@ impl DirectXRenderer {
                                 height: self.height,
                             },
                         );
-                        let raster = self.timings.begin_pass(
-                            &self.devices.as_ref().unwrap().device,
-                            &ctx,
-                            "path_rasterization_and_resolve",
-                        );
-                        let result =
-                            self.draw_paths_to_intermediate(paths, *rasterization_vertex_count);
-                        self.timings.end_pass(&ctx, raster);
-                        result?;
+                        self.draw_paths_to_intermediate(paths, *rasterization_vertex_count)?;
                         set_scissor(&ctx, scissor);
-                        let composite = self.timings.begin_pass(
-                            &self.devices.as_ref().unwrap().device,
-                            &ctx,
-                            "path_composite",
-                        );
-                        let result = self.draw_paths_from_intermediate(paths, *sprite_count);
-                        self.timings.end_pass(&ctx, composite);
-                        result
+                        self.draw_paths_from_intermediate(paths, *sprite_count)
                     }
                     RenderCommand::Batch(PrimitiveBatch::Underlines(range)) => {
                         self.draw_underlines(instance_range(range)?)
@@ -999,7 +874,6 @@ impl DirectXRenderer {
                     scene.surfaces.len(),
                 )
             });
-                self.timings.end_pass(&ctx, timing_pass);
                 command_result?;
             }
         }
@@ -1015,14 +889,7 @@ impl DirectXRenderer {
 
         // Present the offscreen scene by blitting it into the swapchain.
         if retained.rtv.is_some() {
-            let pass = self.timings.begin_pass(
-                &self.devices.as_ref().unwrap().device,
-                &ctx,
-                "retained_blit",
-            );
-            let result = self.dx_blit(&retained.srv, &swapchain_rtv);
-            self.timings.end_pass(&ctx, pass);
-            result?;
+            self.dx_blit(&retained.srv, &swapchain_rtv)?;
         } else if use_offscreen {
             self.dx_blit(&scene_srv, &swapchain_rtv)?;
         }
@@ -1229,21 +1096,16 @@ impl DirectXRenderer {
     }
 
     fn draw_quads(&mut self, instances: InstanceRange, smoothed: bool) -> Result<()> {
-        let result = self.pipelines.quad_pipeline.draw_instances_variant(
+        self.pipelines.quad_pipeline.draw_instances_variant(
             &self.frame_bindings()?,
             None,
             instances,
             smoothed,
-        );
-        if result.is_ok() && !instances.is_empty() {
-            self.timings.record_quad_draws(1, 0);
-        }
-        result
+        )
     }
 
     fn draw_damage_clear(&mut self, instances: InstanceRange) -> Result<()> {
-        let result = self
-            .pipelines
+        self.pipelines
             .quad_pipeline
             .draw_instances_variant_with_blend(
                 &self.frame_bindings()?,
@@ -1251,47 +1113,7 @@ impl DirectXRenderer {
                 instances,
                 false,
                 Some(&self.pipelines.blur_blend_replace),
-            );
-        if result.is_ok() && !instances.is_empty() {
-            self.timings.record_quad_draws(1, 0);
-        }
-        result
-    }
-
-    fn draw_clipped_quads(
-        &mut self,
-        quads: &[Quad],
-        instances: InstanceRange,
-        smoothed: bool,
-        active: DamageRect,
-    ) -> Result<()> {
-        if !self.timings.clipped_quads {
-            return self.draw_quads(instances, smoothed);
-        }
-        let context = self
-            .devices
-            .as_ref()
-            .context("devices missing")?
-            .device_context
-            .clone();
-        let mut draws = 0u64;
-        let result = (|| {
-            for run in gpui_render::quad_clipping::quad_scissor_runs(quads, active) {
-                if run.scissor.width == 0 || run.scissor.height == 0 {
-                    continue;
-                }
-                set_scissor(&context, run.scissor);
-                let first = instances.first() as usize;
-                let range = InstanceRange::new(first + run.range.start..first + run.range.end)
-                    .context("quad scissor range exceeds GPU indices")?;
-                self.draw_quads(range, smoothed)?;
-                draws += 1;
-            }
-            Ok(())
-        })();
-        set_scissor(&context, active);
-        self.timings.record_quad_draws(0, draws.saturating_sub(1));
-        result
+            )
     }
 
     fn draw_paths_to_intermediate(
@@ -2670,25 +2492,6 @@ fn set_scissor(context: &ID3D11DeviceContext, rect: DamageRect) {
     }
 }
 
-fn gpu_command_label(command: &RenderCommand) -> &'static str {
-    match command {
-        RenderCommand::Batch(batch) => match batch {
-            PrimitiveBatch::Shadows { .. } => "shadows",
-            PrimitiveBatch::Quads { .. } => "quads",
-            PrimitiveBatch::Paths { .. } => "paths",
-            PrimitiveBatch::Underlines(_) => "underlines",
-            PrimitiveBatch::MonochromeSprites { .. } => "monochrome_sprites",
-            PrimitiveBatch::SubpixelSprites { .. } => "subpixel_sprites",
-            PrimitiveBatch::PolychromeSprites { .. } => "polychrome_sprites",
-            PrimitiveBatch::Surfaces(_) => "surfaces",
-            PrimitiveBatch::BackdropFilters(_) => "backdrop_filters",
-            PrimitiveBatch::FilterBoundary(_) => "filter_boundary",
-        },
-        RenderCommand::BeginFilter { .. } => "begin_filter",
-        RenderCommand::EndFilter { .. } => "end_filter",
-    }
-}
-
 // https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ns-d3d11-d3d11_blend_desc
 #[inline]
 fn create_blend_state(device: &ID3D11Device) -> Result<ID3D11BlendState> {
@@ -3144,7 +2947,9 @@ mod tests {
     // Explicit imports: a glob of `super` would also pull in gpui's `#[test]` proc macro.
     use super::{DirectXRenderer, report_live_objects};
     use crate::bindings::Windows::Win32::{CreateWindowExW, DestroyWindow, WS_OVERLAPPED};
-    use crate::bindings::Windows::Win32::{HWND, ID3D11Debug};
+    use crate::bindings::Windows::Win32::{
+        DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_SWAP_CHAIN_DESC1, HWND, ID3D11Debug,
+    };
     use crate::directx_devices::DirectXDevices;
     use anyhow::Result;
     use gpui::{
@@ -3237,146 +3042,6 @@ mod tests {
             bounds: scaled(0.0, 0.0, 200.0, 100.0),
             ..Default::default()
         }
-    }
-
-    fn clipped_quad_scene(fraction: f32, smoothing: f32, paint: usize) -> Scene {
-        let bounds = scaled(7.25 + fraction, 8.5 + fraction, 180.25, 83.25);
-        let x = bounds.origin.x.0;
-        let y = bounds.origin.y.0;
-        let w = bounds.size.width.0;
-        let h = bounds.size.height.0;
-        let gradient = gpui::linear_gradient(
-            37.0,
-            gpui::linear_color_stop(gpui::hsla(0.01, 0.85, 0.62, 0.8), 0.0),
-            gpui::linear_color_stop(gpui::hsla(0.62, 0.7, 0.35, 0.55), 1.0),
-        );
-        let background = match paint {
-            0 => gpui::Background::default(), // Actual border-only split shape.
-            1 => gradient.color_space(gpui::ColorSpace::Srgb),
-            2 => gradient.color_space(gpui::ColorSpace::Oklab),
-            _ => gpui::pattern_slash(gpui::hsla(0.6, 0.8, 0.6, 0.7), 1.5, 4.25),
-        };
-        let mut scene = Scene::default();
-        scene.insert_primitive(Quad {
-            bounds: scaled(0.0, 0.0, 200.0, 100.0),
-            content_mask: full_mask(),
-            background: solid_background(gpui::rgb(0x18212b)),
-            ..Default::default()
-        });
-        for (index, clip) in [
-            scaled(x, y, w, 2.5),
-            scaled(x + w - 3.0, y, 3.0, h),
-            scaled(x, y + h - 4.0, w, 4.0),
-            scaled(x, y, 1.5, h),
-            scaled(x + 45.25, y + 25.5, 8.75, 7.25),
-            scaled(x + 250.0, y + 140.0, 1.0, 1.0), // Empty intersection.
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            scene.insert_primitive(Quad {
-                bounds,
-                content_mask: ContentMask {
-                    bounds: clip,
-                    fade_out: if index == 4 {
-                        gpui::Edges::all(ScaledPixels(1.25))
-                    } else {
-                        gpui::Edges::default()
-                    },
-                },
-                background,
-                border_color: gradient,
-                border_style: if paint.is_multiple_of(2) {
-                    gpui::BorderStyle::Solid
-                } else {
-                    gpui::BorderStyle::Dashed
-                },
-                border_dashed_length: 3.75,
-                border_dashed_gap: 1.25,
-                corner_radii: gpui::Corners {
-                    top_left: ScaledPixels(11.5),
-                    top_right: ScaledPixels(16.25),
-                    bottom_right: ScaledPixels(8.75),
-                    bottom_left: ScaledPixels(14.5),
-                },
-                border_widths: gpui::Edges {
-                    top: ScaledPixels(2.5),
-                    right: ScaledPixels(3.0),
-                    bottom: ScaledPixels(4.0),
-                    left: ScaledPixels(1.5),
-                },
-                corner_smoothing: smoothing,
-                ..Default::default()
-            });
-        }
-        // Later translucent paint makes accidental clear/reordering visible.
-        scene.insert_primitive(Quad {
-            bounds: scaled(40.5, 9.5, 18.5, 70.5),
-            content_mask: full_mask(),
-            background: solid_background(gpui::hsla(0.02, 0.8, 0.6, 0.4)),
-            corner_radii: gpui::Corners::all(ScaledPixels(4.25)),
-            ..Default::default()
-        });
-        scene.finish();
-        scene
-    }
-
-    #[test]
-    fn clipped_quads_match_full_pixels_for_fractional_masks_borders_gradients_fades() -> Result<()>
-    {
-        let devices = DirectXDevices::new()?;
-        let window = HiddenWindow::new()?;
-        let mut renderer = DirectXRenderer::new(window.0, &devices, true)?;
-        renderer.resize(Size {
-            width: DevicePixels(200),
-            height: DevicePixels(100),
-        })?;
-        renderer.retained.disable_for_tests();
-        renderer.timings.diagnostic_ablations = gpui::profiler::gpu::DiagnosticAblations::default();
-        assert!(
-            renderer
-                .profile_capabilities()
-                .implemented_experiments
-                .iter()
-                .any(|name| name == "clipped-quads")
-        );
-        for fraction in [0.0, 0.25, 0.5, 0.75] {
-            for smoothing in [0.0, 0.65] {
-                for paint in 0..4 {
-                    let scene = clipped_quad_scene(fraction, smoothing, paint);
-                    renderer.timings.clipped_quads = false;
-                    assert!(
-                        !renderer
-                            .profile_capabilities()
-                            .active_experiments
-                            .iter()
-                            .any(|name| name == "clipped-quads")
-                    );
-                    let full =
-                        renderer.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?;
-                    renderer.timings.clipped_quads = true;
-                    assert!(
-                        renderer
-                            .profile_capabilities()
-                            .active_experiments
-                            .iter()
-                            .any(|name| name == "clipped-quads")
-                    );
-                    let clipped =
-                        renderer.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?;
-                    let difference = full
-                        .pixels()
-                        .zip(clipped.pixels())
-                        .enumerate()
-                        .find(|(_, (a, b))| a != b);
-                    assert!(
-                        difference.is_none(),
-                        "fraction={fraction} smoothing={smoothing} paint={paint} first differing pixel={difference:?}"
-                    );
-                }
-            }
-        }
-        Ok(())
     }
 
     fn dashed_border_scene(dash_length: f32, dash_gap: f32) -> Scene {
@@ -3473,54 +3138,6 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_ablation_clears_and_batch_omissions_match_empty_frame() -> Result<()> {
-        let devices = DirectXDevices::new()?;
-        let window = HiddenWindow::new()?;
-        let mut renderer = DirectXRenderer::new(window.0, &devices, true)?;
-        renderer.resize(Size {
-            width: DevicePixels(200),
-            height: DevicePixels(100),
-        })?;
-        renderer.retained.enable_for_tests();
-        let _scope = gpui::profiler::gpu::set_gpu_frame_context(
-            Some("diagnostic-dx11-test".into()),
-            true,
-            1,
-            1,
-        );
-        let mut empty = Scene::default();
-        empty.finish();
-        let expected = renderer.render_to_image(&empty, WindowBackgroundAppearance::Opaque)?;
-        let scene = retained_scene(false, true);
-        let _scope = gpui::profiler::gpu::set_gpu_frame_context(
-            Some("diagnostic-dx11-test".into()),
-            true,
-            2,
-            2,
-        );
-        assert_ne!(
-            renderer.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?,
-            expected
-        );
-        for name in ["clear-only", "no-quads,no-paths"] {
-            renderer.timings.diagnostic_ablations =
-                gpui::profiler::gpu::DiagnosticAblations::parse(name)
-                    .map_err(anyhow::Error::msg)?;
-            assert_eq!(
-                renderer.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?,
-                expected,
-                "diagnostic {name}"
-            );
-            assert_eq!(renderer.retained.last_damage(), "full");
-            assert_eq!(
-                renderer.profile_capabilities().active_diagnostic_ablations,
-                renderer.timings.diagnostic_ablations.active_names()
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
     fn retained_hover_damage_matches_full_render_and_reuses_keepalive() -> Result<()> {
         let devices = DirectXDevices::new()?;
         let window = HiddenWindow::new()?;
@@ -3536,12 +3153,7 @@ mod tests {
         }
         renderer.retained.enable_for_tests();
         let render = |renderer: &mut DirectXRenderer, scene: &Scene, revision: u64| {
-            let _guard = gpui::profiler::gpu::set_gpu_frame_context(
-                Some("retained-test".into()),
-                true,
-                revision,
-                revision,
-            );
+            let _guard = gpui::profiler::gpu::set_gpu_frame_context(true, revision);
             renderer.render_to_image(scene, WindowBackgroundAppearance::Opaque)
         };
         let initial = retained_scene(false, true);
@@ -3592,8 +3204,7 @@ mod tests {
             "resize invalidates unchanged revision reuse"
         );
         // Changing the background invalidates the previous clear/alpha representation.
-        let _guard =
-            gpui::profiler::gpu::set_gpu_frame_context(Some("retained-test".into()), true, 3, 3);
+        let _guard = gpui::profiler::gpu::set_gpu_frame_context(true, 3);
         assert_eq!(
             renderer.render_to_image(&hovered, WindowBackgroundAppearance::Transparent)?,
             reference.render_to_image(&hovered, WindowBackgroundAppearance::Transparent)?
@@ -3961,69 +3572,59 @@ mod tests {
         for mode in [GlyphRenderMode::Grayscale, GlyphRenderMode::Subpixel] {
             let badge = make_glyph(&renderer, mode, 66);
             let reference_badge = make_glyph(&reference, mode, 66);
-            for clipped in [false, true] {
-                renderer.timings.clipped_quads = clipped;
-                for fraction in [0.0, 0.25, 0.5, 0.75] {
-                    for changing_quad in [false, true] {
-                        renderer.retained.invalidate();
-                        let mut previous = None;
-                        for (revision, hover) in [
-                            (1, None),
-                            (2, Some(0)),
-                            (3, Some(2)),
-                            (4, Some(1)),
-                            (5, None),
-                        ] {
-                            let scene = combined_hover_badge_scene(
-                                hover,
-                                glyph,
-                                badge,
-                                mode == GlyphRenderMode::Subpixel,
-                                fraction,
-                                changing_quad,
-                            );
-                            let reference_scene = combined_hover_badge_scene(
-                                hover,
-                                reference_glyph,
-                                reference_badge,
-                                mode == GlyphRenderMode::Subpixel,
-                                fraction,
-                                changing_quad,
-                            );
-                            let _scope = gpui::profiler::gpu::set_gpu_frame_context(
-                                Some("hover-badge-native".into()),
-                                true,
-                                revision,
-                                revision,
-                            );
-                            let actual = renderer
-                                .render_to_image(&scene, WindowBackgroundAppearance::Transparent)?;
-                            let expected = reference.render_to_image(
-                                &reference_scene,
-                                WindowBackgroundAppearance::Transparent,
-                            )?;
-                            assert_eq!(
-                                actual, expected,
-                                "glyph badge mode={mode:?} fraction={fraction} clipped={clipped} changing_quad={changing_quad} hover={hover:?}"
-                            );
-                            assert_eq!(
-                                renderer.retained.last_damage(),
-                                if revision == 1 { "full" } else { "partial" },
-                                "glyph badge must qualify for actual Partial"
-                            );
-                            if let Some(previous) = &previous {
-                                assert_ne!(&actual, previous, "badge pixels must visibly change");
-                            }
-                            previous = Some(actual);
-                            assert_eq!(
-                                renderer.render_to_image(
-                                    &scene,
-                                    WindowBackgroundAppearance::Transparent
-                                )?,
-                                expected
-                            );
-                            assert_eq!(renderer.retained.last_damage(), "reuse");
+            for fraction in [0.0, 0.25, 0.5, 0.75] {
+                for changing_quad in [false, true] {
+                    renderer.retained.invalidate();
+                    let mut previous = None;
+                    for (revision, hover) in [
+                        (1, None),
+                        (2, Some(0)),
+                        (3, Some(2)),
+                        (4, Some(1)),
+                        (5, None),
+                    ] {
+                        let scene = combined_hover_badge_scene(
+                            hover,
+                            glyph,
+                            badge,
+                            mode == GlyphRenderMode::Subpixel,
+                            fraction,
+                            changing_quad,
+                        );
+                        let reference_scene = combined_hover_badge_scene(
+                            hover,
+                            reference_glyph,
+                            reference_badge,
+                            mode == GlyphRenderMode::Subpixel,
+                            fraction,
+                            changing_quad,
+                        );
+                        let _scope = gpui::profiler::gpu::set_gpu_frame_context(true, revision);
+                        let actual = renderer
+                            .render_to_image(&scene, WindowBackgroundAppearance::Transparent)?;
+                        let expected = reference.render_to_image(
+                            &reference_scene,
+                            WindowBackgroundAppearance::Transparent,
+                        )?;
+                        assert_eq!(
+                            actual, expected,
+                            "glyph badge mode={mode:?} fraction={fraction} changing_quad={changing_quad} hover={hover:?}"
+                        );
+                        assert_eq!(
+                            renderer.retained.last_damage(),
+                            if revision == 1 { "full" } else { "partial" },
+                            "glyph badge must qualify for actual Partial"
+                        );
+                        if let Some(previous) = &previous {
+                            assert_ne!(&actual, previous, "badge pixels must visibly change");
                         }
+                        previous = Some(actual);
+                        assert_eq!(
+                            renderer
+                                .render_to_image(&scene, WindowBackgroundAppearance::Transparent)?,
+                            expected
+                        );
+                        assert_eq!(renderer.retained.last_damage(), "reuse");
                     }
                 }
             }
@@ -4199,74 +3800,65 @@ mod tests {
         for mode in [GlyphRenderMode::Grayscale, GlyphRenderMode::Subpixel] {
             let badge = make_glyph(&renderer, mode, 66);
             let reference_badge = make_glyph(&reference, mode, 66);
-            for clipped in [false, true] {
-                renderer.timings.clipped_quads = clipped;
-                for fraction in [0.0, 0.25, 0.75] {
-                    for appearance in [
-                        WindowBackgroundAppearance::Transparent,
-                        WindowBackgroundAppearance::Opaque,
+            for fraction in [0.0, 0.25, 0.75] {
+                for appearance in [
+                    WindowBackgroundAppearance::Transparent,
+                    WindowBackgroundAppearance::Opaque,
+                ] {
+                    renderer.retained.invalidate();
+                    let mut previous = None;
+                    let mut snapshot = None;
+                    for (revision, hover) in [
+                        (1, None),
+                        (2, Some(0)),
+                        (3, Some(19)),
+                        (4, Some(9)),
+                        (5, None),
                     ] {
-                        renderer.retained.invalidate();
-                        let mut previous = None;
-                        let mut snapshot = None;
-                        for (revision, hover) in [
-                            (1, None),
-                            (2, Some(0)),
-                            (3, Some(19)),
-                            (4, Some(9)),
-                            (5, None),
-                        ] {
-                            let scene = make_scene(
-                                hover,
-                                glyph,
-                                badge,
-                                mode == GlyphRenderMode::Subpixel,
-                                fraction,
+                        let scene = make_scene(
+                            hover,
+                            glyph,
+                            badge,
+                            mode == GlyphRenderMode::Subpixel,
+                            fraction,
+                        );
+                        let reference_scene = make_scene(
+                            hover,
+                            reference_glyph,
+                            reference_badge,
+                            mode == GlyphRenderMode::Subpixel,
+                            fraction,
+                        );
+                        let next = SceneSnapshot::capture(&scene, 1, 512, 1024).unwrap();
+                        if revision == 3 {
+                            let old = snapshot.as_ref().unwrap();
+                            assert!(
+                                next.compare_checked(old).is_err(),
+                                "real bounds-tree fixture must need the tile fallback"
                             );
-                            let reference_scene = make_scene(
-                                hover,
-                                reference_glyph,
-                                reference_badge,
-                                mode == GlyphRenderMode::Subpixel,
-                                fraction,
-                            );
-                            let next = SceneSnapshot::capture(&scene, 1, 512, 1024).unwrap();
-                            if revision == 3 {
-                                let old = snapshot.as_ref().unwrap();
-                                assert!(
-                                    next.compare_checked(old).is_err(),
-                                    "real bounds-tree fixture must need the tile fallback"
-                                );
-                                assert!(matches!(
-                                    next.compare_tiled_checked(old),
-                                    Ok(Damage::Partial(_))
-                                ));
-                            }
-                            snapshot = Some(next);
-                            let _scope = gpui::profiler::gpu::set_gpu_frame_context(
-                                Some("bounds-tree-native".into()),
-                                true,
-                                revision,
-                                revision,
-                            );
-                            let actual = renderer.render_to_image(&scene, appearance)?;
-                            let expected =
-                                reference.render_to_image(&reference_scene, appearance)?;
-                            assert_eq!(
-                                actual, expected,
-                                "normal ranks mode={mode:?} fraction={fraction} clipped={clipped} appearance={appearance:?} hover={hover:?}"
-                            );
-                            assert_eq!(
-                                renderer.retained.last_damage(),
-                                if revision == 1 { "full" } else { "partial" }
-                            );
-                            if let Some(previous) = &previous {
-                                assert_ne!(&actual, previous, "hover pixels must visibly change");
-                            }
-                            previous = Some(actual);
-                            assert_eq!(renderer.render_to_image(&scene, appearance)?, expected);
-                            assert_eq!(renderer.retained.last_damage(), "reuse");
+                            assert!(matches!(
+                                next.compare_tiled_checked(old),
+                                Ok(Damage::Partial(_))
+                            ));
                         }
+                        snapshot = Some(next);
+                        let _scope = gpui::profiler::gpu::set_gpu_frame_context(true, revision);
+                        let actual = renderer.render_to_image(&scene, appearance)?;
+                        let expected = reference.render_to_image(&reference_scene, appearance)?;
+                        assert_eq!(
+                            actual, expected,
+                            "normal ranks mode={mode:?} fraction={fraction} appearance={appearance:?} hover={hover:?}"
+                        );
+                        assert_eq!(
+                            renderer.retained.last_damage(),
+                            if revision == 1 { "full" } else { "partial" }
+                        );
+                        if let Some(previous) = &previous {
+                            assert_ne!(&actual, previous, "hover pixels must visibly change");
+                        }
+                        previous = Some(actual);
+                        assert_eq!(renderer.render_to_image(&scene, appearance)?, expected);
+                        assert_eq!(renderer.retained.last_damage(), "reuse");
                     }
                 }
             }
@@ -4335,34 +3927,26 @@ mod tests {
                 height: DevicePixels(100),
             })?;
         }
-        for clipped in [false, true] {
-            renderer.timings.clipped_quads = clipped;
-            for appearance in [
-                WindowBackgroundAppearance::Transparent,
-                WindowBackgroundAppearance::Opaque,
-            ] {
-                renderer.retained.invalidate();
-                for (revision, hover) in [(1, None), (2, Some(0)), (3, Some(1)), (4, None)] {
-                    let scene = scene(hover);
-                    let _scope = gpui::profiler::gpu::set_gpu_frame_context(
-                        Some("inset-shadow-native".into()),
-                        true,
-                        revision,
-                        revision,
-                    );
-                    let actual = renderer.render_to_image(&scene, appearance)?;
-                    let expected = reference.render_to_image(&scene, appearance)?;
-                    assert_eq!(
-                        actual, expected,
-                        "inset shadow clipped={clipped} appearance={appearance:?} hover={hover:?}"
-                    );
-                    assert_eq!(
-                        renderer.retained.last_damage(),
-                        if revision == 1 { "full" } else { "partial" }
-                    );
-                    assert_eq!(renderer.render_to_image(&scene, appearance)?, expected);
-                    assert_eq!(renderer.retained.last_damage(), "reuse");
-                }
+        for appearance in [
+            WindowBackgroundAppearance::Transparent,
+            WindowBackgroundAppearance::Opaque,
+        ] {
+            renderer.retained.invalidate();
+            for (revision, hover) in [(1, None), (2, Some(0)), (3, Some(1)), (4, None)] {
+                let scene = scene(hover);
+                let _scope = gpui::profiler::gpu::set_gpu_frame_context(true, revision);
+                let actual = renderer.render_to_image(&scene, appearance)?;
+                let expected = reference.render_to_image(&scene, appearance)?;
+                assert_eq!(
+                    actual, expected,
+                    "inset shadow appearance={appearance:?} hover={hover:?}"
+                );
+                assert_eq!(
+                    renderer.retained.last_damage(),
+                    if revision == 1 { "full" } else { "partial" }
+                );
+                assert_eq!(renderer.render_to_image(&scene, appearance)?, expected);
+                assert_eq!(renderer.retained.last_damage(), "reuse");
             }
         }
         Ok(())
@@ -4375,13 +3959,17 @@ mod tests {
         let reference_window = HiddenWindow::new()?;
         let mut renderer = DirectXRenderer::new(window.0, &devices, false)?;
         let mut reference = DirectXRenderer::new(reference_window.0, &devices, false)?;
-        assert_eq!(
+        let mut description = DXGI_SWAP_CHAIN_DESC1::default();
+        unsafe {
             renderer
-                .profile_capabilities()
-                .surface_alpha_mode
-                .as_deref(),
-            Some("premultiplied")
-        );
+                .resources
+                .as_ref()
+                .unwrap()
+                .swap_chain
+                .GetDesc1(&mut description)
+        }
+        .ok()?;
+        assert_eq!(description.AlphaMode, DXGI_ALPHA_MODE_PREMULTIPLIED);
         renderer.retained.enable_for_tests();
         reference.retained.disable_for_tests();
         for renderer in [&mut renderer, &mut reference] {
@@ -4407,69 +3995,52 @@ mod tests {
         };
         let glyph = make_tile(&renderer);
         let reference_glyph = make_tile(&reference);
-        for clipped in [false, true] {
-            renderer.timings.clipped_quads = clipped;
+        renderer.retained.invalidate();
+        for fraction in [0.0, 0.25, 0.5, 0.75] {
             renderer.retained.invalidate();
-            for fraction in [0.0, 0.25, 0.5, 0.75] {
-                renderer.retained.invalidate();
-                let mut previous = None;
-                for (revision, hover) in [
-                    (1, None),
-                    (2, Some(0)),
-                    (3, Some(1)),
-                    (4, Some(2)),
-                    (5, None),
-                ] {
-                    let scene = transparent_retained_scene(hover, glyph, fraction);
-                    let reference_scene =
-                        transparent_retained_scene(hover, reference_glyph, fraction);
-                    let _scope = gpui::profiler::gpu::set_gpu_frame_context(
-                        Some("transparent-native".into()),
-                        true,
-                        revision,
-                        revision,
-                    );
-                    let actual = renderer
-                        .render_to_image(&scene, WindowBackgroundAppearance::Transparent)?;
-                    let expected = reference.render_to_image(
-                        &reference_scene,
-                        WindowBackgroundAppearance::Transparent,
-                    )?;
-                    assert_eq!(
-                        actual, expected,
-                        "transparent fraction={fraction} clipped={clipped} hover={hover:?}"
-                    );
-                    assert_eq!(
-                        renderer.retained.last_damage(),
-                        if revision == 1 { "full" } else { "partial" }
-                    );
-                    assert!(
-                        actual
-                            .pixels()
-                            .any(|pixel| pixel.0[3] > 0 && pixel.0[3] < 255),
-                        "fixture must contain fractional alpha"
-                    );
-                    if let Some(previous) = &previous {
-                        assert_ne!(&actual, previous, "fixture must change visible pixels");
-                    }
-                    previous = Some(actual.clone());
-                    assert_eq!(
-                        renderer
-                            .render_to_image(&scene, WindowBackgroundAppearance::Transparent)?,
-                        expected
-                    );
-                    assert_eq!(renderer.retained.last_damage(), "reuse");
+            let mut previous = None;
+            for (revision, hover) in [
+                (1, None),
+                (2, Some(0)),
+                (3, Some(1)),
+                (4, Some(2)),
+                (5, None),
+            ] {
+                let scene = transparent_retained_scene(hover, glyph, fraction);
+                let reference_scene = transparent_retained_scene(hover, reference_glyph, fraction);
+                let _scope = gpui::profiler::gpu::set_gpu_frame_context(true, revision);
+                let actual =
+                    renderer.render_to_image(&scene, WindowBackgroundAppearance::Transparent)?;
+                let expected = reference
+                    .render_to_image(&reference_scene, WindowBackgroundAppearance::Transparent)?;
+                assert_eq!(
+                    actual, expected,
+                    "transparent fraction={fraction} hover={hover:?}"
+                );
+                assert_eq!(
+                    renderer.retained.last_damage(),
+                    if revision == 1 { "full" } else { "partial" }
+                );
+                assert!(
+                    actual
+                        .pixels()
+                        .any(|pixel| pixel.0[3] > 0 && pixel.0[3] < 255),
+                    "fixture must contain fractional alpha"
+                );
+                if let Some(previous) = &previous {
+                    assert_ne!(&actual, previous, "fixture must change visible pixels");
                 }
+                previous = Some(actual.clone());
+                assert_eq!(
+                    renderer.render_to_image(&scene, WindowBackgroundAppearance::Transparent)?,
+                    expected
+                );
+                assert_eq!(renderer.retained.last_damage(), "reuse");
             }
         }
         let scene = transparent_retained_scene(None, glyph, 0.25);
         let reference_scene = transparent_retained_scene(None, reference_glyph, 0.25);
-        let _scope = gpui::profiler::gpu::set_gpu_frame_context(
-            Some("transparent-native".into()),
-            true,
-            5,
-            5,
-        );
+        let _scope = gpui::profiler::gpu::set_gpu_frame_context(true, 5);
         for appearance in [
             WindowBackgroundAppearance::Opaque,
             WindowBackgroundAppearance::Transparent,
@@ -4524,12 +4095,7 @@ mod tests {
         }
         for (revision, hover) in [(1, false), (2, true), (3, false)] {
             let scene = retained_scene(hover, false);
-            let _scope = gpui::profiler::gpu::set_gpu_frame_context(
-                Some("retained-insert-test".into()),
-                true,
-                revision,
-                revision,
-            );
+            let _scope = gpui::profiler::gpu::set_gpu_frame_context(true, revision);
             assert_eq!(
                 renderer.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?,
                 reference.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?

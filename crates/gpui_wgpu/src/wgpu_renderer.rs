@@ -18,7 +18,6 @@ mod buffers;
 mod drawing;
 mod filters;
 mod frame;
-mod gpu_timing;
 #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
 mod headless;
 mod path_types;
@@ -27,7 +26,7 @@ mod platform;
 pub use platform::RecoveryPending;
 mod resources;
 mod retained;
-pub(crate) mod retained_copy;
+mod retained_copy;
 mod settings;
 mod surfaces;
 mod target;
@@ -77,7 +76,6 @@ pub struct WgpuRenderer {
     adapter_info: wgpu::AdapterInfo,
     uploaded_globals: Option<frame::GlobalUniformState>,
     faults: GpuFaultState,
-    timings: gpu_timing::GpuTimings,
     retained: retained::RetainedFrame,
     #[cfg(test)]
     last_retained_presentation: &'static str,
@@ -118,7 +116,7 @@ impl WgpuRenderer {
             && !target.retained_copy_enabled()
         {
             log::warn!(
-                "retained-copy was rejected: it requires partial-redraw, Windows DX12, a COPY_DST non-sRGB BGRA8/RGBA8 target, supported alpha and encoder timestamps when observing, without diagnostic ablations"
+                "retained-copy was rejected: it requires partial-redraw, Windows DX12, a COPY_DST non-sRGB BGRA8/RGBA8 target and supported alpha"
             );
         }
         if let Some(surface) = surface.as_ref() {
@@ -139,12 +137,6 @@ impl WgpuRenderer {
             last_error,
         } = metadata;
 
-        let timings = gpu_timing::GpuTimings::new(
-            context.device.clone(),
-            context.queue.clone(),
-            format!("wgpu-{:?}", adapter_info.backend).to_ascii_lowercase(),
-            resources.instances.transport() == buffers::InstanceTransport::StorageBuffer,
-        );
         Ok(Self {
             context: gpu_context,
             #[cfg(not(target_family = "wasm"))]
@@ -161,7 +153,6 @@ impl WgpuRenderer {
             dual_source_blending,
             adapter_info,
             uploaded_globals: None,
-            timings,
             retained: retained::RetainedFrame::new(),
             #[cfg(test)]
             last_retained_presentation: "direct",
@@ -326,40 +317,11 @@ impl WgpuRenderer {
             driver_info: self.adapter_info.driver_info.clone(),
         }
     }
-    pub fn profile_capabilities(&self) -> gpui::profiler::gpu::RendererProfileCapabilities {
-        let mut capabilities = self.timings.capabilities();
-        capabilities.present_mode =
-            Some(format!("{:?}", self.target.configuration().present_mode).to_ascii_lowercase());
-        capabilities.surface_alpha_mode =
-            Some(format!("{:?}", self.target.configuration().alpha_mode).to_ascii_lowercase());
-        if self.crop_path_targets {
-            capabilities.active_experiments.push("cropped-paths".into());
-        }
-        if self.retained.enabled() && !self.timings.diagnostic_ablations.enabled() {
-            capabilities
-                .active_experiments
-                .push("partial-redraw".into());
-            if self.target.retained_copy_enabled() && self.timings.can_time_encoder() {
-                capabilities.active_experiments.push("retained-copy".into());
-            }
-        }
-        if self.target.retained_copy_supported() && self.timings.can_time_encoder() {
-            capabilities
-                .implemented_experiments
-                .push("retained-copy".into());
-        }
-        capabilities.active_experiments.sort_unstable();
-        capabilities
-    }
     /// Release the experimental retained frame when a window is deactivated.
     pub fn release_retained_frame(&mut self) {
         if let Some(resources) = &self.resources {
             self.retained.invalidate(&resources.queue);
         }
-    }
-    /// Explain a platform draw skipped before surface acquisition when timings are enabled.
-    pub fn record_skipped_gpu_submission(&self, reason: &str) {
-        self.timings.skipped(reason);
     }
 
     pub fn max_texture_size(&self) -> u32 {
@@ -415,13 +377,11 @@ fn cropped_path_targets_for_experiments(experiments: Option<&str>, default_enabl
 }
 
 fn begin_color_render_pass<'encoder>(
-    timings: &gpu_timing::GpuTimings,
     encoder: &'encoder mut wgpu::CommandEncoder,
     label: &'encoder str,
     target: &'encoder wgpu::TextureView,
     load: wgpu::LoadOp<wgpu::Color>,
 ) -> wgpu::RenderPass<'encoder> {
-    let timestamp = timings.pass(label);
     encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some(label),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -434,7 +394,6 @@ fn begin_color_render_pass<'encoder>(
             depth_slice: None,
         })],
         depth_stencil_attachment: None,
-        timestamp_writes: timestamp.as_ref().map(gpu_timing::TimestampPass::writes),
         ..Default::default()
     })
 }

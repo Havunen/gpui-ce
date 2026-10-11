@@ -2,11 +2,10 @@
 
 use gpui::profiler::gpu;
 
-pub(crate) fn requested() -> bool {
+pub(super) fn requested() -> bool {
     cfg!(target_os = "windows")
         && gpu::experiment_enabled("partial-redraw")
         && gpu::experiment_enabled("retained-copy")
-        && !gpu::DiagnosticAblations::from_environment().enabled()
 }
 
 pub(super) fn format_supported(format: wgpu::TextureFormat) -> bool {

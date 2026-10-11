@@ -22,19 +22,17 @@ struct Target {
     alpha_mode: wgpu::CompositeAlphaMode,
     clear_color: wgpu::Color,
     copy_source: bool,
-    reservation: GpuMemoryReservation,
+    // Held for its drop, which releases the device budget.
+    _reservation: GpuMemoryReservation,
 }
 pub(super) struct RetainedPlan {
     pub view: Option<wgpu::TextureView>,
     pub copy_texture: Option<wgpu::Texture>,
     pub damage: Damage,
     pub snapshot: Option<SceneSnapshot>,
-    pub bytes: u64,
     pub scene_revision: u64,
     pub atlas_generation: u64,
     pub reuse_snapshot: bool,
-    pub fallback_reason: Option<&'static str>,
-    pub diff_detail: Option<String>,
 }
 impl RetainedFrame {
     pub fn new() -> Self {
@@ -80,7 +78,6 @@ impl RetainedFrame {
         atlas: u64,
         width: u32,
         height: u32,
-        eligible: bool,
         copy_source: bool,
         device: &Arc<wgpu::Device>,
         queue: &Arc<wgpu::Queue>,
@@ -94,55 +91,44 @@ impl RetainedFrame {
                 copy_texture: None,
                 damage: Damage::Full,
                 snapshot: None,
-                bytes: 0,
                 scene_revision: 0,
                 atlas_generation: 0,
                 reuse_snapshot: false,
-                fallback_reason: None,
-                diff_detail: None,
             };
         }
         let context = gpu::gpu_frame_context();
-        let full = |reason| RetainedPlan {
+        let full = || RetainedPlan {
             view: None,
             copy_texture: None,
             damage: Damage::Full,
             snapshot: None,
-            bytes: 0,
             scene_revision: context.scene_revision,
             atlas_generation: atlas,
             reuse_snapshot: false,
-            fallback_reason: Some(reason),
-            diff_detail: None,
         };
-        if !eligible || !context.active {
+        if !context.active {
             self.invalidate(queue);
-            return full(if !eligible {
-                "diagnostic-ablation"
-            } else {
-                "inactive-window"
-            });
+            return full();
         }
         if !matches!(
             alpha_mode,
             wgpu::CompositeAlphaMode::Opaque | wgpu::CompositeAlphaMode::PreMultiplied
         ) {
             self.invalidate(queue);
-            return full("unsupported-alpha-mode");
+            return full();
         }
         // The damage-clear Quad must reproduce the raw target clear exactly.
         // Colored translucent clears would be premultiplied again by its shader;
         // arbitrary opaque colors also lack an exact HSL round-trip proof.
         if !retained_clear_supported(clear_color) {
             self.invalidate(queue);
-            return full("unsupported-clear-color");
+            return full();
         }
         if retained_bytes(format, width, height).is_none() {
             self.invalidate(queue);
-            return full("unsupported-target-format-or-size");
+            return full();
         }
         self.queue = Some(queue.clone());
-        let mut target_change = None;
         if self.target.as_ref().is_some_and(|target| {
             target.width != width
                 || target.height != height
@@ -151,7 +137,6 @@ impl RetainedFrame {
                 || target.clear_color != clear_color
                 || target.copy_source != copy_source
         }) {
-            target_change = Some("target-configuration-change");
             self.invalidate(queue);
         }
         // Keepalive submissions reuse the same finished scene. Avoid cloning or comparing
@@ -166,30 +151,27 @@ impl RetainedFrame {
                     copy_texture: copy_source.then(|| target.texture.clone()),
                     damage: Damage::Reuse,
                     snapshot: None,
-                    bytes: target.reservation.bytes,
                     scene_revision: context.scene_revision,
                     atlas_generation: atlas,
                     reuse_snapshot: true,
-                    fallback_reason: None,
-                    diff_detail: None,
                 };
             }
         }
         let snapshot = match SceneSnapshot::capture_checked(scene, atlas, width, height) {
             Ok(snapshot) => snapshot,
-            Err(reason) => {
+            Err(_) => {
                 self.invalidate(queue);
-                return full(reason.as_str());
+                return full();
             }
         };
         if self.target.is_none() {
             let Some(bytes) = retained_bytes(format, width, height) else {
-                return full("unsupported-target-format-or-size");
+                return full();
             };
             let Some(reservation) =
                 gpu::reserve_retained_bytes("wgpu", Arc::as_ptr(device) as usize, bytes)
             else {
-                return full("retained-device-budget");
+                return full();
             };
             let texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("gpui_retained_frame"),
@@ -221,40 +203,17 @@ impl RetainedFrame {
                 alpha_mode,
                 clear_color,
                 copy_source,
-                reservation,
+                _reservation: reservation,
             });
         }
-        let (damage, comparison_reason, diff_detail) = match self.snapshot.as_ref() {
-            Some(previous) => {
-                let (comparison, detail) = if gpu::timings_enabled() {
-                    snapshot.compare_checked_diagnostic(previous)
-                } else {
-                    (snapshot.compare_checked(previous), None)
-                };
-                match comparison {
-                    Ok(damage) => (damage, None, detail),
-                    // Exact local painter sequences handle disjoint global-rank
-                    // permutations without weakening the strict fast path.
-                    Err(_) => match snapshot.compare_tiled_checked(previous) {
-                        Ok(damage) => (damage, None, detail),
-                        Err(reason) => (Damage::Full, Some(reason), detail),
-                    },
-                }
-            }
-            None => (Damage::Full, None, None),
-        };
-        let fallback_reason = if damage == Damage::Full {
-            Some(
-                target_change
-                    .or(comparison_reason)
-                    .unwrap_or(if self.snapshot.is_some() {
-                        "scene-change"
-                    } else {
-                        "initial-scene"
-                    }),
-            )
-        } else {
-            None
+        let damage = match self.snapshot.as_ref() {
+            // Exact local painter sequences handle disjoint global-rank
+            // permutations without weakening the strict fast path.
+            Some(previous) => snapshot
+                .compare_checked(previous)
+                .or_else(|_| snapshot.compare_tiled_checked(previous))
+                .unwrap_or(Damage::Full),
+            None => Damage::Full,
         };
         let target = self.target.as_ref().unwrap();
         RetainedPlan {
@@ -262,12 +221,9 @@ impl RetainedFrame {
             copy_texture: copy_source.then(|| target.texture.clone()),
             damage,
             snapshot: Some(snapshot),
-            bytes: target.reservation.bytes,
             scene_revision: context.scene_revision,
             atlas_generation: atlas,
             reuse_snapshot: false,
-            fallback_reason,
-            diff_detail,
         }
     }
     pub fn complete(

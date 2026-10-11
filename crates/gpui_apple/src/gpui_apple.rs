@@ -7,4 +7,3 @@
 mod damage;
 mod metal_atlas;
 pub mod metal_renderer;
-mod scene_stats;

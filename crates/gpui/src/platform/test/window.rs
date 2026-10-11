@@ -53,7 +53,6 @@ pub(crate) struct TestWindowState {
     can_start_external_drag: bool,
     modifiers: crate::Modifiers,
     fixed_refresh_rate: bool,
-    input_rate_keepalive: Option<bool>,
     presents: usize,
 }
 
@@ -123,7 +122,6 @@ impl TestWindow {
             can_start_external_drag: true,
             modifiers: crate::Modifiers::default(),
             fixed_refresh_rate: false,
-            input_rate_keepalive: None,
             presents: 0,
         })))
     }
@@ -131,11 +129,6 @@ impl TestWindow {
     /// Reports this window's display as refreshing at one fixed rate.
     pub fn set_fixed_refresh_rate(&self, fixed: bool) {
         self.0.lock().fixed_refresh_rate = fixed;
-    }
-
-    /// Override input-rate keepalive while preserving all other frame demands.
-    pub fn set_input_rate_keepalive(&self, enabled: Option<bool>) {
-        self.0.lock().input_rate_keepalive = enabled;
     }
 
     /// Returns how many frames were handed to the platform, drawn or
@@ -512,13 +505,6 @@ impl PlatformWindow for TestWindow {
 
     fn has_fixed_refresh_rate(&self) -> bool {
         self.0.lock().fixed_refresh_rate
-    }
-
-    fn needs_input_rate_keepalive(&self) -> bool {
-        let state = self.0.lock();
-        state
-            .input_rate_keepalive
-            .unwrap_or(!state.fixed_refresh_rate)
     }
 
     fn sprite_atlas(&self) -> sync::Arc<dyn crate::PlatformAtlas> {

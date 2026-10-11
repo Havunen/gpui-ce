@@ -13,7 +13,6 @@ pub(super) struct RenderTarget {
     copy_backend_supported: bool,
     copy_surface_supported: bool,
     copy_requested: bool,
-    copy_encoder_timestamps: bool,
     pub(super) clear_color: wgpu::Color,
 }
 
@@ -108,10 +107,6 @@ impl RenderTarget {
             copy_backend_supported: cfg!(target_os = "windows") && backend == wgpu::Backend::Dx12,
             copy_surface_supported,
             copy_requested: super::retained_copy::requested(),
-            copy_encoder_timestamps: !gpui::profiler::gpu::timings_enabled()
-                || device
-                    .features()
-                    .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
             clear_color: clear_color(requested.transparent),
         };
         target.refresh_copy_usage();
@@ -151,7 +146,6 @@ impl RenderTarget {
     pub(super) fn retained_copy_supported(&self) -> bool {
         self.copy_backend_supported
             && self.copy_surface_supported
-            && self.copy_encoder_timestamps
             && super::retained_copy::format_supported(self.config.format)
             && super::retained_copy::alpha_supported(self.config.alpha_mode)
     }
@@ -400,7 +394,6 @@ mod tests {
             copy_backend_supported: true,
             copy_surface_supported: true,
             copy_requested: true,
-            copy_encoder_timestamps: true,
             clear_color: wgpu::Color::TRANSPARENT,
         };
         let mut caps = wgpu::SurfaceCapabilities {

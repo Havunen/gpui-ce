@@ -22,36 +22,27 @@ pub(super) fn render_to_view(
     frame_texture: Option<&wgpu::Texture>,
     readback: Option<ReadbackCopy<'_>>,
 ) -> Option<wgpu::SubmissionIndex> {
-    renderer.timings.begin(&renderer.resources().device);
-    let Some(mut targets) = PreparedTargets::prepare(renderer, scene, frame_view) else {
-        renderer.timings.cancel("Frame preparation failed");
-        return None;
-    };
+    let mut targets = PreparedTargets::prepare(renderer, scene, frame_view)?;
     let device = renderer.resources().device.clone();
     let queue = renderer.resources().queue.clone();
-    let atlas_generation =
-        if renderer.retained.enabled() && !renderer.timings.diagnostic_ablations.enabled() {
-            gpui::PlatformAtlas::generation(renderer.atlas.as_ref())
-        } else {
-            0
-        };
-    let mut retained = renderer.retained.prepare(
+    let atlas_generation = if renderer.retained.enabled() {
+        gpui::PlatformAtlas::generation(renderer.atlas.as_ref())
+    } else {
+        0
+    };
+    let retained = renderer.retained.prepare(
         scene,
         atlas_generation,
         renderer.target.width(),
         renderer.target.height(),
-        !renderer.timings.diagnostic_ablations.enabled(),
-        renderer.target.retained_copy_enabled() && renderer.timings.can_time_encoder(),
+        renderer.target.retained_copy_enabled(),
         &device,
         &queue,
         renderer.target.format(),
         renderer.target.configuration().alpha_mode,
         renderer.target.clear_color(),
     );
-    let retained_copy = if renderer.target.retained_copy_enabled()
-        && renderer.timings.can_time_encoder()
-        && targets.offscreen.is_none()
-    {
+    let retained_copy = if renderer.target.retained_copy_enabled() && targets.offscreen.is_none() {
         retained
             .copy_texture
             .as_ref()
@@ -80,9 +71,6 @@ pub(super) fn render_to_view(
                     .uniforms;
             uniforms.filter_count = uniforms.filter_count.saturating_add(1);
             if !renderer.ensure_uniform_capacity(uniforms) {
-                renderer
-                    .timings
-                    .cancel("Retained presentation uniform upload unavailable");
                 renderer.retained.invalidate(&queue);
                 return None;
             }
@@ -97,23 +85,6 @@ pub(super) fn render_to_view(
             .pipelines
             .ensure_damage_clear(&device);
     }
-    let mut experiments = Vec::new();
-    if renderer.crop_path_targets {
-        experiments.push("cropped-paths".into());
-    }
-    if renderer.retained.enabled() && !renderer.timings.diagnostic_ablations.enabled() {
-        experiments.push("partial-redraw".into());
-        if renderer.target.retained_copy_enabled() && renderer.timings.can_time_encoder() {
-            experiments.push("retained-copy".into());
-        }
-    }
-    renderer.timings.describe_damage(
-        retained.damage.kind(),
-        retained.bytes,
-        retained.fallback_reason,
-        retained.diff_detail.take(),
-        experiments,
-    );
     // Partial regions replay batches independently. Reserve bounded duplicate uploads and clear quads.
     if let Damage::Partial(regions) = &retained.damage {
         let device = renderer.resources().device.clone();
@@ -133,19 +104,12 @@ pub(super) fn render_to_view(
             bytes,
             batches,
         ) {
-            renderer
-                .timings
-                .cancel("Partial frame storage exceeded capacity");
             return None;
         }
         let resources = renderer.resources();
-        let Some(instances) = resources
+        let instances = resources
             .instances
-            .begin_upload(&resources.queue, bytes, batches)
-        else {
-            renderer.timings.cancel("Partial frame upload unavailable");
-            return None;
-        };
+            .begin_upload(&resources.queue, bytes, batches)?;
         targets.instances = instances;
     }
     // Prune once against the complete scene. Doing this inside each draw batch would evict a
@@ -185,7 +149,6 @@ pub(super) fn render_to_view(
     match result {
         Ok(command_buffer) => {
             let submission = renderer.resources().queue.submit([command_buffer]);
-            renderer.timings.submitted(submission.clone());
             // A cleanup skipped a frame. Only a real submission without a new validation
             // error can reset that retry budget; merely starting the next frame cannot.
             if renderer.faults.cleaned_up_failed_frames
@@ -196,17 +159,12 @@ pub(super) fn render_to_view(
             }
             Some(submission)
         }
-        Err(DrawError::ExternalSurface) => {
-            renderer.timings.cancel("External surface failed");
-            None
-        }
+        Err(DrawError::ExternalSurface) => None,
         Err(DrawError::CapacityPlanningInvariant) => {
-            renderer.timings.cancel("Frame storage exceeded capacity");
             log::error!("frame storage exceeded its precomputed capacity");
             None
         }
         Err(DrawError::MissingIntermediateTarget) => {
-            renderer.timings.cancel("Intermediate target missing");
             log::error!("frame preparation did not create a required intermediate target");
             None
         }
@@ -237,12 +195,8 @@ impl PreparedTargets {
         if !begin_frame(renderer) {
             return None;
         }
-        let requirements = if renderer.timings.diagnostic_ablations.clear_only() {
-            FrameRequirements::default()
-        } else {
-            let transport = renderer.resources().instances.transport();
-            FrameRequirements::for_scene(scene, transport)
-        };
+        let transport = renderer.resources().instances.transport();
+        let requirements = FrameRequirements::for_scene(scene, transport);
         let device = renderer.resources().device.clone();
         let resources = renderer.resources_mut();
         if !resources.instances.ensure_capacity(
@@ -769,10 +723,6 @@ impl<'a> FrameEncoder<'a> {
         let result = self.encode_commands();
         if result.is_ok() {
             if let Some((source, destination)) = &self.retained_copy {
-                let interval = self
-                    .renderer
-                    .timings
-                    .begin_encoder_interval(&mut self.encoder, "scene_copy");
                 self.encoder.copy_texture_to_texture(
                     source.as_image_copy(),
                     destination.as_image_copy(),
@@ -782,9 +732,6 @@ impl<'a> FrameEncoder<'a> {
                         depth_or_array_layers: 1,
                     },
                 );
-                self.renderer
-                    .timings
-                    .end_encoder_interval(&mut self.encoder, interval);
             }
             if self.retained_blit {
                 self.renderer.blit_to_frame(
@@ -818,7 +765,6 @@ impl<'a> FrameEncoder<'a> {
         }
         self.instances.finish(&mut self.encoder);
         self.renderer.resources().finish_frame_uploads();
-        self.renderer.timings.resolve(&mut self.encoder);
         let command_buffer = self.encoder.finish();
         result.map(|()| command_buffer)
     }
@@ -839,11 +785,7 @@ impl<'a> FrameEncoder<'a> {
         let mut pass = begin_scene_render_pass(
             self.renderer,
             &mut self.encoder,
-            if self.renderer.timings.diagnostic_ablations.clear_only() {
-                "clear_only"
-            } else {
-                "main_pass"
-            },
+            "main_pass",
             self.targets.current(),
             if region.is_some() {
                 wgpu::LoadOp::Load
@@ -868,15 +810,6 @@ impl<'a> FrameEncoder<'a> {
         }
 
         for command in self.scene.render_commands() {
-            if self.renderer.timings.diagnostic_ablations.enabled()
-                && self
-                    .renderer
-                    .timings
-                    .diagnostic_ablations
-                    .skips_command(command)
-            {
-                continue;
-            }
             if let (Some(region), RenderCommand::Batch(batch)) = (region, command) {
                 if !batch_intersects(self.scene, batch, region) {
                     continue;
@@ -940,7 +873,6 @@ impl<'a> FrameEncoder<'a> {
                     batch,
                     &mut self.instances,
                     &mut pass,
-                    region,
                 )?,
                 RenderCommand::BeginFilter {
                     target: FilterRenderTarget::Isolated(index),
@@ -1014,7 +946,7 @@ fn begin_scene_render_pass<'a>(
     load: wgpu::LoadOp<wgpu::Color>,
     region: Option<DamageRect>,
 ) -> wgpu::RenderPass<'a> {
-    let mut pass = begin_color_render_pass(&renderer.timings, encoder, label, target, load);
+    let mut pass = begin_color_render_pass(encoder, label, target, load);
     if let Some(region) = region {
         pass.set_scissor_rect(region.x, region.y, region.width, region.height);
     }
@@ -1080,16 +1012,11 @@ fn encode_inline_batch(
     batch: &PrimitiveBatch,
     instances: &mut InstanceUpload,
     pass: &mut wgpu::RenderPass<'_>,
-    region: Option<DamageRect>,
 ) -> DrawResult {
     match batch {
-        PrimitiveBatch::Quads { range, smoothed } => renderer.draw_quads(
-            &scene.quads[range.clone()],
-            *smoothed,
-            instances,
-            pass,
-            region,
-        ),
+        PrimitiveBatch::Quads { range, smoothed } => {
+            renderer.draw_quads(&scene.quads[range.clone()], *smoothed, instances, pass)
+        }
         PrimitiveBatch::Shadows { range, smoothed } => {
             renderer.draw_shadows(&scene.shadows[range.clone()], *smoothed, instances, pass)
         }

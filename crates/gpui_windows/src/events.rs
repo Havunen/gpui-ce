@@ -367,7 +367,6 @@ impl WindowsWindowInner {
     }
 
     fn handle_mouse_move_msg(&self, handle: HWND, lparam: LPARAM, wparam: WPARAM) -> Option<isize> {
-        let native_input = crate::input_diagnostics::current_native_input();
         self.start_tracking_mouse(handle, TME_LEAVE as u32);
         self.restore_cursor_after_hide();
 
@@ -395,12 +394,7 @@ impl WindowsWindowInner {
             pressed_button,
             modifiers: current_modifiers(),
         });
-        let native_scope = crate::input_diagnostics::NativeInputScope::enter(
-            &self.state.native_input_diagnostic,
-            native_input,
-        );
         let handled = !func(input).propagate;
-        drop(native_scope);
         self.state.callbacks.input.set(Some(func));
 
         if handled { Some(0) } else { Some(1) }
@@ -1332,8 +1326,8 @@ impl WindowsWindowInner {
             return Some(0);
         };
         let mut request_frame = self.state.callbacks.request_frame.take()?;
-        // Resolve completed queries without flushing, drawing, or extending input keepalive.
-        self.state.renderer.borrow_mut().poll_gpu_timings();
+        // Release retired retained targets whose GPU work has finished, without drawing.
+        self.state.renderer.borrow_mut().poll_retired();
         self.state.direct_manipulation.update();
 
         let events = self.state.direct_manipulation.drain_events();

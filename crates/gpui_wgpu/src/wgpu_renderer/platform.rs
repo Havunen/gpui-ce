@@ -171,7 +171,6 @@ impl WgpuRenderer {
     /// Acquires, renders, and presents one native or canvas surface frame.
     pub fn draw(&mut self, scene: &Scene) -> bool {
         if !self.target.is_configured() {
-            self.timings.skipped("Surface is not configured");
             return false;
         }
         let frame = match self
@@ -183,27 +182,19 @@ impl WgpuRenderer {
         {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
-                self.timings
-                    .skipped("Suboptimal swapchain acquisition; reconfiguration required");
                 drop(frame);
                 self.reconfigure_surface();
                 return false;
             }
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
-                self.timings
-                    .skipped("Lost or outdated swapchain acquisition");
                 self.reconfigure_surface();
                 return false;
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                self.timings
-                    .skipped("Swapchain acquisition timed out or window was occluded");
                 self.target.request_redraw();
                 return false;
             }
             wgpu::CurrentSurfaceTexture::Validation => {
-                self.timings
-                    .skipped("Swapchain acquisition validation failed");
                 self.target.request_redraw();
                 // This frame never reaches render_to_view; account for its error here so
                 // persistent acquisition failures cannot bypass the terminal-error limit.

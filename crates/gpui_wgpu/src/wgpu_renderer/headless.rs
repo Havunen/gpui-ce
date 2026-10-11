@@ -276,141 +276,6 @@ mod path_target_tests {
         }
     }
 
-    fn clipped_quad_scene(fraction: f32, smoothing: f32, paint: usize) -> Scene {
-        let bounds = scaled(7.25 + fraction, 8.5 + fraction, 180.25, 83.25);
-        let x = bounds.origin.x.0;
-        let y = bounds.origin.y.0;
-        let w = bounds.size.width.0;
-        let h = bounds.size.height.0;
-        let gradient = gpui::linear_gradient(
-            37.0,
-            gpui::linear_color_stop(gpui::hsla(0.01, 0.85, 0.62, 0.8), 0.0),
-            gpui::linear_color_stop(gpui::hsla(0.62, 0.7, 0.35, 0.55), 1.0),
-        );
-        let background = match paint {
-            0 => gpui::Background::default(), // Actual border-only split shape.
-            1 => gradient.color_space(gpui::ColorSpace::Srgb),
-            2 => gradient.color_space(gpui::ColorSpace::Oklab),
-            _ => gpui::pattern_slash(gpui::hsla(0.6, 0.8, 0.6, 0.7), 1.5, 4.25),
-        };
-        let mut scene = Scene::default();
-        scene.insert_primitive(Quad {
-            bounds: scaled(0.0, 0.0, 200.0, 100.0),
-            content_mask: full_mask(),
-            background: solid_background(gpui::rgb(0x18212b)),
-            ..Default::default()
-        });
-        for (index, clip) in [
-            scaled(x, y, w, 2.5),
-            scaled(x + w - 3.0, y, 3.0, h),
-            scaled(x, y + h - 4.0, w, 4.0),
-            scaled(x, y, 1.5, h),
-            scaled(x + 45.25, y + 25.5, 8.75, 7.25),
-            scaled(x + 250.0, y + 140.0, 1.0, 1.0), // Empty intersection.
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            scene.insert_primitive(Quad {
-                bounds,
-                content_mask: ContentMask {
-                    bounds: clip,
-                    fade_out: if index == 4 {
-                        gpui::Edges::all(ScaledPixels(1.25))
-                    } else {
-                        gpui::Edges::default()
-                    },
-                },
-                background,
-                border_color: gradient,
-                border_style: if paint.is_multiple_of(2) {
-                    gpui::BorderStyle::Solid
-                } else {
-                    gpui::BorderStyle::Dashed
-                },
-                border_dashed_length: 3.75,
-                border_dashed_gap: 1.25,
-                corner_radii: gpui::Corners {
-                    top_left: ScaledPixels(11.5),
-                    top_right: ScaledPixels(16.25),
-                    bottom_right: ScaledPixels(8.75),
-                    bottom_left: ScaledPixels(14.5),
-                },
-                border_widths: gpui::Edges {
-                    top: ScaledPixels(2.5),
-                    right: ScaledPixels(3.0),
-                    bottom: ScaledPixels(4.0),
-                    left: ScaledPixels(1.5),
-                },
-                corner_smoothing: smoothing,
-                ..Default::default()
-            });
-        }
-        // Later translucent paint makes accidental clear/reordering visible.
-        scene.insert_primitive(Quad {
-            bounds: scaled(40.5, 9.5, 18.5, 70.5),
-            content_mask: full_mask(),
-            background: solid_background(gpui::hsla(0.02, 0.8, 0.6, 0.4)),
-            corner_radii: gpui::Corners::all(ScaledPixels(4.25)),
-            ..Default::default()
-        });
-        scene.finish();
-        scene
-    }
-
-    #[test]
-    fn clipped_quads_match_full_pixels_for_fractional_masks_borders_gradients_fades()
-    -> anyhow::Result<()> {
-        let _gpu_test_guard = crate::test_gpu::guard();
-        let context = WgpuContext::new_headless(None)?;
-        let mut renderer =
-            WgpuRenderer::new_headless(&context, size(DevicePixels(200), DevicePixels(100)))?;
-        renderer.retained.disable_for_tests();
-        renderer.timings.diagnostic_ablations = gpui::profiler::gpu::DiagnosticAblations::default();
-        assert!(
-            renderer
-                .profile_capabilities()
-                .implemented_experiments
-                .iter()
-                .any(|name| name == "clipped-quads")
-        );
-        for fraction in [0.0, 0.25, 0.5, 0.75] {
-            for smoothing in [0.0, 0.65] {
-                for paint in 0..4 {
-                    let scene = clipped_quad_scene(fraction, smoothing, paint);
-                    renderer.timings.clipped_quads = false;
-                    assert!(
-                        !renderer
-                            .profile_capabilities()
-                            .active_experiments
-                            .iter()
-                            .any(|name| name == "clipped-quads")
-                    );
-                    let full = renderer.render_to_image(&scene)?;
-                    renderer.timings.clipped_quads = true;
-                    assert!(
-                        renderer
-                            .profile_capabilities()
-                            .active_experiments
-                            .iter()
-                            .any(|name| name == "clipped-quads")
-                    );
-                    let clipped = renderer.render_to_image(&scene)?;
-                    let difference = full
-                        .pixels()
-                        .zip(clipped.pixels())
-                        .enumerate()
-                        .find(|(_, (a, b))| a != b);
-                    assert!(
-                        difference.is_none(),
-                        "fraction={fraction} smoothing={smoothing} paint={paint} first differing pixel={difference:?}"
-                    );
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// Vertex clipping to the content mask must draw exactly what fragment
     /// masking alone draws: every pixel centered inside the mask matches the
     /// unmasked frame and every pixel centered outside it is untouched. A
@@ -613,44 +478,6 @@ mod path_target_tests {
     }
 
     #[test]
-    fn diagnostic_ablation_clears_and_batch_omissions_match_empty_frame() -> anyhow::Result<()> {
-        let _gpu_test_guard = crate::test_gpu::guard();
-        let context = WgpuContext::new_headless(None)?;
-        let target = size(DevicePixels(200), DevicePixels(100));
-        let mut renderer = WgpuRenderer::new_headless(&context, target)?;
-        renderer.retained.enable_for_tests();
-        let mut reference = WgpuRenderer::new_headless(&context, target)?;
-        reference.retained.disable_for_tests();
-        let mut empty = Scene::default();
-        empty.finish();
-        let expected = reference.render_to_image(&empty)?;
-        let scene = hover_scene(0, true);
-        let _scope = gpui::profiler::gpu::set_gpu_frame_context(
-            Some("diagnostic-wgpu-test".into()),
-            true,
-            1,
-            1,
-        );
-        assert_ne!(renderer.render_to_image(&scene)?, expected);
-        for name in ["clear-only", "no-quads,no-paths"] {
-            renderer.timings.diagnostic_ablations =
-                gpui::profiler::gpu::DiagnosticAblations::parse(name)
-                    .map_err(anyhow::Error::msg)?;
-            assert_eq!(
-                renderer.render_to_image(&scene)?,
-                expected,
-                "diagnostic {name}"
-            );
-            assert_eq!(renderer.retained.last_damage(), "full");
-            assert_eq!(
-                renderer.profile_capabilities().active_diagnostic_ablations,
-                renderer.timings.diagnostic_ablations.active_names()
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
     fn retained_hover_matches_full_pixels_for_rows_graph_clip_and_invalidation()
     -> anyhow::Result<()> {
         let _gpu_test_guard = crate::test_gpu::guard();
@@ -672,12 +499,7 @@ mod path_target_tests {
                     revision += 1;
                 }
                 let scene = hover_scene(row, resting_fills);
-                let _scope = gpui::profiler::gpu::set_gpu_frame_context(
-                    Some("retained-wgpu-test".into()),
-                    true,
-                    revision,
-                    revision,
-                );
+                let _scope = gpui::profiler::gpu::set_gpu_frame_context(true, revision);
                 let expected = full.render_to_image(&scene)?;
                 let actual = retained.render_to_image(&scene)?;
                 assert_eq!(
@@ -698,12 +520,7 @@ mod path_target_tests {
                 previous = Some(row);
             }
             let scene = hover_scene(0, resting_fills);
-            let _scope = gpui::profiler::gpu::set_gpu_frame_context(
-                Some("retained-wgpu-test".into()),
-                true,
-                revision,
-                revision,
-            );
+            let _scope = gpui::profiler::gpu::set_gpu_frame_context(true, revision);
             retained.atlas.clear();
             assert_eq!(
                 retained.render_to_image(&scene)?,
@@ -754,12 +571,7 @@ mod path_target_tests {
         damage: &str,
         context: &str,
     ) -> anyhow::Result<image::RgbaImage> {
-        let _scope = gpui::profiler::gpu::set_gpu_frame_context(
-            Some("transparent-retained-wgpu-test".into()),
-            true,
-            revision,
-            revision,
-        );
+        let _scope = gpui::profiler::gpu::set_gpu_frame_context(true, revision);
         let expected = full
             .render_to_image(scene)
             .map_err(|error| anyhow::anyhow!("{context}: full renderer: {error:#}"))?;
@@ -819,8 +631,6 @@ mod path_target_tests {
         retained.retained.enable_for_tests();
         full.update_transparency(true);
         retained.update_transparency(true);
-        full.timings.diagnostic_ablations = Default::default();
-        retained.timings.diagnostic_ablations = Default::default();
         let mut revision = 0;
         let mut previous = None;
         for (index, row) in [None, None, Some(0), Some(0), Some(1), Some(1), None, None]
@@ -872,8 +682,6 @@ mod path_target_tests {
         retained.retained.disable_for_tests();
         full.update_transparency(true);
         retained.update_transparency(true);
-        full.timings.diagnostic_ablations = Default::default();
-        retained.timings.diagnostic_ablations = Default::default();
         let resting = empty_transparent_hover_scene(None);
         assert_retained_rgba(
             &mut full,
@@ -889,12 +697,7 @@ mod path_target_tests {
         );
         retained.retained.enable_for_tests();
         {
-            let _scope = gpui::profiler::gpu::set_gpu_frame_context(
-                Some("inactive-prewarm-test".into()),
-                false,
-                1,
-                1,
-            );
+            let _scope = gpui::profiler::gpu::set_gpu_frame_context(false, 1);
             assert_eq!(
                 retained.render_to_image(&resting)?,
                 full.render_to_image(&resting)?
@@ -1032,7 +835,6 @@ mod path_target_tests {
             WgpuRenderer::new_headless(&fresh_context, size(DevicePixels(203), DevicePixels(105)))?;
         recreated.retained.enable_for_tests();
         recreated.update_transparency(true);
-        recreated.timings.diagnostic_ablations = Default::default();
         assert!(
             recreated.resources().pipelines.damage_clear_quads.is_none(),
             "a new device must not reuse a pipeline belonging to the previous device"
@@ -1078,12 +880,7 @@ mod path_target_tests {
     fn retained_copy_full_partial_reuse_preserves_exact_rgba_and_odd_extents() -> anyhow::Result<()>
     {
         let _gpu_test_guard = crate::test_gpu::guard();
-        let requirements = crate::WgpuDeviceRequirements {
-            features: wgpu::Features::TIMESTAMP_QUERY
-                | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS,
-            ..Default::default()
-        };
-        let context = WgpuContext::new_headless(Some(&requirements))?;
+        let context = WgpuContext::new_headless(None)?;
         let adapter = context.adapter.get_info();
         assert_eq!(
             adapter.backend,
@@ -1101,19 +898,12 @@ mod path_target_tests {
                 full.retained.disable_for_tests();
                 retained.retained.enable_for_tests();
                 for renderer in [&mut full, &mut retained] {
-                    renderer.timings.diagnostic_ablations = Default::default();
                     renderer.target.set_format_for_tests(format);
                     renderer.rebuild_pipelines();
                     renderer.update_transparency(transparent);
                 }
                 retained.target.enable_retained_copy_for_tests();
-                assert!(
-                    retained
-                        .profile_capabilities()
-                        .active_experiments
-                        .iter()
-                        .any(|flag| flag == "retained-copy")
-                );
+                assert!(retained.target.retained_copy_enabled());
                 let glyph = retained_glyph_tile(&full)?;
                 assert_eq!(glyph, retained_glyph_tile(&retained)?);
                 let mut revision = 0;
@@ -1199,12 +989,7 @@ mod path_target_tests {
 
                 // A view-only caller cannot safely infer its underlying texture.
                 let target = retained.create_offscreen_target();
-                let _scope = gpui::profiler::gpu::set_gpu_frame_context(
-                    Some("view-only-copy-fallback".into()),
-                    true,
-                    revision,
-                    revision,
-                );
+                let _scope = gpui::profiler::gpu::set_gpu_frame_context(true, revision);
                 let submission = super::super::frame::render_to_view(
                     &mut retained,
                     &scene,
@@ -1249,13 +1034,7 @@ mod path_target_tests {
                 retained
                     .target
                     .update_surface_copy_support(wgpu::TextureUsages::RENDER_ATTACHMENT, &[format]);
-                assert!(
-                    !retained
-                        .profile_capabilities()
-                        .active_experiments
-                        .iter()
-                        .any(|flag| flag == "retained-copy")
-                );
+                assert!(!retained.target.retained_copy_enabled());
                 assert!(
                     !retained
                         .target
@@ -1290,106 +1069,6 @@ mod path_target_tests {
         Ok(())
     }
 
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn retained_copy_timestamps_cover_full_partial_and_copy_only_reuse() -> anyhow::Result<()> {
-        let _gpu_test_guard = crate::test_gpu::guard();
-        let requirements = crate::WgpuDeviceRequirements {
-            features: wgpu::Features::TIMESTAMP_QUERY
-                | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS,
-            ..Default::default()
-        };
-        let context = WgpuContext::new_headless(Some(&requirements))?;
-        let adapter = context.adapter.get_info();
-        assert_eq!(adapter.backend, wgpu::Backend::Dx12);
-        let mut retained =
-            WgpuRenderer::new_headless(&context, size(DevicePixels(201), DevicePixels(103)))?;
-        retained.retained.enable_for_tests();
-        retained.update_transparency(true);
-        retained.target.enable_retained_copy_for_tests();
-        retained.timings = super::super::gpu_timing::GpuTimings::new_with_observer(
-            context.device.clone(),
-            context.queue,
-            "wgpu-dx12".into(),
-            true,
-            true,
-        );
-        let renderer_id = retained.timings.renderer_id;
-        for (submission, row, revision, damage) in [
-            (101, None, 1, "full"),
-            (102, Some(0), 2, "partial"),
-            (103, Some(0), 2, "reuse"),
-        ] {
-            let _scope = gpui::profiler::gpu::set_gpu_frame_context(
-                Some("retained-copy-timestamp-test".into()),
-                true,
-                submission,
-                revision,
-            );
-            retained.render_to_image(&empty_transparent_hover_scene(row))?;
-            assert_eq!(retained.last_retained_presentation, "copy");
-            assert_eq!(retained.retained.last_damage(), damage);
-        }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        let mut events = Vec::new();
-        while events.len() < 3 && std::time::Instant::now() < deadline {
-            let (drained, dropped) = gpui::profiler::gpu::take_gpu_events();
-            assert_eq!(dropped, 0, "timing events must not be silently discarded");
-            events.extend(
-                drained
-                    .into_iter()
-                    .filter(|event| event.renderer_id == renderer_id),
-            );
-            if events.len() < 3 {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        }
-        events.sort_by_key(|event| event.submission_id);
-        assert_eq!(
-            events.len(),
-            3,
-            "every copy must have an asynchronous timing event"
-        );
-        for (event, (submission, revision, damage)) in
-            events
-                .iter()
-                .zip([(101, 1, "full"), (102, 2, "partial"), (103, 2, "reuse")])
-        {
-            assert_eq!(event.status, "complete", "{:?}", event.reason);
-            assert_eq!(
-                event.window.as_deref(),
-                Some("retained-copy-timestamp-test")
-            );
-            assert_eq!(
-                (event.submission_id, event.scene_revision),
-                (submission, revision)
-            );
-            assert_eq!(event.damage_kind, damage);
-            assert!(event.elapsed_ns.is_some_and(|elapsed| elapsed > 0));
-            assert_eq!(
-                event.passes.last().map(|pass| pass.name.as_str()),
-                Some("scene_copy")
-            );
-            assert_eq!(
-                event
-                    .passes
-                    .iter()
-                    .filter(|pass| pass.name == "scene_copy")
-                    .count(),
-                1
-            );
-            assert!(event.passes.last().unwrap().elapsed_ns > 0);
-            if damage == "reuse" {
-                assert_eq!(
-                    event.passes.len(),
-                    1,
-                    "Reuse must time its only copy command"
-                );
-            }
-        }
-        Ok(())
-    }
-
     #[test]
     fn retained_raw_clear_endpoints_and_colored_fallback_match_full_rgba() -> anyhow::Result<()> {
         let _gpu_test_guard = crate::test_gpu::guard();
@@ -1399,8 +1078,6 @@ mod path_target_tests {
         let mut retained = WgpuRenderer::new_headless(&context, target)?;
         full.retained.disable_for_tests();
         retained.retained.enable_for_tests();
-        full.timings.diagnostic_ablations = Default::default();
-        retained.timings.diagnostic_ablations = Default::default();
         for transparent in [false, true] {
             full.update_transparency(transparent);
             retained.update_transparency(transparent);
@@ -1683,9 +1360,7 @@ mod path_target_tests {
         let _gpu_test_guard = crate::test_gpu::guard();
         let context = WgpuContext::new_headless(None)?;
         for mode in [GlyphRenderMode::Grayscale, GlyphRenderMode::Subpixel] {
-            for (transparent, fraction, clipped) in
-                [(false, 0.0, false), (true, 0.25, false), (true, 0.75, true)]
-            {
+            for (transparent, fraction) in [(false, 0.0), (true, 0.25), (true, 0.75)] {
                 let target = size(DevicePixels(512), DevicePixels(1024));
                 let mut full = WgpuRenderer::new_headless(&context, target)?;
                 let mut retained = WgpuRenderer::new_headless(&context, target)?;
@@ -1693,10 +1368,6 @@ mod path_target_tests {
                 retained.retained.enable_for_tests();
                 full.update_transparency(transparent);
                 retained.update_transparency(transparent);
-                full.timings.clipped_quads = clipped;
-                retained.timings.clipped_quads = clipped;
-                full.timings.diagnostic_ablations = Default::default();
-                retained.timings.diagnostic_ablations = Default::default();
                 let glyph = retained_tiled_glyph(&full, mode)?;
                 assert_eq!(glyph, retained_tiled_glyph(&retained, mode)?);
                 let first = tiled_history_scene(Some(0), fraction, glyph, mode);
@@ -1750,7 +1421,7 @@ mod path_target_tests {
                             "partial"
                         },
                         &format!(
-                            "tiled history mode={mode:?}, transparent={transparent}, fraction={fraction}, clipped={clipped}, step={index}, row={row:?}"
+                            "tiled history mode={mode:?}, transparent={transparent}, fraction={fraction}, step={index}, row={row:?}"
                         ),
                     )?;
                     previous = row;
@@ -1989,8 +1660,6 @@ mod path_target_tests {
                 retained.update_transparency(true);
                 full.crop_path_targets = crop_paths;
                 retained.crop_path_targets = crop_paths;
-                full.timings.diagnostic_ablations = Default::default();
-                retained.timings.diagnostic_ablations = Default::default();
                 let glyph = retained_glyph_tile(&full)?;
                 assert_eq!(glyph, retained_glyph_tile(&retained)?);
                 let label = format!(
