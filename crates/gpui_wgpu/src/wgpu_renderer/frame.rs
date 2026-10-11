@@ -769,7 +769,7 @@ impl<'a> FrameEncoder<'a> {
     }
 
     fn encode_commands(&mut self) -> DrawResult {
-        match self.damage.clone() {
+        match std::mem::replace(&mut self.damage, Damage::Reuse) {
             Damage::Reuse => Ok(()),
             Damage::Partial(regions) => {
                 for region in regions {

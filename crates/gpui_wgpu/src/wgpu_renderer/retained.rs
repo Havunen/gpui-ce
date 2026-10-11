@@ -35,7 +35,7 @@ pub(super) struct RetainedPlan {
 impl RetainedFrame {
     pub fn new() -> Self {
         Self {
-            enabled: cfg!(target_os = "windows") && gpu::experiment_enabled("partial-redraw"),
+            enabled: gpu::experiment_enabled("partial-redraw"),
             target: None,
             scene: RetainedScene::default(),
             queue: None,
