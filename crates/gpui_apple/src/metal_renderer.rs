@@ -51,15 +51,13 @@ struct PathLayerPlan {
     /// Right and bottom edge of the layer's geometry, in device pixels.
     extent: (u32, u32),
     /// Regions compositing samples (sprite bounds), grown by one pixel.
-    regions: Vec<Bounds<ScaledPixels>>,
+    regions: SmallVec<[Bounds<ScaledPixels>; 8]>,
     union: Option<Bounds<ScaledPixels>>,
     /// Indices into the scene's render commands.
     batches: SmallVec<[usize; 8]>,
 }
 
 struct PathPrepassPlan {
-    /// The layer of each render command, for path batches with geometry.
-    layer_of_command: Vec<Option<u8>>,
     layers: SmallVec<[PathLayerPlan; MAX_PATH_LAYERS]>,
 }
 
@@ -86,12 +84,10 @@ fn overlaps(a: &Bounds<ScaledPixels>, b: &Bounds<ScaledPixels>) -> bool {
 /// Plans the path prepass for a frame, or `None` when the batches need more
 /// layers than allowed (the frame then renders paths the original way).
 fn plan_path_prepass(scene: &Scene, viewport: Size<DevicePixels>) -> Option<PathPrepassPlan> {
-    let commands = scene.render_commands();
     let mut plan = PathPrepassPlan {
-        layer_of_command: vec![None; commands.len()],
         layers: SmallVec::new(),
     };
-    for (index, command) in commands.iter().enumerate() {
+    for (index, command) in scene.render_commands().iter().enumerate() {
         let RenderCommand::Batch(PrimitiveBatch::Paths {
             range,
             rasterization_vertex_count,
@@ -128,7 +124,7 @@ fn plan_path_prepass(scene: &Scene, viewport: Size<DevicePixels>) -> Option<Path
             None if plan.layers.len() < MAX_PATH_LAYERS => {
                 plan.layers.push(PathLayerPlan {
                     extent: (0, 0),
-                    regions: Vec::new(),
+                    regions: SmallVec::new(),
                     union: None,
                     batches: SmallVec::new(),
                 });
@@ -150,12 +146,11 @@ fn plan_path_prepass(scene: &Scene, viewport: Size<DevicePixels>) -> Option<Path
         layer.extent.0 = layer.extent.0.max(clamp(right, viewport.width.0));
         layer.extent.1 = layer.extent.1.max(clamp(bottom, viewport.height.0));
         layer.batches.push(index);
-        plan.layer_of_command[index] = Some(layer_index as u8);
     }
     Some(plan)
 }
 
-pub(crate) fn quad_is_opaque(quad: &Quad) -> bool {
+fn quad_is_opaque(quad: &Quad) -> bool {
     quad_is_opaque_with(quad, false)
 }
 
@@ -478,7 +473,7 @@ pub struct MetalRenderer {
     shadows_pipeline_state: metal::RenderPipelineState,
     smoothed_shadows_pipeline_state: metal::RenderPipelineState,
     quads_pipeline_state: metal::RenderPipelineState,
-    /// The quad pipeline without blending, for opaque rectangles (`opaque-quads`).
+    /// The quad pipeline without blending, for opaque rectangles.
     opaque_quads_pipeline_state: metal::RenderPipelineState,
     smoothed_quads_pipeline_state: metal::RenderPipelineState,
     underlines_pipeline_state: metal::RenderPipelineState,
@@ -499,7 +494,7 @@ pub struct MetalRenderer {
     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
-    /// Resolve targets for path prepass layers after the first (`path-prepass`).
+    /// Resolve targets for path prepass layers after the first.
     path_layer_textures: Vec<metal::Texture>,
     /// Off with `GPUI_GPU_EXPERIMENTS=no-partial-redraw`: every frame renders
     /// straight to the drawable.
@@ -659,6 +654,7 @@ impl MetalRenderer {
             &shadows_library,
             shadows_shader,
             MTLPixelFormat::BGRA8Unorm,
+            true,
         );
         let (smoothed_shadows_shader, smoothed_shadows_library) = pipeline("smoothed_shadows");
         let smoothed_shadows_pipeline_state = build_pipeline_state(
@@ -666,6 +662,7 @@ impl MetalRenderer {
             &smoothed_shadows_library,
             smoothed_shadows_shader,
             MTLPixelFormat::BGRA8Unorm,
+            true,
         );
         let (quads_shader, quads_library) = pipeline("quads");
         let quads_pipeline_state = build_pipeline_state(
@@ -673,12 +670,14 @@ impl MetalRenderer {
             &quads_library,
             quads_shader,
             MTLPixelFormat::BGRA8Unorm,
+            true,
         );
-        let opaque_quads_pipeline_state = build_opaque_pipeline_state(
+        let opaque_quads_pipeline_state = build_pipeline_state(
             &device,
             &quads_library,
             quads_shader,
             MTLPixelFormat::BGRA8Unorm,
+            false,
         );
         let (smoothed_quads_shader, smoothed_quads_library) = pipeline("smoothed_quads");
         let smoothed_quads_pipeline_state = build_pipeline_state(
@@ -686,6 +685,7 @@ impl MetalRenderer {
             &smoothed_quads_library,
             smoothed_quads_shader,
             MTLPixelFormat::BGRA8Unorm,
+            true,
         );
         let (underlines_shader, underlines_library) = pipeline("underlines");
         let underlines_pipeline_state = build_pipeline_state(
@@ -693,6 +693,7 @@ impl MetalRenderer {
             &underlines_library,
             underlines_shader,
             MTLPixelFormat::BGRA8Unorm,
+            true,
         );
         let (monochrome_shader, monochrome_library) = pipeline("monochrome_sprites");
         let monochrome_sprites_pipeline_state = build_pipeline_state(
@@ -700,6 +701,7 @@ impl MetalRenderer {
             &monochrome_library,
             monochrome_shader,
             MTLPixelFormat::BGRA8Unorm,
+            true,
         );
         let (polychrome_shader, polychrome_library) = pipeline("polychrome_sprites");
         let polychrome_sprites_pipeline_state = build_pipeline_state(
@@ -707,6 +709,7 @@ impl MetalRenderer {
             &polychrome_library,
             polychrome_shader,
             MTLPixelFormat::BGRA8Unorm,
+            true,
         );
         let (smoothed_polychrome_shader, smoothed_polychrome_library) =
             pipeline("smoothed_polychrome_sprites");
@@ -715,6 +718,7 @@ impl MetalRenderer {
             &smoothed_polychrome_library,
             smoothed_polychrome_shader,
             MTLPixelFormat::BGRA8Unorm,
+            true,
         );
         let (surfaces_shader, surfaces_library) = pipeline("surfaces");
         let surfaces_pipeline_state = build_pipeline_state(
@@ -722,6 +726,7 @@ impl MetalRenderer {
             &surfaces_library,
             surfaces_shader,
             MTLPixelFormat::BGRA8Unorm,
+            true,
         );
         let (blur_downsample_shader, blur_downsample_library) = pipeline("blur_downsample");
         let blur_downsample_pipeline_state = build_blur_pipeline_state(
@@ -1459,14 +1464,14 @@ impl MetalRenderer {
                         continue;
                     }
                     let paths = &scene.paths[range.clone()];
-                    if let Some(layer) = path_plan
-                        .as_ref()
-                        .and_then(|plan| plan.layer_of_command[command_index])
-                    {
+                    if let Some(layer) = path_plan.as_ref().and_then(|plan| {
+                        (plan.layers.iter())
+                            .position(|layer| layer.batches.contains(&command_index))
+                    }) {
                         let texture = if layer == 0 {
                             self.path_intermediate_texture.clone()
                         } else {
-                            self.path_layer_textures.get(layer as usize - 1).cloned()
+                            self.path_layer_textures.get(layer - 1).cloned()
                         };
                         let Some(texture) = texture else {
                             continue;
@@ -1680,27 +1685,7 @@ impl MetalRenderer {
 
         // Present the offscreen scene by copying it into the drawable/target texture.
         if use_offscreen && scene_color_owned.is_some() {
-            self.run_metal_blur_pass(
-                command_buffer,
-                &self.blur_downsample_pipeline_state,
-                texture,
-                scene_color,
-                viewport_size,
-                &scene_uniforms,
-                BlurUniforms::copy([
-                    i32::from(viewport_size.width) as f32,
-                    i32::from(viewport_size.height) as f32,
-                ]),
-                ScissorRectangle {
-                    x: 0,
-                    y: 0,
-                    width: i32::from(viewport_size.width).max(0) as u32,
-                    height: i32::from(viewport_size.height).max(0) as u32,
-                },
-                metal::MTLPrimitiveType::Triangle,
-                3,
-                false,
-            );
+            self.copy_texture(command_buffer, scene_color, texture, viewport_size);
         }
 
         if !self.is_unified_memory {
@@ -1745,12 +1730,7 @@ impl MetalRenderer {
                 }
             },
         );
-        encoder.set_scissor_rect(MTLScissorRect {
-            x: scissor.x as u64,
-            y: scissor.y as u64,
-            width: scissor.width as u64,
-            height: scissor.height as u64,
-        });
+        set_scissor(&encoder, scissor);
         encoder.set_render_pipeline_state(pipeline);
         bind_scene_uniforms(encoder, scene_uniforms);
         encoder.set_vertex_bytes(
@@ -2280,106 +2260,65 @@ impl MetalRenderer {
             return true;
         }
         align_offset(instance_offset);
-
-        let quad_bytes_len = mem::size_of_val(quads);
-        let next_offset = *instance_offset + quad_bytes_len;
+        // Large rounded opaque quads draw as an opaque interior and four blended
+        // rims. Smoothed corners keep their own pipeline.
+        let split = |quad: &Quad| (!smoothed).then(|| split_rounded_opaque_quad(quad))?;
+        let count: usize = quads
+            .iter()
+            .map(|quad| if split(quad).is_some() { 5 } else { 1 })
+            .sum();
+        let next_offset = *instance_offset + count * mem::size_of::<Quad>();
         if next_offset > instance_buffer.size {
             return false;
         }
-
-        let pipeline = if smoothed {
-            &self.smoothed_quads_pipeline_state
-        } else {
-            &self.quads_pipeline_state
-        };
-        command_encoder.set_render_pipeline_state(pipeline);
         bind_scene_uniforms(command_encoder, scene_uniforms);
-
-        if !smoothed {
-            // Rounded opaque quads become an opaque interior plus blended rims.
-            let mut expanded = Vec::new();
-            for (index, quad) in quads.iter().enumerate() {
-                if let Some(pieces) = split_rounded_opaque_quad(quad) {
-                    if expanded.is_empty() {
-                        expanded.reserve(quads.len() + 4);
-                        expanded.extend_from_slice(&quads[..index]);
-                    }
-                    expanded.extend_from_slice(&pieces);
-                } else if !expanded.is_empty() {
-                    expanded.push(*quad);
-                }
-            }
-            let quads: &[Quad] = if expanded.is_empty() {
-                quads
+        // Runs of opaque and blended quads, in order. Opaque fragments overwrite
+        // instead of blending, which lets the tile hardware drop fragments a
+        // later opaque quad hides.
+        let draw_run = |opaque: bool, start: usize, end: usize| {
+            command_encoder.set_render_pipeline_state(if smoothed {
+                &self.smoothed_quads_pipeline_state
+            } else if opaque {
+                &self.opaque_quads_pipeline_state
             } else {
-                &expanded
-            };
-            let quad_bytes_len = mem::size_of_val(quads);
-            let next_offset = *instance_offset + quad_bytes_len;
-            if next_offset > instance_buffer.size {
-                return false;
-            }
-            let buffer_contents = unsafe {
-                (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset)
-            };
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    quads.as_ptr() as *const u8,
-                    buffer_contents,
-                    quad_bytes_len,
-                );
-            }
-            // Runs of opaque and blended quads, in order. Opaque fragments
-            // overwrite instead of blending, which lets the tile hardware drop
-            // fragments a later opaque quad hides.
-            let mut start = 0;
-            while start < quads.len() {
-                let opaque = quad_is_opaque(&quads[start]);
-                let mut end = start + 1;
-                while end < quads.len() && quad_is_opaque(&quads[end]) == opaque {
-                    end += 1;
+                &self.quads_pipeline_state
+            });
+            bind_instance_bytes(
+                command_encoder,
+                &instance_buffer.metal_buffer,
+                *instance_offset + start * mem::size_of::<Quad>(),
+                (end - start) * mem::size_of::<Quad>(),
+            );
+            command_encoder.draw_primitives_instanced(
+                metal::MTLPrimitiveType::TriangleStrip,
+                0,
+                4,
+                (end - start) as u64,
+            );
+        };
+        let destination = unsafe {
+            (instance_buffer.metal_buffer.contents() as *mut u8)
+                .add(*instance_offset)
+                .cast::<Quad>()
+        };
+        let (mut written, mut run_start, mut run_opaque) = (0, 0, false);
+        for quad in quads {
+            let pieces = split(quad);
+            for piece in pieces
+                .as_ref()
+                .map_or(std::slice::from_ref(quad), |pieces| &pieces[..])
+            {
+                let opaque = !smoothed && quad_is_opaque(piece);
+                if written > run_start && opaque != run_opaque {
+                    draw_run(run_opaque, run_start, written);
+                    run_start = written;
                 }
-                command_encoder.set_render_pipeline_state(if opaque {
-                    &self.opaque_quads_pipeline_state
-                } else {
-                    &self.quads_pipeline_state
-                });
-                bind_instances(
-                    command_encoder,
-                    &instance_buffer.metal_buffer,
-                    *instance_offset + start * mem::size_of::<Quad>(),
-                    &quads[start..end],
-                );
-                command_encoder.draw_primitives_instanced(
-                    metal::MTLPrimitiveType::TriangleStrip,
-                    0,
-                    4,
-                    (end - start) as u64,
-                );
-                start = end;
+                run_opaque = opaque;
+                unsafe { destination.add(written).write(*piece) };
+                written += 1;
             }
-            *instance_offset = next_offset;
-            return true;
         }
-
-        let buffer_contents =
-            unsafe { (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset) };
-        unsafe {
-            ptr::copy_nonoverlapping(quads.as_ptr() as *const u8, buffer_contents, quad_bytes_len);
-        }
-        bind_instances(
-            command_encoder,
-            &instance_buffer.metal_buffer,
-            *instance_offset,
-            quads,
-        );
-
-        command_encoder.draw_primitives_instanced(
-            metal::MTLPrimitiveType::TriangleStrip,
-            0,
-            4,
-            quads.len() as u64,
-        );
+        draw_run(run_opaque, run_start, written);
         *instance_offset = next_offset;
         true
     }
@@ -2707,11 +2646,13 @@ fn new_command_encoder_for_texture<'a>(
     command_encoder
 }
 
+/// Without `blending`, fragments overwrite the target.
 fn build_pipeline_state(
     device: &metal::DeviceRef,
     library: &metal::LibraryRef,
     shader: &NativeShader,
     pixel_format: metal::MTLPixelFormat,
+    blending: bool,
 ) -> metal::RenderPipelineState {
     let vertex_fn = library
         .get_function(shader.vertex_entry, None)
@@ -2726,40 +2667,13 @@ fn build_pipeline_state(
     descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
     let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
     color_attachment.set_pixel_format(pixel_format);
-    color_attachment.set_blending_enabled(true);
+    color_attachment.set_blending_enabled(blending);
     color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
     color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
     color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::SourceAlpha);
     color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::One);
     color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
     color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::One);
-
-    device
-        .new_render_pipeline_state(&descriptor)
-        .expect("could not create render pipeline state")
-}
-
-/// `build_pipeline_state` without blending: fragments overwrite the target.
-fn build_opaque_pipeline_state(
-    device: &metal::DeviceRef,
-    library: &metal::LibraryRef,
-    shader: &NativeShader,
-    pixel_format: metal::MTLPixelFormat,
-) -> metal::RenderPipelineState {
-    let vertex_fn = library
-        .get_function(shader.vertex_entry, None)
-        .unwrap_or_else(|error| panic!("error locating {}: {error}", shader.vertex_entry));
-    let fragment_fn = library
-        .get_function(shader.fragment_entry, None)
-        .unwrap_or_else(|error| panic!("error locating {}: {error}", shader.fragment_entry));
-
-    let descriptor = metal::RenderPipelineDescriptor::new();
-    descriptor.set_label(shader.label);
-    descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
-    descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
-    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
-    color_attachment.set_pixel_format(pixel_format);
-    color_attachment.set_blending_enabled(false);
 
     device
         .new_render_pipeline_state(&descriptor)
@@ -3903,6 +3817,40 @@ mod tests {
             0.2,
             1.0
         )));
+    }
+
+    #[test]
+    fn opaque_and_split_quads_match_nearly_opaque_blending() {
+        let size = gpui::size(DevicePixels(240), DevicePixels(200));
+        let scene = |alpha: f32| {
+            let mut scene = Scene::default();
+            scene.insert_primitive(quad(rect(0.0, 0.0, 240.0, 200.0), 0.1, 1.0));
+            // Opaque, this card splits into an opaque interior and blended rims.
+            let mut card = quad(rect(10.25, 12.5, 150.5, 120.75), 0.0, alpha);
+            card.corner_radii = Corners {
+                top_left: ScaledPixels(16.0),
+                top_right: ScaledPixels(0.0),
+                bottom_right: ScaledPixels(0.0),
+                bottom_left: ScaledPixels(16.0),
+            };
+            scene.insert_primitive(card);
+            // A plain rectangle over it takes the opaque pipeline.
+            scene.insert_primitive(quad(rect(100.5, 80.25, 60.0, 40.0), 0.55, alpha));
+            scene.finish();
+            scene
+        };
+        assert!(split_rounded_opaque_quad(&scene(1.0).quads[1]).is_some());
+        let opaque = headless_renderer()
+            .render_scene_to_image(&scene(1.0), size)
+            .unwrap();
+        // Just below opaque, the same quads blend whole and never split.
+        let blended = headless_renderer()
+            .render_scene_to_image(&scene(254.5 / 255.0), size)
+            .unwrap();
+        let worst = (opaque.pixels().zip(blended.pixels()))
+            .flat_map(|(a, b)| a.0.into_iter().zip(b.0).map(|(a, b)| a.abs_diff(b)))
+            .max();
+        assert!(worst <= Some(1), "differ by {worst:?} levels");
     }
 
     #[test]
