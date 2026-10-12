@@ -3200,6 +3200,40 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn unfocused_repaints_return_the_retained_budget() -> Result<()> {
+        use gpui_render::retained::{RETAINED_DEVICE_LIMIT, reserve_retained_bytes};
+
+        let devices = DirectXDevices::new()?;
+        let window = HiddenWindow::new()?;
+        let mut renderer = DirectXRenderer::new(window.0, &devices, true)?;
+        renderer.retained.enable_for_tests();
+        renderer.resize(Size {
+            width: DevicePixels(200),
+            height: DevicePixels(400),
+        })?;
+        let device_key = devices.device.as_raw() as usize;
+        let target_bytes = 200 * 400 * 4;
+        let scene = retained_scene(false, true);
+        {
+            let _guard = gpui::profiler::gpu::set_gpu_frame_context(true, 1);
+            renderer.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?;
+        }
+        // Other windows hold the rest of the device budget.
+        let _others =
+            reserve_retained_bytes("d3d11", device_key, RETAINED_DEVICE_LIMIT - target_bytes)
+                .expect("the retained target fits beside the other windows");
+        assert!(reserve_retained_bytes("d3d11", device_key, 1).is_none());
+        // The pointer left an unfocused window, which repaints once.
+        let _guard = gpui::profiler::gpu::set_gpu_frame_context(false, 2);
+        renderer.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?;
+        assert_eq!(renderer.retained.last_damage(), "full");
+        // The readback waited for the GPU, so the next poll frees the target.
+        renderer.poll_retired();
+        assert!(reserve_retained_bytes("d3d11", device_key, target_bytes).is_some());
+        Ok(())
+    }
+
     fn transparent_retained_scene(hover: Option<usize>, glyph: AtlasTile, fraction: f32) -> Scene {
         transparent_retained_scene_with_badge(hover, glyph, fraction, None)
     }

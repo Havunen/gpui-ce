@@ -182,7 +182,7 @@ impl RetainedFrame {
             return Ok(full());
         }
         poll_retired();
-        if !frame.active {
+        if !frame.interactive {
             self.invalidate();
             return Ok(full());
         }

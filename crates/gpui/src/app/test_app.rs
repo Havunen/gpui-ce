@@ -655,6 +655,31 @@ mod tests {
     }
 
     #[test]
+    fn unfocused_windows_keep_their_retained_frame_while_hovered() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window(|_, _| MoveInvalidator);
+        let platform_window = window.test_window().unwrap();
+        // Unchanged frames are not presented again, so each present below repaints.
+        platform_window.set_fixed_refresh_rate(true);
+        platform_window.simulate_active_status_change(false);
+        platform_window.simulate_hover_status_change(true);
+        // Hover highlights repaint an unfocused window too.
+        window.simulate_mouse_move(point(px(10.), px(10.)));
+        window.simulate_request_frame(RequestFrameOptions::default());
+        assert!(platform_window.last_frame_context().interactive);
+        // Leaving repaints unprompted, so the renderer frees the frame at once.
+        let presents = platform_window.presents();
+        platform_window.simulate_hover_status_change(false);
+        window.simulate_request_frame(RequestFrameOptions::default());
+        assert_eq!(platform_window.presents(), presents + 1);
+        assert!(!platform_window.last_frame_context().interactive);
+        // A focused window keeps it with the pointer elsewhere.
+        platform_window.simulate_active_status_change(true);
+        window.simulate_request_frame(RequestFrameOptions::default());
+        assert!(platform_window.last_frame_context().interactive);
+    }
+
+    #[test]
     fn force_render_refreshes_cached_views() {
         let mut app = TestApp::new();
         let render_count = Rc::new(Cell::new(0));

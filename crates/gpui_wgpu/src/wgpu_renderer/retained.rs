@@ -89,7 +89,7 @@ impl RetainedFrame {
             return full();
         }
         let bytes = retained_bytes(format, width, height);
-        if !context.active
+        if !context.interactive
             || !matches!(
                 alpha_mode,
                 wgpu::CompositeAlphaMode::Opaque | wgpu::CompositeAlphaMode::PreMultiplied

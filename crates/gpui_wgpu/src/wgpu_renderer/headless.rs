@@ -968,7 +968,7 @@ mod path_target_tests {
     }
 
     #[test]
-    fn released_and_dropped_retained_targets_return_their_budget_at_once() -> anyhow::Result<()> {
+    fn retained_targets_return_their_budget_at_once() -> anyhow::Result<()> {
         use gpui_render::retained::{RETAINED_DEVICE_LIMIT, reserve_retained_bytes};
 
         let _gpu_test_guard = crate::test_gpu::guard();
@@ -978,7 +978,7 @@ mod path_target_tests {
         scene.finish();
         let _scope = gpui::profiler::gpu::set_gpu_frame_context(true, 1);
         let target_bytes = 64 * 64 * 4;
-        for close_window in [false, true] {
+        for leave in ["release", "unfocused repaint", "close"] {
             let mut renderer =
                 WgpuRenderer::new_headless(&context, size(DevicePixels(64), DevicePixels(64)))?;
             renderer.retained.enable_for_tests();
@@ -989,15 +989,19 @@ mod path_target_tests {
                 reserve_retained_bytes("wgpu", device_key, RETAINED_DEVICE_LIMIT - target_bytes)
                     .expect("the retained target fits beside the other windows");
             assert!(reserve_retained_bytes("wgpu", device_key, 1).is_none());
-            if close_window {
-                drop(renderer);
-            } else {
-                renderer.release_retained_frame();
+            match leave {
+                "release" => renderer.release_retained_frame(),
+                // The pointer left an unfocused window, which repaints once.
+                "unfocused repaint" => {
+                    let _scope = gpui::profiler::gpu::set_gpu_frame_context(false, 2);
+                    assert!(renderer.render_to_texture(&scene, &target.texture, &target.view));
+                }
+                _ => drop(renderer),
             }
             // An idle or closed window renders and polls nothing more.
             assert!(
                 reserve_retained_bytes("wgpu", device_key, target_bytes).is_some(),
-                "close={close_window}"
+                "{leave}"
             );
         }
         Ok(())

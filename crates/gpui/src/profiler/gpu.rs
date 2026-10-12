@@ -4,14 +4,14 @@ use std::cell::Cell;
 /// Window state passed to the platform renderer on this thread.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GpuFrameContext {
-    /// Whether the submitting window is active.
-    pub active: bool,
+    /// Whether the submitting window has focus or the pointer.
+    pub interactive: bool,
     /// Current painted scene revision.
     pub scene_revision: u64,
 }
 thread_local! {
     static CONTEXT: Cell<GpuFrameContext> = const {
-        Cell::new(GpuFrameContext { active: false, scene_revision: 0 })
+        Cell::new(GpuFrameContext { interactive: false, scene_revision: 0 })
     };
 }
 
@@ -23,10 +23,10 @@ impl Drop for GpuFrameContextGuard {
     }
 }
 /// Install a scoped renderer context, restoring the previous value when the guard drops.
-pub fn set_gpu_frame_context(active: bool, scene_revision: u64) -> GpuFrameContextGuard {
+pub fn set_gpu_frame_context(interactive: bool, scene_revision: u64) -> GpuFrameContextGuard {
     CONTEXT.with(|context| {
         GpuFrameContextGuard(context.replace(GpuFrameContext {
-            active,
+            interactive,
             scene_revision,
         }))
     })
@@ -52,6 +52,6 @@ mod tests {
             assert_eq!(gpu_frame_context().scene_revision, 9);
         }
         assert_eq!(gpu_frame_context().scene_revision, 4);
-        assert!(gpu_frame_context().active);
+        assert!(gpu_frame_context().interactive);
     }
 }
