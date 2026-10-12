@@ -330,9 +330,8 @@ fn tile_spans(region: ScissorRectangle, columns: u32) -> impl Iterator<Item = us
     (top..bottom).flat_map(move |y| (left..right).map(move |x| (y * columns + x) as usize))
 }
 
-/// The tile-aligned box around every dirty tile, clipped to the target, or a
-/// full redraw when it covers over half of it.
-/// The box around the dirty tiles, given in ascending order.
+/// The tile-aligned box around the dirty tiles, given in ascending order,
+/// clipped to the target, or a full redraw when it covers over half of it.
 fn dirty_bounds(dirty: impl Iterator<Item = u32>, columns: u32, width: u32, height: u32) -> Damage {
     let mut tiles = dirty.map(|tile| (tile % columns, tile / columns));
     let Some((x, y)) = tiles.next() else {
@@ -902,6 +901,69 @@ mod tests {
         });
         rejected(&|scene| scene.monochrome_sprites[0].transformation.translation[0] = f32::NAN);
         rejected(&|scene| scene.monochrome_sprites[0].bounds.size.width.0 = f32::NAN);
+    }
+
+    #[test]
+    fn underlines_damage_their_wave_and_polychrome_sprites_their_bounds() {
+        let background = quad(bounds(0.0, 0.0, 512.0, 1024.0), gpui::black());
+        let damage = |next: Primitive, previous: Primitive| {
+            capture([background.into(), next]).compare(&capture([background.into(), previous]))
+        };
+        let underline = Underline {
+            order: 0,
+            padding: 0,
+            bounds: bounds(130.0, 70.0, 40.0, 2.0),
+            content_mask: full_mask(),
+            color: gpui::white().into(),
+            thickness: ScaledPixels(2.0),
+            wavy: gpui::ShaderBool::Enabled,
+        };
+        let recoloured = Underline {
+            color: gpui::red().into(),
+            ..underline
+        };
+        // The wave swings four thicknesses past the line, which alone would
+        // only touch the tile at (128, 64).
+        assert_eq!(
+            region(damage(recoloured.into(), underline.into())),
+            rect(64, 0, 128, 128)
+        );
+        let broken = Underline {
+            thickness: ScaledPixels(f32::NAN),
+            ..underline
+        };
+        assert!(
+            SceneSnapshot::capture(&finished([broken.into()]), 1, 512, 1024, Vec::new()).is_none()
+        );
+        let image = PolychromeSprite {
+            order: 0,
+            grayscale: gpui::ShaderBool::Disabled,
+            opacity: 1.0,
+            corner_smoothing: 0.0,
+            bounds: bounds(300.0, 500.0, 16.0, 16.0),
+            content_mask: full_mask(),
+            corner_radii: Default::default(),
+            tile: gpui::AtlasTile {
+                texture_id: gpui::AtlasTextureId {
+                    index: 0,
+                    kind: gpui::AtlasTextureKind::Polychrome,
+                },
+                tile_id: gpui::TileId(1),
+                padding: 0,
+                bounds: Bounds::new(
+                    point(gpui::DevicePixels(0), gpui::DevicePixels(0)),
+                    size(gpui::DevicePixels(16), gpui::DevicePixels(16)),
+                ),
+            },
+        };
+        let faded = PolychromeSprite {
+            opacity: 0.5,
+            ..image
+        };
+        assert_eq!(
+            region(damage(faded.into(), image.into())),
+            rect(256, 448, 64, 128)
+        );
     }
 
     #[test]
