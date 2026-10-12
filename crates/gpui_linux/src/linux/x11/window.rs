@@ -1721,6 +1721,12 @@ impl PlatformWindow for X11Window {
             .unwrap_or_default()
     }
 
+    // X11 gives variable refresh only to a fullscreen window that sets
+    // _VARIABLE_REFRESH under an opt-in driver option, so skip input keepalive.
+    fn has_fixed_refresh_rate(&self) -> bool {
+        true
+    }
+
     fn minimize(&self) {
         let state = self.0.state.borrow();
         const WINDOW_ICONIC_STATE: u32 = 3;

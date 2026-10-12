@@ -342,7 +342,7 @@ mod tests {
             key: "$".to_string(),
             key_char: None,
         };
-        let mapped = mapper.map_key_equivalent(keystroke.clone(), true);
+        let mapped = mapper.map_key_equivalent(keystroke, true);
         assert_eq!(mapped.inner().modifiers, Modifiers::control());
         assert_eq!(mapped.inner().key, shifted_key);
         assert_eq!(mapped.key(), base_key);
@@ -356,8 +356,8 @@ mod tests {
         };
         let mapped = mapper.map_key_equivalent(keystroke, true);
         assert_eq!(mapped.inner().modifiers, Modifiers::control());
-        assert_eq!(mapped.inner().key, shifted_key.clone());
-        assert_eq!(mapped.key(), base_key.clone());
+        assert_eq!(mapped.inner().key, shifted_key);
+        assert_eq!(mapped.key(), base_key);
         assert_eq!(*mapped.modifiers(), Modifiers::control_shift());
 
         // Windows style

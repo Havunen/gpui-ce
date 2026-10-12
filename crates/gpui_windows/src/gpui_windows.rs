@@ -10,6 +10,7 @@ mod direct_write;
 mod directx_atlas;
 mod directx_devices;
 mod directx_renderer;
+mod directx_retained;
 mod dispatcher;
 mod display;
 mod events;

@@ -266,6 +266,13 @@ pub(crate) enum WindowRenderer {
 }
 
 impl WindowRenderer {
+    pub(crate) fn release_retained_frame(&mut self) {
+        match self {
+            Self::Dx11(renderer) => renderer.release_retained_frame(),
+            #[cfg(feature = "windows-wgpu")]
+            Self::Dx12(renderer) => renderer.renderer.release_retained_frame(),
+        }
+    }
     pub(crate) fn new(
         hwnd: HWND,
         devices: &DirectXDevices,
@@ -573,7 +580,6 @@ mod tests {
         );
         assert_eq!(
             context
-                .clone()
                 .create_with(
                     || panic!("repeated probe"),
                     || panic!("repeated DX12"),

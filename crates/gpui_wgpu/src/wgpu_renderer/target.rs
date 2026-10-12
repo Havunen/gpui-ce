@@ -10,6 +10,8 @@ pub(super) struct RenderTarget {
     maximum_dimension: u32,
     configured: bool,
     needs_redraw: bool,
+    copy_backend_supported: bool,
+    copy_surface_supported: bool,
     pub(super) clear_color: wgpu::Color,
 }
 
@@ -19,52 +21,65 @@ impl RenderTarget {
         device: &wgpu::Device,
         surface: Option<&wgpu::Surface<'_>>,
         requested: WgpuSurfaceConfig,
+        backend: wgpu::Backend,
     ) -> anyhow::Result<Self> {
-        let (format, transparent_alpha_mode, opaque_alpha_mode, present_mode) =
-            if let Some(surface) = surface {
-                let capabilities = surface.get_capabilities(adapter);
-                let format = [
-                    wgpu::TextureFormat::Bgra8Unorm,
-                    wgpu::TextureFormat::Rgba8Unorm,
-                ]
-                .into_iter()
-                .find(|format| capabilities.formats.contains(format))
-                .or_else(|| {
-                    capabilities
-                        .formats
-                        .iter()
-                        .find(|format| !format.is_srgb())
-                        .copied()
-                })
-                .or_else(|| capabilities.formats.first().copied())
-                .ok_or_else(|| {
+        let (
+            format,
+            transparent_alpha_mode,
+            opaque_alpha_mode,
+            present_mode,
+            copy_surface_supported,
+        ) = if let Some(surface) = surface {
+            let capabilities = surface.get_capabilities(adapter);
+            let format = [
+                wgpu::TextureFormat::Bgra8Unorm,
+                wgpu::TextureFormat::Rgba8Unorm,
+            ]
+            .into_iter()
+            .find(|format| capabilities.formats.contains(format))
+            .or_else(|| {
+                capabilities
+                    .formats
+                    .iter()
+                    .find(|format| !format.is_srgb())
+                    .copied()
+            })
+            .or_else(|| capabilities.formats.first().copied())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "surface reports no texture formats for adapter {:?}",
+                    adapter.get_info().name
+                )
+            })?;
+            let (transparent, opaque) =
+                select_alpha_modes(&capabilities.alpha_modes).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "surface reports no texture formats for adapter {:?}",
+                        "surface reports no alpha modes for adapter {:?}",
                         adapter.get_info().name
                     )
                 })?;
-                let (transparent, opaque) = select_alpha_modes(&capabilities.alpha_modes)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "surface reports no alpha modes for adapter {:?}",
-                            adapter.get_info().name
-                        )
-                    })?;
-                let present_mode = select_present_mode(
-                    requested.preferred_present_mode,
-                    &capabilities.present_modes,
-                    wgpu::PresentMode::Fifo,
-                );
-                (format, transparent, opaque, present_mode)
-            } else {
-                // Native desktop swapchains are BGRA; matching that keeps snapshots comparable.
-                (
-                    wgpu::TextureFormat::Bgra8Unorm,
-                    wgpu::CompositeAlphaMode::PreMultiplied,
-                    wgpu::CompositeAlphaMode::Opaque,
-                    wgpu::PresentMode::Fifo,
-                )
-            };
+            let present_mode = select_present_mode(
+                requested.preferred_present_mode,
+                &capabilities.present_modes,
+                wgpu::PresentMode::Fifo,
+            );
+            (
+                format,
+                transparent,
+                opaque,
+                present_mode,
+                capabilities.usages.contains(wgpu::TextureUsages::COPY_DST),
+            )
+        } else {
+            // Native desktop swapchains are BGRA; matching that keeps snapshots comparable.
+            (
+                wgpu::TextureFormat::Bgra8Unorm,
+                wgpu::CompositeAlphaMode::PreMultiplied,
+                wgpu::CompositeAlphaMode::Opaque,
+                wgpu::PresentMode::Fifo,
+                true,
+            )
+        };
         let maximum_dimension = device.limits().max_texture_dimension_2d;
         let (width, height) = clamped_size(requested.size, maximum_dimension);
         let alpha_mode = if requested.transparent {
@@ -72,7 +87,7 @@ impl RenderTarget {
         } else {
             opaque_alpha_mode
         };
-        Ok(Self {
+        let mut target = Self {
             config: wgpu::SurfaceConfiguration {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                 format,
@@ -88,8 +103,12 @@ impl RenderTarget {
             maximum_dimension,
             configured: surface.is_some(),
             needs_redraw: false,
+            copy_backend_supported: cfg!(target_os = "windows") && backend == wgpu::Backend::Dx12,
+            copy_surface_supported,
             clear_color: clear_color(requested.transparent),
-        })
+        };
+        target.refresh_copy_usage();
+        Ok(target)
     }
 
     pub(super) fn configuration(&self) -> &wgpu::SurfaceConfiguration {
@@ -118,22 +137,71 @@ impl RenderTarget {
             return false;
         }
         self.config.alpha_mode = alpha_mode;
+        self.refresh_copy_usage();
         true
+    }
+
+    /// Whether the retained frame reaches the swapchain by copy rather than blit.
+    pub(super) fn retained_copy_enabled(&self) -> bool {
+        self.copy_backend_supported
+            && self.copy_surface_supported
+            // The formats the copy is verified with.
+            && matches!(
+                self.config.format,
+                wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm
+            )
+            && super::retained::alpha_supported(self.config.alpha_mode)
+    }
+
+    fn refresh_copy_usage(&mut self) {
+        let enabled = self.retained_copy_enabled();
+        self.config
+            .usage
+            .set(wgpu::TextureUsages::COPY_DST, enabled);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(super) fn update_surface_copy_support(
+        &mut self,
+        usages: wgpu::TextureUsages,
+        formats: &[wgpu::TextureFormat],
+    ) {
+        self.copy_surface_supported =
+            usages.contains(wgpu::TextureUsages::COPY_DST) && formats.contains(&self.config.format);
+        self.refresh_copy_usage();
+    }
+
+    #[cfg(all(test, target_os = "windows"))]
+    pub(super) fn set_format_for_tests(&mut self, format: wgpu::TextureFormat) {
+        self.config.format = format;
+        self.refresh_copy_usage();
     }
 
     #[cfg(not(target_family = "wasm"))]
     pub(super) fn apply(
         &mut self,
         requested: WgpuSurfaceConfig,
-        supported_present_modes: &[wgpu::PresentMode],
-    ) -> bool {
+        capabilities: &wgpu::SurfaceCapabilities,
+    ) -> anyhow::Result<bool> {
+        // Validate before changing the live target. An unsupported retained alpha
+        // mode would invalidate configure() and misreport presentation-copy support.
+        let (transparent, opaque) = select_alpha_modes(&capabilities.alpha_modes)
+            .ok_or_else(|| anyhow::anyhow!("replacement surface reports no alpha modes"))?;
+        anyhow::ensure!(
+            capabilities.formats.contains(&self.config.format),
+            "replacement surface does not support the existing target format {:?}",
+            self.config.format
+        );
+        self.transparent_alpha_mode = transparent;
+        self.opaque_alpha_mode = opaque;
+        self.update_surface_copy_support(capabilities.usages, &capabilities.formats);
         self.resize(requested.size);
         self.config.present_mode = select_present_mode(
             requested.preferred_present_mode,
-            supported_present_modes,
+            &capabilities.present_modes,
             self.config.present_mode,
         );
-        self.set_transparent(requested.transparent)
+        Ok(self.set_transparent(requested.transparent))
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -275,6 +343,76 @@ fn clear_color(transparent: bool) -> wgpu::Color {
 #[cfg(test)]
 mod tests {
     use super::{select_alpha_modes, select_present_mode};
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn replacement_reselects_supported_alpha_and_copy_usage_before_configuration() {
+        use super::{RenderTarget, WgpuSurfaceConfig};
+        use gpui::{DevicePixels, Size};
+        use wgpu::{CompositeAlphaMode as Alpha, TextureUsages as Usage};
+        let size = Size {
+            width: DevicePixels(201),
+            height: DevicePixels(103),
+        };
+        let request = |transparent| WgpuSurfaceConfig {
+            size,
+            transparent,
+            preferred_present_mode: None,
+        };
+        let mut target = RenderTarget {
+            config: wgpu::SurfaceConfiguration {
+                usage: Usage::RENDER_ATTACHMENT | Usage::COPY_DST,
+                format: wgpu::TextureFormat::Bgra8Unorm,
+                width: 201,
+                height: 103,
+                present_mode: wgpu::PresentMode::Fifo,
+                desired_maximum_frame_latency: 2,
+                alpha_mode: Alpha::PreMultiplied,
+                view_formats: Vec::new(),
+            },
+            transparent_alpha_mode: Alpha::PreMultiplied,
+            opaque_alpha_mode: Alpha::Opaque,
+            maximum_dimension: 4096,
+            configured: true,
+            needs_redraw: false,
+            copy_backend_supported: true,
+            copy_surface_supported: true,
+            clear_color: wgpu::Color::TRANSPARENT,
+        };
+        let mut caps = wgpu::SurfaceCapabilities {
+            formats: vec![wgpu::TextureFormat::Bgra8Unorm],
+            present_modes: vec![wgpu::PresentMode::Fifo],
+            alpha_modes: vec![Alpha::Opaque, Alpha::Inherit],
+            usages: Usage::RENDER_ATTACHMENT | Usage::COPY_DST,
+        };
+        assert!(target.apply(request(true), &caps).unwrap());
+        assert_eq!(target.alpha_mode(), Alpha::Inherit);
+        assert!(!target.retained_copy_enabled());
+        assert!(!target.configuration().usage.contains(Usage::COPY_DST));
+        assert!(target.apply(request(false), &caps).unwrap());
+        assert_eq!(target.alpha_mode(), Alpha::Opaque);
+        assert!(target.retained_copy_enabled());
+        caps.alpha_modes = vec![Alpha::PreMultiplied, Alpha::Opaque];
+        assert!(target.apply(request(true), &caps).unwrap());
+        assert_eq!(target.alpha_mode(), Alpha::PreMultiplied);
+        assert!(target.configuration().usage.contains(Usage::COPY_DST));
+        caps.usages = Usage::RENDER_ATTACHMENT;
+        assert!(!target.apply(request(true), &caps).unwrap());
+        assert!(!target.retained_copy_enabled());
+        assert!(!target.configuration().usage.contains(Usage::COPY_DST));
+        let unchanged = target.configuration().clone();
+        caps.alpha_modes.clear();
+        assert!(target.apply(request(true), &caps).is_err());
+        assert_eq!(
+            *target.configuration(),
+            unchanged,
+            "failed replacement must leave the live configuration intact"
+        );
+        caps.alpha_modes = vec![Alpha::PreMultiplied];
+        caps.formats = vec![wgpu::TextureFormat::Rgba8Unorm];
+        assert!(target.apply(request(true), &caps).is_err());
+        assert_eq!(*target.configuration(), unchanged);
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

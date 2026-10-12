@@ -210,7 +210,7 @@ impl WgpuRenderer {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let rendered = self.render_to_view(scene, &view);
+        let rendered = self.render_to_texture(scene, &frame.texture, &view);
         if rendered {
             frame.present();
         } else {
@@ -237,6 +237,7 @@ impl WgpuRenderer {
 
     /// Keeps device resources alive while detaching a destroyed native surface.
     pub fn unconfigure_surface(&mut self) {
+        self.release_retained_frame();
         self.target.set_configured(false);
         if let Some(resources) = self.resources.as_mut() {
             resources.invalidate_intermediate_textures();
@@ -260,7 +261,7 @@ impl WgpuRenderer {
         // A replacement surface can expose different present modes (for example when a
         // window moves between displays or Wayland/X11 surfaces). Query the new surface,
         // rather than reusing capabilities from the old target.
-        let supported_present_modes = {
+        let capabilities = {
             let context_slot = self.context.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("native surface replacement requires a GPU context")
             })?;
@@ -278,9 +279,9 @@ impl WgpuRenderer {
                     info.device,
                 );
             }
-            capabilities.present_modes
+            capabilities
         };
-        if self.target.apply(config, &supported_present_modes) {
+        if self.target.apply(config, &capabilities)? {
             self.rebuild_pipelines();
         }
         let target_config = self.target.configuration().clone();
@@ -297,6 +298,7 @@ impl WgpuRenderer {
     }
 
     pub fn destroy(&mut self) {
+        self.retained.invalidate();
         self.resources.take();
     }
 

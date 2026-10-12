@@ -35,6 +35,7 @@ pub(crate) struct TestWindowState {
     input_callback: Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>,
     active_status_change_callback: Option<Box<dyn FnMut(bool)>>,
     hover_status_change_callback: Option<Box<dyn FnMut(bool)>>,
+    hovered: bool,
     resize_callback: Option<Box<dyn FnMut(Size<Pixels>, f32)>>,
     moved_callback: Option<Box<dyn FnMut()>>,
     appearance_change_callback: Option<Box<dyn FnMut()>>,
@@ -54,6 +55,8 @@ pub(crate) struct TestWindowState {
     modifiers: crate::Modifiers,
     fixed_refresh_rate: bool,
     presents: usize,
+    last_frame_context: crate::profiler::gpu::GpuFrameContext,
+    during_next_draw: Option<Box<dyn FnOnce()>>,
 }
 
 #[derive(Clone)]
@@ -104,6 +107,7 @@ impl TestWindow {
             input_callback: None,
             active_status_change_callback: None,
             hover_status_change_callback: None,
+            hovered: false,
             resize_callback: None,
             moved_callback: None,
             appearance_change_callback: None,
@@ -123,6 +127,8 @@ impl TestWindow {
             modifiers: crate::Modifiers::default(),
             fixed_refresh_rate: false,
             presents: 0,
+            last_frame_context: Default::default(),
+            during_next_draw: None,
         })))
     }
 
@@ -135,6 +141,11 @@ impl TestWindow {
     /// re-presented.
     pub fn presents(&self) -> usize {
         self.0.lock().presents
+    }
+
+    /// The frame context the latest present handed to the renderer.
+    pub fn last_frame_context(&self) -> crate::profiler::gpu::GpuFrameContext {
+        self.0.lock().last_frame_context
     }
 
     pub fn simulate_scheduled_frame(&self) -> bool {
@@ -208,6 +219,25 @@ impl TestWindow {
         drop(lock);
         callback(active);
         self.0.lock().active_status_change_callback = Some(callback);
+    }
+
+    /// Moves the pointer into or out of the window and delivers the
+    /// platform's hover callback.
+    pub fn simulate_hover_status_change(&self, hovered: bool) {
+        let mut lock = self.0.lock();
+        lock.hovered = hovered;
+        let Some(mut callback) = lock.hover_status_change_callback.take() else {
+            return;
+        };
+        drop(lock);
+        callback(hovered);
+        self.0.lock().hover_status_change_callback = Some(callback);
+    }
+
+    /// Runs `f` inside the next draw, like a platform event that a nested
+    /// message pump delivers while the window draws.
+    pub fn run_during_next_draw(&self, f: impl FnOnce() + 'static) {
+        self.0.lock().during_next_draw = Some(Box::new(f));
     }
 
     pub fn simulate_appearance_change(&self, appearance: WindowAppearance) {
@@ -384,7 +414,7 @@ impl PlatformWindow for TestWindow {
     }
 
     fn is_hovered(&self) -> bool {
-        false
+        self.0.lock().hovered
     }
 
     fn background_appearance(&self) -> WindowBackgroundAppearance {
@@ -495,11 +525,17 @@ impl PlatformWindow for TestWindow {
         let scale_factor = self.scale_factor();
         let mut state = self.0.lock();
         state.presents += 1;
+        state.last_frame_context = crate::profiler::gpu::gpu_frame_context();
         state.frame_callback_pending = true;
         state.frame_scheduled = true;
         let device_size: Size<DevicePixels> = state.bounds.size.to_device_pixels(scale_factor);
         if let Some(renderer) = &mut state.renderer {
             renderer.render_scene(scene, device_size).warn_on_err();
+        }
+        let during_draw = state.during_next_draw.take();
+        drop(state);
+        if let Some(f) = during_draw {
+            f();
         }
     }
 

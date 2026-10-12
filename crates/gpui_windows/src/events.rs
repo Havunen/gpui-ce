@@ -840,6 +840,9 @@ impl WindowsWindowInner {
 
         self.executor
             .spawn(async move {
+                if !activated {
+                    this.state.renderer.borrow_mut().release_retained_frame();
+                }
                 if let Some(mut func) = this.state.callbacks.active_status_change.take() {
                     func(activated);
                     this.state.callbacks.active_status_change.set(Some(func));

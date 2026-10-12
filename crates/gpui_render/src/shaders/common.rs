@@ -180,6 +180,16 @@ mod source {
         pub fn center(bounds: Bounds) -> Vec2f {
             bounds.origin + Bounds::half_size(bounds)
         }
+
+        /// The overlap of two bounds, empty (zero size) when they are disjoint.
+        pub fn intersect(a: Bounds, b: Bounds) -> Bounds {
+            let origin = max(a.origin, b.origin);
+            let end = max(min(a.origin + a.size, b.origin + b.size), origin);
+            Bounds {
+                origin,
+                size: end - origin,
+            }
+        }
     }
 
     #[repr(C)]
@@ -427,8 +437,14 @@ mod source {
         )
     }
 
+    /// The mask is half open, like a rasterized rectangle: a pixel centered on its
+    /// left or top edge is inside, on its right or bottom edge outside, so masks
+    /// that meet draw such pixels once. There the interpolated distance is a
+    /// rounding error either side of zero that depends on the primitive's
+    /// vertices, so a small margin decides every primitive alike.
     pub fn is_clipped(distances: Vec4f) -> bool {
-        min(min(distances.x, distances.y), min(distances.z, distances.w)) < 0.0
+        let margin = 1.0 / 256.0;
+        min(distances.x, distances.z) < -margin || min(distances.y, distances.w) < margin
     }
 
     pub fn unclipped_distances() -> Vec4f {

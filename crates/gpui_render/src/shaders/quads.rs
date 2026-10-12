@@ -535,7 +535,13 @@ pub mod quad {
     }
 
     pub fn prepare_quad_vertex(vertex_id: u32, instance_id: u32, quad: Quad) -> QuadVertexData {
-        let vertex = rectangle_vertex(vertex_id, quad.bounds);
+        // Rasterize only what the content mask lets through: the fragment
+        // stage discards everything outside it anyway, after shading it.
+        // Geometry and paint still use the quad's own bounds.
+        let vertex = rectangle_vertex(
+            vertex_id,
+            Bounds::intersect(quad.bounds, quad.content_mask.bounds),
+        );
         QuadVertexData {
             position: vertex.clip_position,
             border: prepare_paint(Paint::new(quad.border_color, quad.bounds)),

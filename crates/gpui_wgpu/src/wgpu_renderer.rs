@@ -25,6 +25,7 @@ mod pipelines;
 mod platform;
 pub use platform::RecoveryPending;
 mod resources;
+mod retained;
 mod settings;
 mod surfaces;
 mod target;
@@ -68,12 +69,14 @@ pub struct WgpuRenderer {
     atlas: Arc<WgpuAtlas>,
     globals: GlobalBufferLayout,
     rendering_params: RenderingParameters,
-    crop_path_targets: bool,
     subpixel_order: SubpixelOrder,
     dual_source_blending: bool,
     adapter_info: wgpu::AdapterInfo,
     uploaded_globals: Option<frame::GlobalUniformState>,
     faults: GpuFaultState,
+    retained: retained::RetainedFrame,
+    #[cfg(test)]
+    last_retained_presentation: &'static str,
 }
 
 impl WgpuRenderer {
@@ -98,15 +101,20 @@ impl WgpuRenderer {
         extra_requirements: Option<WgpuDeviceRequirements>,
         atlas: Arc<WgpuAtlas>,
     ) -> anyhow::Result<Self> {
-        let target =
-            RenderTarget::new(&context.adapter, &context.device, surface.as_ref(), config)?;
+        let adapter_info = context.adapter.get_info();
+        let target = RenderTarget::new(
+            &context.adapter,
+            &context.device,
+            surface.as_ref(),
+            config,
+            adapter_info.backend,
+        )?;
         if let Some(surface) = surface.as_ref() {
             surface.configure(&context.device, target.configuration());
         }
 
         let dual_source_blending = context.supports_dual_source_blending();
         let rendering_params = RenderingParameters::new(&context.adapter, target.format());
-        let adapter_info = context.adapter.get_info();
         let (resources, metadata) = WgpuResources::new(
             context,
             surface,
@@ -130,11 +138,13 @@ impl WgpuRenderer {
             atlas,
             globals,
             rendering_params,
-            crop_path_targets: cropped_path_targets_enabled(),
             subpixel_order: SubpixelOrder::RedGreenBlue,
             dual_source_blending,
             adapter_info,
             uploaded_globals: None,
+            retained: retained::RetainedFrame::new(),
+            #[cfg(test)]
+            last_retained_presentation: "direct",
             faults: GpuFaultState {
                 pending_error: last_error,
                 consecutive_failed_frames: 0,
@@ -172,6 +182,7 @@ impl WgpuRenderer {
         if !self.target.resize(size) {
             return;
         }
+        self.retained.invalidate();
         let config = self.target.configuration().clone();
         let Some(resources) = self.resources.as_mut() else {
             return;
@@ -184,11 +195,15 @@ impl WgpuRenderer {
 
     /// Selects the physical LCD component order used by subpixel glyph correction.
     pub fn set_subpixel_order(&mut self, order: SubpixelOrder) {
+        if order != self.subpixel_order {
+            self.retained.invalidate();
+        }
         self.subpixel_order = order;
     }
 
     /// Updates platform-specific text rasterization parameters.
     pub fn set_font_rasterization_settings(&mut self, settings: FontRasterizationSettings) {
+        self.retained.invalidate();
         self.rendering_params.font_rasterization = settings;
         self.subpixel_order = settings.subpixel_order;
     }
@@ -206,6 +221,7 @@ impl WgpuRenderer {
         if !self.target.set_transparent(transparent) {
             return;
         }
+        self.retained.invalidate();
         let config = self.target.configuration().clone();
         if let Some(resources) = self.resources.as_ref() {
             if let Some(surface) = resources.surface.as_ref() {
@@ -282,16 +298,23 @@ impl WgpuRenderer {
             driver_info: self.adapter_info.driver_info.clone(),
         }
     }
+    /// Release the retained frame when a window is deactivated.
+    pub fn release_retained_frame(&mut self) {
+        self.retained.invalidate();
+    }
 
     pub fn max_texture_size(&self) -> u32 {
         self.target.maximum_dimension()
     }
 
-    /// Encodes and submits a complete scene into an arbitrary color target.
-    /// Swapchain drawing, window capture, and headless rendering all use this path so
-    /// platform integrations can't diverge in batching, filters, or pipeline state.
-    fn render_to_view(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> bool {
-        frame::render_to_view(self, scene, frame_view, None).is_some()
+    /// Encodes through the shared scene path with the exact presentation texture.
+    fn render_to_texture(
+        &mut self,
+        scene: &Scene,
+        texture: &wgpu::Texture,
+        view: &wgpu::TextureView,
+    ) -> bool {
+        frame::render_to_view(self, scene, view, texture, None).is_some()
     }
 
     #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
@@ -301,29 +324,14 @@ impl WgpuRenderer {
         frame_view: &wgpu::TextureView,
         readback: frame::ReadbackCopy<'_>,
     ) -> Option<wgpu::SubmissionIndex> {
-        frame::render_to_view(self, scene, frame_view, Some(readback))
-    }
-}
-
-// Linux uses the measured memory optimization by default; other targets remain
-// opt-in. An explicit experiment list overrides the default, including an empty
-// list to disable cropping. Read the environment once, never on the draw path.
-fn cropped_path_targets_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        cropped_path_targets_for_experiments(
-            std::env::var("GPUI_GPU_EXPERIMENTS").ok().as_deref(),
-            cfg!(target_os = "linux"),
+        frame::render_to_view(
+            self,
+            scene,
+            frame_view,
+            readback.texture,
+            Some(readback),
         )
-    })
-}
-
-fn cropped_path_targets_for_experiments(experiments: Option<&str>, default_enabled: bool) -> bool {
-    experiments.map_or(default_enabled, |value| {
-        value
-            .split(',')
-            .any(|option| option.trim() == "cropped-paths")
-    })
+    }
 }
 
 fn begin_color_render_pass<'encoder>(
@@ -352,28 +360,6 @@ fn begin_color_render_pass<'encoder>(
 mod tests {
     use super::*;
     use crate::wgpu_renderer::filters::FrameUniformRequirements;
-
-    #[test]
-    fn cropped_path_target_experiments_override_platform_defaults() {
-        for default_enabled in [false, true] {
-            assert_eq!(
-                cropped_path_targets_for_experiments(None, default_enabled),
-                default_enabled
-            );
-            for experiments in ["", "  ", "fixed-refresh", "not-cropped-paths"] {
-                assert!(!cropped_path_targets_for_experiments(
-                    Some(experiments),
-                    default_enabled
-                ));
-            }
-            for experiments in ["cropped-paths", " fixed-refresh, cropped-paths "] {
-                assert!(cropped_path_targets_for_experiments(
-                    Some(experiments),
-                    default_enabled
-                ));
-            }
-        }
-    }
 
     #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
     fn dashed_border_scene(dash_length: f32, dash_gap: f32) -> Scene {

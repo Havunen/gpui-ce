@@ -633,6 +633,72 @@ mod tests {
     }
 
     #[test]
+    fn every_present_hands_the_renderer_the_drawn_scene_revision() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window(|_, _| MoveInvalidator);
+        let platform_window = window.test_window().unwrap();
+        for x in 0..8 {
+            window.simulate_mouse_move(point(px(10. + x as f32), px(10.)));
+        }
+        window.simulate_request_frame(RequestFrameOptions::default());
+        let drawn = platform_window.last_frame_context().scene_revision;
+        assert!(drawn > 0);
+        // Fast input re-presents the unchanged scene, which keeps its revision.
+        let presents = platform_window.presents();
+        window.simulate_request_frame(RequestFrameOptions::default());
+        assert_eq!(platform_window.presents(), presents + 1);
+        assert_eq!(platform_window.last_frame_context().scene_revision, drawn);
+        window.simulate_mouse_move(point(px(30.), px(10.)));
+        window.simulate_request_frame(RequestFrameOptions::default());
+        assert!(platform_window.last_frame_context().scene_revision > drawn);
+    }
+
+    #[test]
+    fn unfocused_windows_keep_their_retained_frame_while_hovered() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window(|_, _| MoveInvalidator);
+        let platform_window = window.test_window().unwrap();
+        // Unchanged frames are not presented again, so each present below repaints.
+        platform_window.set_fixed_refresh_rate(true);
+        platform_window.simulate_active_status_change(false);
+        platform_window.simulate_hover_status_change(true);
+        // Hover highlights repaint an unfocused window too.
+        window.simulate_mouse_move(point(px(10.), px(10.)));
+        window.simulate_request_frame(RequestFrameOptions::default());
+        assert!(platform_window.last_frame_context().interactive);
+        // Leaving repaints unprompted, so the renderer frees the frame at once.
+        let presents = platform_window.presents();
+        platform_window.simulate_hover_status_change(false);
+        window.simulate_request_frame(RequestFrameOptions::default());
+        assert_eq!(platform_window.presents(), presents + 1);
+        assert!(!platform_window.last_frame_context().interactive);
+        // A focused window keeps it with the pointer elsewhere.
+        platform_window.simulate_active_status_change(true);
+        window.simulate_request_frame(RequestFrameOptions::default());
+        assert!(platform_window.last_frame_context().interactive);
+    }
+
+    #[test]
+    fn a_pointer_exit_during_a_draw_still_frees_the_retained_frame() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window(|_, _| MoveInvalidator);
+        let platform_window = window.test_window().unwrap();
+        platform_window.set_fixed_refresh_rate(true);
+        platform_window.simulate_active_status_change(false);
+        platform_window.simulate_hover_status_change(true);
+        window.simulate_mouse_move(point(px(10.), px(10.)));
+        // The pointer leaves mid-draw, as a nested Windows message pump can
+        // deliver it. The hover callback can't update the drawing window.
+        let pointer = platform_window.clone();
+        platform_window.run_during_next_draw(move || pointer.simulate_hover_status_change(false));
+        window.simulate_request_frame(RequestFrameOptions::default());
+        assert!(platform_window.last_frame_context().interactive);
+        // The next frame still repaints without the retained frame.
+        window.simulate_request_frame(RequestFrameOptions::default());
+        assert!(!platform_window.last_frame_context().interactive);
+    }
+
+    #[test]
     fn force_render_refreshes_cached_views() {
         let mut app = TestApp::new();
         let render_count = Rc::new(Cell::new(0));

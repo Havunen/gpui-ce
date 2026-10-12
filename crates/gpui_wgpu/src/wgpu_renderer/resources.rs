@@ -226,6 +226,11 @@ impl WgpuResources {
         self.surface_uniforms.finish_upload();
     }
 
+    #[cfg(test)]
+    pub(super) fn blur_bind_group_count(&self) -> usize {
+        self.blur_bind_groups.borrow().groups.len()
+    }
+
     pub(super) fn blur_bind_group(&self, source: &wgpu::TextureView) -> wgpu::BindGroup {
         let mut cache = self.blur_bind_groups.borrow_mut();
         let uniform_generation = self.filter_uniforms.generation();
@@ -254,15 +259,12 @@ impl WgpuResources {
 
 impl WgpuRenderer {
     pub(super) fn ensure_path_textures(&mut self, scene: &gpui::Scene) {
-        let (mut width, mut height) = if self.crop_path_targets {
-            path_target_extent(
-                scene.paths.iter().map(|path| path.clipped_bounds()),
-                self.target.width(),
-                self.target.height(),
-            )
-        } else {
-            (self.target.width(), self.target.height())
-        };
+        // Path targets cover only the paths' bounds.
+        let (mut width, mut height) = path_target_extent(
+            scene.paths.iter().map(|path| path.clipped_bounds()),
+            self.target.width(),
+            self.target.height(),
+        );
         if let Some(texture) = self.resources().path_intermediate_texture.as_ref() {
             // Grow in coarse blocks to avoid reallocating for each small graph
             // change. Window resize invalidates these targets as before.
@@ -277,13 +279,6 @@ impl WgpuRenderer {
         }
         let format = self.target.format();
         let sample_count = self.rendering_params.path_sample_count;
-        if std::env::var_os("GPUI_PROFILE_PATH_TARGET").is_some() {
-            eprintln!(
-                "GPUI path target {width}x{height}, viewport {}x{}, samples {sample_count}",
-                self.target.width(),
-                self.target.height()
-            );
-        }
         let resources = self.resources_mut();
         resources.instances.invalidate_texture_bindings();
         let (texture, view) = sampled_render_texture(&resources.device, format, width, height);

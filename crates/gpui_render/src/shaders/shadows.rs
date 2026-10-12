@@ -175,7 +175,12 @@ pub mod shadow {
         instance_id: u32,
         shadow: Shadow,
     ) -> ShadowVertexData {
-        let vertex = rectangle_vertex(vertex_id, shadow_geometry(shadow));
+        // Rasterize only what the content mask lets through, as quads do.
+        // Coverage and paint still use the shadow's own bounds.
+        let vertex = rectangle_vertex(
+            vertex_id,
+            Bounds::intersect(shadow_geometry(shadow), shadow.content_mask.bounds),
+        );
         ShadowVertexData {
             position: vertex.clip_position,
             paint: prepare_paint(shadow_paint(shadow)),

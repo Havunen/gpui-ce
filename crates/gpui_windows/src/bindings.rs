@@ -3068,6 +3068,7 @@ pub mod Windows {
             pub MultisampleEnable: windows_core::BOOL,
             pub AntialiasedLineEnable: windows_core::BOOL,
         }
+        pub type D3D11_RECT = RECT;
         #[repr(C)]
         #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
         pub struct D3D11_RENDER_TARGET_BLEND_DESC {
@@ -5491,6 +5492,15 @@ pub mod Windows {
                     );
                 }
             }
+            pub unsafe fn RSSetScissorRects(&self, prects: Option<&[D3D11_RECT]>) {
+                unsafe {
+                    (windows_core::Interface::vtable(self).RSSetScissorRects)(
+                        windows_core::Interface::as_raw(self),
+                        prects.map_or(0, |slice| slice.len().try_into().unwrap()),
+                        prects.map_or(core::ptr::null(), |slice| slice.as_ptr()),
+                    );
+                }
+            }
             pub unsafe fn CopyResource<P0, P1>(&self, pdstresource: P0, psrcresource: P1)
             where
                 P0: windows_core::Param<ID3D11Resource>,
@@ -5683,7 +5693,8 @@ pub mod Windows {
                 unsafe extern "system" fn(*mut core::ffi::c_void, *mut core::ffi::c_void),
             pub RSSetViewports:
                 unsafe extern "system" fn(*mut core::ffi::c_void, u32, *const D3D11_VIEWPORT),
-            RSSetScissorRects: usize,
+            pub RSSetScissorRects:
+                unsafe extern "system" fn(*mut core::ffi::c_void, u32, *const D3D11_RECT),
             CopySubresourceRegion: usize,
             pub CopyResource: unsafe extern "system" fn(
                 *mut core::ffi::c_void,

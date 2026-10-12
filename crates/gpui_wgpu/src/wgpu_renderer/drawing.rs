@@ -13,6 +13,26 @@ use super::{
 };
 
 impl WgpuRenderer {
+    /// Replace every RGBA channel in a damaged region before replaying its scene.
+    /// Source-over blending cannot erase old alpha with a transparent clear.
+    pub(super) fn draw_damage_clear(
+        &self,
+        quads: &[Quad],
+        instances: &mut InstanceUpload,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> frame::DrawResult {
+        self.draw_instances(
+            quads,
+            self.resources()
+                .pipelines
+                .damage_clear_quads
+                .as_ref()
+                .expect("damage clear pipeline is prepared before partial encoding"),
+            instances,
+            pass,
+        )
+    }
+
     pub(super) fn draw_quads(
         &self,
         quads: &[Quad],

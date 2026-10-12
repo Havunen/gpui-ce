@@ -8,7 +8,9 @@ use gpui::{
     FilterRenderTarget, MAX_FILTER_GROUP_DEPTH, MonochromeSprite, PolychromeSprite, PrimitiveBatch,
     Quad, RenderCommand, Scene, Shadow, SubpixelSprite, Underline,
 };
+use gpui_render::blur::ScissorRectangle;
 use gpui_render::blur::{FilterCompositeClip, FilterCompositeParameters};
+use gpui_render::damage::{Damage, batch_intersects, clear_quad};
 use gpui_render::shaders::{
     common::{FontRasterizationUniforms, GlobalUniforms, ShaderBool},
     interface as shader_interface,
@@ -18,16 +20,79 @@ pub(super) fn render_to_view(
     renderer: &mut WgpuRenderer,
     scene: &Scene,
     frame_view: &wgpu::TextureView,
+    frame_texture: &wgpu::Texture,
     readback: Option<ReadbackCopy<'_>>,
 ) -> Option<wgpu::SubmissionIndex> {
-    let Some(targets) = PreparedTargets::prepare(renderer, scene, frame_view) else {
+    if !begin_frame(renderer) {
         return None;
+    }
+    let atlas_generation = if renderer.retained.enabled() {
+        gpui::PlatformAtlas::generation(renderer.atlas.as_ref())
+    } else {
+        0
     };
+    let mut retained = renderer.retained.prepare(
+        scene,
+        atlas_generation,
+        renderer.target.width(),
+        renderer.target.height(),
+        renderer.target.retained_copy_enabled(),
+        renderer.resources.as_ref()?,
+        renderer.target.format(),
+        renderer.target.alpha_mode(),
+        renderer.target.clear_color(),
+    );
+    let transport = renderer.resources().instances.transport();
+    let requirements = FrameRequirements::for_damage(scene, &retained.damage, transport);
+    let mut targets = PreparedTargets::prepare(renderer, scene, frame_view, &requirements)?;
+    // The retained texture matches the target by construction. The frame
+    // texture may not: it can predate a resize or lack COPY_DST.
+    let retained_copy = (retained.copy_texture.take())
+        .filter(|source| {
+            targets.offscreen.is_none()
+                && frame_texture.usage().contains(wgpu::TextureUsages::COPY_DST)
+                && frame_texture.size() == source.size()
+                && frame_texture.format() == source.format()
+        })
+        .map(|source| (source, frame_texture.clone()));
+    if let Some(view) = &retained.view {
+        targets.active = view.clone();
+        // Create the overwrite-clear PSO with the target's first full frame, so
+        // its first partial frame doesn't compile a pipeline on hover.
+        if retained.damage != Damage::Reuse {
+            let device = renderer.resources().device.clone();
+            renderer
+                .resources_mut()
+                .pipelines
+                .ensure_damage_clear(&device);
+        }
+    }
     // Prune once against the complete scene. Doing this inside each draw batch would evict a
     // texture that reappears after an intervening primitive and recreate its platform view.
     renderer.retain_surface_cache(&scene.surfaces);
 
-    match FrameEncoder::new(renderer, scene, targets).encode(readback) {
+    let retained_blit = retained.blit.take().filter(|_| retained_copy.is_none());
+    #[cfg(test)]
+    {
+        renderer.last_retained_presentation = if retained_copy.is_some() {
+            "copy"
+        } else if retained_blit.is_some() {
+            "blit"
+        } else {
+            "direct"
+        };
+    }
+    let result = FrameEncoder::new(
+        renderer,
+        scene,
+        targets,
+        retained.damage,
+        retained_blit,
+        retained_copy,
+    )
+    .encode(readback);
+    renderer.retained.complete(retained, result.is_ok());
+    match result {
         Ok(command_buffer) => {
             let submission = renderer.resources().queue.submit([command_buffer]);
             // A cleanup skipped a frame. Only a real submission without a new validation
@@ -72,14 +137,8 @@ impl PreparedTargets {
         renderer: &mut WgpuRenderer,
         scene: &Scene,
         frame_view: &wgpu::TextureView,
+        requirements: &FrameRequirements,
     ) -> Option<Self> {
-        if !begin_frame(renderer) {
-            return None;
-        }
-        let requirements = {
-            let transport = renderer.resources().instances.transport();
-            FrameRequirements::for_scene(scene, transport)
-        };
         let device = renderer.resources().device.clone();
         let resources = renderer.resources_mut();
         if !resources.instances.ensure_capacity(
@@ -149,6 +208,7 @@ fn begin_frame(renderer: &mut WgpuRenderer) -> bool {
 }
 
 pub(super) fn handle_gpu_error(renderer: &mut WgpuRenderer, error: String) -> bool {
+    renderer.release_retained_frame();
     renderer.faults.consecutive_failed_frames += 1;
     log::error!(
         "GPU error during frame (failure {} of 10): {error}",
@@ -325,64 +385,37 @@ pub(super) struct FrameRequirements {
 }
 
 impl FrameRequirements {
+    /// What a frame uploads: the whole scene, the batches a partial frame
+    /// repaints, or nothing when it reuses the retained frame.
+    fn for_damage(scene: &Scene, damage: &Damage, transport: InstanceTransport) -> Self {
+        match damage {
+            Damage::Full => Self::for_scene(scene, transport),
+            Damage::Partial(region) => Self::for_partial_scene(scene, *region, transport),
+            Damage::Reuse => Self::default(),
+        }
+    }
+
     pub(super) fn for_scene(scene: &Scene, transport: InstanceTransport) -> Self {
         let planned = scene.render_plan().requirements();
-        let mut storage_bytes = 0_u64;
-        let mut instance_batches = 0_u64;
-        let mut reserve = |element_size: usize, count: usize| {
-            if count > 0 {
-                let stride = element_size as u64;
-                storage_bytes = storage_bytes.next_multiple_of(transport.batch_alignment(stride));
-                storage_bytes = storage_bytes.saturating_add(stride.saturating_mul(count as u64));
-                instance_batches += 1;
-            }
-        };
+        let mut requirements = Self::scene_metadata(scene);
 
         for command in scene.render_commands() {
             let RenderCommand::Batch(batch) = command else {
                 continue;
             };
-            match batch {
-                PrimitiveBatch::Shadows { range, .. } => {
-                    reserve(std::mem::size_of::<Shadow>(), range.len())
-                }
-                PrimitiveBatch::Quads { range, .. } => {
-                    reserve(std::mem::size_of::<Quad>(), range.len())
-                }
-                PrimitiveBatch::Paths {
-                    rasterization_vertex_count,
-                    sprite_count,
-                    ..
-                } if *rasterization_vertex_count > 0 => {
-                    reserve(
-                        std::mem::size_of::<path_types::PathRasterizationVertex>(),
-                        *rasterization_vertex_count,
-                    );
-                    reserve(std::mem::size_of::<path_types::PathSprite>(), *sprite_count);
-                }
-                PrimitiveBatch::Underlines(range) => {
-                    reserve(std::mem::size_of::<Underline>(), range.len())
-                }
-                PrimitiveBatch::MonochromeSprites { range, .. } => {
-                    reserve(std::mem::size_of::<MonochromeSprite>(), range.len())
-                }
-                PrimitiveBatch::SubpixelSprites { range, .. } => {
-                    reserve(std::mem::size_of::<SubpixelSprite>(), range.len())
-                }
-                PrimitiveBatch::PolychromeSprites { range, .. } => {
-                    reserve(std::mem::size_of::<PolychromeSprite>(), range.len())
-                }
-                PrimitiveBatch::Paths { .. }
-                | PrimitiveBatch::Surfaces(_)
-                | PrimitiveBatch::BackdropFilters(_)
-                | PrimitiveBatch::FilterBoundary(_) => {}
-            }
+            requirements.reserve_batch(batch, transport);
         }
-        debug_assert_eq!(instance_batches as usize, planned.instance_batch_count);
+        debug_assert_eq!(
+            requirements.instance_batches as usize,
+            planned.instance_batch_count
+        );
 
+        requirements
+    }
+
+    fn scene_metadata(scene: &Scene) -> Self {
+        let planned = scene.render_plan().requirements();
         Self {
-            storage_bytes,
-            instance_batches,
             uniforms: FrameUniformRequirements {
                 filter_count: FILTER_UNIFORMS_PER_COMPOSITE
                     * (planned.backdrop_filter_count + planned.isolated_filter_count) as u64
@@ -392,6 +425,185 @@ impl FrameRequirements {
             isolated_target_count: planned.isolated_target_count,
             uses_path_target: planned.uses_path_target,
             uses_offscreen_target: planned.uses_offscreen_target,
+            ..Default::default()
+        }
+    }
+
+    fn for_partial_scene(
+        scene: &Scene,
+        region: ScissorRectangle,
+        transport: InstanceTransport,
+    ) -> Self {
+        let mut requirements = Self::scene_metadata(scene);
+        // Encoding prepends a clear and skips nonintersecting batches. Either
+        // changes the alignment of every following type, so a full-frame
+        // estimate can't be reused.
+        requirements.reserve(std::mem::size_of::<Quad>(), 1, transport);
+        for command in scene.render_commands() {
+            if let RenderCommand::Batch(batch) = command
+                && batch_intersects(scene, batch, region)
+            {
+                requirements.reserve_batch(batch, transport);
+            }
+        }
+        requirements
+    }
+
+    fn reserve(&mut self, element_size: usize, count: usize, transport: InstanceTransport) {
+        if count > 0 {
+            let stride = element_size as u64;
+            self.storage_bytes = self
+                .storage_bytes
+                .next_multiple_of(transport.batch_alignment(stride));
+            self.storage_bytes = self
+                .storage_bytes
+                .saturating_add(stride.saturating_mul(count as u64));
+            self.instance_batches += 1;
+        }
+    }
+
+    fn reserve_batch(&mut self, batch: &PrimitiveBatch, transport: InstanceTransport) {
+        match batch {
+            PrimitiveBatch::Shadows { range, .. } => {
+                self.reserve(std::mem::size_of::<Shadow>(), range.len(), transport)
+            }
+            PrimitiveBatch::Quads { range, .. } => {
+                self.reserve(std::mem::size_of::<Quad>(), range.len(), transport)
+            }
+            PrimitiveBatch::Paths {
+                rasterization_vertex_count,
+                sprite_count,
+                ..
+            } if *rasterization_vertex_count > 0 => {
+                self.reserve(
+                    std::mem::size_of::<path_types::PathRasterizationVertex>(),
+                    *rasterization_vertex_count,
+                    transport,
+                );
+                self.reserve(
+                    std::mem::size_of::<path_types::PathSprite>(),
+                    *sprite_count,
+                    transport,
+                );
+            }
+            PrimitiveBatch::Underlines(range) => {
+                self.reserve(std::mem::size_of::<Underline>(), range.len(), transport)
+            }
+            PrimitiveBatch::MonochromeSprites { range, .. } => self.reserve(
+                std::mem::size_of::<MonochromeSprite>(),
+                range.len(),
+                transport,
+            ),
+            PrimitiveBatch::SubpixelSprites { range, .. } => self.reserve(
+                std::mem::size_of::<SubpixelSprite>(),
+                range.len(),
+                transport,
+            ),
+            PrimitiveBatch::PolychromeSprites { range, .. } => self.reserve(
+                std::mem::size_of::<PolychromeSprite>(),
+                range.len(),
+                transport,
+            ),
+            PrimitiveBatch::Paths { .. }
+            | PrimitiveBatch::Surfaces(_)
+            | PrimitiveBatch::BackdropFilters(_)
+            | PrimitiveBatch::FilterBoundary(_) => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod planning_tests {
+    use super::*;
+
+    #[test]
+    fn partial_alignment_includes_the_clear() {
+        let transport = InstanceTransport::StorageBuffer;
+        let sequence = [
+            (std::mem::size_of::<Shadow>(), 1),
+            (std::mem::size_of::<Quad>(), 1),
+            (std::mem::size_of::<Shadow>(), 1),
+            (std::mem::size_of::<Quad>(), 1),
+            (
+                std::mem::size_of::<path_types::PathRasterizationVertex>(),
+                3,
+            ),
+            (std::mem::size_of::<path_types::PathSprite>(), 1),
+            (std::mem::size_of::<MonochromeSprite>(), 1),
+            (std::mem::size_of::<Quad>(), 1),
+        ];
+        let mut full = FrameRequirements::default();
+        for &(stride, count) in &sequence {
+            full.reserve(stride, count, transport);
+        }
+        assert_eq!(full.storage_bytes, 1984);
+        let old_estimate = full.storage_bytes + 2 * std::mem::size_of::<Quad>() as u64;
+        assert_eq!(old_estimate, 2480);
+        let mut partial = FrameRequirements::default();
+        partial.reserve(std::mem::size_of::<Quad>(), 1, transport);
+        for &(stride, count) in &sequence {
+            partial.reserve(stride, count, transport);
+        }
+        assert_eq!(partial.storage_bytes, 2728);
+        assert_eq!(partial.instance_batches, 9);
+        assert!(partial.storage_bytes > old_estimate);
+    }
+
+    #[test]
+    fn partial_planner_counts_only_intersecting_batches_and_clear_slots() {
+        use gpui::{Bounds, ContentMask, ScaledPixels, point, size};
+        let bounds = |x, y| {
+            Bounds::new(
+                point(ScaledPixels(x), ScaledPixels(y)),
+                size(ScaledPixels(10.0), ScaledPixels(10.0)),
+            )
+        };
+        let mask = ContentMask {
+            bounds: Bounds::new(
+                point(ScaledPixels(0.0), ScaledPixels(0.0)),
+                size(ScaledPixels(100.0), ScaledPixels(100.0)),
+            ),
+            ..Default::default()
+        };
+        let mut scene = Scene::default();
+        for (index, (x, y)) in [(0.0, 0.0), (20.0, 20.0)].into_iter().enumerate() {
+            scene.insert_primitive(Quad {
+                bounds: bounds(x, y),
+                content_mask: mask,
+                corner_smoothing: if index == 0 { 0.0 } else { 0.65 },
+                ..Default::default()
+            });
+        }
+        scene.finish();
+        let region = |x, y| ScissorRectangle {
+            x,
+            y,
+            width: 5,
+            height: 5,
+        };
+        for transport in [
+            InstanceTransport::StorageBuffer,
+            InstanceTransport::DataTexture,
+        ] {
+            // The clear, then only the batch under the region: the second quad's.
+            let requirements =
+                FrameRequirements::for_partial_scene(&scene, region(24, 24), transport);
+            let mut expected = FrameRequirements::default();
+            expected.reserve(std::mem::size_of::<Quad>(), 1, transport);
+            expected.reserve(std::mem::size_of::<Quad>(), 1, transport);
+            assert_eq!(requirements.instance_batches, 2);
+            assert_eq!(requirements.storage_bytes, expected.storage_bytes);
+            assert!(!requirements.uses_path_target);
+            assert!(!requirements.uses_offscreen_target);
+            // A region over neither quad replays only the clear.
+            let empty = FrameRequirements::for_partial_scene(&scene, region(60, 60), transport);
+            assert_eq!(empty.instance_batches, 1);
+            // A frame uploads once, sized by its damage; a reused frame uploads nothing.
+            let partial =
+                FrameRequirements::for_damage(&scene, &Damage::Partial(region(24, 24)), transport);
+            assert_eq!(partial.storage_bytes, requirements.storage_bytes);
+            let reuse = FrameRequirements::for_damage(&scene, &Damage::Reuse, transport);
+            assert_eq!((reuse.storage_bytes, reuse.instance_batches), (0, 0));
         }
     }
 }
@@ -404,10 +616,20 @@ struct FrameEncoder<'a> {
     offscreen: Option<wgpu::TextureView>,
     presentation: wgpu::TextureView,
     instances: InstanceUpload,
+    damage: Damage,
+    retained_blit: Option<wgpu::BindGroup>,
+    retained_copy: Option<(wgpu::Texture, wgpu::Texture)>,
 }
 
 impl<'a> FrameEncoder<'a> {
-    fn new(renderer: &'a WgpuRenderer, scene: &'a Scene, targets: PreparedTargets) -> Self {
+    fn new(
+        renderer: &'a WgpuRenderer,
+        scene: &'a Scene,
+        targets: PreparedTargets,
+        damage: Damage,
+        retained_blit: Option<wgpu::BindGroup>,
+        retained_copy: Option<(wgpu::Texture, wgpu::Texture)>,
+    ) -> Self {
         let encoder =
             renderer
                 .resources()
@@ -423,6 +645,9 @@ impl<'a> FrameEncoder<'a> {
             offscreen: targets.offscreen,
             presentation: targets.presentation,
             instances: targets.instances,
+            damage,
+            retained_blit,
+            retained_copy,
         }
     }
 
@@ -432,6 +657,21 @@ impl<'a> FrameEncoder<'a> {
     ) -> Result<wgpu::CommandBuffer, DrawError> {
         let result = self.encode_commands();
         if result.is_ok() {
+            if let Some((source, destination)) = &self.retained_copy {
+                self.encoder.copy_texture_to_texture(
+                    source.as_image_copy(),
+                    destination.as_image_copy(),
+                    wgpu::Extent3d {
+                        width: self.renderer.target.width(),
+                        height: self.renderer.target.height(),
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+            if let Some(bind_group) = &self.retained_blit {
+                self.renderer
+                    .draw_blit(&mut self.encoder, bind_group, 0, &self.presentation);
+            }
             if let Some(offscreen) = &self.offscreen {
                 self.renderer
                     .blit_to_frame(&mut self.encoder, offscreen, &self.presentation);
@@ -462,15 +702,41 @@ impl<'a> FrameEncoder<'a> {
     }
 
     fn encode_commands(&mut self) -> DrawResult {
+        match std::mem::replace(&mut self.damage, Damage::Reuse) {
+            Damage::Reuse => Ok(()),
+            Damage::Partial(region) => self.encode_region(Some(region)),
+            Damage::Full => self.encode_region(None),
+        }
+    }
+    fn encode_region(&mut self, region: Option<ScissorRectangle>) -> DrawResult {
         let mut pass = begin_scene_render_pass(
             self.renderer,
             &mut self.encoder,
             "main_pass",
             self.targets.current(),
-            wgpu::LoadOp::Clear(self.renderer.target.clear_color()),
+            if region.is_some() {
+                wgpu::LoadOp::Load
+            } else {
+                wgpu::LoadOp::Clear(self.renderer.target.clear_color())
+            },
+            region,
         );
+        if let Some(region) = region {
+            let clear = self.renderer.target.clear_color();
+            let clear = [clear.r, clear.g, clear.b, clear.a].map(|channel| channel as f32);
+            self.renderer.draw_damage_clear(
+                &[clear_quad(region, clear)],
+                &mut self.instances,
+                &mut pass,
+            )?;
+        }
 
         for command in self.scene.render_commands() {
+            if let (Some(region), RenderCommand::Batch(batch)) = (region, command) {
+                if !batch_intersects(self.scene, batch, region) {
+                    continue;
+                }
+            }
             match command {
                 RenderCommand::Batch(PrimitiveBatch::Paths {
                     range,
@@ -493,6 +759,7 @@ impl<'a> FrameEncoder<'a> {
                         "after_paths",
                         self.targets.current(),
                         wgpu::LoadOp::Load,
+                        region,
                     );
                     rasterized?;
                     self.renderer.draw_paths_from_intermediate(
@@ -516,6 +783,7 @@ impl<'a> FrameEncoder<'a> {
                         "after_backdrop_filter",
                         self.targets.current(),
                         wgpu::LoadOp::Load,
+                        region,
                     );
                 }
                 RenderCommand::Batch(PrimitiveBatch::FilterBoundary(_)) => {
@@ -542,6 +810,7 @@ impl<'a> FrameEncoder<'a> {
                         "filter_group",
                         self.targets.current(),
                         wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        region,
                     );
                 }
                 RenderCommand::EndFilter {
@@ -572,6 +841,7 @@ impl<'a> FrameEncoder<'a> {
                         "after_content_filter",
                         self.targets.current(),
                         wgpu::LoadOp::Load,
+                        region,
                     );
                 }
                 RenderCommand::BeginFilter {
@@ -596,8 +866,12 @@ fn begin_scene_render_pass<'a>(
     label: &'a str,
     target: &'a wgpu::TextureView,
     load: wgpu::LoadOp<wgpu::Color>,
+    region: Option<ScissorRectangle>,
 ) -> wgpu::RenderPass<'a> {
     let mut pass = begin_color_render_pass(encoder, label, target, load);
+    if let Some(region) = region {
+        pass.set_scissor_rect(region.x, region.y, region.width, region.height);
+    }
     pass.set_bind_group(
         shader_interface::GLOBAL_BIND_GROUP,
         &renderer.resources().globals_bind_group,

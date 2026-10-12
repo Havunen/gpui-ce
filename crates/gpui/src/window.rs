@@ -1340,6 +1340,8 @@ pub struct Window {
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
     #[cfg(feature = "profiler")]
     window_profiler: profiler::WindowProfiler,
+    /// Bumped by every draw; a renderer can reuse its last frame while it is unchanged.
+    scene_revision: u64,
     last_input_modality: InputModality,
     touch_gestures: TouchGestureRecognizer,
     touch_prediction_enabled: bool,
@@ -2101,6 +2103,7 @@ impl Window {
             input_rate_tracker,
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
+            scene_revision: 0,
             last_input_modality: InputModality::Mouse,
             touch_gestures: TouchGestureRecognizer::new(
                 cx.platform
@@ -3263,6 +3266,7 @@ impl Window {
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        self.scene_revision = self.scene_revision.wrapping_add(1);
         // Drain every draw in profiler builds so a previous frame's
         // first-invalidation timestamp can't be attributed to this one.
         #[cfg(feature = "profiler")]
@@ -3455,7 +3459,17 @@ impl Window {
         let _foreground_turn = profiler::journal::foreground_turn();
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
+        // Hover repaints unfocused windows too. The platform's hover state can't
+        // go stale like `self.hovered`, whose callback fails during a draw.
+        let interactive = self.active.get() || self.platform_window.is_hovered();
+        let _frame_context =
+            crate::profiler::gpu::set_gpu_frame_context(interactive, self.scene_revision);
         self.platform_window.draw(&self.rendered_frame.scene);
+        // A pointer exit during that draw couldn't refresh the window. Repaint
+        // once more so the renderer frees the retained frame.
+        if interactive && !self.active.get() && !self.platform_window.is_hovered() {
+            self.invalidator.set_dirty(true);
+        }
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
             present_start,

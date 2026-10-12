@@ -11,8 +11,9 @@ use gpui_render::{
     artifacts::{Dx11DrawConstants, Dx11DrawConstantsBinding},
     blur::{
         BlurAxis, BlurKernel, BlurUniforms, FilterCompositeClip,
-        GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS, downsampled_dimension,
+        GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS, ScissorRectangle, downsampled_dimension,
     },
+    damage::{Damage, batch_intersects, clear_quad},
     path_types::{PathRasterizationVertex, PathSprite},
     shaders::{
         common::{FontRasterizationUniforms, GlobalUniforms, ShaderBool, SurfaceColorFormat},
@@ -30,7 +31,7 @@ use crate::*;
 use gpui::*;
 
 pub(crate) const DISABLE_DIRECT_COMPOSITION: &str = "GPUI_DISABLE_DIRECT_COMPOSITION";
-const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
+pub(super) const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 // This configuration is used for MSAA rendering on paths only, and it's guaranteed to be supported by DirectX 11.
 const PATH_MULTISAMPLE_COUNT: u32 = 4;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
@@ -77,6 +78,9 @@ pub(crate) struct DirectXRenderer {
     active_render_target: Option<ID3D11RenderTargetView>,
     path_rasterization_vertices: Vec<PathRasterizationVertex>,
     path_sprites: Vec<PathSprite>,
+    /// The scene's quads and a partial frame's damage clear, uploaded together.
+    partial_quads: Vec<Quad>,
+    retained: crate::directx_retained::RetainedFrame,
 }
 
 /// Direct3D objects
@@ -371,14 +375,28 @@ impl DirectXRenderer {
             active_render_target: None,
             path_rasterization_vertices: Vec::new(),
             path_sprites: Vec::new(),
+            partial_quads: Vec::new(),
+            retained: crate::directx_retained::RetainedFrame::new(),
         })
     }
 
     pub(crate) fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.atlas.clone()
     }
+    pub(crate) fn release_retained_frame(&mut self) {
+        self.retained.invalidate();
+    }
 
-    fn pre_draw(&self, clear_color: &[f32; 4]) -> Result<()> {
+    fn full_scissor(&self) -> ScissorRectangle {
+        ScissorRectangle {
+            x: 0,
+            y: 0,
+            width: self.width,
+            height: self.height,
+        }
+    }
+
+    fn pre_draw(&self, clear_color: &[f32; 4], clear_swapchain: bool) -> Result<()> {
         let resources = self.resources.as_ref().expect("resources missing");
         let device_context = &self
             .devices
@@ -413,16 +431,19 @@ impl DirectXRenderer {
             }],
         )?;
         unsafe {
-            device_context.ClearRenderTargetView(
-                resources
-                    .render_target_view
-                    .as_ref()
-                    .context("missing render target view")?,
-                clear_color,
-            );
+            if clear_swapchain {
+                device_context.ClearRenderTargetView(
+                    resources
+                        .render_target_view
+                        .as_ref()
+                        .context("missing render target view")?,
+                    clear_color,
+                );
+            }
             device_context
                 .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
             device_context.RSSetViewports(Some(slice::from_ref(&resources.viewport)));
+            set_scissor(device_context, self.full_scissor());
         }
         Ok(())
     }
@@ -447,6 +468,7 @@ impl DirectXRenderer {
     }
 
     fn handle_device_lost_impl(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
+        self.retained.invalidate();
         let disable_direct_composition = self.direct_composition.is_none();
 
         unsafe {
@@ -522,7 +544,11 @@ impl DirectXRenderer {
             return Ok(());
         }
         self.render(scene, background_appearance)?;
-        self.present()
+        let result = self.present();
+        if result.is_err() {
+            self.retained.invalidate();
+        }
+        result
     }
 
     /// Encodes a complete frame without presenting it. Window drawing and test readback share
@@ -532,12 +558,51 @@ impl DirectXRenderer {
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
-        self.pre_draw(&match background_appearance {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let plan = self.retained.prepare(
+            scene,
+            self.atlas.as_ref(),
+            self.width,
+            self.height,
+            background_appearance,
+            &devices.device,
+        );
+        let result = self.render_scene(scene, background_appearance, &plan);
+        self.retained.complete(plan, result.is_ok());
+        result
+    }
+
+    fn render_scene(
+        &mut self,
+        scene: &Scene,
+        background_appearance: WindowBackgroundAppearance,
+        retained: &crate::directx_retained::RetainedPlan,
+    ) -> Result<()> {
+        let clear_color = match background_appearance {
             appearance if appearance.is_opaque() => [1.0f32; 4],
             _ => [0.0f32; 4],
-        })?;
+        };
+        self.pre_draw(&clear_color, retained.rtv.is_none())?;
+        if retained.damage == Damage::Reuse {
+            return self.dx_blit(
+                &retained.srv,
+                &self.resources.as_ref().unwrap().render_target_view,
+            );
+        }
 
-        self.upload_scene_buffers(scene)?;
+        let mut quads = std::mem::take(&mut self.partial_quads);
+        let frame_quads = match &retained.damage {
+            Damage::Partial(region) => {
+                quads.clear();
+                quads.extend_from_slice(&scene.quads);
+                quads.push(clear_quad(*region, clear_color));
+                &quads
+            }
+            _ => &scene.quads,
+        };
+        let uploaded = self.upload_scene_buffers(scene, frame_quads);
+        self.partial_quads = quads;
+        uploaded?;
 
         // Only route through the offscreen scene texture when the scene contains blur filters;
         // otherwise render straight to the swapchain exactly as before.
@@ -589,7 +654,15 @@ impl DirectXRenderer {
             .device_context
             .clone();
 
-        if use_offscreen {
+        if let Some(rtv) = &retained.rtv {
+            unsafe {
+                if retained.damage == Damage::Full {
+                    ctx.ClearRenderTargetView(rtv, &clear_color);
+                }
+                ctx.OMSetRenderTargets(Some(slice::from_ref(&retained.rtv)), None);
+            }
+            self.active_render_target = retained.rtv.clone();
+        } else if use_offscreen {
             unsafe {
                 if let Some(rtv) = scene_rtv.as_ref() {
                     ctx.ClearRenderTargetView(rtv, &[0.0; 4]);
@@ -620,7 +693,22 @@ impl DirectXRenderer {
             .as_ref()
             .and_then(|devices| devices.annotation.clone())
             .filter(|annotation| unsafe { annotation.GetStatus().as_bool() });
+        let region = match &retained.damage {
+            Damage::Partial(region) => Some(*region),
+            _ => None,
+        };
+        let full = self.full_scissor();
+        let scissor = region.unwrap_or(full);
+        set_scissor(&ctx, scissor);
+        if region.is_some() {
+            self.draw_damage_clear(instance_range(&(scene.quads.len()..scene.quads.len() + 1))?)?;
+        }
         for command in scene.render_commands() {
+            if let (Some(region), RenderCommand::Batch(batch)) = (region, command) {
+                if !batch_intersects(scene, batch, region) {
+                    continue;
+                }
+            }
             let _annotation = annotation
                 .as_ref()
                 .map(|annotation| Annotation::new(annotation, HSTRING::from(command.label())));
@@ -640,7 +728,10 @@ impl DirectXRenderer {
                         continue;
                     }
                     let paths = &scene.paths[range.clone()];
+                    // Paths rasterize into an intermediate target outside the damage.
+                    set_scissor(&ctx, full);
                     self.draw_paths_to_intermediate(paths, *rasterization_vertex_count)?;
+                    set_scissor(&ctx, scissor);
                     self.draw_paths_from_intermediate(paths, *sprite_count)
                 }
                 RenderCommand::Batch(PrimitiveBatch::Underlines(range)) => {
@@ -763,9 +854,12 @@ impl DirectXRenderer {
                 )
             })?;
         }
+        set_scissor(&ctx, full);
 
         // Present the offscreen scene by blitting it into the swapchain.
-        if use_offscreen {
+        if retained.rtv.is_some() {
+            self.dx_blit(&retained.srv, &swapchain_rtv)?;
+        } else if use_offscreen {
             self.dx_blit(&scene_srv, &swapchain_rtv)?;
         }
         self.active_render_target = None;
@@ -858,6 +952,7 @@ impl DirectXRenderer {
         }
         self.width = width;
         self.height = height;
+        self.retained.invalidate();
 
         // Clear the render target before resizing
         let devices = self.devices.as_ref().context("devices missing")?;
@@ -889,7 +984,7 @@ impl DirectXRenderer {
         Ok(())
     }
 
-    fn upload_scene_buffers(&mut self, scene: &Scene) -> Result<()> {
+    fn upload_scene_buffers(&mut self, scene: &Scene, quads: &[Quad]) -> Result<()> {
         let devices = self.devices.as_ref().context("devices missing")?;
 
         if !scene.shadows.is_empty() {
@@ -900,11 +995,11 @@ impl DirectXRenderer {
             )?;
         }
 
-        if !scene.quads.is_empty() {
+        if !quads.is_empty() {
             self.pipelines.quad_pipeline.update_buffer(
                 &devices.device,
                 &devices.device_context,
-                &scene.quads,
+                quads,
             )?;
         }
 
@@ -966,6 +1061,7 @@ impl DirectXRenderer {
             None,
             instances,
             smoothed,
+            None,
         )
     }
 
@@ -975,6 +1071,17 @@ impl DirectXRenderer {
             None,
             instances,
             smoothed,
+            None,
+        )
+    }
+
+    fn draw_damage_clear(&mut self, instances: InstanceRange) -> Result<()> {
+        self.pipelines.quad_pipeline.draw_instances_variant(
+            &self.frame_bindings()?,
+            None,
+            instances,
+            false,
+            Some(&self.pipelines.blur_blend_replace),
         )
     }
 
@@ -1153,6 +1260,7 @@ impl DirectXRenderer {
             Some(&texture_view),
             instances,
             smoothed,
+            None,
         )
     }
 
@@ -1934,6 +2042,7 @@ impl<T> PipelineState<T> {
         texture: Option<&[Option<ID3D11ShaderResourceView>]>,
         instances: InstanceRange,
         use_variant: bool,
+        blend_override: Option<&ID3D11BlendState>,
     ) -> Result<()> {
         let variant = use_variant.then(|| {
             self.variant
@@ -1947,7 +2056,14 @@ impl<T> PipelineState<T> {
             .vertex_count
             .fixed()
             .with_context(|| format!("{} has no fixed vertex count", self.label))?;
-        self.draw_with_variant(frame, texture, vertex_count, instances, variant)
+        self.draw_with_variant(
+            frame,
+            texture,
+            vertex_count,
+            instances,
+            variant,
+            blend_override,
+        )
     }
 
     /// Draws `vertex_count` vertex-pulled vertices as a single instance.
@@ -1967,7 +2083,7 @@ impl<T> PipelineState<T> {
         vertex_count: u32,
         instances: InstanceRange,
     ) -> Result<()> {
-        self.draw_with_variant(frame, texture, vertex_count, instances, None)
+        self.draw_with_variant(frame, texture, vertex_count, instances, None, None)
     }
 
     fn draw_with_variant(
@@ -1977,6 +2093,7 @@ impl<T> PipelineState<T> {
         vertex_count: u32,
         instances: InstanceRange,
         variant: Option<&PipelineVariant>,
+        blend_override: Option<&ID3D11BlendState>,
     ) -> Result<()> {
         if instances.is_empty() || vertex_count == 0 {
             return Ok(());
@@ -2027,7 +2144,11 @@ impl<T> PipelineState<T> {
             ctx.VSSetConstantBuffers(0, Some(&frame.globals.cbuffers()));
             ctx.PSSetConstantBuffers(0, Some(&frame.globals.cbuffers()));
             ctx.VSSetConstantBuffers(self.draw_constants.register, Some(&draw_constants));
-            ctx.OMSetBlendState(&self.blend_state, None, 0xFFFFFFFF);
+            ctx.OMSetBlendState(
+                blend_override.unwrap_or(&self.blend_state),
+                None,
+                0xFFFFFFFF,
+            );
             if let Some(texture) = texture {
                 ctx.PSSetSamplers(
                     PRIMARY_SAMPLER_REGISTER,
@@ -2302,7 +2423,7 @@ fn set_rasterizer_state(device: &ID3D11Device, device_context: &ID3D11DeviceCont
         DepthBiasClamp: 0.0,
         SlopeScaledDepthBias: 0.0,
         DepthClipEnable: true.into(),
-        ScissorEnable: false.into(),
+        ScissorEnable: true.into(),
         MultisampleEnable: true.into(),
         AntialiasedLineEnable: false.into(),
     };
@@ -2313,6 +2434,16 @@ fn set_rasterizer_state(device: &ID3D11Device, device_context: &ID3D11DeviceCont
     };
     unsafe { device_context.RSSetState(&rasterizer_state) };
     Ok(())
+}
+
+fn set_scissor(context: &ID3D11DeviceContext, rect: ScissorRectangle) {
+    let native = RECT {
+        left: rect.x as i32,
+        top: rect.y as i32,
+        right: (rect.x + rect.width) as i32,
+        bottom: (rect.y + rect.height) as i32,
+    };
+    unsafe { context.RSSetScissorRects(Some(&[native])) };
 }
 
 // https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ns-d3d11-d3d11_blend_desc
@@ -2770,7 +2901,9 @@ mod tests {
     // Explicit imports: a glob of `super` would also pull in gpui's `#[test]` proc macro.
     use super::{DirectXRenderer, report_live_objects};
     use crate::bindings::Windows::Win32::{CreateWindowExW, DestroyWindow, WS_OVERLAPPED};
-    use crate::bindings::Windows::Win32::{HWND, ID3D11Debug};
+    use crate::bindings::Windows::Win32::{
+        DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_SWAP_CHAIN_DESC1, HWND, ID3D11Debug,
+    };
     use crate::directx_devices::DirectXDevices;
     use anyhow::Result;
     use gpui::{
@@ -2901,6 +3034,953 @@ mod tests {
         (4..16).any(|y| (left..right).any(|x| first.get_pixel(x, y) != second.get_pixel(x, y)))
     }
 
+    fn retained_scene(hover: bool, resting_fills: bool) -> Scene {
+        let mut scene = Scene::default();
+        let dark = rgb_to_hsla(rgb(0x18212b));
+        scene.insert_primitive(Quad {
+            bounds: scaled(0.0, 0.0, 200.0, 100.0),
+            content_mask: full_mask(),
+            background: solid_background(dark),
+            ..Default::default()
+        });
+        for row in 0..3 {
+            if !resting_fills && !((row == 0 && !hover) || (row == 1 && hover)) {
+                continue;
+            }
+            scene.insert_primitive(Quad {
+                bounds: scaled(0.0, 10.0 + row as f32 * 25.0, 200.0, 14.0),
+                content_mask: full_mask(),
+                background: solid_background(if (row == 0 && !hover) || (row == 1 && hover) {
+                    hsla(0.6, 0.4, 0.4, 0.7)
+                } else {
+                    dark
+                }),
+                ..Default::default()
+            });
+        }
+        let mut path = gpui::Path::new(gpui::point(gpui::px(22.0), gpui::px(8.0)));
+        path.line_to(gpui::point(gpui::px(40.0), gpui::px(24.0)));
+        path.line_to(gpui::point(gpui::px(20.0), gpui::px(24.0)));
+        let mut path = path.scale(1.0);
+        path.content_mask = ContentMask {
+            bounds: scaled(20.0, 10.0, 18.0, 14.0),
+            ..Default::default()
+        };
+        for vertex in &mut path.vertices {
+            vertex.content_mask = path.content_mask;
+        }
+        path.color = solid_background(if hover {
+            dark
+        } else {
+            hsla(0.6, 0.4, 0.4, 0.7)
+        });
+        scene.insert_primitive(path);
+        // A translucent later primitive crosses both old/new hover rows. It must be
+        // repainted in the original order even though its own color is unchanged.
+        scene.insert_primitive(Quad {
+            bounds: scaled(80.0, 5.0, 15.0, 70.0),
+            content_mask: ContentMask {
+                bounds: scaled(82.0, 0.0, 10.0, 100.0),
+                ..Default::default()
+            },
+            background: solid_background(hsla(0.02, 0.8, 0.6, 0.4)),
+            corner_radii: Corners::all(ScaledPixels(4.0)),
+            ..Default::default()
+        });
+        scene.finish();
+        scene
+    }
+
+    #[test]
+    fn retained_hover_damage_matches_full_render_and_reuses_keepalive() -> Result<()> {
+        let devices = DirectXDevices::new()?;
+        let window = HiddenWindow::new()?;
+        let reference_window = HiddenWindow::new()?;
+        let mut renderer = DirectXRenderer::new(window.0, &devices, true)?;
+        let mut reference = DirectXRenderer::new(reference_window.0, &devices, true)?;
+        reference.retained.disable_for_tests();
+        for renderer in [&mut renderer, &mut reference] {
+            renderer.resize(Size {
+                width: DevicePixels(200),
+                height: DevicePixels(400),
+            })?;
+        }
+        renderer.retained.enable_for_tests();
+        let render = |renderer: &mut DirectXRenderer, scene: &Scene, revision: u64| {
+            let _guard = gpui::profiler::gpu::set_gpu_frame_context(true, revision);
+            renderer.render_to_image(scene, WindowBackgroundAppearance::Opaque)
+        };
+        let initial = retained_scene(false, true);
+        assert_eq!(
+            render(&mut renderer, &initial, 1)?,
+            render(&mut reference, &initial, 1)?
+        );
+        let hovered = retained_scene(true, true);
+        let actual = render(&mut renderer, &hovered, 2)?;
+        assert_eq!(
+            renderer.retained.last_damage(),
+            "partial",
+            "fixture must exercise sparse replay"
+        );
+        let expected = render(&mut reference, &hovered, 2)?;
+        assert_eq!(
+            actual, expected,
+            "partial old/new row repaint must preserve alpha, dark backing, clipping and painter order"
+        );
+        assert_eq!(
+            render(&mut renderer, &hovered, 2)?,
+            expected,
+            "unchanged scene revision must reuse the completed frame"
+        );
+        assert_eq!(renderer.retained.last_damage(), "reuse");
+        renderer
+            .atlas
+            .handle_device_lost(&devices.device, &devices.device_context);
+        assert_eq!(render(&mut renderer, &hovered, 2)?, expected);
+        assert_eq!(
+            renderer.retained.last_damage(),
+            "full",
+            "atlas generation invalidates unchanged revision reuse"
+        );
+        for renderer in [&mut renderer, &mut reference] {
+            renderer.resize(Size {
+                width: DevicePixels(190),
+                height: DevicePixels(100),
+            })?;
+        }
+        assert_eq!(
+            render(&mut renderer, &hovered, 2)?,
+            render(&mut reference, &hovered, 2)?
+        );
+        assert_eq!(
+            renderer.retained.last_damage(),
+            "full",
+            "resize invalidates unchanged revision reuse"
+        );
+        // Changing the background invalidates the previous clear/alpha representation.
+        let _guard = gpui::profiler::gpu::set_gpu_frame_context(true, 3);
+        assert_eq!(
+            renderer.render_to_image(&hovered, WindowBackgroundAppearance::Transparent)?,
+            reference.render_to_image(&hovered, WindowBackgroundAppearance::Transparent)?
+        );
+        assert_eq!(renderer.retained.last_damage(), "full");
+        Ok(())
+    }
+
+    #[test]
+    fn unfocused_repaints_return_the_retained_budget() -> Result<()> {
+        use gpui_render::retained::{RETAINED_DEVICE_LIMIT, reserve_retained_bytes};
+
+        let devices = DirectXDevices::new()?;
+        let window = HiddenWindow::new()?;
+        let mut renderer = DirectXRenderer::new(window.0, &devices, true)?;
+        renderer.retained.enable_for_tests();
+        renderer.resize(Size {
+            width: DevicePixels(200),
+            height: DevicePixels(400),
+        })?;
+        let device_key = devices.device.as_raw() as usize;
+        let target_bytes = 200 * 400 * 4;
+        let scene = retained_scene(false, true);
+        {
+            let _guard = gpui::profiler::gpu::set_gpu_frame_context(true, 1);
+            renderer.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?;
+        }
+        // Other windows hold the rest of the device budget.
+        let _others =
+            reserve_retained_bytes("d3d11", device_key, RETAINED_DEVICE_LIMIT - target_bytes)
+                .expect("the retained target fits beside the other windows");
+        assert!(reserve_retained_bytes("d3d11", device_key, 1).is_none());
+        // The pointer left an unfocused window, which repaints once and frees
+        // the target at once.
+        let _guard = gpui::profiler::gpu::set_gpu_frame_context(false, 2);
+        renderer.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?;
+        assert_eq!(renderer.retained.last_damage(), "full");
+        assert!(reserve_retained_bytes("d3d11", device_key, target_bytes).is_some());
+        Ok(())
+    }
+
+    fn transparent_retained_scene(hover: Option<usize>, glyph: AtlasTile, fraction: f32) -> Scene {
+        use gpui::{Path, Shadow, point, px};
+        let mut scene = Scene::default();
+        let canvas = scaled(5.0, 5.0, 190.0, 90.0);
+        scene.insert_primitive(Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(8.0),
+            bounds: scaled(0.0, 0.0, 200.0, 100.0),
+            corner_radii: Corners::all(ScaledPixels(16.0)),
+            content_mask: full_mask(),
+            color: solid_background(hsla(0.0, 0.0, 0.0, 0.3)),
+            element_bounds: canvas,
+            element_corner_radii: Corners::all(ScaledPixels(10.0)),
+            inset: ShaderBool::Disabled,
+            corner_smoothing: 0.0,
+        });
+        scene.insert_primitive(Quad {
+            bounds: canvas,
+            content_mask: full_mask(),
+            background: solid_background(hsla(0.6, 0.2, 0.16, 0.55)),
+            corner_radii: Corners::all(ScaledPixels(10.0)),
+            ..Default::default()
+        });
+        for row in 0..3 {
+            let bounds = scaled(
+                9.0 + fraction,
+                12.0 + row as f32 * 24.0 + fraction,
+                180.0,
+                14.0,
+            );
+            scene.push_layer(bounds);
+            if hover == Some(row) {
+                scene.insert_primitive(Quad {
+                    bounds,
+                    content_mask: ContentMask {
+                        bounds: scaled(10.25, 5.25, 177.5, 89.5),
+                        ..Default::default()
+                    },
+                    background: solid_background(hsla(0.65, 0.8, 0.65, 0.7)),
+                    corner_radii: Corners::all(ScaledPixels(3.0)),
+                    ..Default::default()
+                });
+            }
+            // Unchanged, overlapping glyphs must be replayed after the erased hover fill.
+            scene.insert_primitive(MonochromeSprite {
+                order: 0,
+                padding: 0,
+                bounds: scaled(25.5, bounds.origin.y.0 + 2.0, 8.0, 8.0),
+                content_mask: full_mask(),
+                color: hsla(0.1, 0.6, 0.7, 0.7).into(),
+                tile: glyph,
+                transformation: Default::default(),
+            });
+            let mut path = Path::new(point(px(43.5), px(bounds.origin.y.0 + 2.0)));
+            path.line_to(point(px(49.5), px(bounds.origin.y.0 + 12.0)));
+            path.line_to(point(px(37.5), px(bounds.origin.y.0 + 12.0)));
+            let mut path = path.scale(1.0);
+            path.content_mask = ContentMask {
+                bounds: scaled(37.75, bounds.origin.y.0 + 1.25, 11.5, 11.5),
+                ..Default::default()
+            };
+            for vertex in &mut path.vertices {
+                vertex.content_mask = path.content_mask;
+            }
+            path.color = solid_background(if hover == Some(row) {
+                hsla(0.65, 0.8, 0.65, 0.7)
+            } else {
+                hsla(0.6, 0.2, 0.16, 0.55)
+            });
+            scene.insert_primitive(path);
+            scene.pop_layer();
+        }
+        // Later translucent coverage exercises alpha compositing across both damaged rows.
+        scene.insert_primitive(Quad {
+            bounds: scaled(80.25, 9.5, 12.5, 77.0),
+            content_mask: full_mask(),
+            background: solid_background(hsla(0.03, 0.8, 0.6, 0.3)),
+            corner_radii: Corners::all(ScaledPixels(3.0)),
+            ..Default::default()
+        });
+        scene.finish();
+        scene
+    }
+
+    fn combined_hover_badge_scene(
+        hover: Option<usize>,
+        glyph: AtlasTile,
+        badge: AtlasTile,
+        subpixel: bool,
+        fraction: f32,
+        changing_quad: bool,
+    ) -> Scene {
+        use gpui::{Path, Shadow, point, px};
+        let mut scene = Scene::default();
+        let canvas = scaled(5.0, 5.0, 190.0, 90.0);
+        scene.insert_primitive(Shadow {
+            order: 0,
+            blur_radius: ScaledPixels(8.0),
+            bounds: scaled(0.0, 0.0, 200.0, 100.0),
+            corner_radii: Corners::all(ScaledPixels(16.0)),
+            content_mask: full_mask(),
+            color: solid_background(hsla(0.0, 0.0, 0.0, 0.3)),
+            element_bounds: canvas,
+            element_corner_radii: Corners::all(ScaledPixels(10.0)),
+            inset: ShaderBool::Disabled,
+            corner_smoothing: 0.0,
+        });
+        scene.insert_primitive(Quad {
+            bounds: canvas,
+            content_mask: full_mask(),
+            background: solid_background(hsla(0.6, 0.2, 0.16, 0.55)),
+            corner_radii: Corners::all(ScaledPixels(10.0)),
+            ..Default::default()
+        });
+        // Static graph and labels precede the dynamic block in the painter
+        // sequence. No unchanged primitive separates its hover fill and badge.
+        scene.push_layer(canvas);
+        for row in 0..3 {
+            let y = 12.0 + row as f32 * 24.0 + fraction;
+            // Glyph sprites sit on whole device pixels, as GPUI paints them: a
+            // fractional sprite samples atlas texels beyond its tile, which D3D11
+            // leaves undefined.
+            scene.insert_primitive(MonochromeSprite {
+                order: 0,
+                padding: 0,
+                bounds: scaled(25.0, (y + 2.0).floor(), 8.0, 8.0),
+                content_mask: full_mask(),
+                color: hsla(0.1, 0.6, 0.7, 0.7).into(),
+                tile: glyph,
+                transformation: Default::default(),
+            });
+            let mut path = Path::new(point(px(43.5), px(y + 2.0)));
+            path.line_to(point(px(49.5), px(y + 12.0)));
+            path.line_to(point(px(37.5), px(y + 12.0)));
+            let mut path = path.scale(1.0);
+            path.content_mask = full_mask();
+            for vertex in &mut path.vertices {
+                vertex.content_mask = path.content_mask;
+            }
+            path.color = solid_background(hsla(0.7, 0.7, 0.65, 0.75));
+            scene.insert_primitive(path);
+        }
+        scene.pop_layer();
+        if let Some(row) = hover {
+            let bounds = scaled(
+                9.0 + fraction,
+                12.0 + row as f32 * 24.0 + fraction,
+                if changing_quad {
+                    180.0 - row as f32 * 8.0
+                } else {
+                    180.0
+                },
+                if changing_quad {
+                    14.0 + row as f32
+                } else {
+                    14.0
+                },
+            );
+            scene.push_layer(bounds);
+            scene.insert_primitive(Quad {
+                bounds,
+                content_mask: if changing_quad {
+                    ContentMask {
+                        bounds: scaled(
+                            bounds.origin.x.0 + 0.75,
+                            bounds.origin.y.0 + 0.5,
+                            bounds.size.width.0 - 1.5,
+                            bounds.size.height.0 - 1.0,
+                        ),
+                        fade_out: Edges {
+                            top: ScaledPixels(1.5 + row as f32 * 0.25),
+                            right: ScaledPixels(2.0),
+                            bottom: ScaledPixels(1.0),
+                            left: ScaledPixels(2.5),
+                        },
+                    }
+                } else {
+                    full_mask()
+                },
+                background: solid_background(hsla(0.65, 0.8, 0.65, 0.7)),
+                corner_radii: Corners::all(ScaledPixels(if changing_quad {
+                    2.0 + row as f32
+                } else {
+                    3.0
+                })),
+                border_widths: if changing_quad {
+                    Edges::all(ScaledPixels(0.5 + row as f32 * 0.25))
+                } else {
+                    Default::default()
+                },
+                border_color: if changing_quad {
+                    solid_background(hsla(0.1, 0.65, 0.7, 0.65))
+                } else {
+                    Default::default()
+                },
+                corner_smoothing: if changing_quad && row == 1 { 0.65 } else { 0.0 },
+                ..Default::default()
+            });
+            for index in 0..7 + row {
+                let bounds = scaled(
+                    100.0 + index as f32 * 8.0,
+                    (bounds.origin.y.0 + 2.0).floor(),
+                    8.0,
+                    8.0,
+                );
+                if subpixel {
+                    scene.insert_primitive(gpui::SubpixelSprite {
+                        order: 0,
+                        padding: 0,
+                        bounds,
+                        content_mask: full_mask(),
+                        color: hsla(0.07, 0.6, 0.73, 0.7).into(),
+                        tile: badge,
+                        transformation: Default::default(),
+                    });
+                } else {
+                    scene.insert_primitive(MonochromeSprite {
+                        order: 0,
+                        padding: 0,
+                        bounds,
+                        content_mask: full_mask(),
+                        color: hsla(0.07, 0.6, 0.73, 0.7).into(),
+                        tile: badge,
+                        transformation: Default::default(),
+                    });
+                }
+            }
+            scene.pop_layer();
+        }
+        // This is the first exact anchor after the entire changed block.
+        // Its translucent coverage crosses both distant damaged row regions.
+        scene.insert_primitive(Quad {
+            bounds: scaled(80.25, 9.5, 12.5, 77.0),
+            content_mask: full_mask(),
+            background: solid_background(hsla(0.03, 0.8, 0.6, 0.3)),
+            corner_radii: Corners::all(ScaledPixels(3.0)),
+            ..Default::default()
+        });
+        scene.finish();
+        if hover.is_some() {
+            let commands = scene.render_commands();
+            let suffix = &commands[commands.len() - 3..];
+            assert!(matches!(
+                &suffix[0],
+                RenderCommand::Batch(PrimitiveBatch::Quads { range, .. }) if range.len() == 1
+            ));
+            assert!(matches!(
+                &suffix[1],
+                RenderCommand::Batch(PrimitiveBatch::MonochromeSprites { range, .. })
+                    | RenderCommand::Batch(PrimitiveBatch::SubpixelSprites { range, .. })
+                    if range.len() >= 7
+            ));
+            assert!(matches!(
+                &suffix[2],
+                RenderCommand::Batch(PrimitiveBatch::Quads { range, .. }) if range.len() == 1
+            ));
+        }
+        scene
+    }
+
+    #[test]
+    fn retained_hover_badge_glyph_runs_match_full_pixels_on_transparent_target() -> Result<()> {
+        use gpui::GlyphRenderMode;
+        let devices = DirectXDevices::new()?;
+        let window = HiddenWindow::new()?;
+        let reference_window = HiddenWindow::new()?;
+        let mut renderer = DirectXRenderer::new(window.0, &devices, false)?;
+        let mut reference = DirectXRenderer::new(reference_window.0, &devices, false)?;
+        renderer.retained.enable_for_tests();
+        reference.retained.disable_for_tests();
+        for renderer in [&mut renderer, &mut reference] {
+            renderer.resize(Size {
+                width: DevicePixels(200),
+                height: DevicePixels(400),
+            })?;
+        }
+        let glyph = glyph_tile(&renderer, GlyphRenderMode::Grayscale, 65);
+        let reference_glyph = glyph_tile(&reference, GlyphRenderMode::Grayscale, 65);
+        for mode in [GlyphRenderMode::Grayscale, GlyphRenderMode::Subpixel] {
+            let badge = glyph_tile(&renderer, mode, 66);
+            let reference_badge = glyph_tile(&reference, mode, 66);
+            for fraction in [0.0, 0.25, 0.5, 0.75] {
+                for changing_quad in [false, true] {
+                    renderer.retained.invalidate();
+                    let mut previous = None;
+                    for (revision, hover) in [
+                        (1, None),
+                        (2, Some(0)),
+                        (3, Some(2)),
+                        (4, Some(1)),
+                        (5, None),
+                    ] {
+                        let scene = combined_hover_badge_scene(
+                            hover,
+                            glyph,
+                            badge,
+                            mode == GlyphRenderMode::Subpixel,
+                            fraction,
+                            changing_quad,
+                        );
+                        let reference_scene = combined_hover_badge_scene(
+                            hover,
+                            reference_glyph,
+                            reference_badge,
+                            mode == GlyphRenderMode::Subpixel,
+                            fraction,
+                            changing_quad,
+                        );
+                        let _scope = gpui::profiler::gpu::set_gpu_frame_context(true, revision);
+                        let actual = renderer
+                            .render_to_image(&scene, WindowBackgroundAppearance::Transparent)?;
+                        let expected = reference.render_to_image(
+                            &reference_scene,
+                            WindowBackgroundAppearance::Transparent,
+                        )?;
+                        assert_eq!(
+                            actual, expected,
+                            "glyph badge mode={mode:?} fraction={fraction} changing_quad={changing_quad} hover={hover:?}"
+                        );
+                        assert_eq!(
+                            renderer.retained.last_damage(),
+                            if revision == 1 { "full" } else { "partial" },
+                            "glyph badge must qualify for actual Partial"
+                        );
+                        if let Some(previous) = &previous {
+                            assert_ne!(&actual, previous, "badge pixels must visibly change");
+                        }
+                        previous = Some(actual);
+                        assert_eq!(
+                            renderer
+                                .render_to_image(&scene, WindowBackgroundAppearance::Transparent)?,
+                            expected
+                        );
+                        assert_eq!(renderer.retained.last_damage(), "reuse");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn retained_normal_bounds_tree_rows_match_full_pixels_without_paint_layers() -> Result<()> {
+        use gpui::{GlyphRenderMode, Path, Shadow, point, px};
+        use gpui_render::damage::{Damage, SceneSnapshot};
+
+        let mask = ContentMask {
+            bounds: scaled(0.0, 0.0, 512.0, 1024.0),
+            ..Default::default()
+        };
+        let make_scene =
+            |hover: Option<usize>, glyph: AtlasTile, badge: AtlasTile, subpixel, fraction| {
+                let mut scene = Scene::default();
+                let canvas = scaled(2.0, 2.0, 508.0, 1020.0);
+                scene.insert_primitive(Shadow {
+                    order: 0,
+                    blur_radius: ScaledPixels(10.0),
+                    bounds: canvas,
+                    corner_radii: Corners::all(ScaledPixels(12.0)),
+                    content_mask: mask,
+                    color: solid_background(hsla(0.0, 0.0, 0.0, 0.35)),
+                    element_bounds: canvas,
+                    element_corner_radii: Corners::all(ScaledPixels(12.0)),
+                    inset: ShaderBool::Disabled,
+                    corner_smoothing: 0.0,
+                });
+                scene.insert_primitive(Quad {
+                    bounds: canvas,
+                    content_mask: mask,
+                    background: solid_background(hsla(0.62, 0.2, 0.16, 0.75)),
+                    corner_radii: Corners::all(ScaledPixels(12.0)),
+                    ..Default::default()
+                });
+                // Keep the graph raster group exact while ordinary row primitives
+                // change global ranks around it. No layer/order-floor shortcuts.
+                for index in 0..4 {
+                    let x = 8.0 + index as f32 * 3.0;
+                    let mut path = Path::new(point(px(x), px(6.0)));
+                    path.line_to(point(px(x + 4.0), px(1018.0)));
+                    path.line_to(point(px(x), px(1018.0)));
+                    path.line_to(point(px(x), px(6.0)));
+                    let mut path = path.scale(1.0);
+                    path.content_mask = mask;
+                    for vertex in &mut path.vertices {
+                        vertex.content_mask = mask;
+                    }
+                    path.color = solid_background(hsla(0.1 + index as f32 * 0.17, 0.7, 0.65, 0.55));
+                    scene.insert_primitive(path);
+                }
+                for row in 0..20 {
+                    let y = 16.25 + 40.0 * row as f32 + fraction;
+                    if hover == Some(row) {
+                        scene.insert_primitive(Quad {
+                            bounds: scaled(0.0, y, 512.0, 18.5),
+                            content_mask: ContentMask {
+                                bounds: scaled(0.5, y + 0.25, 511.0, 18.0),
+                                fade_out: Edges::all(ScaledPixels(0.75)),
+                            },
+                            background: solid_background(hsla(0.62, 0.65, 0.62, 0.35)),
+                            corner_radii: Corners::all(ScaledPixels(2.25)),
+                            ..Default::default()
+                        });
+                    }
+                    // Different unchanged Quad shapes expose the actual global-rank
+                    // failure: a moved row fill changes their flattened positions.
+                    for (x, w, h) in [
+                        (4.0, 3.0, 3.0),
+                        (25.0, 7.0, 5.0),
+                        (402.0, 4.0, 12.0),
+                        (411.0, 8.0, 8.0),
+                    ] {
+                        scene.insert_primitive(Quad {
+                            bounds: scaled(x, y + 4.0, w, h),
+                            content_mask: mask,
+                            background: solid_background(hsla(0.12, 0.55, 0.72, 0.6)),
+                            ..Default::default()
+                        });
+                    }
+                    for index in 0..20 {
+                        scene.insert_primitive(MonochromeSprite {
+                            order: 0,
+                            padding: 0,
+                            bounds: scaled(40.0 + index as f32 * 18.0, y + 2.0, 8.0, 8.0),
+                            content_mask: mask,
+                            color: hsla(0.12, 0.25, 0.8, 0.85).into(),
+                            tile: glyph,
+                            transformation: Default::default(),
+                        });
+                    }
+                    if hover == Some(row) {
+                        for index in 0..7 + row % 3 {
+                            let bounds = scaled(432.0 + index as f32 * 8.0, y + 2.0, 8.0, 8.0);
+                            if subpixel {
+                                scene.insert_primitive(gpui::SubpixelSprite {
+                                    order: 0,
+                                    padding: 0,
+                                    bounds,
+                                    content_mask: mask,
+                                    color: hsla(0.07, 0.6, 0.73, 0.7).into(),
+                                    tile: badge,
+                                    transformation: Default::default(),
+                                });
+                            } else {
+                                scene.insert_primitive(MonochromeSprite {
+                                    order: 0,
+                                    padding: 0,
+                                    bounds,
+                                    content_mask: mask,
+                                    color: hsla(0.07, 0.6, 0.73, 0.7).into(),
+                                    tile: badge,
+                                    transformation: Default::default(),
+                                });
+                            }
+                        }
+                    }
+                }
+                scene.finish();
+                scene
+            };
+        let devices = DirectXDevices::new()?;
+        let window = HiddenWindow::new()?;
+        let reference_window = HiddenWindow::new()?;
+        let mut renderer = DirectXRenderer::new(window.0, &devices, false)?;
+        let mut reference = DirectXRenderer::new(reference_window.0, &devices, false)?;
+        renderer.retained.enable_for_tests();
+        reference.retained.disable_for_tests();
+        for renderer in [&mut renderer, &mut reference] {
+            renderer.resize(Size {
+                width: DevicePixels(512),
+                height: DevicePixels(1024),
+            })?;
+        }
+        let glyph = glyph_tile(&renderer, GlyphRenderMode::Grayscale, 65);
+        let reference_glyph = glyph_tile(&reference, GlyphRenderMode::Grayscale, 65);
+        for mode in [GlyphRenderMode::Grayscale, GlyphRenderMode::Subpixel] {
+            let badge = glyph_tile(&renderer, mode, 66);
+            let reference_badge = glyph_tile(&reference, mode, 66);
+            for fraction in [0.0, 0.25, 0.75] {
+                for appearance in [
+                    WindowBackgroundAppearance::Transparent,
+                    WindowBackgroundAppearance::Opaque,
+                ] {
+                    renderer.retained.invalidate();
+                    let mut previous = None;
+                    let mut snapshot = None;
+                    // One box spans both changed rows, so a jump across the list
+                    // repaints in full.
+                    for (revision, hover, damage) in [
+                        (1, None, "full"),
+                        (2, Some(0), "partial"),
+                        (3, Some(1), "partial"),
+                        (4, Some(19), "full"),
+                        (5, Some(18), "partial"),
+                        (6, None, "partial"),
+                    ] {
+                        let scene = make_scene(
+                            hover,
+                            glyph,
+                            badge,
+                            mode == GlyphRenderMode::Subpixel,
+                            fraction,
+                        );
+                        let reference_scene = make_scene(
+                            hover,
+                            reference_glyph,
+                            reference_badge,
+                            mode == GlyphRenderMode::Subpixel,
+                            fraction,
+                        );
+                        let next =
+                            SceneSnapshot::capture(&scene, 1, 512, 1024, Vec::new()).unwrap();
+                        if revision == 3 {
+                            // The hover raises a row's draw order; only its tiles change.
+                            let old = snapshot.as_ref().unwrap();
+                            assert!(matches!(next.compare(old), Damage::Partial(_)));
+                        }
+                        snapshot = Some(next);
+                        let _scope = gpui::profiler::gpu::set_gpu_frame_context(true, revision);
+                        let actual = renderer.render_to_image(&scene, appearance)?;
+                        let expected = reference.render_to_image(&reference_scene, appearance)?;
+                        assert_eq!(
+                            actual, expected,
+                            "normal ranks mode={mode:?} fraction={fraction} appearance={appearance:?} hover={hover:?}"
+                        );
+                        assert_eq!(renderer.retained.last_damage(), damage);
+                        if let Some(previous) = &previous {
+                            assert_ne!(&actual, previous, "hover pixels must visibly change");
+                        }
+                        previous = Some(actual);
+                        assert_eq!(renderer.render_to_image(&scene, appearance)?, expected);
+                        assert_eq!(renderer.retained.last_damage(), "reuse");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn retained_inset_shadow_outside_shifted_hole_matches_full_pixels() -> Result<()> {
+        let scene = |hover: Option<usize>| {
+            let mut scene = Scene::default();
+            let element = scaled(8.0, 8.0, 184.0, 84.0);
+            scene.insert_primitive(Quad {
+                bounds: element,
+                content_mask: full_mask(),
+                background: solid_background(hsla(0.61, 0.35, 0.21, 0.4)),
+                corner_radii: Corners::all(ScaledPixels(12.0)),
+                ..Default::default()
+            });
+            // Positive spread20 and offset(70,6) shift/shrink the inset hole.
+            // The actual shadow still covers element_bounds. Both hover rows
+            // lie outside hole bounds dilated by4*blur, exposing incorrect culling.
+            scene.insert_primitive(gpui::Shadow {
+                order: 0,
+                blur_radius: ScaledPixels(0.5),
+                bounds: scaled(98.0, 34.0, 144.0, 44.0),
+                corner_radii: Corners::all(ScaledPixels(0.0)),
+                content_mask: full_mask(),
+                color: solid_background(hsla(0.08, 0.7, 0.5, 0.65)),
+                element_bounds: element,
+                element_corner_radii: Corners::all(ScaledPixels(12.0)),
+                inset: ShaderBool::Enabled,
+                corner_smoothing: 0.65,
+            });
+            if let Some(row) = hover {
+                scene.push_layer(element);
+                scene.insert_primitive(Quad {
+                    bounds: scaled(14.25, 14.25 + row as f32 * 52.0, 56.0, 14.0),
+                    content_mask: full_mask(),
+                    background: solid_background(hsla(0.7, 0.65, 0.7, 0.6)),
+                    corner_radii: Corners::all(ScaledPixels(3.0)),
+                    ..Default::default()
+                });
+                scene.pop_layer();
+            }
+            scene.insert_primitive(Quad {
+                bounds: element,
+                content_mask: full_mask(),
+                background: solid_background(hsla(0.4, 0.5, 0.4, 0.08)),
+                corner_radii: Corners::all(ScaledPixels(12.0)),
+                ..Default::default()
+            });
+            scene.finish();
+            scene
+        };
+        let devices = DirectXDevices::new()?;
+        let window = HiddenWindow::new()?;
+        let reference_window = HiddenWindow::new()?;
+        let mut renderer = DirectXRenderer::new(window.0, &devices, false)?;
+        let mut reference = DirectXRenderer::new(reference_window.0, &devices, false)?;
+        renderer.retained.enable_for_tests();
+        reference.retained.disable_for_tests();
+        for renderer in [&mut renderer, &mut reference] {
+            renderer.resize(Size {
+                width: DevicePixels(200),
+                height: DevicePixels(400),
+            })?;
+        }
+        for appearance in [
+            WindowBackgroundAppearance::Transparent,
+            WindowBackgroundAppearance::Opaque,
+        ] {
+            renderer.retained.invalidate();
+            for (revision, hover) in [(1, None), (2, Some(0)), (3, Some(1)), (4, None)] {
+                let scene = scene(hover);
+                let _scope = gpui::profiler::gpu::set_gpu_frame_context(true, revision);
+                let actual = renderer.render_to_image(&scene, appearance)?;
+                let expected = reference.render_to_image(&scene, appearance)?;
+                assert_eq!(
+                    actual, expected,
+                    "inset shadow appearance={appearance:?} hover={hover:?}"
+                );
+                assert_eq!(
+                    renderer.retained.last_damage(),
+                    if revision == 1 { "full" } else { "partial" }
+                );
+                assert_eq!(renderer.render_to_image(&scene, appearance)?, expected);
+                assert_eq!(renderer.retained.last_damage(), "reuse");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn retained_transparent_regions_erase_alpha_and_preserve_shadow_glyph_corners() -> Result<()> {
+        let devices = DirectXDevices::new()?;
+        let window = HiddenWindow::new()?;
+        let reference_window = HiddenWindow::new()?;
+        let mut renderer = DirectXRenderer::new(window.0, &devices, false)?;
+        let mut reference = DirectXRenderer::new(reference_window.0, &devices, false)?;
+        let mut description = DXGI_SWAP_CHAIN_DESC1::default();
+        unsafe {
+            renderer
+                .resources
+                .as_ref()
+                .unwrap()
+                .swap_chain
+                .GetDesc1(&mut description)
+        }
+        .ok()?;
+        assert_eq!(description.AlphaMode, DXGI_ALPHA_MODE_PREMULTIPLIED);
+        renderer.retained.enable_for_tests();
+        reference.retained.disable_for_tests();
+        for renderer in [&mut renderer, &mut reference] {
+            renderer.resize(Size {
+                width: DevicePixels(200),
+                height: DevicePixels(400),
+            })?;
+        }
+        let make_tile = |renderer: &DirectXRenderer| {
+            tile(
+                renderer.sprite_atlas().as_ref(),
+                AtlasKey::Svg(RenderSvgParams {
+                    path: "retained-transparent-glyph".into(),
+                    size: Size {
+                        width: DevicePixels(8),
+                        height: DevicePixels(8),
+                    },
+                }),
+                (0..64)
+                    .map(|index| if index % 3 == 0 { 128 } else { 255 })
+                    .collect(),
+            )
+        };
+        let glyph = make_tile(&renderer);
+        let reference_glyph = make_tile(&reference);
+        renderer.retained.invalidate();
+        for fraction in [0.0, 0.25, 0.5, 0.75] {
+            renderer.retained.invalidate();
+            let mut previous = None;
+            for (revision, hover) in [
+                (1, None),
+                (2, Some(0)),
+                (3, Some(1)),
+                (4, Some(2)),
+                (5, None),
+            ] {
+                let scene = transparent_retained_scene(hover, glyph, fraction);
+                let reference_scene = transparent_retained_scene(hover, reference_glyph, fraction);
+                let _scope = gpui::profiler::gpu::set_gpu_frame_context(true, revision);
+                let actual =
+                    renderer.render_to_image(&scene, WindowBackgroundAppearance::Transparent)?;
+                let expected = reference
+                    .render_to_image(&reference_scene, WindowBackgroundAppearance::Transparent)?;
+                assert_eq!(
+                    actual, expected,
+                    "transparent fraction={fraction} hover={hover:?}"
+                );
+                assert_eq!(
+                    renderer.retained.last_damage(),
+                    if revision == 1 { "full" } else { "partial" }
+                );
+                assert!(
+                    actual
+                        .pixels()
+                        .any(|pixel| pixel.0[3] > 0 && pixel.0[3] < 255),
+                    "fixture must contain fractional alpha"
+                );
+                if let Some(previous) = &previous {
+                    assert_ne!(&actual, previous, "fixture must change visible pixels");
+                }
+                previous = Some(actual.clone());
+                assert_eq!(
+                    renderer.render_to_image(&scene, WindowBackgroundAppearance::Transparent)?,
+                    expected
+                );
+                assert_eq!(renderer.retained.last_damage(), "reuse");
+            }
+        }
+        let scene = transparent_retained_scene(None, glyph, 0.25);
+        let reference_scene = transparent_retained_scene(None, reference_glyph, 0.25);
+        let _scope = gpui::profiler::gpu::set_gpu_frame_context(true, 5);
+        for appearance in [
+            WindowBackgroundAppearance::Opaque,
+            WindowBackgroundAppearance::Transparent,
+        ] {
+            assert_eq!(
+                renderer.render_to_image(&scene, appearance)?,
+                reference.render_to_image(&reference_scene, appearance)?
+            );
+            assert_eq!(
+                renderer.retained.last_damage(),
+                "full",
+                "appearance invalidates unchanged revision"
+            );
+            assert_eq!(
+                renderer.render_to_image(&scene, appearance)?,
+                reference.render_to_image(&reference_scene, appearance)?
+            );
+            assert_eq!(renderer.retained.last_damage(), "reuse");
+        }
+        for renderer in [&mut renderer, &mut reference] {
+            renderer.resize(Size {
+                width: DevicePixels(190),
+                height: DevicePixels(100),
+            })?;
+        }
+        assert_eq!(
+            renderer.render_to_image(&scene, WindowBackgroundAppearance::Transparent)?,
+            reference.render_to_image(&reference_scene, WindowBackgroundAppearance::Transparent)?
+        );
+        assert_eq!(
+            renderer.retained.last_damage(),
+            "full",
+            "resize invalidates unchanged revision"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retained_inserted_hover_fill_matches_full_frame() -> Result<()> {
+        let devices = DirectXDevices::new()?;
+        let window = HiddenWindow::new()?;
+        let reference_window = HiddenWindow::new()?;
+        let mut renderer = DirectXRenderer::new(window.0, &devices, true)?;
+        let mut reference = DirectXRenderer::new(reference_window.0, &devices, true)?;
+        renderer.retained.enable_for_tests();
+        reference.retained.disable_for_tests();
+        for renderer in [&mut renderer, &mut reference] {
+            renderer.resize(Size {
+                width: DevicePixels(200),
+                height: DevicePixels(400),
+            })?;
+        }
+        for (revision, hover) in [(1, false), (2, true), (3, false)] {
+            let scene = retained_scene(hover, false);
+            let _scope = gpui::profiler::gpu::set_gpu_frame_context(true, revision);
+            assert_eq!(
+                renderer.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?,
+                reference.render_to_image(&scene, WindowBackgroundAppearance::Opaque)?
+            );
+            assert_eq!(
+                renderer.retained.last_damage(),
+                if revision == 1 { "full" } else { "partial" },
+                "actual hover fill omission must use sparse repaint"
+            );
+        }
+        Ok(())
+    }
+
     fn tile(atlas: &dyn PlatformAtlas, key: AtlasKey, bytes: Vec<u8>) -> AtlasTile {
         atlas
             .get_or_insert_with(&key, &mut || {
@@ -2914,6 +3994,40 @@ mod tests {
             })
             .expect("atlas insert must succeed")
             .expect("atlas insert must produce a tile")
+    }
+
+    /// An 8x8 glyph drawn by the production atlas and glyph shaders, whatever
+    /// fonts or native raster settings the machine has.
+    fn glyph_tile(
+        renderer: &DirectXRenderer,
+        mode: gpui::GlyphRenderMode,
+        glyph: u32,
+    ) -> AtlasTile {
+        use gpui::{FontId, GlyphId, GlyphRenderMode, PreparedRasterStyle, RenderGlyphParams};
+        let key = AtlasKey::Glyph {
+            params: RenderGlyphParams {
+                font_id: FontId(0),
+                glyph_id: GlyphId(glyph),
+                font_size: gpui::px(8.0),
+                subpixel_variant: gpui::point(0, 0),
+                scale_factor: 1.0,
+                raster_style: PreparedRasterStyle::independent(mode),
+            },
+            format: mode.rasterized_format(),
+        };
+        let coverage = (0..64).map(|index| match (index / 8, index % 8) {
+            (4, 1..=6) | (1..=6, 1 | 6) => 255,
+            (_, 2 | 5) => 96,
+            _ => 0u8,
+        });
+        let bytes = if mode == GlyphRenderMode::Subpixel {
+            coverage
+                .flat_map(|value| [value / 2, value, value.saturating_add(24), 255])
+                .collect()
+        } else {
+            coverage.collect()
+        };
+        tile(renderer.sprite_atlas().as_ref(), key, bytes)
     }
 
     #[test]
