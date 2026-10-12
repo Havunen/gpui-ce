@@ -106,7 +106,7 @@ impl RenderTarget {
             needs_redraw: false,
             copy_backend_supported: cfg!(target_os = "windows") && backend == wgpu::Backend::Dx12,
             copy_surface_supported,
-            copy_requested: super::retained_copy::requested(),
+            copy_requested: gpui::profiler::gpu::partial_redraw_enabled(),
             clear_color: clear_color(requested.transparent),
         };
         target.refresh_copy_usage();

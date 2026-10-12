@@ -1,12 +1,4 @@
-//! Conservative full-image presentation copy for the retained-frame experiment.
-
-use gpui::profiler::gpu;
-
-pub(super) fn requested() -> bool {
-    cfg!(target_os = "windows")
-        && gpu::experiment_enabled("partial-redraw")
-        && gpu::experiment_enabled("retained-copy")
-}
+//! Conservative full-image presentation copy of the retained frame.
 
 pub(super) fn format_supported(format: wgpu::TextureFormat) -> bool {
     matches!(

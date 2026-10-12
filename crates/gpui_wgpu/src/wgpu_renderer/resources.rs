@@ -277,13 +277,6 @@ impl WgpuRenderer {
         }
         let format = self.target.format();
         let sample_count = self.rendering_params.path_sample_count;
-        if std::env::var_os("GPUI_PROFILE_PATH_TARGET").is_some() {
-            eprintln!(
-                "GPUI path target {width}x{height}, viewport {}x{}, samples {sample_count}",
-                self.target.width(),
-                self.target.height()
-            );
-        }
         let resources = self.resources_mut();
         resources.instances.invalidate_texture_bindings();
         let (texture, view) = sampled_render_texture(&resources.device, format, width, height);

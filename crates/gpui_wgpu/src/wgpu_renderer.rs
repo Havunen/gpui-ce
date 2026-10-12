@@ -70,6 +70,8 @@ pub struct WgpuRenderer {
     atlas: Arc<WgpuAtlas>,
     globals: GlobalBufferLayout,
     rendering_params: RenderingParameters,
+    /// Path targets cover only the paths' bounds. Tests turn this off to
+    /// compare against full-viewport targets.
     crop_path_targets: bool,
     subpixel_order: SubpixelOrder,
     dual_source_blending: bool,
@@ -111,14 +113,6 @@ impl WgpuRenderer {
             config,
             adapter_info.backend,
         )?;
-        if cfg!(target_os = "windows")
-            && gpui::profiler::gpu::experiment_enabled("retained-copy")
-            && !target.retained_copy_enabled()
-        {
-            log::warn!(
-                "retained-copy was rejected: it requires partial-redraw, Windows DX12, a COPY_DST non-sRGB BGRA8/RGBA8 target and supported alpha"
-            );
-        }
         if let Some(surface) = surface.as_ref() {
             surface.configure(&context.device, target.configuration());
         }
@@ -148,7 +142,7 @@ impl WgpuRenderer {
             atlas,
             globals,
             rendering_params,
-            crop_path_targets: cropped_path_targets_enabled(),
+            crop_path_targets: true,
             subpixel_order: SubpixelOrder::RedGreenBlue,
             dual_source_blending,
             adapter_info,
@@ -345,27 +339,6 @@ impl WgpuRenderer {
     }
 }
 
-// Linux uses the measured memory optimization by default; other targets remain
-// opt-in. An explicit experiment list overrides the default, including an empty
-// list to disable cropping. Read the environment once, never on the draw path.
-fn cropped_path_targets_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        cropped_path_targets_for_experiments(
-            std::env::var("GPUI_GPU_EXPERIMENTS").ok().as_deref(),
-            cfg!(target_os = "linux"),
-        )
-    })
-}
-
-fn cropped_path_targets_for_experiments(experiments: Option<&str>, default_enabled: bool) -> bool {
-    experiments.map_or(default_enabled, |value| {
-        value
-            .split(',')
-            .any(|option| option.trim() == "cropped-paths")
-    })
-}
-
 fn begin_color_render_pass<'encoder>(
     encoder: &'encoder mut wgpu::CommandEncoder,
     label: &'encoder str,
@@ -392,28 +365,6 @@ fn begin_color_render_pass<'encoder>(
 mod tests {
     use super::*;
     use crate::wgpu_renderer::filters::FrameUniformRequirements;
-
-    #[test]
-    fn cropped_path_target_experiments_override_platform_defaults() {
-        for default_enabled in [false, true] {
-            assert_eq!(
-                cropped_path_targets_for_experiments(None, default_enabled),
-                default_enabled
-            );
-            for experiments in ["", "  ", "fixed-refresh", "not-cropped-paths"] {
-                assert!(!cropped_path_targets_for_experiments(
-                    Some(experiments),
-                    default_enabled
-                ));
-            }
-            for experiments in ["cropped-paths", " fixed-refresh, cropped-paths "] {
-                assert!(cropped_path_targets_for_experiments(
-                    Some(experiments),
-                    default_enabled
-                ));
-            }
-        }
-    }
 
     #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
     fn dashed_border_scene(dash_length: f32, dash_gap: f32) -> Scene {

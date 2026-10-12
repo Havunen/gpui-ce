@@ -43,19 +43,18 @@ use wgsl_rs::std::{vec2f, vec4f};
 
 use std::{cell::Cell, mem, ptr, sync::Arc};
 
-/// Renderer options (`GPUI_METAL_EXPERIMENTS`, comma separated).
-///
-/// On by default, each with an opt-out for comparisons:
-/// - path prepass (`no-path-prepass`): every path batch of a frame is rasterized
-///   in at most [`MAX_PATH_LAYERS`] cropped passes before the main pass, instead
-///   of ending the main pass around each batch with a full-window MSAA pass.
-/// - opaque quads (`no-opaque-quads`): opaque rectangles are drawn without
-///   blending, so the tile hardware skips fragments a later opaque quad hides.
-/// - split rounded quads (`no-split-rounded`): large rounded opaque quads draw
-///   an opaque interior and blended rims (needs opaque quads).
-/// - partial redraw (`no-partial-redraw`): frames render into a retained
-///   texture that is copied to the drawable, and repaint only the region whose
-///   primitives changed since the previous frame (see [`gpui_render::damage`]).
+/// Renderer optimizations, all on; tests turn them off to render reference frames.
+/// - path prepass: every path batch of a frame is rasterized in at most
+///   [`MAX_PATH_LAYERS`] cropped passes before the main pass, instead of ending
+///   the main pass around each batch with a full-window MSAA pass.
+/// - opaque quads: opaque rectangles are drawn without blending, so the tile
+///   hardware skips fragments a later opaque quad hides.
+/// - split rounded quads: large rounded opaque quads draw an opaque interior and
+///   blended rims (needs opaque quads).
+/// - partial redraw: frames render into a retained texture that is copied to the
+///   drawable, and repaint only the region whose primitives changed since the
+///   previous frame (see [`gpui_render::damage`]). `GPUI_GPU_EXPERIMENTS=no-partial-redraw`
+///   turns it off.
 #[derive(Clone, Copy, Debug, Default)]
 struct Experiments {
     path_prepass: bool,
@@ -63,20 +62,6 @@ struct Experiments {
     /// Rounded opaque quads draw an opaque interior (needs `opaque_quads`).
     split_rounded: bool,
     partial_redraw: bool,
-}
-
-fn experiments() -> Experiments {
-    static EXPERIMENTS: std::sync::OnceLock<Experiments> = std::sync::OnceLock::new();
-    *EXPERIMENTS.get_or_init(|| {
-        let value = std::env::var("GPUI_METAL_EXPERIMENTS").unwrap_or_default();
-        let flags: Vec<&str> = value.split(',').map(str::trim).collect();
-        Experiments {
-            path_prepass: !flags.contains(&"no-path-prepass"),
-            opaque_quads: !flags.contains(&"no-opaque-quads"),
-            split_rounded: !flags.contains(&"no-split-rounded"),
-            partial_redraw: !flags.contains(&"no-partial-redraw"),
-        }
-    })
 }
 
 /// Path batches of one frame are grouped into layers whose sampled regions are
@@ -830,7 +815,12 @@ impl MetalRenderer {
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_layer_textures: Vec::new(),
-            experiments: experiments(),
+            experiments: Experiments {
+                path_prepass: true,
+                opaque_quads: true,
+                split_rounded: true,
+                partial_redraw: gpu::partial_redraw_enabled(),
+            },
             scene_color_texture: None,
             blur_ping_texture: None,
             blur_pong_texture: None,

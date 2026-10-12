@@ -34,7 +34,12 @@ pub(super) struct RetainedPlan {
 impl RetainedFrame {
     pub fn new() -> Self {
         Self {
-            enabled: gpu::experiment_enabled("partial-redraw"),
+            // Measured on Windows and Linux; the web and macOS builds draw in full.
+            enabled: cfg!(any(
+                target_os = "windows",
+                target_os = "linux",
+                target_os = "freebsd"
+            )) && gpu::partial_redraw_enabled(),
             target: None,
             scene: RetainedScene::default(),
             #[cfg(test)]

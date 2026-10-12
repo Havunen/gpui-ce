@@ -1,4 +1,4 @@
-//! Frame context and experiment flags for the retained renderers.
+//! Frame context and the partial-redraw opt-out for the retained renderers.
 use std::cell::Cell;
 
 /// Window state passed to the platform renderer on this thread.
@@ -35,10 +35,13 @@ pub fn set_gpu_frame_context(interactive: bool, scene_revision: u64) -> GpuFrame
 pub fn gpu_frame_context() -> GpuFrameContext {
     CONTEXT.with(Cell::get)
 }
-/// Whether an experiment flag was explicitly requested by the environment.
-pub fn experiment_enabled(name: &str) -> bool {
-    std::env::var("GPUI_GPU_EXPERIMENTS")
-        .is_ok_and(|value| value.split(',').any(|flag| flag.trim() == name))
+/// Partial redraw is on unless `GPUI_GPU_EXPERIMENTS` lists `no-partial-redraw`.
+pub fn partial_redraw_enabled() -> bool {
+    !std::env::var("GPUI_GPU_EXPERIMENTS").is_ok_and(|value| {
+        value
+            .split(',')
+            .any(|flag| flag.trim() == "no-partial-redraw")
+    })
 }
 
 #[cfg(test)]
