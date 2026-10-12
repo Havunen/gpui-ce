@@ -121,6 +121,20 @@ impl RetainedFrame {
         }) {
             self.invalidate();
         }
+        // Reserve before hashing, so a window the budget can't hold doesn't
+        // capture its scene every frame only to draw in full.
+        let reservation = if self.target.is_none() {
+            let reservation = bytes.and_then(|bytes| {
+                reserve_retained_bytes("wgpu", Arc::as_ptr(device) as usize, bytes)
+            });
+            if reservation.is_none() {
+                self.invalidate();
+                return full();
+            }
+            reservation
+        } else {
+            None
+        };
         let Some((mut damage, snapshot)) =
             self.scene
                 .plan(scene, context.scene_revision, atlas, width, height)
@@ -128,13 +142,7 @@ impl RetainedFrame {
             self.invalidate();
             return full();
         };
-        if self.target.is_none() {
-            let Some(reservation) = bytes.and_then(|bytes| {
-                reserve_retained_bytes("wgpu", Arc::as_ptr(device) as usize, bytes)
-            }) else {
-                self.invalidate();
-                return full();
-            };
+        if let Some(reservation) = reservation {
             #[cfg(not(target_family = "wasm"))]
             let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
             let texture = device.create_texture(&wgpu::TextureDescriptor {

@@ -90,6 +90,19 @@ impl RetainedFrame {
         }) {
             self.invalidate();
         }
+        // Reserve before hashing, so a window the budget can't hold doesn't
+        // capture its scene every frame only to draw in full.
+        let reservation = if self.target.is_none() {
+            let bytes = width as u64 * height as u64 * 4;
+            let reservation = reserve_retained_bytes("d3d11", device.as_raw() as usize, bytes);
+            if reservation.is_none() {
+                self.invalidate();
+                return full();
+            }
+            reservation
+        } else {
+            None
+        };
         let Some((mut damage, snapshot)) =
             self.scene
                 .plan(scene, frame.scene_revision, generation, width, height)
@@ -97,14 +110,7 @@ impl RetainedFrame {
             self.invalidate();
             return full();
         };
-        if self.target.is_none() {
-            let bytes = width as u64 * height as u64 * 4;
-            let Some(reservation) =
-                reserve_retained_bytes("d3d11", device.as_raw() as usize, bytes)
-            else {
-                self.invalidate();
-                return full();
-            };
+        if let Some(reservation) = reservation {
             let desc = D3D11_TEXTURE2D_DESC {
                 Width: width,
                 Height: height,
