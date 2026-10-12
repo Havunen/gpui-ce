@@ -179,7 +179,7 @@ pub mod shadow {
         // Coverage and paint still use the shadow's own bounds.
         let vertex = rectangle_vertex(
             vertex_id,
-            Bounds::intersect(shadow_geometry(shadow), shadow.content_mask.bounds),
+            Bounds::clip_to_mask(shadow_geometry(shadow), shadow.content_mask.bounds),
         );
         ShadowVertexData {
             position: vertex.clip_position,

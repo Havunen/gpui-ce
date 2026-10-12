@@ -271,13 +271,63 @@ mod path_target_tests {
         }
     }
 
+    /// A clipped quad covers the same pixels as a straight underline, which
+    /// only fragment masking clips, including those centered on the mask's
+    /// right and bottom edges. A rasterized rectangle drops centers on those
+    /// edges, so vertex clipping must not end exactly there.
+    #[test]
+    fn clipped_quads_and_underlines_share_mask_edge_pixels() -> anyhow::Result<()> {
+        fn render(
+            renderer: &mut WgpuRenderer,
+            primitive: gpui::Primitive,
+        ) -> anyhow::Result<image::RgbaImage> {
+            let mut scene = Scene::default();
+            scene.insert_primitive(primitive);
+            scene.finish();
+            renderer.render_to_image(&scene)
+        }
+        let _gpu_test_guard = crate::test_gpu::guard();
+        let context = WgpuContext::new_headless(None)?;
+        let mut renderer =
+            WgpuRenderer::new_headless(&context, size(DevicePixels(64), DevicePixels(64)))?;
+        renderer.retained.disable_for_tests();
+        let geometry = scaled(4.0, 4.0, 56.0, 56.0);
+        // The right and bottom edges run through pixel centers at 24.5.
+        let mask = ContentMask {
+            bounds: scaled(8.0, 8.0, 16.5, 16.5),
+            ..Default::default()
+        };
+        let quad = Quad {
+            bounds: geometry,
+            content_mask: mask,
+            background: solid_background(gpui::white()),
+            ..Default::default()
+        };
+        let underline = gpui::Underline {
+            order: 0,
+            padding: 0,
+            bounds: geometry,
+            content_mask: mask,
+            color: gpui::white().into(),
+            thickness: ScaledPixels(1.0),
+            wavy: Default::default(),
+        };
+        let quad = render(&mut renderer, quad.into())?;
+        let underline = render(&mut renderer, underline.into())?;
+        assert_eq!(quad.get_pixel(24, 12), underline.get_pixel(24, 12));
+        assert_eq!(quad.get_pixel(12, 24), underline.get_pixel(12, 24));
+        assert!(
+            quad == underline,
+            "the quad and the underline cover different pixels"
+        );
+        Ok(())
+    }
+
     /// Vertex clipping to the content mask must draw exactly what fragment
-    /// masking alone draws: every pixel centered inside the mask matches the
-    /// unmasked frame and every pixel centered outside it is untouched. A
-    /// center exactly on a mask edge may go either way. Fragment masking
-    /// compares an interpolated distance with zero there, and the rasterizer
-    /// drops centers on a rectangle's right and bottom edges. Mask edges land
-    /// on pixel centers whenever an odd logical coordinate is scaled by 1.5.
+    /// masking alone draws: every pixel centered inside the mask or on its edge
+    /// matches the unmasked frame, and every pixel centered outside it is
+    /// untouched. Mask edges land on pixel centers whenever an odd logical
+    /// coordinate is scaled by 1.5.
     #[test]
     fn vertex_clipping_matches_fragment_masking_on_pixel_center_edges() -> anyhow::Result<()> {
         let _gpu_test_guard = crate::test_gpu::guard();
@@ -367,12 +417,10 @@ mod path_target_tests {
                 let difference = masked.enumerate_pixels().find(|(x, y, pixel)| {
                     let (cx, cy) = (*x as f32 + 0.5, *y as f32 + 0.5);
                     let inside = cx >= left && cx <= right && cy >= top && cy <= bottom;
-                    let on_edge = cx == left || cx == right || cy == top || cy == bottom;
-                    let (full, background) = (full.get_pixel(*x, *y), background.get_pixel(*x, *y));
-                    match (inside, on_edge) {
-                        (true, true) => *pixel != full && *pixel != background,
-                        (true, false) => *pixel != full,
-                        (false, _) => *pixel != background,
+                    if inside {
+                        *pixel != full.get_pixel(*x, *y)
+                    } else {
+                        *pixel != background.get_pixel(*x, *y)
                     }
                 });
                 if let Some((x, y, _)) = difference {
