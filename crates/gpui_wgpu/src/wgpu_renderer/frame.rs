@@ -50,7 +50,9 @@ pub(super) fn render_to_view(
     let retained_copy = (retained.copy_texture.take())
         .filter(|source| {
             targets.offscreen.is_none()
-                && frame_texture.usage().contains(wgpu::TextureUsages::COPY_DST)
+                && frame_texture
+                    .usage()
+                    .contains(wgpu::TextureUsages::COPY_DST)
                 && frame_texture.size() == source.size()
                 && frame_texture.format() == source.format()
         })

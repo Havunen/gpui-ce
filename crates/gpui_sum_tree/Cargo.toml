@@ -16,11 +16,11 @@ heapless = "0.9"
 rayon = "1.12"
 log = "0.4"
 tracing = { version = "0.1", features = ["attributes"] }
-proptest = { version = "1.11", features = ["attr-macro"], optional = true }
+proptest = { version = "1.12", features = ["attr-macro"], optional = true }
 
 [dev-dependencies]
 rand = "0.10"
-proptest = { version = "1.11", features = ["attr-macro"] }
+proptest = { version = "1.12", features = ["attr-macro"] }
 
 [features]
 test-support = ["proptest"]

@@ -453,31 +453,32 @@ impl<C: HasConnection> X11rbClient<C> {
                 };
 
                 if let Some(name) = name.strip_prefix("@server=")
-                    && name == im_name {
-                        conn.convert_selection(
-                            client_window,
-                            server_atom,
-                            atoms.TRANSPORT,
-                            atoms.TRANSPORT,
-                            CURRENT_TIME,
-                        )?;
+                    && name == im_name
+                {
+                    conn.convert_selection(
+                        client_window,
+                        server_atom,
+                        atoms.TRANSPORT,
+                        atoms.TRANSPORT,
+                        CURRENT_TIME,
+                    )?;
 
-                        conn.flush()?;
+                    conn.flush()?;
 
-                        return Ok(Self {
-                            has_conn,
-                            atoms,
-                            server_atom,
-                            server_owner_window: server_owner,
-                            im_attributes: AHashMap::with_hasher(Default::default()),
-                            ic_attributes: AHashMap::with_hasher(Default::default()),
-                            im_window: x11rb::NONE,
-                            transport_max: 20,
-                            client_window,
-                            sequence: 0,
-                            buf: Vec::with_capacity(1024),
-                        });
-                    }
+                    return Ok(Self {
+                        has_conn,
+                        atoms,
+                        server_atom,
+                        server_owner_window: server_owner,
+                        im_attributes: AHashMap::with_hasher(Default::default()),
+                        ic_attributes: AHashMap::with_hasher(Default::default()),
+                        im_window: x11rb::NONE,
+                        transport_max: 20,
+                        client_window,
+                        sequence: 0,
+                        buf: Vec::with_capacity(1024),
+                    });
+                }
             }
 
             Err(ClientError::NoXimServer)

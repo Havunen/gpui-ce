@@ -29,7 +29,7 @@ itertools = "0.15"
 log = { version = "0.4", features = ["kv_unstable_serde", "serde"] }
 regex = "1"
 rand = { version = "0.10", optional = true }
-rust-embed = { version = "8.12", features = ["include-exclude"] }
+rust-embed = { version = "8.13", features = ["include-exclude"] }
 schemars = { version = "1.2", features = ["indexmap2"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
