@@ -56,6 +56,7 @@ pub(crate) struct TestWindowState {
     fixed_refresh_rate: bool,
     presents: usize,
     last_frame_context: crate::profiler::gpu::GpuFrameContext,
+    during_next_draw: Option<Box<dyn FnOnce()>>,
 }
 
 #[derive(Clone)]
@@ -127,6 +128,7 @@ impl TestWindow {
             fixed_refresh_rate: false,
             presents: 0,
             last_frame_context: Default::default(),
+            during_next_draw: None,
         })))
     }
 
@@ -230,6 +232,12 @@ impl TestWindow {
         drop(lock);
         callback(hovered);
         self.0.lock().hover_status_change_callback = Some(callback);
+    }
+
+    /// Runs `f` inside the next draw, like a platform event that a nested
+    /// message pump delivers while the window draws.
+    pub fn run_during_next_draw(&self, f: impl FnOnce() + 'static) {
+        self.0.lock().during_next_draw = Some(Box::new(f));
     }
 
     pub fn simulate_appearance_change(&self, appearance: WindowAppearance) {
@@ -523,6 +531,11 @@ impl PlatformWindow for TestWindow {
         let device_size: Size<DevicePixels> = state.bounds.size.to_device_pixels(scale_factor);
         if let Some(renderer) = &mut state.renderer {
             renderer.render_scene(scene, device_size).warn_on_err();
+        }
+        let during_draw = state.during_next_draw.take();
+        drop(state);
+        if let Some(f) = during_draw {
+            f();
         }
     }
 

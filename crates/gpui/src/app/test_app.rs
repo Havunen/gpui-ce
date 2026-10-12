@@ -680,6 +680,26 @@ mod tests {
     }
 
     #[test]
+    fn a_pointer_exit_during_a_draw_still_frees_the_retained_frame() {
+        let mut app = TestApp::new();
+        let mut window = app.open_window(|_, _| MoveInvalidator);
+        let platform_window = window.test_window().unwrap();
+        platform_window.set_fixed_refresh_rate(true);
+        platform_window.simulate_active_status_change(false);
+        platform_window.simulate_hover_status_change(true);
+        window.simulate_mouse_move(point(px(10.), px(10.)));
+        // The pointer leaves mid-draw, as a nested Windows message pump can
+        // deliver it. The hover callback can't update the drawing window.
+        let pointer = platform_window.clone();
+        platform_window.run_during_next_draw(move || pointer.simulate_hover_status_change(false));
+        window.simulate_request_frame(RequestFrameOptions::default());
+        assert!(platform_window.last_frame_context().interactive);
+        // The next frame still repaints without the retained frame.
+        window.simulate_request_frame(RequestFrameOptions::default());
+        assert!(!platform_window.last_frame_context().interactive);
+    }
+
+    #[test]
     fn force_render_refreshes_cached_views() {
         let mut app = TestApp::new();
         let render_count = Rc::new(Cell::new(0));

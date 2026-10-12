@@ -3461,11 +3461,15 @@ impl Window {
         let present_start = Instant::now();
         // Hover repaints unfocused windows too. The platform's hover state can't
         // go stale like `self.hovered`, whose callback fails during a draw.
-        let _frame_context = crate::profiler::gpu::set_gpu_frame_context(
-            self.active.get() || self.platform_window.is_hovered(),
-            self.scene_revision,
-        );
+        let interactive = self.active.get() || self.platform_window.is_hovered();
+        let _frame_context =
+            crate::profiler::gpu::set_gpu_frame_context(interactive, self.scene_revision);
         self.platform_window.draw(&self.rendered_frame.scene);
+        // A pointer exit during that draw couldn't refresh the window. Repaint
+        // once more so the renderer frees the retained frame.
+        if interactive && !self.active.get() && !self.platform_window.is_hovered() {
+            self.invalidator.set_dirty(true);
+        }
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
             present_start,
