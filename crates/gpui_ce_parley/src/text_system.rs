@@ -2167,8 +2167,11 @@ impl ParleyTextSystem {
                     glyphs,
                     x_range: start..start + px(glyph_run.advance()),
                     style: PaintStyle::from(&source_runs[source_run]),
-                    underline_offset: Some(px(run_metrics.underline_offset)),
-                    strikethrough_offset: Some(px(run_metrics.strikethrough_offset)),
+                    // Parley reports font metrics y-up (an underline below the
+                    // baseline is negative); gpui adds these to `baseline_y` in
+                    // y-down space, so flip them.
+                    underline_offset: Some(px(-run_metrics.underline_offset)),
+                    strikethrough_offset: Some(px(-run_metrics.strikethrough_offset)),
                 });
             }
 
@@ -2477,10 +2480,6 @@ impl PlatformTextSystem for ParleyTextSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::font_fixtures::{
-        IBM_PLEX, IBM_PLEX_SEMIBOLD, LILEX, NOTO_ARABIC, NOTO_COLOR_EMOJI, NOTO_HEBREW, NOTO_SANS,
-        SOURCE_SERIF,
-    };
     use crate::{FontSynthesis, FontVariation, RasterFace};
     use gpui::{
         AppContext, CaretSelection, Context, FontFallbacks, FontFeatures as GpuiFontFeatures,
@@ -2488,6 +2487,10 @@ mod tests {
         HeadlessAppContext, HighlightStyle, Hsla, IntoElement, Point, RasterizedGlyphFormat,
         Render, ScaledPixels, StrikethroughStyle, Styled, StyledText, TextSystem, UnderlineStyle,
         VerticalAlign, Window, WindowHandle, WindowTextSystem, div, font, hsla, prelude::*,
+    };
+    use gpui_fonts::{
+        IBM_PLEX, IBM_PLEX_SEMIBOLD, LILEX, NOTO_ARABIC, NOTO_COLOR_EMOJI, NOTO_HEBREW, NOTO_SANS,
+        SOURCE_SERIF,
     };
     use std::{
         cell::Cell,
@@ -2696,6 +2699,37 @@ mod tests {
             line_height
         );
         assert_eq!(down.result.index, text.len());
+    }
+
+    #[test]
+    fn decoration_offsets_are_y_down_from_the_baseline() {
+        let system = test_system();
+        for family in [IBM_PLEX.family, SOURCE_SERIF.family, LILEX.family] {
+            let text = "Learn how";
+            let layout = layout_line(&system, text, px(16.0), &[text_run(text, family)]);
+            let fragment = &layout.paint_fragments[0];
+            let underline = fragment.underline_offset.unwrap();
+            let strikethrough = fragment.strikethrough_offset.unwrap();
+
+            // gpui paints at `baseline_y + offset` with y growing downward: the
+            // underline sits below the baseline, within the descent, and the
+            // strikethrough sits above it, within the ascent.
+            assert!(underline > px(0.0), "{family}: underline={underline:?}");
+            assert!(
+                underline <= layout.descent,
+                "{family}: underline={underline:?}, descent={:?}",
+                layout.descent
+            );
+            assert!(
+                strikethrough < px(0.0),
+                "{family}: strikethrough={strikethrough:?}"
+            );
+            assert!(
+                -strikethrough < layout.ascent,
+                "{family}: strikethrough={strikethrough:?}, ascent={:?}",
+                layout.ascent
+            );
+        }
     }
 
     #[test]

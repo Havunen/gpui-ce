@@ -17,6 +17,7 @@ members = [
     "./crates/xim_parser/",
     "./crates/xim_ctext/",
     "./crates/gpui_elements/",
+    "./crates/gpui_ce_fonts/",
     "./crates/gpui_collections/",
     "./crates/gpui_refineable/",
     "./crates/gpui_derive_refineable/",
@@ -75,7 +76,7 @@ futures = "0.3"
 futures-concurrency = "7.7"
 flume = "0.12"
 http = "1"
-image = "0.25"
+image = { version = "0.25", default-features = false, features = ["gif", "webp"] }
 inventory = "0.3"
 itertools = "0.15"
 log = { version = "0.4", features = ["kv_unstable_serde", "serde"] }
@@ -286,7 +287,7 @@ x11-dl = "2.21"
 x11rb = "0.14"
 xkbcommon = { version = "0.9", default-features = false }
 
-gpui = { path = "./crates/gpui/", version = "0.2.2", package = "gpui-ce" }
+gpui = { path = "./crates/gpui/", version = "0.2.2", package = "gpui-ce", default-features = false }
 gpui_render = { path = "./crates/gpui_render/", version = "0.1.0", package = "gpui_ce_render" }
 gpui_platform = { path = "./crates/gpui_platform/", version = "0.1.0", package = "gpui_ce_platform" }
 gpui_linux = { path = "./crates/gpui_linux/", version = "0.1.0", package = "gpui_ce_linux" }
