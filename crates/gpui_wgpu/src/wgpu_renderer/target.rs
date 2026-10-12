@@ -161,6 +161,7 @@ impl RenderTarget {
             .set(wgpu::TextureUsages::COPY_DST, enabled);
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub(super) fn update_surface_copy_support(
         &mut self,
         usages: wgpu::TextureUsages,

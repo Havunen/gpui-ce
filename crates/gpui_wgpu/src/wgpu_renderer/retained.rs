@@ -132,6 +132,8 @@ impl RetainedFrame {
                 self.invalidate();
                 return full();
             };
+            #[cfg(not(target_family = "wasm"))]
+            let scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
             let texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("gpui_retained_frame"),
                 size: wgpu::Extent3d {
@@ -152,6 +154,14 @@ impl RetainedFrame {
                     },
                 view_formats: &[],
             });
+            // The target is optional: without memory for it, draw in full, as
+            // with an exhausted budget, instead of failing the device. The web
+            // never retains frames.
+            #[cfg(not(target_family = "wasm"))]
+            if gpui::block_on(scope.pop()).is_some() {
+                self.invalidate();
+                return full();
+            }
             let view = texture.create_view(&Default::default());
             self.target = Some(Target {
                 texture,
