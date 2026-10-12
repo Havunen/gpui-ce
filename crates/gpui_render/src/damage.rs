@@ -191,18 +191,16 @@ impl SceneSnapshot {
                 }
                 PrimitiveBatch::Underlines(range) => {
                     for underline in &scene.underlines[range.clone()] {
-                        if underline.thickness.0.is_nan() || underline.thickness.0 < 0.0 {
-                            return None;
-                        }
                         let key = Underline {
                             order: 0,
                             ..*underline
                         };
-                        // Wavy underlines swing past their bounds.
-                        let geometry = underline
-                            .bounds
-                            .dilate(ScaledPixels(underline.thickness.0 * 4.0));
-                        paint(geometry, &underline.content_mask, hash_of(10, &[key]))?;
+                        // The shader rasterizes only the bounds, waves included.
+                        paint(
+                            underline.bounds,
+                            &underline.content_mask,
+                            hash_of(10, &[key]),
+                        )?;
                     }
                 }
                 PrimitiveBatch::MonochromeSprites { range, .. } => {
@@ -419,12 +417,9 @@ pub fn batch_intersects(scene: &Scene, batch: &PrimitiveBatch, region: ScissorRe
         PrimitiveBatch::Paths { range, .. } => scene.paths[range.clone()]
             .iter()
             .any(|p| region.intersects(p.clipped_bounds().dilate(ScaledPixels(1.0)))),
-        PrimitiveBatch::Underlines(range) => scene.underlines[range.clone()].iter().any(|p| {
-            visible(
-                p.bounds.dilate(ScaledPixels(p.thickness.0 * 4.0)),
-                p.content_mask.bounds,
-            )
-        }),
+        PrimitiveBatch::Underlines(range) => scene.underlines[range.clone()]
+            .iter()
+            .any(|p| visible(p.bounds, p.content_mask.bounds)),
         PrimitiveBatch::MonochromeSprites { range, .. } => {
             scene.monochrome_sprites[range.clone()].iter().any(|p| {
                 visible(
@@ -966,7 +961,7 @@ mod tests {
     }
 
     #[test]
-    fn underlines_damage_their_wave_and_polychrome_sprites_their_bounds() {
+    fn underlines_and_polychrome_sprites_damage_their_bounds() {
         let background = quad(bounds(0.0, 0.0, 512.0, 1024.0), gpui::black());
         let damage = |next: Primitive, previous: Primitive| {
             capture([background.into(), next]).compare(&capture([background.into(), previous]))
@@ -984,18 +979,11 @@ mod tests {
             color: gpui::red().into(),
             ..underline
         };
-        // The wave swings four thicknesses past the line, which alone would
-        // only touch the tile at (128, 64).
+        // The shader draws even a wave inside the bounds, so only their tile
+        // repaints.
         assert_eq!(
             region(damage(recoloured.into(), underline.into())),
-            rect(64, 0, 128, 128)
-        );
-        let broken = Underline {
-            thickness: ScaledPixels(f32::NAN),
-            ..underline
-        };
-        assert!(
-            SceneSnapshot::capture(&finished([broken.into()]), 1, 512, 1024, Vec::new()).is_none()
+            rect(128, 64, 64, 64)
         );
         let image = PolychromeSprite {
             order: 0,
