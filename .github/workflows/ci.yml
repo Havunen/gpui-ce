@@ -233,6 +233,12 @@ jobs:
             target: i686-pc-windows-msvc
             check_targets: --lib
             cargo_args: --no-default-features
+          # The default Windows build has no WGPU renderer; apps may opt in.
+          - name: Windows Server 2025 x86_64 WGPU
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            check_targets: --all-targets
+            cargo_args: --features gpui_ce_windows/windows-wgpu
 
     steps:
       - name: Checkout
