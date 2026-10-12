@@ -3212,11 +3212,12 @@ mod tests {
         let mut scene = Scene::default();
         scene.finish();
         let _guard = gpui::profiler::gpu::set_gpu_frame_context(true, 1);
-        // Within the budget but wider than any D3D11 texture, so creation fails.
+        // Within the budget but far wider than any D3D11 device allows (16384 is
+        // the feature-level limit, which some devices exceed), so creation fails.
         let plan = renderer.retained.prepare(
             &scene,
             renderer.atlas.as_ref(),
-            16385,
+            1 << 20,
             1,
             WindowBackgroundAppearance::Opaque,
             &devices.device,
