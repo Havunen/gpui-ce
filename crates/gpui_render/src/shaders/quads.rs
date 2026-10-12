@@ -540,7 +540,7 @@ pub mod quad {
         // Geometry and paint still use the quad's own bounds.
         let vertex = rectangle_vertex(
             vertex_id,
-            Bounds::clip_to_mask(quad.bounds, quad.content_mask.bounds),
+            Bounds::intersect(quad.bounds, quad.content_mask.bounds),
         );
         QuadVertexData {
             position: vertex.clip_position,

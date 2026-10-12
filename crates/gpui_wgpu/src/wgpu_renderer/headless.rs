@@ -272,9 +272,9 @@ mod path_target_tests {
     }
 
     /// A clipped quad covers the same pixels as a straight underline, which
-    /// only fragment masking clips, including those centered on the mask's
-    /// right and bottom edges. A rasterized rectangle drops centers on those
-    /// edges, so vertex clipping must not end exactly there.
+    /// only fragment masking clips. Both follow a rasterized rectangle's rule
+    /// at the mask: a pixel centered on its left or top edge is inside, on its
+    /// right or bottom edge outside.
     #[test]
     fn clipped_quads_and_underlines_share_mask_edge_pixels() -> anyhow::Result<()> {
         fn render(
@@ -292,9 +292,9 @@ mod path_target_tests {
             WgpuRenderer::new_headless(&context, size(DevicePixels(64), DevicePixels(64)))?;
         renderer.retained.disable_for_tests();
         let geometry = scaled(4.0, 4.0, 56.0, 56.0);
-        // The right and bottom edges run through pixel centers at 24.5.
+        // Every edge runs through pixel centers, at 8.5 and 24.5.
         let mask = ContentMask {
-            bounds: scaled(8.0, 8.0, 16.5, 16.5),
+            bounds: scaled(8.5, 8.5, 16.0, 16.0),
             ..Default::default()
         };
         let quad = Quad {
@@ -314,8 +314,16 @@ mod path_target_tests {
         };
         let quad = render(&mut renderer, quad.into())?;
         let underline = render(&mut renderer, underline.into())?;
-        assert_eq!(quad.get_pixel(24, 12), underline.get_pixel(24, 12));
-        assert_eq!(quad.get_pixel(12, 24), underline.get_pixel(12, 24));
+        let (white, black) = (
+            image::Rgba([255, 255, 255, 255]),
+            image::Rgba([0, 0, 0, 255]),
+        );
+        for (what, image) in [("quad", &quad), ("underline", &underline)] {
+            assert_eq!(*image.get_pixel(8, 12), white, "{what}: left edge");
+            assert_eq!(*image.get_pixel(12, 8), white, "{what}: top edge");
+            assert_eq!(*image.get_pixel(24, 12), black, "{what}: right edge");
+            assert_eq!(*image.get_pixel(12, 24), black, "{what}: bottom edge");
+        }
         assert!(
             quad == underline,
             "the quad and the underline cover different pixels"
@@ -324,10 +332,10 @@ mod path_target_tests {
     }
 
     /// Vertex clipping to the content mask must draw exactly what fragment
-    /// masking alone draws: every pixel centered inside the mask or on its edge
-    /// matches the unmasked frame, and every pixel centered outside it is
-    /// untouched. Mask edges land on pixel centers whenever an odd logical
-    /// coordinate is scaled by 1.5.
+    /// masking alone draws: every pixel centered inside the half-open mask
+    /// (its left and top edges included, right and bottom excluded) matches
+    /// the unmasked frame, and every other pixel is untouched. Mask edges land
+    /// on pixel centers whenever an odd logical coordinate is scaled by 1.5.
     #[test]
     fn vertex_clipping_matches_fragment_masking_on_pixel_center_edges() -> anyhow::Result<()> {
         let _gpu_test_guard = crate::test_gpu::guard();
@@ -416,7 +424,7 @@ mod path_target_tests {
                 let (right, bottom) = (left + mask.size.width.0, top + mask.size.height.0);
                 let difference = masked.enumerate_pixels().find(|(x, y, pixel)| {
                     let (cx, cy) = (*x as f32 + 0.5, *y as f32 + 0.5);
-                    let inside = cx >= left && cx <= right && cy >= top && cy <= bottom;
+                    let inside = cx >= left && cx < right && cy >= top && cy < bottom;
                     if inside {
                         *pixel != full.get_pixel(*x, *y)
                     } else {

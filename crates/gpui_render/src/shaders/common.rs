@@ -181,21 +181,10 @@ mod source {
             bounds.origin + Bounds::half_size(bounds)
         }
 
-        /// The part of `bounds` that can reach a pixel inside `mask`, empty (zero
-        /// size) when there is none. The mask grows by a pixel: a rectangle drops
-        /// pixels centered on its right and bottom edges, so ending exactly at the
-        /// mask would cut pixels that fragment masking keeps for every other
-        /// primitive.
-        pub fn clip_to_mask(bounds: Bounds, mask: Bounds) -> Bounds {
-            let margin = vec2f(1.0, 1.0);
-            let origin = max(bounds.origin, mask.origin - margin);
-            let end = max(
-                min(
-                    bounds.origin + bounds.size,
-                    mask.origin + mask.size + margin,
-                ),
-                origin,
-            );
+        /// The overlap of two bounds, empty (zero size) when they are disjoint.
+        pub fn intersect(a: Bounds, b: Bounds) -> Bounds {
+            let origin = max(a.origin, b.origin);
+            let end = max(min(a.origin + a.size, b.origin + b.size), origin);
             Bounds {
                 origin,
                 size: end - origin,
@@ -448,11 +437,14 @@ mod source {
         )
     }
 
-    /// A pixel centered on a mask edge stays inside. Its interpolated distance is
-    /// a rounding error either side of zero, which depends on the primitive's
-    /// vertices, so every primitive must decide it with the same margin.
+    /// The mask is half open, like a rasterized rectangle: a pixel centered on its
+    /// left or top edge is inside, on its right or bottom edge outside, so masks
+    /// that meet draw such pixels once. There the interpolated distance is a
+    /// rounding error either side of zero that depends on the primitive's
+    /// vertices, so a small margin decides every primitive alike.
     pub fn is_clipped(distances: Vec4f) -> bool {
-        min(min(distances.x, distances.y), min(distances.z, distances.w)) < -1.0 / 256.0
+        let margin = 1.0 / 256.0;
+        min(distances.x, distances.z) < -margin || min(distances.y, distances.w) < margin
     }
 
     pub fn unclipped_distances() -> Vec4f {
