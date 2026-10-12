@@ -233,43 +233,25 @@ fn write_bytes(out_dir: &std::path::Path, name: &str, bytes: &[u8]) {
 }
 
 fn validate_with_current(name: &str, source: &str) {
-    let module = naga::front::wgsl::parse_str(source).unwrap_or_else(|error| {
-        panic!(
-            "current Naga failed to parse {name}:\n{}",
-            error.emit_to_string(source)
-        )
-    });
+    let module = naga::front::wgsl::parse_str(source)
+        .unwrap_or_else(|error| panic!("current Naga failed to parse {name}: {error}"));
     naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
         naga::valid::Capabilities::all(),
     )
     .validate(&module)
-    .unwrap_or_else(|error| {
-        panic!(
-            "current Naga failed to validate {name}:\n{}",
-            error.emit_to_string(source)
-        )
-    });
+    .unwrap_or_else(|error| panic!("current Naga failed to validate {name}: {error}"));
 }
 
 fn validate_with_floor(name: &str, source: &str) {
-    let module = naga_old::front::wgsl::parse_str(source).unwrap_or_else(|error| {
-        panic!(
-            "floor Naga failed to parse {name}:\n{}",
-            error.emit_to_string(source)
-        )
-    });
+    let module = naga_old::front::wgsl::parse_str(source)
+        .unwrap_or_else(|error| panic!("floor Naga failed to parse {name}: {error}"));
     naga_old::valid::Validator::new(
         naga_old::valid::ValidationFlags::all(),
         naga_old::valid::Capabilities::all(),
     )
     .validate(&module)
-    .unwrap_or_else(|error| {
-        panic!(
-            "floor Naga failed to validate {name}:\n{}",
-            error.emit_to_string(source)
-        )
-    });
+    .unwrap_or_else(|error| panic!("floor Naga failed to validate {name}: {error}"));
 }
 
 /// Validates with the current Naga always, plus the floor Naga unless current-only.
