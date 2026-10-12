@@ -1326,8 +1326,6 @@ impl WindowsWindowInner {
             return Some(0);
         };
         let mut request_frame = self.state.callbacks.request_frame.take()?;
-        // Release retired retained targets whose GPU work has finished, without drawing.
-        self.state.renderer.borrow_mut().poll_retired();
         self.state.direct_manipulation.update();
 
         let events = self.state.direct_manipulation.drain_events();

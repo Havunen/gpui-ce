@@ -273,13 +273,6 @@ impl WindowRenderer {
             Self::Dx12(renderer) => renderer.renderer.release_retained_frame(),
         }
     }
-    pub(crate) fn poll_retired(&self) {
-        match self {
-            Self::Dx11(renderer) => renderer.poll_retired(),
-            #[cfg(feature = "windows-wgpu")]
-            Self::Dx12(_) => {}
-        }
-    }
     pub(crate) fn new(
         hwnd: HWND,
         devices: &DirectXDevices,
@@ -453,11 +446,7 @@ impl Dx12Renderer {
             WgpuSurfaceConfig {
                 size: gpui::size(DevicePixels(1), DevicePixels(1)),
                 transparent: false,
-                preferred_present_mode: Some(dx12_present_mode(
-                    std::env::var("GPUI_WINDOWS_DX12_PRESENT_MODE")
-                        .ok()
-                        .as_deref(),
-                )?),
+                preferred_present_mode: Some(wgpu::PresentMode::Immediate),
             },
             None,
             None,
@@ -500,39 +489,10 @@ impl Dx12Renderer {
     }
 }
 
-#[cfg(feature = "windows-wgpu")]
-fn dx12_present_mode(value: Option<&str>) -> Result<gpui_wgpu::wgpu::PresentMode> {
-    match value {
-        None | Some("immediate") => Ok(gpui_wgpu::wgpu::PresentMode::Immediate),
-        Some("fifo") => Ok(gpui_wgpu::wgpu::PresentMode::Fifo),
-        Some(value) => {
-            bail!("Invalid GPUI_WINDOWS_DX12_PRESENT_MODE={value:?}; expected immediate or fifo")
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::RefCell;
-
-    #[cfg(feature = "windows-wgpu")]
-    #[test]
-    fn dx12_present_mode_override_is_explicit_and_preserves_default() {
-        assert_eq!(
-            dx12_present_mode(None).unwrap(),
-            gpui_wgpu::wgpu::PresentMode::Immediate
-        );
-        assert_eq!(
-            dx12_present_mode(Some("immediate")).unwrap(),
-            gpui_wgpu::wgpu::PresentMode::Immediate
-        );
-        assert_eq!(
-            dx12_present_mode(Some("fifo")).unwrap(),
-            gpui_wgpu::wgpu::PresentMode::Fifo
-        );
-        assert!(dx12_present_mode(Some("typo")).is_err());
-    }
 
     fn context(
         preference: WindowsRendererPreference,
