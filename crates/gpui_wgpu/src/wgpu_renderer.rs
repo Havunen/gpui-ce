@@ -70,9 +70,6 @@ pub struct WgpuRenderer {
     atlas: Arc<WgpuAtlas>,
     globals: GlobalBufferLayout,
     rendering_params: RenderingParameters,
-    /// Path targets cover only the paths' bounds. Tests turn this off to
-    /// compare against full-viewport targets.
-    crop_path_targets: bool,
     subpixel_order: SubpixelOrder,
     dual_source_blending: bool,
     adapter_info: wgpu::AdapterInfo,
@@ -142,7 +139,6 @@ impl WgpuRenderer {
             atlas,
             globals,
             rendering_params,
-            crop_path_targets: true,
             subpixel_order: SubpixelOrder::RedGreenBlue,
             dual_source_blending,
             adapter_info,

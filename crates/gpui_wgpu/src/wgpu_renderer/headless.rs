@@ -482,15 +482,11 @@ mod path_target_tests {
     -> anyhow::Result<()> {
         let _gpu_test_guard = crate::test_gpu::guard();
         let context = WgpuContext::new_headless(None)?;
-        for (crop_paths, resting_fills) in
-            [(false, true), (true, true), (false, false), (true, false)]
-        {
+        for resting_fills in [true, false] {
             let target = size(DevicePixels(200), DevicePixels(400));
             let mut full = WgpuRenderer::new_headless(&context, target)?;
             full.retained.disable_for_tests();
             let mut retained = WgpuRenderer::new_headless(&context, target)?;
-            full.crop_path_targets = crop_paths;
-            retained.crop_path_targets = crop_paths;
             retained.retained.enable_for_tests();
             let mut revision = 0;
             let mut previous = None;
@@ -504,7 +500,7 @@ mod path_target_tests {
                 let actual = retained.render_to_image(&scene)?;
                 assert_eq!(
                     actual, expected,
-                    "retained pixels differ for row {row}, revision {revision}, cropped paths {crop_paths}"
+                    "retained pixels differ for row {row}, revision {revision}, resting fills {resting_fills}"
                 );
                 assert_eq!(
                     retained.retained.last_damage(),
@@ -515,7 +511,7 @@ mod path_target_tests {
                     } else {
                         "partial"
                     },
-                    "damage selection for row {row}, previous {previous:?}, revision {revision}, cropped paths {crop_paths}, resting fills {resting_fills}"
+                    "damage selection for row {row}, previous {previous:?}, revision {revision}, resting fills {resting_fills}"
                 );
                 previous = Some(row);
             }
@@ -1761,14 +1757,7 @@ mod path_target_tests {
     -> anyhow::Result<()> {
         let _gpu_test_guard = crate::test_gpu::guard();
         let context = WgpuContext::new_headless(None)?;
-        for (crop_paths, badge_before_graph) in [
-            (false, None),
-            (true, None),
-            (false, Some(false)),
-            (true, Some(false)),
-            (false, Some(true)),
-            (true, Some(true)),
-        ] {
+        for badge_before_graph in [None, Some(false), Some(true)] {
             for (fraction, smoothing, backing_alpha) in [
                 (0.0, 0.0, 0.45),
                 (0.25, 0.65, 1.0),
@@ -1782,12 +1771,10 @@ mod path_target_tests {
                 retained.retained.enable_for_tests();
                 full.update_transparency(true);
                 retained.update_transparency(true);
-                full.crop_path_targets = crop_paths;
-                retained.crop_path_targets = crop_paths;
                 let glyph = retained_glyph_tile(&full)?;
                 assert_eq!(glyph, retained_glyph_tile(&retained)?);
                 let label = format!(
-                    "fraction={fraction}, smoothing={smoothing}, backing={backing_alpha}, crop={crop_paths}, badge_before_graph={badge_before_graph:?}"
+                    "fraction={fraction}, smoothing={smoothing}, backing={backing_alpha}, badge_before_graph={badge_before_graph:?}"
                 );
                 let mut revision = 0;
                 let mut previous = None;
@@ -1992,8 +1979,6 @@ mod path_target_tests {
         };
         let mut full = WgpuRenderer::new_headless(&context, target).unwrap();
         let mut cropped = WgpuRenderer::new_headless(&context, target).unwrap();
-        full.crop_path_targets = false;
-        cropped.crop_path_targets = true;
         for (x, y, target) in [
             (16.0, 16.0, target),
             (180.0, 120.0, target),

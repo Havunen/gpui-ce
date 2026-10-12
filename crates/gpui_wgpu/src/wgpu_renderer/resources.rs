@@ -254,15 +254,12 @@ impl WgpuResources {
 
 impl WgpuRenderer {
     pub(super) fn ensure_path_textures(&mut self, scene: &gpui::Scene) {
-        let (mut width, mut height) = if self.crop_path_targets {
-            path_target_extent(
-                scene.paths.iter().map(|path| path.clipped_bounds()),
-                self.target.width(),
-                self.target.height(),
-            )
-        } else {
-            (self.target.width(), self.target.height())
-        };
+        // Path targets cover only the paths' bounds.
+        let (mut width, mut height) = path_target_extent(
+            scene.paths.iter().map(|path| path.clipped_bounds()),
+            self.target.width(),
+            self.target.height(),
+        );
         if let Some(texture) = self.resources().path_intermediate_texture.as_ref() {
             // Grow in coarse blocks to avoid reallocating for each small graph
             // change. Window resize invalidates these targets as before.

@@ -43,27 +43,6 @@ use wgsl_rs::std::{vec2f, vec4f};
 
 use std::{cell::Cell, mem, ptr, sync::Arc};
 
-/// Renderer optimizations, all on; tests turn them off to render reference frames.
-/// - path prepass: every path batch of a frame is rasterized in at most
-///   [`MAX_PATH_LAYERS`] cropped passes before the main pass, instead of ending
-///   the main pass around each batch with a full-window MSAA pass.
-/// - opaque quads: opaque rectangles are drawn without blending, so the tile
-///   hardware skips fragments a later opaque quad hides.
-/// - split rounded quads: large rounded opaque quads draw an opaque interior and
-///   blended rims (needs opaque quads).
-/// - partial redraw: frames render into a retained texture that is copied to the
-///   drawable, and repaint only the region whose primitives changed since the
-///   previous frame (see [`gpui_render::damage`]). `GPUI_GPU_EXPERIMENTS=no-partial-redraw`
-///   turns it off.
-#[derive(Clone, Copy, Debug, Default)]
-struct Experiments {
-    path_prepass: bool,
-    opaque_quads: bool,
-    /// Rounded opaque quads draw an opaque interior (needs `opaque_quads`).
-    split_rounded: bool,
-    partial_redraw: bool,
-}
-
 /// Path batches of one frame are grouped into layers whose sampled regions are
 /// pairwise disjoint; each layer is one rasterization pass into its own target.
 const MAX_PATH_LAYERS: usize = 3;
@@ -522,7 +501,9 @@ pub struct MetalRenderer {
     path_intermediate_msaa_texture: Option<metal::Texture>,
     /// Resolve targets for path prepass layers after the first (`path-prepass`).
     path_layer_textures: Vec<metal::Texture>,
-    experiments: Experiments,
+    /// Off with `GPUI_GPU_EXPERIMENTS=no-partial-redraw`: every frame renders
+    /// straight to the drawable.
+    partial_redraw: bool,
     // Offscreen scene target (the scene is rendered here, then blitted to the drawable, so blur
     // passes can sample already-painted content), the half-res ping/pong blur targets, and a
     // full-res target for content-filter groups.
@@ -815,12 +796,7 @@ impl MetalRenderer {
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_layer_textures: Vec::new(),
-            experiments: Experiments {
-                path_prepass: true,
-                opaque_quads: true,
-                split_rounded: true,
-                partial_redraw: gpu::partial_redraw_enabled(),
-            },
+            partial_redraw: gpu::partial_redraw_enabled(),
             scene_color_texture: None,
             blur_ping_texture: None,
             blur_pong_texture: None,
@@ -1022,7 +998,7 @@ impl MetalRenderer {
     fn frame_mode(&mut self, scene: &Scene, viewport_size: Size<DevicePixels>) -> FrameMode {
         // Synchronous presents (live resize, window activation, display
         // requests from the layer) always repaint everything.
-        if !self.experiments.partial_redraw || self.presents_with_transaction {
+        if !self.partial_redraw || self.presents_with_transaction {
             self.forget_previous_frame();
             return FrameMode::Direct;
         }
@@ -1408,13 +1384,11 @@ impl MetalRenderer {
         let mut current_target: &metal::TextureRef = scene_color;
         let mut filter_stack = SmallVec::<[&metal::TextureRef; MAX_FILTER_GROUP_DEPTH]>::new();
 
-        let experiments = self.experiments;
-        let path_plan =
-            if experiments.path_prepass && scene.render_plan().requirements().uses_path_target {
-                plan_path_prepass(scene, viewport_size)
-            } else {
-                None
-            };
+        let path_plan = if scene.render_plan().requirements().uses_path_target {
+            plan_path_prepass(scene, viewport_size)
+        } else {
+            None
+        };
         if let Some(plan) = &path_plan {
             self.ensure_path_layer_textures(plan.layers.len(), viewport_size);
             for (layer_index, layer) in plan.layers.iter().enumerate() {
@@ -2335,20 +2309,18 @@ impl MetalRenderer {
         command_encoder.set_render_pipeline_state(pipeline);
         bind_scene_uniforms(command_encoder, scene_uniforms);
 
-        if !smoothed && self.experiments.opaque_quads {
+        if !smoothed {
             // Rounded opaque quads become an opaque interior plus blended rims.
             let mut expanded = Vec::new();
-            if self.experiments.split_rounded {
-                for (index, quad) in quads.iter().enumerate() {
-                    if let Some(pieces) = split_rounded_opaque_quad(quad) {
-                        if expanded.is_empty() {
-                            expanded.reserve(quads.len() + 4);
-                            expanded.extend_from_slice(&quads[..index]);
-                        }
-                        expanded.extend_from_slice(&pieces);
-                    } else if !expanded.is_empty() {
-                        expanded.push(*quad);
+            for (index, quad) in quads.iter().enumerate() {
+                if let Some(pieces) = split_rounded_opaque_quad(quad) {
+                    if expanded.is_empty() {
+                        expanded.reserve(quads.len() + 4);
+                        expanded.extend_from_slice(&quads[..index]);
                     }
+                    expanded.extend_from_slice(&pieces);
+                } else if !expanded.is_empty() {
+                    expanded.push(*quad);
                 }
             }
             let quads: &[Quad] = if expanded.is_empty() {
@@ -3801,11 +3773,9 @@ mod tests {
         );
     }
 
-    fn experiment_renderer(experiments: Experiments) -> MetalRenderer {
+    fn headless_renderer() -> MetalRenderer {
         let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
-        let mut renderer = MetalRenderer::new_headless(pool);
-        renderer.experiments = experiments;
-        renderer
+        MetalRenderer::new_headless(pool)
     }
 
     fn rect(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
@@ -3897,23 +3867,6 @@ mod tests {
     }
 
     #[test]
-    fn path_prepass_matches_per_batch_passes() {
-        let size = size(DevicePixels(160), DevicePixels(160));
-        for (what, scene) in path_layer_scenes() {
-            let legacy = experiment_renderer(Experiments::default())
-                .render_scene_to_image(&scene, size)
-                .unwrap();
-            let prepass = experiment_renderer(Experiments {
-                path_prepass: true,
-                ..Default::default()
-            })
-            .render_scene_to_image(&scene, size)
-            .unwrap();
-            assert_same_pixels(&legacy, &prepass, what);
-        }
-    }
-
-    #[test]
     fn path_prepass_plans_layers_by_sampled_region() {
         let size = size(DevicePixels(160), DevicePixels(160));
         let scenes = path_layer_scenes();
@@ -3932,15 +3885,11 @@ mod tests {
     }
 
     #[test]
-    fn opaque_quads_match_blended_quads() {
-        let size = size(DevicePixels(96), DevicePixels(96));
-        let mut scene = Scene::default();
-        // Opaque background, then quads that must keep blending: clipped by
-        // their content mask, faded mask edges, rounded, bordered, translucent.
-        scene.insert_primitive(quad(rect(0.0, 0.0, 96.0, 96.0), 0.1, 1.0));
+    fn only_plain_opaque_quads_skip_blending() {
+        // Quads that must keep blending: clipped by their content mask, faded
+        // mask edges, rounded, bordered, translucent.
         let mut clipped = quad(rect(10.0, 10.0, 40.0, 40.0), 0.3, 1.0);
         clipped.content_mask.bounds = rect(20.0, 20.0, 40.0, 10.0);
-        scene.insert_primitive(clipped);
         let mut faded = quad(rect(50.0, 10.0, 30.0, 30.0), 0.4, 1.0);
         faded.content_mask.fade_out = Edges {
             top: ScaledPixels(0.0),
@@ -3948,90 +3897,26 @@ mod tests {
             bottom: ScaledPixels(0.0),
             left: ScaledPixels(0.0),
         };
-        scene.insert_primitive(faded);
         let mut rounded = quad(rect(10.0, 55.0, 30.0, 30.0), 0.5, 1.0);
         rounded.corner_radii = Corners::all(ScaledPixels(9.0));
-        scene.insert_primitive(rounded);
         let mut bordered = quad(rect(50.0, 50.0, 30.0, 30.0), 0.6, 1.0);
         bordered.border_widths = Edges::all(ScaledPixels(2.0));
-        bordered.border_color = solid_background(hsla(0.0, 0.0, 0.1, 1.0));
-        scene.insert_primitive(bordered);
-        scene.insert_primitive(quad(rect(30.0, 30.0, 40.0, 40.0), 0.8, 0.5));
-        // Opaque quads stacked over the translucent one and each other.
-        scene.insert_primitive(quad(rect(35.0, 35.0, 10.0, 10.0), 0.9, 1.0));
-        scene.insert_primitive(quad(rect(40.5, 40.25, 10.0, 10.0), 0.2, 1.0));
-        scene.finish();
-
-        let blended = experiment_renderer(Experiments::default())
-            .render_scene_to_image(&scene, size)
-            .unwrap();
-        let opaque = experiment_renderer(Experiments {
-            opaque_quads: true,
-            ..Default::default()
-        })
-        .render_scene_to_image(&scene, size)
-        .unwrap();
-        assert_same_pixels(&blended, &opaque, "opaque quads");
-
-        let mut both = experiment_renderer(Experiments {
-            opaque_quads: true,
-            path_prepass: true,
-            ..Default::default()
-        });
-        let path_size = gpui::size(DevicePixels(160), DevicePixels(160));
-        for (what, scene) in path_layer_scenes() {
-            let legacy = experiment_renderer(Experiments::default())
-                .render_scene_to_image(&scene, path_size)
-                .unwrap();
-            let image = both.render_scene_to_image(&scene, path_size).unwrap();
-            assert_same_pixels(&legacy, &image, what);
+        let translucent = quad(rect(30.0, 30.0, 40.0, 40.0), 0.8, 0.5);
+        for (what, blended) in [
+            ("clipped", clipped),
+            ("faded", faded),
+            ("rounded", rounded),
+            ("bordered", bordered),
+            ("translucent", translucent),
+        ] {
+            assert!(!quad_is_opaque(&blended), "{what} quads blend");
         }
-    }
-
-    #[test]
-    fn split_rounded_quads_match_blended_quads() {
-        let size = gpui::size(DevicePixels(240), DevicePixels(200));
-        let mut scene = Scene::default();
-        scene.insert_primitive(quad(rect(0.0, 0.0, 240.0, 200.0), 0.1, 1.0));
-        // A card rounded on its left corners at fractional bounds, the
-        // content card's shape.
-        let mut card = quad(rect(10.25, 12.5, 150.5, 120.75), 0.0, 1.0);
-        card.corner_radii = Corners {
-            top_left: ScaledPixels(16.0),
-            top_right: ScaledPixels(0.0),
-            bottom_right: ScaledPixels(0.0),
-            bottom_left: ScaledPixels(16.0),
-        };
-        scene.insert_primitive(card);
-        // Every corner rounded, with unequal radii.
-        let mut pill = quad(rect(120.0, 100.0, 110.0, 90.0), 0.55, 1.0);
-        pill.corner_radii = Corners {
-            top_left: ScaledPixels(20.0),
-            top_right: ScaledPixels(7.0),
-            bottom_right: ScaledPixels(30.0),
-            bottom_left: ScaledPixels(3.0),
-        };
-        scene.insert_primitive(pill);
-        // Translucent and bordered quads over both, which must still blend.
-        scene.insert_primitive(quad(rect(100.0, 80.0, 60.0, 60.0), 0.8, 0.4));
-        let mut bordered = quad(rect(140.0, 20.0, 80.0, 70.0), 0.3, 1.0);
-        bordered.corner_radii = Corners::all(ScaledPixels(12.0));
-        bordered.border_widths = Edges::all(ScaledPixels(2.0));
-        bordered.border_color = solid_background(hsla(0.0, 0.0, 0.1, 1.0));
-        scene.insert_primitive(bordered);
-        scene.finish();
-
-        let blended = experiment_renderer(Experiments::default())
-            .render_scene_to_image(&scene, size)
-            .unwrap();
-        let split = experiment_renderer(Experiments {
-            opaque_quads: true,
-            split_rounded: true,
-            ..Default::default()
-        })
-        .render_scene_to_image(&scene, size)
-        .unwrap();
-        assert_same_pixels(&blended, &split, "split rounded quads");
+        assert!(quad_is_opaque(&quad(rect(0.0, 0.0, 96.0, 96.0), 0.1, 1.0)));
+        assert!(quad_is_opaque(&quad(
+            rect(40.5, 40.25, 10.0, 10.0),
+            0.2,
+            1.0
+        )));
     }
 
     #[test]
@@ -4198,12 +4083,6 @@ mod tests {
     #[test]
     fn partial_redraw_matches_full_redraw() {
         let size = gpui::size(DevicePixels(512), DevicePixels(384));
-        let experiments = Experiments {
-            path_prepass: true,
-            opaque_quads: true,
-            split_rounded: true,
-            ..Default::default()
-        };
         let mask: Vec<u8> = (0..32 * 32)
             .map(|index| ((index % 32) * 8) as u8 ^ ((index / 32) * 5) as u8)
             .collect();
@@ -4226,14 +4105,13 @@ mod tests {
                 .unwrap()
         };
         for opaque in [true, false] {
-            let mut renderer = experiment_renderer(Experiments {
-                partial_redraw: true,
-                ..experiments
-            });
+            let mut renderer = headless_renderer();
+            renderer.partial_redraw = true;
             renderer.opaque = opaque;
             // Full redraws from a renderer of their own, so nothing a partial
             // frame skips is left behind in shared intermediate textures.
-            let mut reference = experiment_renderer(experiments);
+            let mut reference = headless_renderer();
+            reference.partial_redraw = false;
             reference.opaque = opaque;
             let tile = spinner(&renderer);
             assert_eq!(
