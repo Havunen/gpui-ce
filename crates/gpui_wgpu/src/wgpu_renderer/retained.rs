@@ -1,7 +1,9 @@
+use super::resources::WgpuResources;
 use gpui::Scene;
 use gpui::profiler::gpu;
 use gpui_render::damage::{Damage, SceneSnapshot};
 use gpui_render::retained::{GpuMemoryReservation, RetainedScene, reserve_retained_bytes};
+use gpui_render::shaders::{blur::BlurUniforms, interface::bytes_of};
 use std::sync::Arc;
 
 pub(super) struct RetainedFrame {
@@ -20,12 +22,16 @@ struct Target {
     alpha_mode: wgpu::CompositeAlphaMode,
     clear_color: wgpu::Color,
     copy_source: bool,
+    /// Samples the target onto the presentation texture when it isn't copied.
+    /// Owned here: a shared cache would keep the texture alive after a release.
+    blit: wgpu::BindGroup,
     // Held for its drop, which releases the device budget.
     _reservation: GpuMemoryReservation,
 }
 pub(super) struct RetainedPlan {
     pub view: Option<wgpu::TextureView>,
     pub copy_texture: Option<wgpu::Texture>,
+    pub blit: Option<wgpu::BindGroup>,
     pub damage: Damage,
     pub snapshot: Option<SceneSnapshot>,
     pub scene_revision: u64,
@@ -76,15 +82,17 @@ impl RetainedFrame {
         width: u32,
         height: u32,
         copy_source: bool,
-        device: &Arc<wgpu::Device>,
+        resources: &WgpuResources,
         format: wgpu::TextureFormat,
         alpha_mode: wgpu::CompositeAlphaMode,
         clear_color: wgpu::Color,
     ) -> RetainedPlan {
         let context = gpu::gpu_frame_context();
+        let device = &resources.device;
         let full = || RetainedPlan {
             view: None,
             copy_texture: None,
+            blit: None,
             damage: Damage::Full,
             snapshot: None,
             scene_revision: context.scene_revision,
@@ -163,6 +171,22 @@ impl RetainedFrame {
                 return full();
             }
             let view = texture.create_view(&Default::default());
+            let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("gpui_retained_blit"),
+                size: std::mem::size_of::<BlurUniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let size = [width as f32, height as f32];
+            resources
+                .queue
+                .write_buffer(&uniforms, 0, bytes_of(&BlurUniforms::copy(size)));
+            let blit = resources.bind_group_layouts.create_blur(
+                device,
+                uniforms.as_entire_buffer_binding(),
+                &view,
+                &resources.surface_sampler,
+            );
             self.target = Some(Target {
                 texture,
                 view,
@@ -172,6 +196,7 @@ impl RetainedFrame {
                 alpha_mode,
                 clear_color,
                 copy_source,
+                blit,
                 _reservation: reservation,
             });
             // A new target holds nothing yet.
@@ -181,6 +206,7 @@ impl RetainedFrame {
         RetainedPlan {
             view: Some(target.view.clone()),
             copy_texture: copy_source.then(|| target.texture.clone()),
+            blit: Some(target.blit.clone()),
             damage,
             snapshot,
             scene_revision: context.scene_revision,

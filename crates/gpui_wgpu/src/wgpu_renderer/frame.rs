@@ -22,8 +22,9 @@ pub(super) fn render_to_view(
     frame_texture: Option<&wgpu::Texture>,
     readback: Option<ReadbackCopy<'_>>,
 ) -> Option<wgpu::SubmissionIndex> {
-    let mut targets = PreparedTargets::prepare(renderer, scene, frame_view)?;
-    let device = renderer.resources().device.clone();
+    if !begin_frame(renderer) {
+        return None;
+    }
     let atlas_generation = if renderer.retained.enabled() {
         gpui::PlatformAtlas::generation(renderer.atlas.as_ref())
     } else {
@@ -35,11 +36,14 @@ pub(super) fn render_to_view(
         renderer.target.width(),
         renderer.target.height(),
         renderer.target.retained_copy_enabled(),
-        &device,
+        renderer.resources.as_ref()?,
         renderer.target.format(),
         renderer.target.configuration().alpha_mode,
         renderer.target.clear_color(),
     );
+    let transport = renderer.resources().instances.transport();
+    let requirements = FrameRequirements::for_damage(scene, &retained.damage, transport);
+    let mut targets = PreparedTargets::prepare(renderer, scene, frame_view, &requirements)?;
     let retained_copy = if renderer.target.retained_copy_enabled() && targets.offscreen.is_none() {
         retained
             .copy_texture
@@ -61,65 +65,26 @@ pub(super) fn render_to_view(
     };
     if let Some(view) = &retained.view {
         targets.active = view.clone();
-        // The sampled presentation fallback needs a BlurUniforms slot even
-        // without filters. A texture copy has no shader-uniform upload.
-        if retained_copy.is_none() {
-            let mut uniforms =
-                FrameRequirements::for_scene(scene, renderer.resources().instances.transport())
-                    .uniforms;
-            uniforms.filter_count = uniforms.filter_count.saturating_add(1);
-            if !renderer.ensure_uniform_capacity(uniforms) {
-                renderer.retained.invalidate();
-                return None;
-            }
+        // Create the overwrite-clear PSO with the target's first full frame, so
+        // its first partial frame doesn't compile a pipeline on hover.
+        if retained.damage != Damage::Reuse {
+            let device = renderer.resources().device.clone();
+            renderer
+                .resources_mut()
+                .pipelines
+                .ensure_damage_clear(&device);
         }
-    }
-    // Create the overwrite-clear PSO while a qualified retained Full frame is
-    // being initialized. Its first use must not compile a pipeline on hover.
-    // Ineligible scenes and exhausted retained budgets have no retained view.
-    if retained.view.is_some() && retained.damage == Damage::Full {
-        renderer
-            .resources_mut()
-            .pipelines
-            .ensure_damage_clear(&device);
-    }
-    // Partial regions replay batches independently. Reserve bounded duplicate uploads and clear quads.
-    if let Damage::Partial(region) = &retained.damage {
-        let device = renderer.resources().device.clone();
-        renderer
-            .resources_mut()
-            .pipelines
-            .ensure_damage_clear(&device);
-        let transport = renderer.resources().instances.transport();
-        let requirements = FrameRequirements::for_partial_scene(scene, *region, transport);
-        let bytes = requirements.storage_bytes;
-        let batches = requirements.instance_batches;
-        let device = renderer.resources().device.clone();
-        let resources = renderer.resources_mut();
-        if !resources.instances.ensure_capacity(
-            &device,
-            &resources.bind_group_layouts,
-            bytes,
-            batches,
-        ) {
-            return None;
-        }
-        let resources = renderer.resources();
-        let instances = resources
-            .instances
-            .begin_upload(&resources.queue, bytes, batches)?;
-        targets.instances = instances;
     }
     // Prune once against the complete scene. Doing this inside each draw batch would evict a
     // texture that reappears after an intervening primitive and recreate its platform view.
     renderer.retain_surface_cache(&scene.surfaces);
 
-    let retained_blit = retained.view.is_some() && retained_copy.is_none();
+    let retained_blit = retained.blit.filter(|_| retained_copy.is_none());
     #[cfg(test)]
     {
         renderer.last_retained_presentation = if retained_copy.is_some() {
             "copy"
-        } else if retained_blit {
+        } else if retained_blit.is_some() {
             "blit"
         } else {
             "direct"
@@ -187,12 +152,8 @@ impl PreparedTargets {
         renderer: &mut WgpuRenderer,
         scene: &Scene,
         frame_view: &wgpu::TextureView,
+        requirements: &FrameRequirements,
     ) -> Option<Self> {
-        if !begin_frame(renderer) {
-            return None;
-        }
-        let transport = renderer.resources().instances.transport();
-        let requirements = FrameRequirements::for_scene(scene, transport);
         let device = renderer.resources().device.clone();
         let resources = renderer.resources_mut();
         if !resources.instances.ensure_capacity(
@@ -439,6 +400,16 @@ pub(super) struct FrameRequirements {
 }
 
 impl FrameRequirements {
+    /// What a frame uploads: the whole scene, the batches a partial frame
+    /// repaints, or nothing when it reuses the retained frame.
+    fn for_damage(scene: &Scene, damage: &Damage, transport: InstanceTransport) -> Self {
+        match damage {
+            Damage::Full => Self::for_scene(scene, transport),
+            Damage::Partial(region) => Self::for_partial_scene(scene, *region, transport),
+            Damage::Reuse => Self::default(),
+        }
+    }
+
     pub(super) fn for_scene(scene: &Scene, transport: InstanceTransport) -> Self {
         let planned = scene.render_plan().requirements();
         let mut requirements = Self::scene_metadata(scene);
@@ -638,6 +609,12 @@ mod planning_tests {
             // A region over neither quad replays only the clear.
             let empty = FrameRequirements::for_partial_scene(&scene, region(60, 60), transport);
             assert_eq!(empty.instance_batches, 1);
+            // A frame uploads once, sized by its damage; a reused frame uploads nothing.
+            let partial =
+                FrameRequirements::for_damage(&scene, &Damage::Partial(region(24, 24)), transport);
+            assert_eq!(partial.storage_bytes, requirements.storage_bytes);
+            let reuse = FrameRequirements::for_damage(&scene, &Damage::Reuse, transport);
+            assert_eq!((reuse.storage_bytes, reuse.instance_batches), (0, 0));
         }
     }
 }
@@ -651,7 +628,7 @@ struct FrameEncoder<'a> {
     presentation: wgpu::TextureView,
     instances: InstanceUpload,
     damage: Damage,
-    retained_blit: bool,
+    retained_blit: Option<wgpu::BindGroup>,
     retained_copy: Option<(wgpu::Texture, wgpu::Texture)>,
 }
 
@@ -661,7 +638,7 @@ impl<'a> FrameEncoder<'a> {
         scene: &'a Scene,
         targets: PreparedTargets,
         damage: Damage,
-        retained_blit: bool,
+        retained_blit: Option<wgpu::BindGroup>,
         retained_copy: Option<(wgpu::Texture, wgpu::Texture)>,
     ) -> Self {
         let encoder =
@@ -702,12 +679,9 @@ impl<'a> FrameEncoder<'a> {
                     },
                 );
             }
-            if self.retained_blit {
-                self.renderer.blit_to_frame(
-                    &mut self.encoder,
-                    self.targets.current(),
-                    &self.presentation,
-                );
+            if let Some(bind_group) = &self.retained_blit {
+                self.renderer
+                    .draw_blit(&mut self.encoder, bind_group, 0, &self.presentation);
             }
             if let Some(offscreen) = &self.offscreen {
                 self.renderer

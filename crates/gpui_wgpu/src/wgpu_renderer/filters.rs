@@ -200,6 +200,17 @@ impl WgpuRenderer {
         let size = [self.target.width() as f32, self.target.height() as f32];
         let (bind_group, uniform_offset) =
             self.make_blur_bind_group(BlurUniforms::copy(size), source);
+        self.draw_blit(encoder, &bind_group, uniform_offset, frame_view);
+    }
+
+    /// Draws the texture `bind_group` samples over `frame_view` with copy uniforms.
+    pub(super) fn draw_blit(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        bind_group: &wgpu::BindGroup,
+        uniform_offset: u32,
+        frame_view: &wgpu::TextureView,
+    ) {
         let resources = self.resources();
         let mut pass = begin_color_render_pass(
             encoder,
@@ -215,7 +226,7 @@ impl WgpuRenderer {
         );
         pass.set_bind_group(
             shader_interface::DATA_BIND_GROUP,
-            &bind_group,
+            bind_group,
             &[uniform_offset],
         );
         pass.draw(

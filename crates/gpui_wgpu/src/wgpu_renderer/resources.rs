@@ -226,6 +226,11 @@ impl WgpuResources {
         self.surface_uniforms.finish_upload();
     }
 
+    #[cfg(test)]
+    pub(super) fn blur_bind_group_count(&self) -> usize {
+        self.blur_bind_groups.borrow().groups.len()
+    }
+
     pub(super) fn blur_bind_group(&self, source: &wgpu::TextureView) -> wgpu::BindGroup {
         let mut cache = self.blur_bind_groups.borrow_mut();
         let uniform_generation = self.filter_uniforms.generation();

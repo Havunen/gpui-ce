@@ -964,6 +964,28 @@ mod path_target_tests {
     }
 
     #[test]
+    fn replaced_retained_targets_leave_no_blit_bind_groups_behind() -> anyhow::Result<()> {
+        let _gpu_test_guard = crate::test_gpu::guard();
+        let context = WgpuContext::new_headless(None)?;
+        let mut renderer =
+            WgpuRenderer::new_headless(&context, size(DevicePixels(64), DevicePixels(64)))?;
+        renderer.retained.enable_for_tests();
+        #[cfg(target_os = "windows")]
+        renderer.target.disable_retained_copy_for_tests();
+        let mut scene = Scene::default();
+        scene.finish();
+        for revision in 1..=3 {
+            let _scope = gpui::profiler::gpu::set_gpu_frame_context(true, revision);
+            renderer.render_to_image(&scene)?;
+            assert_eq!(renderer.last_retained_presentation, "blit");
+            // A cached bind group would keep each released target alive.
+            renderer.release_retained_frame();
+        }
+        assert_eq!(renderer.resources().blur_bind_group_count(), 0);
+        Ok(())
+    }
+
+    #[test]
     fn retained_targets_return_their_budget_at_once() -> anyhow::Result<()> {
         use gpui_render::retained::{RETAINED_DEVICE_LIMIT, reserve_retained_bytes};
 
