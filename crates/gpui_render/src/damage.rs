@@ -92,8 +92,8 @@ fn rectangle(bounds: Bounds<ScaledPixels>, width: u32, height: u32) -> ScissorRe
 pub struct SceneSnapshot {
     pub(crate) tiles: Vec<u64>,
     pub(crate) atlas_generation: u64,
-    width: u32,
-    height: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
 }
 
 impl SceneSnapshot {

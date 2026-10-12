@@ -40,8 +40,10 @@ impl RetainedScene {
         height: u32,
     ) -> Option<(Damage, Option<SceneSnapshot>)> {
         if self.revision == Some(revision)
-            && (self.snapshot.as_ref())
-                .is_some_and(|kept| kept.atlas_generation == atlas_generation)
+            && self.snapshot.as_ref().is_some_and(|kept| {
+                (kept.atlas_generation, kept.width, kept.height)
+                    == (atlas_generation, width, height)
+            })
         {
             return Some((Damage::Reuse, None));
         }
@@ -150,8 +152,10 @@ mod tests {
         let (damage, snapshot) = retained.plan(&scene(gpui::blue()), 2, 1, 200, 200).unwrap();
         assert!(matches!(damage, Damage::Partial(_)));
         assert!(snapshot.is_some());
-        // An atlas change, a scene that can't be captured, or forgetting all repaint in full.
+        // An atlas change, a resize, a scene that can't be captured, or forgetting
+        // all repaint in full.
         assert_eq!(retained.plan(&red, 1, 2, 200, 200).unwrap().0, Damage::Full);
+        assert_eq!(retained.plan(&red, 1, 1, 400, 200).unwrap().0, Damage::Full);
         assert!(retained.plan(&red, 3, 1, 0, 200).is_none());
         retained.forget();
         assert_eq!(retained.plan(&red, 1, 1, 200, 200).unwrap().0, Damage::Full);
