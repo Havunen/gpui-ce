@@ -130,14 +130,9 @@ impl WgpuRenderer {
     /// Renders through the normal scene path and reads back without presenting.
     pub fn render_to_image(&mut self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
         let target = self.create_offscreen_target();
-        // Frame preparation can consume an asynchronous validation error.
-        // Retain its text for test diagnostics without changing retry policy.
-        let pending_before = self.faults.pending_error.lock().unwrap().clone();
         let submission = self
             .render_to_view_with_readback(scene, &target.view, target.readback_copy())
-            .ok_or_else(|| anyhow::anyhow!(
-                "failed to render scene into the offscreen target; pending_before={pending_before:?}; pending_after={:?}; terminal={:?}; failed_frames={}",
-                self.faults.pending_error.lock().unwrap(), self.terminal_error(), self.faults.consecutive_failed_frames))?;
+            .ok_or_else(|| anyhow::anyhow!("failed to render scene into the offscreen target"))?;
         self.read_offscreen_target(&target, submission)
     }
 }
@@ -411,13 +406,6 @@ mod path_target_tests {
     }
 
     fn hover_scene(row: usize, resting_fills: bool) -> Scene {
-        let mask = ContentMask {
-            bounds: Bounds::new(
-                point(ScaledPixels(0.0), ScaledPixels(0.0)),
-                size(ScaledPixels(200.0), ScaledPixels(100.0)),
-            ),
-            ..Default::default()
-        };
         let mut scene = Scene::default();
         // The headless target clears to black. Leave uncovered pixels around each
         // translucent row so a wrong retained clear color is observable.
@@ -426,11 +414,8 @@ mod path_target_tests {
                 continue;
             }
             scene.insert_primitive(Quad {
-                bounds: Bounds::new(
-                    point(ScaledPixels(4.0), ScaledPixels(10.0 + index as f32 * 25.0)),
-                    size(ScaledPixels(192.0), ScaledPixels(14.0)),
-                ),
-                content_mask: mask,
+                bounds: scaled(4.0, 10.0 + index as f32 * 25.0, 192.0, 14.0),
+                content_mask: full_mask(),
                 background: solid_background(if row == index {
                     gpui::hsla(0.6, 0.4, 0.4, 0.7)
                 } else {
@@ -444,10 +429,7 @@ mod path_target_tests {
             8.0,
             18.0,
             ContentMask {
-                bounds: Bounds::new(
-                    point(ScaledPixels(20.0), ScaledPixels(10.0)),
-                    size(ScaledPixels(18.0), ScaledPixels(14.0)),
-                ),
+                bounds: scaled(20.0, 10.0, 18.0, 14.0),
                 ..Default::default()
             },
         );
@@ -458,15 +440,9 @@ mod path_target_tests {
         });
         scene.insert_primitive(graph);
         scene.insert_primitive(Quad {
-            bounds: Bounds::new(
-                point(ScaledPixels(80.0), ScaledPixels(5.0)),
-                size(ScaledPixels(15.0), ScaledPixels(70.0)),
-            ),
+            bounds: scaled(80.0, 5.0, 15.0, 70.0),
             content_mask: ContentMask {
-                bounds: Bounds::new(
-                    point(ScaledPixels(82.0), ScaledPixels(0.0)),
-                    size(ScaledPixels(10.0), ScaledPixels(100.0)),
-                ),
+                bounds: scaled(82.0, 0.0, 10.0, 100.0),
                 ..Default::default()
             },
             background: solid_background(gpui::hsla(0.02, 0.8, 0.6, 0.4)),

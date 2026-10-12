@@ -3201,15 +3201,6 @@ mod tests {
     }
 
     fn transparent_retained_scene(hover: Option<usize>, glyph: AtlasTile, fraction: f32) -> Scene {
-        transparent_retained_scene_with_badge(hover, glyph, fraction, None)
-    }
-
-    fn transparent_retained_scene_with_badge(
-        hover: Option<usize>,
-        glyph: AtlasTile,
-        fraction: f32,
-        badge: Option<(AtlasTile, bool)>,
-    ) -> Scene {
         use gpui::{Path, Shadow, point, px};
         let mut scene = Scene::default();
         let canvas = scaled(5.0, 5.0, 190.0, 90.0);
@@ -3279,45 +3270,6 @@ mod tests {
                 hsla(0.6, 0.2, 0.16, 0.55)
             });
             scene.insert_primitive(path);
-            if hover == Some(row)
-                && let Some((tile, subpixel)) = badge
-            {
-                // Real history hover adds a branch-name glyph run to an otherwise
-                // empty ref column. Run lengths differ without changing static text.
-                for index in 0..7 + row {
-                    let bounds = scaled(
-                        100.25 + fraction + index as f32 * 8.0,
-                        bounds.origin.y.0 + 2.0,
-                        8.0,
-                        8.0,
-                    );
-                    let mask = ContentMask {
-                        bounds: scaled(99.5, bounds.origin.y.0 - 1.0, 79.5, 11.0),
-                        ..Default::default()
-                    };
-                    if subpixel {
-                        scene.insert_primitive(gpui::SubpixelSprite {
-                            order: 0,
-                            padding: 0,
-                            bounds,
-                            content_mask: mask,
-                            color: hsla(0.07, 0.6, 0.73, 0.7).into(),
-                            tile,
-                            transformation: Default::default(),
-                        });
-                    } else {
-                        scene.insert_primitive(MonochromeSprite {
-                            order: 0,
-                            padding: 0,
-                            bounds,
-                            content_mask: mask,
-                            color: hsla(0.07, 0.6, 0.73, 0.7).into(),
-                            tile,
-                            transformation: Default::default(),
-                        });
-                    }
-                }
-            }
             scene.pop_layer();
         }
         // Later translucent coverage exercises alpha compositing across both damaged rows.
@@ -3510,9 +3462,7 @@ mod tests {
 
     #[test]
     fn retained_hover_badge_glyph_runs_match_full_pixels_on_transparent_target() -> Result<()> {
-        use gpui::{
-            FontId, GlyphId, GlyphRenderMode, PreparedRasterStyle, RenderGlyphParams, point, px,
-        };
+        use gpui::GlyphRenderMode;
         let devices = DirectXDevices::new()?;
         let window = HiddenWindow::new()?;
         let reference_window = HiddenWindow::new()?;
@@ -3526,42 +3476,11 @@ mod tests {
                 height: DevicePixels(400),
             })?;
         }
-        // Stable glyph-shaped coverage uses the production atlas and both glyph
-        // shaders, independent of locally installed fonts or native raster settings.
-        let coverage: Vec<u8> = (0..64)
-            .map(|index| match (index / 8, index % 8) {
-                (4, 1..=6) | (1..=6, 1 | 6) => 255,
-                (_, 2 | 5) => 96,
-                _ => 0,
-            })
-            .collect();
-        let make_glyph = |renderer: &DirectXRenderer, mode: GlyphRenderMode, glyph: u32| {
-            let key = AtlasKey::Glyph {
-                params: RenderGlyphParams {
-                    font_id: FontId(0),
-                    glyph_id: GlyphId(glyph),
-                    font_size: px(8.0),
-                    subpixel_variant: point(0, 0),
-                    scale_factor: 1.0,
-                    raster_style: PreparedRasterStyle::independent(mode),
-                },
-                format: mode.rasterized_format(),
-            };
-            let bytes = if mode == GlyphRenderMode::Subpixel {
-                coverage
-                    .iter()
-                    .flat_map(|&value| [value / 2, value, value.saturating_add(24), 255])
-                    .collect()
-            } else {
-                coverage.clone()
-            };
-            tile(renderer.sprite_atlas().as_ref(), key, bytes)
-        };
-        let glyph = make_glyph(&renderer, GlyphRenderMode::Grayscale, 65);
-        let reference_glyph = make_glyph(&reference, GlyphRenderMode::Grayscale, 65);
+        let glyph = glyph_tile(&renderer, GlyphRenderMode::Grayscale, 65);
+        let reference_glyph = glyph_tile(&reference, GlyphRenderMode::Grayscale, 65);
         for mode in [GlyphRenderMode::Grayscale, GlyphRenderMode::Subpixel] {
-            let badge = make_glyph(&renderer, mode, 66);
-            let reference_badge = make_glyph(&reference, mode, 66);
+            let badge = glyph_tile(&renderer, mode, 66);
+            let reference_badge = glyph_tile(&reference, mode, 66);
             for fraction in [0.0, 0.25, 0.5, 0.75] {
                 for changing_quad in [false, true] {
                     renderer.retained.invalidate();
@@ -3624,10 +3543,7 @@ mod tests {
 
     #[test]
     fn retained_normal_bounds_tree_rows_match_full_pixels_without_paint_layers() -> Result<()> {
-        use gpui::{
-            FontId, GlyphId, GlyphRenderMode, Path, PreparedRasterStyle, RenderGlyphParams, Shadow,
-            point, px,
-        };
+        use gpui::{GlyphRenderMode, Path, Shadow, point, px};
         use gpui_render::damage::{Damage, SceneSnapshot};
 
         let mask = ContentMask {
@@ -3756,40 +3672,11 @@ mod tests {
                 height: DevicePixels(1024),
             })?;
         }
-        let make_glyph = |renderer: &DirectXRenderer, mode: GlyphRenderMode, glyph: u32| {
-            let key = AtlasKey::Glyph {
-                params: RenderGlyphParams {
-                    font_id: FontId(0),
-                    glyph_id: GlyphId(glyph),
-                    font_size: px(8.0),
-                    subpixel_variant: point(0, 0),
-                    scale_factor: 1.0,
-                    raster_style: PreparedRasterStyle::independent(mode),
-                },
-                format: mode.rasterized_format(),
-            };
-            let coverage: Vec<u8> = (0..64)
-                .map(|index| match (index / 8, index % 8) {
-                    (4, 1..=6) | (1..=6, 1 | 6) => 255,
-                    (_, 2 | 5) => 96,
-                    _ => 0,
-                })
-                .collect();
-            let bytes = if mode == GlyphRenderMode::Subpixel {
-                coverage
-                    .iter()
-                    .flat_map(|&value| [value / 2, value, value.saturating_add(24), 255])
-                    .collect()
-            } else {
-                coverage
-            };
-            tile(renderer.sprite_atlas().as_ref(), key, bytes)
-        };
-        let glyph = make_glyph(&renderer, GlyphRenderMode::Grayscale, 65);
-        let reference_glyph = make_glyph(&reference, GlyphRenderMode::Grayscale, 65);
+        let glyph = glyph_tile(&renderer, GlyphRenderMode::Grayscale, 65);
+        let reference_glyph = glyph_tile(&reference, GlyphRenderMode::Grayscale, 65);
         for mode in [GlyphRenderMode::Grayscale, GlyphRenderMode::Subpixel] {
-            let badge = make_glyph(&renderer, mode, 66);
-            let reference_badge = make_glyph(&reference, mode, 66);
+            let badge = glyph_tile(&renderer, mode, 66);
+            let reference_badge = glyph_tile(&reference, mode, 66);
             for fraction in [0.0, 0.25, 0.75] {
                 for appearance in [
                     WindowBackgroundAppearance::Transparent,
@@ -4107,6 +3994,40 @@ mod tests {
             })
             .expect("atlas insert must succeed")
             .expect("atlas insert must produce a tile")
+    }
+
+    /// An 8x8 glyph drawn by the production atlas and glyph shaders, whatever
+    /// fonts or native raster settings the machine has.
+    fn glyph_tile(
+        renderer: &DirectXRenderer,
+        mode: gpui::GlyphRenderMode,
+        glyph: u32,
+    ) -> AtlasTile {
+        use gpui::{FontId, GlyphId, GlyphRenderMode, PreparedRasterStyle, RenderGlyphParams};
+        let key = AtlasKey::Glyph {
+            params: RenderGlyphParams {
+                font_id: FontId(0),
+                glyph_id: GlyphId(glyph),
+                font_size: gpui::px(8.0),
+                subpixel_variant: gpui::point(0, 0),
+                scale_factor: 1.0,
+                raster_style: PreparedRasterStyle::independent(mode),
+            },
+            format: mode.rasterized_format(),
+        };
+        let coverage = (0..64).map(|index| match (index / 8, index % 8) {
+            (4, 1..=6) | (1..=6, 1 | 6) => 255,
+            (_, 2 | 5) => 96,
+            _ => 0u8,
+        });
+        let bytes = if mode == GlyphRenderMode::Subpixel {
+            coverage
+                .flat_map(|value| [value / 2, value, value.saturating_add(24), 255])
+                .collect()
+        } else {
+            coverage.collect()
+        };
+        tile(renderer.sprite_atlas().as_ref(), key, bytes)
     }
 
     #[test]

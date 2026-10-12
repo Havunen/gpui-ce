@@ -71,7 +71,7 @@ struct DeviceBudget(AtomicU64);
 pub struct GpuMemoryReservation {
     budget: Arc<DeviceBudget>,
     /// Number of bytes reserved against the device budget.
-    pub bytes: u64,
+    bytes: u64,
 }
 impl Drop for GpuMemoryReservation {
     fn drop(&mut self) {
