@@ -80,18 +80,18 @@ impl Drop for GpuMemoryReservation {
 }
 /// Reserve additional retained bytes on one device, failing when its shared budget is exceeded.
 pub fn reserve_retained_bytes(
-    backend: &str,
+    backend: &'static str,
     device_key: usize,
     bytes: u64,
 ) -> Option<GpuMemoryReservation> {
-    type Registry = HashMap<(String, usize), Weak<DeviceBudget>>;
+    type Registry = HashMap<(&'static str, usize), Weak<DeviceBudget>>;
     static BUDGETS: OnceLock<Mutex<Registry>> = OnceLock::new();
     let mut budgets = BUDGETS
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     budgets.retain(|_, budget| budget.strong_count() != 0);
-    let key = (backend.to_owned(), device_key);
+    let key = (backend, device_key);
     let budget = budgets
         .get(&key)
         .and_then(Weak::upgrade)
