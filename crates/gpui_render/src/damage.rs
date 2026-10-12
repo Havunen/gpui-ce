@@ -166,14 +166,17 @@ impl SceneSnapshot {
                     sprite_count,
                 } => {
                     // A batch's paths rasterize together, so each also hashes its
-                    // group: the batch's size and where each member lies. Coincident
-                    // paths share MSAA samples only within one batch.
+                    // group: the batch's size and where each member lies and is
+                    // clipped. Coincident paths share MSAA samples only within one
+                    // batch.
                     let paths = &scene.paths[range.clone()];
                     let group = [range.len(), *rasterization_vertex_count, *sprite_count]
                         .into_iter()
                         .fold(SEED ^ 5, |hash, value| mix(hash, value as u64));
-                    let group = (paths.iter())
-                        .fold(group, |hash, path| mix(hash, hash_of(7, &[path.bounds])));
+                    let group = paths.iter().fold(group, |hash, path| {
+                        let hash = mix(hash, hash_of(7, &[path.bounds]));
+                        mix(hash, hash_of(8, &[path.content_mask]))
+                    });
                     for path in paths {
                         let hash = [
                             hash_of(6, &path.vertices),
@@ -855,10 +858,10 @@ mod tests {
 
     #[test]
     fn regrouped_paths_repaint_although_every_tile_and_batch_size_matches() {
-        // A quad in a tile of its own splits four triangles into two batches.
-        // Coincident triangles in one batch share MSAA samples; in two batches
-        // they composite twice, so moving them apart changes their edges.
-        let frame = |xs: [f32; 4]| {
+        // A quad in a tile of its own splits four paths into two batches.
+        // Coincident paths in one batch share MSAA samples; in two batches
+        // they composite twice, so regrouping them changes their edges.
+        let frame = |paths: [Path<ScaledPixels>; 4]| {
             let mut scene = Scene::default();
             // A layer each gives every primitive its own draw order.
             let mut paint = |primitive: Primitive| {
@@ -866,11 +869,11 @@ mod tests {
                 scene.insert_primitive(primitive);
                 scene.pop_layer();
             };
-            for (index, x) in xs.into_iter().enumerate() {
+            for (index, path) in paths.into_iter().enumerate() {
                 if index == 2 {
                     paint(quad(bounds(420.0, 420.0, 20.0, 20.0), gpui::white()).into());
                 }
-                paint(path(x, 8.25, gpui::white()).into());
+                paint(path.into());
             }
             scene.finish();
             assert!(matches!(
@@ -883,9 +886,28 @@ mod tests {
             ));
             SceneSnapshot::capture(&scene, 1, 512, 1024, Vec::new()).unwrap()
         };
-        let paired = frame([8.25, 8.25, 200.25, 200.25]);
-        let crossed = frame([8.25, 200.25, 8.25, 200.25]);
+        // Triangles moved apart.
+        let at = |x| path(x, 8.25, gpui::white());
+        let paired = frame([at(8.25), at(8.25), at(200.25), at(200.25)]);
+        let crossed = frame([at(8.25), at(200.25), at(8.25), at(200.25)]);
         assert_eq!(region(crossed.compare(&paired)), rect(0, 0, 256, 64));
+        // One wide triangle clipped to the left or the right: every path has
+        // the same bounds, so only the masks tell the batches apart.
+        let clipped = |left: f32| {
+            let mut wide = Path::new(point(gpui::px(12.25), gpui::px(12.25)));
+            wide.line_to(point(gpui::px(300.25), gpui::px(12.25)));
+            wide.line_to(point(gpui::px(12.25), gpui::px(120.25)));
+            let mut wide = wide.scale(1.0);
+            wide.content_mask = ContentMask {
+                bounds: bounds(left, 0.0, 56.0, 256.0),
+                ..Default::default()
+            };
+            wide.color = gpui::white().into();
+            wide
+        };
+        let paired = frame([clipped(0.0), clipped(0.0), clipped(200.0), clipped(200.0)]);
+        let crossed = frame([clipped(0.0), clipped(200.0), clipped(0.0), clipped(200.0)]);
+        assert_eq!(region(crossed.compare(&paired)), rect(0, 0, 320, 128));
     }
 
     #[test]

@@ -548,10 +548,10 @@ mod path_target_tests {
             bounds: scaled(0.0, 0.0, 512.0, 512.0),
             ..Default::default()
         };
-        // A quad in a tile of its own splits four triangles into two batches.
-        // Coincident triangles in one batch share MSAA samples; in two batches
-        // they composite twice, so moving them apart changes their edges.
-        let scene = |xs: [f32; 4]| {
+        // A quad in a tile of its own splits four paths into two batches.
+        // Coincident paths in one batch share MSAA samples; in two batches
+        // they composite twice, so regrouping them changes their edges.
+        let scene = |paths: [gpui::Path<ScaledPixels>; 4]| {
             let mut scene = Scene::default();
             // A layer each gives every primitive its own draw order.
             let mut paint = |primitive: gpui::Primitive| {
@@ -559,7 +559,7 @@ mod path_target_tests {
                 scene.insert_primitive(primitive);
                 scene.pop_layer();
             };
-            for (index, x) in xs.into_iter().enumerate() {
+            for (index, path) in paths.into_iter().enumerate() {
                 if index == 2 {
                     paint(
                         Quad {
@@ -571,17 +571,39 @@ mod path_target_tests {
                         .into(),
                     );
                 }
-                paint(triangle(x, 12.25, 24.75, mask).into());
+                paint(path.into());
             }
             scene.finish();
             scene
         };
-        let paired = scene([12.25, 12.25, 204.25, 204.25]);
-        let crossed = scene([12.25, 204.25, 12.25, 204.25]);
-        let before = assert_retained_rgba(&mut full, &mut retained, &paired, 1, "full", "paired")?;
-        let after =
-            assert_retained_rgba(&mut full, &mut retained, &crossed, 2, "partial", "crossed")?;
-        assert_ne!(before, after, "regrouping must change the edges");
+        let moved = |x| triangle(x, 12.25, 24.75, mask);
+        // One wide triangle clipped to the left or the right: every path has
+        // the same bounds, so only the masks tell the batches apart.
+        let clipped = |left| {
+            let mask = ContentMask {
+                bounds: scaled(left, 0.0, 56.0, 256.0),
+                ..Default::default()
+            };
+            triangle(12.25, 12.25, 288.0, mask)
+        };
+        for (what, paired, crossed) in [
+            (
+                "moved",
+                scene([moved(12.25), moved(12.25), moved(204.25), moved(204.25)]),
+                scene([moved(12.25), moved(204.25), moved(12.25), moved(204.25)]),
+            ),
+            (
+                "clipped",
+                scene([clipped(0.0), clipped(0.0), clipped(200.0), clipped(200.0)]),
+                scene([clipped(0.0), clipped(200.0), clipped(0.0), clipped(200.0)]),
+            ),
+        ] {
+            retained.release_retained_frame();
+            let before = assert_retained_rgba(&mut full, &mut retained, &paired, 1, "full", what)?;
+            let after =
+                assert_retained_rgba(&mut full, &mut retained, &crossed, 2, "partial", what)?;
+            assert_ne!(before, after, "{what}: regrouping must change the edges");
+        }
         Ok(())
     }
 
