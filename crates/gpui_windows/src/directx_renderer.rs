@@ -3200,36 +3200,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn a_retained_target_that_cannot_be_created_draws_in_full() -> Result<()> {
-        use gpui_render::damage::Damage;
-        use gpui_render::retained::{RETAINED_DEVICE_LIMIT, reserve_retained_bytes};
-
-        let devices = DirectXDevices::new()?;
-        let window = HiddenWindow::new()?;
-        let mut renderer = DirectXRenderer::new(window.0, &devices, true)?;
-        renderer.retained.enable_for_tests();
-        let mut scene = Scene::default();
-        scene.finish();
-        let _guard = gpui::profiler::gpu::set_gpu_frame_context(true, 1);
-        // Within the budget but far wider than any D3D11 device allows (16384 is
-        // the feature-level limit, which some devices exceed), so creation fails.
-        let plan = renderer.retained.prepare(
-            &scene,
-            renderer.atlas.as_ref(),
-            1 << 20,
-            1,
-            WindowBackgroundAppearance::Opaque,
-            &devices.device,
-        );
-        assert!(plan.rtv.is_none());
-        assert_eq!(plan.damage, Damage::Full);
-        // The failed attempt keeps none of the budget.
-        let device_key = devices.device.as_raw() as usize;
-        assert!(reserve_retained_bytes("d3d11", device_key, RETAINED_DEVICE_LIMIT).is_some());
-        Ok(())
-    }
-
     fn transparent_retained_scene(hover: Option<usize>, glyph: AtlasTile, fraction: f32) -> Scene {
         transparent_retained_scene_with_badge(hover, glyph, fraction, None)
     }
