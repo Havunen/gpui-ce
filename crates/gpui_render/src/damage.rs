@@ -165,11 +165,16 @@ impl SceneSnapshot {
                     rasterization_vertex_count,
                     sprite_count,
                 } => {
-                    // A batch's paths rasterize together, so each hashes its group too.
+                    // A batch's paths rasterize together, so each also hashes its
+                    // group: the batch's size and where each member lies. Coincident
+                    // paths share MSAA samples only within one batch.
+                    let paths = &scene.paths[range.clone()];
                     let group = [range.len(), *rasterization_vertex_count, *sprite_count]
                         .into_iter()
                         .fold(SEED ^ 5, |hash, value| mix(hash, value as u64));
-                    for path in &scene.paths[range.clone()] {
+                    let group = (paths.iter())
+                        .fold(group, |hash, path| mix(hash, hash_of(7, &[path.bounds])));
+                    for path in paths {
                         let hash = [
                             hash_of(6, &path.vertices),
                             hash_of(7, &[path.bounds]),
@@ -846,6 +851,41 @@ mod tests {
         ));
         let joined = SceneSnapshot::capture(&joined, 1, 512, 1024, Vec::new()).unwrap();
         assert_eq!(region(joined.compare(&alone)), rect(0, 0, 448, 64));
+    }
+
+    #[test]
+    fn regrouped_paths_repaint_although_every_tile_and_batch_size_matches() {
+        // A quad in a tile of its own splits four triangles into two batches.
+        // Coincident triangles in one batch share MSAA samples; in two batches
+        // they composite twice, so moving them apart changes their edges.
+        let frame = |xs: [f32; 4]| {
+            let mut scene = Scene::default();
+            // A layer each gives every primitive its own draw order.
+            let mut paint = |primitive: Primitive| {
+                scene.push_layer(full_mask().bounds);
+                scene.insert_primitive(primitive);
+                scene.pop_layer();
+            };
+            for (index, x) in xs.into_iter().enumerate() {
+                if index == 2 {
+                    paint(quad(bounds(420.0, 420.0, 20.0, 20.0), gpui::white()).into());
+                }
+                paint(path(x, 8.25, gpui::white()).into());
+            }
+            scene.finish();
+            assert!(matches!(
+                scene.render_commands(),
+                [
+                    RenderCommand::Batch(PrimitiveBatch::Paths { range: a, .. }),
+                    RenderCommand::Batch(PrimitiveBatch::Quads { .. }),
+                    RenderCommand::Batch(PrimitiveBatch::Paths { range: b, .. }),
+                ] if a.len() == 2 && b.len() == 2
+            ));
+            SceneSnapshot::capture(&scene, 1, 512, 1024, Vec::new()).unwrap()
+        };
+        let paired = frame([8.25, 8.25, 200.25, 200.25]);
+        let crossed = frame([8.25, 200.25, 8.25, 200.25]);
+        assert_eq!(region(crossed.compare(&paired)), rect(0, 0, 256, 64));
     }
 
     #[test]

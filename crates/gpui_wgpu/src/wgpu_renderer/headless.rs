@@ -536,6 +536,56 @@ mod path_target_tests {
     }
 
     #[test]
+    fn retained_regrouped_coincident_paths_match_full_pixels() -> anyhow::Result<()> {
+        let _gpu_test_guard = crate::test_gpu::guard();
+        let context = WgpuContext::new_headless(None)?;
+        let target = size(DevicePixels(512), DevicePixels(512));
+        let mut full = WgpuRenderer::new_headless(&context, target)?;
+        let mut retained = WgpuRenderer::new_headless(&context, target)?;
+        full.retained.disable_for_tests();
+        retained.retained.enable_for_tests();
+        let mask = ContentMask {
+            bounds: scaled(0.0, 0.0, 512.0, 512.0),
+            ..Default::default()
+        };
+        // A quad in a tile of its own splits four triangles into two batches.
+        // Coincident triangles in one batch share MSAA samples; in two batches
+        // they composite twice, so moving them apart changes their edges.
+        let scene = |xs: [f32; 4]| {
+            let mut scene = Scene::default();
+            // A layer each gives every primitive its own draw order.
+            let mut paint = |primitive: gpui::Primitive| {
+                scene.push_layer(mask.bounds);
+                scene.insert_primitive(primitive);
+                scene.pop_layer();
+            };
+            for (index, x) in xs.into_iter().enumerate() {
+                if index == 2 {
+                    paint(
+                        Quad {
+                            bounds: scaled(420.0, 420.0, 20.0, 20.0),
+                            content_mask: mask,
+                            background: solid_background(gpui::white()),
+                            ..Default::default()
+                        }
+                        .into(),
+                    );
+                }
+                paint(triangle(x, 12.25, 24.75, mask).into());
+            }
+            scene.finish();
+            scene
+        };
+        let paired = scene([12.25, 12.25, 204.25, 204.25]);
+        let crossed = scene([12.25, 204.25, 12.25, 204.25]);
+        let before = assert_retained_rgba(&mut full, &mut retained, &paired, 1, "full", "paired")?;
+        let after =
+            assert_retained_rgba(&mut full, &mut retained, &crossed, 2, "partial", "crossed")?;
+        assert_ne!(before, after, "regrouping must change the edges");
+        Ok(())
+    }
+
+    #[test]
     fn retained_moves_shadows_rings_paths_and_rotated_sprites_exactly() -> anyhow::Result<()> {
         let _gpu_test_guard = crate::test_gpu::guard();
         let context = WgpuContext::new_headless(None)?;
