@@ -4225,6 +4225,9 @@ mod tests {
             drag.ended(NSDragOperationMove)
                 .map(|completion| completion.files),
             Some(outbound_files(Operation::Move))
+        );
+    }
+
     #[test]
     fn directional_resize_specs_preserve_each_corner() {
         assert_eq!(

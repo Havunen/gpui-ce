@@ -20,7 +20,8 @@ use parley::{
     Affinity, Alignment, AlignmentOptions, CHROMIUM_LINE_BREAK_OVERRIDE, Cluster, Cursor,
     FontContext, FontFamily, FontFamilyName, FontFeature, FontFeatures, FontStyle,
     FontVariation as ParleyFontVariation, FontWeight, GenericFamily, InlineBox, InlineBoxKind,
-    Layout, LayoutContext, Line, LineHeight, PositionedLayoutItem, Selection, StyleProperty,
+    Layout, LayoutContext, Line, LineHeight, LineMetrics, PositionedLayoutItem, Selection,
+    StyleProperty, VerticalAlign,
 };
 use skrifa::instance::NormalizedCoord;
 use std::{
@@ -832,7 +833,7 @@ impl ParleyLayout {
             .collect::<HashSet<_>>();
 
         for line in layout.lines() {
-            let block = f64::from(line.metrics().block_min_coord);
+            let block = f64::from(Self::cursor_top(line.metrics()));
             visit_line_clusters(line, |cluster, advance| {
                 let range = cluster.text_range();
                 let (left, right) = if cluster.is_rtl() {
@@ -994,8 +995,14 @@ impl ParleyLayout {
             // f64; converting it back to f32 preserves that value exactly.
             // Adjacent line bounds can overlap due to independent rounding,
             // so containment can mistakenly select the preceding line.
-            .position(|line| line.metrics().block_min_coord == cursor_top)
+            .position(|line| Self::cursor_top(line.metrics()) == cursor_top)
             .unwrap_or_else(|| self.layout.len().saturating_sub(1))
+    }
+
+    /// The top of a caret on this line, as Parley's cursor geometry places it:
+    /// the higher of the line box and its content box, which can overflow it.
+    fn cursor_top(metrics: &LineMetrics) -> f32 {
+        f32::min(metrics.block_min_coord, metrics.content_block_min_coord)
     }
 
     fn inline_cluster_geometry(&self) -> Vec<ParleyClusterGeometry> {
@@ -1057,7 +1064,7 @@ impl PlatformTextLayout for ParleyLayout {
     }
 
     fn size(&self) -> Size<Pixels> {
-        let width = if self.text.is_empty() && self.layout.inline_boxes().is_empty() {
+        let width = if self.text.is_empty() && self.layout.inline_boxes().len() == 0 {
             Pixels::ZERO
         } else {
             px(self.layout.width())
@@ -1126,7 +1133,7 @@ impl PlatformTextLayout for ParleyLayout {
             return None;
         }
 
-        if self.text.is_empty() && self.layout.inline_boxes().is_empty() {
+        if self.text.is_empty() && self.layout.inline_boxes().len() == 0 {
             return Some(Bounds::new(
                 point(self.inline_lines[0].origin.x, Pixels::ZERO),
                 size(Pixels::ZERO, line_height),
@@ -1152,7 +1159,7 @@ impl PlatformTextLayout for ParleyLayout {
         caret: CaretPosition,
         direction: VisualDirection,
     ) -> Option<CaretPosition> {
-        if self.text.is_empty() && self.layout.inline_boxes().is_empty() {
+        if self.text.is_empty() && self.layout.inline_boxes().len() == 0 {
             return None;
         }
 
@@ -1956,6 +1963,8 @@ impl ParleyTextSystem {
                     index: inline_box.index,
                     width: f32::from(inline_box.size.width),
                     height: f32::from(inline_box.size.height),
+                    baseline: None,
+                    vertical_align: VerticalAlign::BASELINE,
                 });
             }
 
@@ -2029,6 +2038,7 @@ impl ParleyTextSystem {
                 alignment,
                 AlignmentOptions {
                     align_when_overflowing: true,
+                    last_line_alignment: None,
                 },
             );
         }
@@ -2092,8 +2102,7 @@ impl ParleyTextSystem {
                 let normalized_coords = run
                     .normalized_coords()
                     .iter()
-                    .copied()
-                    .map(NormalizedCoord::from_bits)
+                    .map(|coord| NormalizedCoord::from_bits(coord.to_bits()))
                     .collect::<Vec<_>>();
                 let shaping_variations = self
                     .automatic_optical_sizing
@@ -2107,10 +2116,10 @@ impl ParleyTextSystem {
                 )?;
 
                 let baseline = glyph_run.baseline();
-                let run_metrics = glyph_run.run().metrics();
+                let run_metrics = glyph_run.run().font_metrics();
 
-                // Resolve leading from the input ranges. Parley 0.11 can report the
-                // following style's line height in a shaped run's cached metrics.
+                // Resolve leading from the input ranges. Parley's run metrics carry
+                // only the font's metrics, not the style's line height.
                 let range = run.text_range();
                 let first_style =
                     text_styles.partition_point(|style| style.range.end <= range.start);
@@ -2119,11 +2128,7 @@ impl ParleyTextSystem {
                     .take_while(|style| style.range.start < range.end)
                     .map(|style| f32::from(style.line_height))
                     .reduce(f32::max)
-                    .unwrap_or_else(|| {
-                        line_height
-                            .map(f32::from)
-                            .unwrap_or(run_metrics.line_height)
-                    });
+                    .unwrap_or_else(|| line_height.map(f32::from).unwrap_or(metrics.line_height));
 
                 let half_leading =
                     ((run_line_height - run_metrics.ascent - run_metrics.descent) / 2.).max(0.);
@@ -2201,8 +2206,8 @@ impl ParleyTextSystem {
             inline_text_bounds.push((text_top, text_bottom));
 
             width = width.max(line_advance);
-            ascent = ascent.max(px(metrics.ascent));
-            descent = descent.max(px(metrics.descent));
+            ascent = ascent.max(px(metrics.baseline - metrics.content_block_min_coord));
+            descent = descent.max(px(metrics.content_block_max_coord - metrics.baseline));
         }
 
         if visual_lines.is_empty() {

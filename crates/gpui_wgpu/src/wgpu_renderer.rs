@@ -324,13 +324,7 @@ impl WgpuRenderer {
         frame_view: &wgpu::TextureView,
         readback: frame::ReadbackCopy<'_>,
     ) -> Option<wgpu::SubmissionIndex> {
-        frame::render_to_view(
-            self,
-            scene,
-            frame_view,
-            readback.texture,
-            Some(readback),
-        )
+        frame::render_to_view(self, scene, frame_view, readback.texture, Some(readback))
     }
 }
 
