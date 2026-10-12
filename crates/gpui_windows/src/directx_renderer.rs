@@ -593,13 +593,9 @@ impl DirectXRenderer {
         }
 
         self.upload_scene_buffers(scene)?;
-        if let Damage::Partial(regions) = &retained.damage {
+        if let Damage::Partial(region) = &retained.damage {
             let mut quads = scene.quads.clone();
-            quads.extend(
-                regions
-                    .iter()
-                    .map(|region| clear_quad(*region, clear_color)),
-            );
+            quads.push(clear_quad(*region, clear_color));
             let devices = self.devices.as_ref().unwrap();
             self.pipelines.quad_pipeline.update_buffer(
                 &devices.device,
@@ -697,168 +693,162 @@ impl DirectXRenderer {
             .as_ref()
             .and_then(|devices| devices.annotation.clone())
             .filter(|annotation| unsafe { annotation.GetStatus().as_bool() });
-        let regions: SmallVec<[Option<DamageRect>; 8]> = match &retained.damage {
-            Damage::Partial(regions) => regions.iter().copied().map(Some).collect(),
-            _ => smallvec::smallvec![None],
+        let region = match &retained.damage {
+            Damage::Partial(region) => Some(*region),
+            _ => None,
         };
-        for (region_index, region) in regions.into_iter().enumerate() {
-            let scissor = region.unwrap_or(DamageRect {
-                x: 0,
-                y: 0,
-                width: self.width,
-                height: self.height,
-            });
-            set_scissor(&ctx, scissor);
-            if region.is_some() {
-                self.draw_damage_clear(instance_range(
-                    &(scene.quads.len() + region_index..scene.quads.len() + region_index + 1),
-                )?)?;
-            }
-            for command in scene.render_commands() {
-                if let (Some(region), RenderCommand::Batch(batch)) = (region, command) {
-                    if !batch_intersects(scene, batch, region) {
-                        continue;
-                    }
-                }
-                if matches!(
-                    command,
-                    RenderCommand::Batch(PrimitiveBatch::Paths {
-                        rasterization_vertex_count: 0,
-                        ..
-                    })
-                ) {
+        let scissor = region.unwrap_or(DamageRect {
+            x: 0,
+            y: 0,
+            width: self.width,
+            height: self.height,
+        });
+        set_scissor(&ctx, scissor);
+        if region.is_some() {
+            self.draw_damage_clear(instance_range(&(scene.quads.len()..scene.quads.len() + 1))?)?;
+        }
+        for command in scene.render_commands() {
+            if let (Some(region), RenderCommand::Batch(batch)) = (region, command) {
+                if !batch_intersects(scene, batch, region) {
                     continue;
                 }
-                let _annotation = annotation
-                    .as_ref()
-                    .map(|annotation| Annotation::new(annotation, HSTRING::from(command.label())));
-                let command_result = match command {
-                    RenderCommand::Batch(PrimitiveBatch::Shadows { range, smoothed }) => {
-                        self.draw_shadows(instance_range(range)?, *smoothed)
-                    }
-                    RenderCommand::Batch(PrimitiveBatch::Quads { range, smoothed }) => {
-                        self.draw_quads(instance_range(range)?, *smoothed)
-                    }
-                    RenderCommand::Batch(PrimitiveBatch::Paths {
-                        range,
-                        rasterization_vertex_count,
-                        sprite_count,
-                    }) => {
-                        let paths = &scene.paths[range.clone()];
-                        set_scissor(
-                            &ctx,
-                            DamageRect {
-                                x: 0,
-                                y: 0,
-                                width: self.width,
-                                height: self.height,
-                            },
-                        );
-                        self.draw_paths_to_intermediate(paths, *rasterization_vertex_count)?;
-                        set_scissor(&ctx, scissor);
-                        self.draw_paths_from_intermediate(paths, *sprite_count)
-                    }
-                    RenderCommand::Batch(PrimitiveBatch::Underlines(range)) => {
-                        self.draw_underlines(instance_range(range)?)
-                    }
-                    RenderCommand::Batch(PrimitiveBatch::MonochromeSprites {
-                        texture_id,
-                        range,
-                    }) => self.draw_monochrome_sprites(*texture_id, instance_range(range)?),
-                    RenderCommand::Batch(PrimitiveBatch::SubpixelSprites { texture_id, range }) => {
-                        self.draw_subpixel_sprites(*texture_id, instance_range(range)?)
-                    }
-                    RenderCommand::Batch(PrimitiveBatch::PolychromeSprites {
-                        texture_id,
-                        range,
-                        smoothed,
-                    }) => {
-                        self.draw_polychrome_sprites(*texture_id, instance_range(range)?, *smoothed)
-                    }
-                    RenderCommand::Batch(PrimitiveBatch::Surfaces(range)) => self.draw_surfaces(
-                        &scene.surfaces[range.clone()],
-                        &scene.surface_opacities()[range.clone()],
-                    ),
-                    RenderCommand::Batch(PrimitiveBatch::BackdropFilters(range)) => {
-                        let result = (|| {
-                            for filter in &scene.backdrop_filters[range.clone()] {
-                                self.dx_blur_and_composite(
-                                    &current_srv,
-                                    &current_rtv,
-                                    filter.bounds,
-                                    filter.content_mask.bounds,
-                                    filter.corner_radii,
-                                    filter.corner_smoothing,
-                                    filter.max_blur_radius(),
-                                    filter.opacity,
-                                    true,
-                                )?;
-                            }
-                            Ok::<(), anyhow::Error>(())
-                        })();
-                        // Restore the current target for subsequent batches.
-                        unsafe {
-                            ctx.OMSetRenderTargets(Some(slice::from_ref(&current_rtv)), None);
+            }
+            if matches!(
+                command,
+                RenderCommand::Batch(PrimitiveBatch::Paths {
+                    rasterization_vertex_count: 0,
+                    ..
+                })
+            ) {
+                continue;
+            }
+            let _annotation = annotation
+                .as_ref()
+                .map(|annotation| Annotation::new(annotation, HSTRING::from(command.label())));
+            let command_result = match command {
+                RenderCommand::Batch(PrimitiveBatch::Shadows { range, smoothed }) => {
+                    self.draw_shadows(instance_range(range)?, *smoothed)
+                }
+                RenderCommand::Batch(PrimitiveBatch::Quads { range, smoothed }) => {
+                    self.draw_quads(instance_range(range)?, *smoothed)
+                }
+                RenderCommand::Batch(PrimitiveBatch::Paths {
+                    range,
+                    rasterization_vertex_count,
+                    sprite_count,
+                }) => {
+                    let paths = &scene.paths[range.clone()];
+                    set_scissor(
+                        &ctx,
+                        DamageRect {
+                            x: 0,
+                            y: 0,
+                            width: self.width,
+                            height: self.height,
+                        },
+                    );
+                    self.draw_paths_to_intermediate(paths, *rasterization_vertex_count)?;
+                    set_scissor(&ctx, scissor);
+                    self.draw_paths_from_intermediate(paths, *sprite_count)
+                }
+                RenderCommand::Batch(PrimitiveBatch::Underlines(range)) => {
+                    self.draw_underlines(instance_range(range)?)
+                }
+                RenderCommand::Batch(PrimitiveBatch::MonochromeSprites { texture_id, range }) => {
+                    self.draw_monochrome_sprites(*texture_id, instance_range(range)?)
+                }
+                RenderCommand::Batch(PrimitiveBatch::SubpixelSprites { texture_id, range }) => {
+                    self.draw_subpixel_sprites(*texture_id, instance_range(range)?)
+                }
+                RenderCommand::Batch(PrimitiveBatch::PolychromeSprites {
+                    texture_id,
+                    range,
+                    smoothed,
+                }) => self.draw_polychrome_sprites(*texture_id, instance_range(range)?, *smoothed),
+                RenderCommand::Batch(PrimitiveBatch::Surfaces(range)) => self.draw_surfaces(
+                    &scene.surfaces[range.clone()],
+                    &scene.surface_opacities()[range.clone()],
+                ),
+                RenderCommand::Batch(PrimitiveBatch::BackdropFilters(range)) => {
+                    let result = (|| {
+                        for filter in &scene.backdrop_filters[range.clone()] {
+                            self.dx_blur_and_composite(
+                                &current_srv,
+                                &current_rtv,
+                                filter.bounds,
+                                filter.content_mask.bounds,
+                                filter.corner_radii,
+                                filter.corner_smoothing,
+                                filter.max_blur_radius(),
+                                filter.opacity,
+                                true,
+                            )?;
                         }
-                        result
+                        Ok::<(), anyhow::Error>(())
+                    })();
+                    // Restore the current target for subsequent batches.
+                    unsafe {
+                        ctx.OMSetRenderTargets(Some(slice::from_ref(&current_rtv)), None);
                     }
-                    RenderCommand::BeginFilter {
-                        target: FilterRenderTarget::Isolated(target_index),
-                        ..
-                    } => {
-                        filter_stack.push((current_rtv.clone(), current_srv.clone()));
-                        current_rtv = group_rtvs[target_index.as_usize()].clone();
-                        current_srv = group_srvs[target_index.as_usize()].clone();
-                        self.active_render_target = current_rtv.clone();
-                        unsafe {
-                            if let Some(rtv) = current_rtv.as_ref() {
-                                ctx.ClearRenderTargetView(rtv, &[0.0; 4]);
-                            }
-                            ctx.OMSetRenderTargets(Some(slice::from_ref(&current_rtv)), None);
+                    result
+                }
+                RenderCommand::BeginFilter {
+                    target: FilterRenderTarget::Isolated(target_index),
+                    ..
+                } => {
+                    filter_stack.push((current_rtv.clone(), current_srv.clone()));
+                    current_rtv = group_rtvs[target_index.as_usize()].clone();
+                    current_srv = group_srvs[target_index.as_usize()].clone();
+                    self.active_render_target = current_rtv.clone();
+                    unsafe {
+                        if let Some(rtv) = current_rtv.as_ref() {
+                            ctx.ClearRenderTargetView(rtv, &[0.0; 4]);
                         }
-                        Ok(())
+                        ctx.OMSetRenderTargets(Some(slice::from_ref(&current_rtv)), None);
                     }
-                    RenderCommand::EndFilter {
-                        boundary_index,
-                        target: FilterRenderTarget::Isolated(_),
-                        ..
-                    } => {
-                        let boundary = &scene.filter_boundaries[*boundary_index];
-                        let (parent_rtv, parent_srv) = filter_stack
-                            .pop()
-                            .expect("render plan emitted an unmatched isolated filter end");
-                        let result = self.dx_blur_and_composite(
-                            &current_srv,
-                            &parent_rtv,
-                            boundary.bounds,
-                            boundary.content_mask.bounds,
-                            boundary.corner_radii,
-                            boundary.corner_smoothing,
-                            boundary.max_blur_radius(),
-                            boundary.opacity,
-                            false,
-                        );
-                        current_rtv = parent_rtv;
-                        current_srv = parent_srv;
-                        self.active_render_target = current_rtv.clone();
-                        unsafe {
-                            ctx.OMSetRenderTargets(Some(slice::from_ref(&current_rtv)), None);
-                        }
-                        result
+                    Ok(())
+                }
+                RenderCommand::EndFilter {
+                    boundary_index,
+                    target: FilterRenderTarget::Isolated(_),
+                    ..
+                } => {
+                    let boundary = &scene.filter_boundaries[*boundary_index];
+                    let (parent_rtv, parent_srv) = filter_stack
+                        .pop()
+                        .expect("render plan emitted an unmatched isolated filter end");
+                    let result = self.dx_blur_and_composite(
+                        &current_srv,
+                        &parent_rtv,
+                        boundary.bounds,
+                        boundary.content_mask.bounds,
+                        boundary.corner_radii,
+                        boundary.corner_smoothing,
+                        boundary.max_blur_radius(),
+                        boundary.opacity,
+                        false,
+                    );
+                    current_rtv = parent_rtv;
+                    current_srv = parent_srv;
+                    self.active_render_target = current_rtv.clone();
+                    unsafe {
+                        ctx.OMSetRenderTargets(Some(slice::from_ref(&current_rtv)), None);
                     }
-                    RenderCommand::BeginFilter {
-                        target: FilterRenderTarget::Inline,
-                        ..
-                    }
-                    | RenderCommand::EndFilter {
-                        target: FilterRenderTarget::Inline,
-                        ..
-                    } => Ok(()),
-                    RenderCommand::Batch(PrimitiveBatch::FilterBoundary(_)) => {
-                        unreachable!("filter boundaries are resolved by the render plan")
-                    }
-                };
-                let command_result=command_result.with_context(|| {
+                    result
+                }
+                RenderCommand::BeginFilter {
+                    target: FilterRenderTarget::Inline,
+                    ..
+                }
+                | RenderCommand::EndFilter {
+                    target: FilterRenderTarget::Inline,
+                    ..
+                } => Ok(()),
+                RenderCommand::Batch(PrimitiveBatch::FilterBoundary(_)) => {
+                    unreachable!("filter boundaries are resolved by the render plan")
+                }
+            };
+            let command_result=command_result.with_context(|| {
                 format!(
                     "scene too large:\
                     {} paths, {} shadows, {} quads, {} underlines, {} mono, {} subpixel, {} poly, {} surfaces",
@@ -872,8 +862,7 @@ impl DirectXRenderer {
                     scene.surfaces.len(),
                 )
             });
-                command_result?;
-            }
+            command_result?;
         }
         set_scissor(
             &ctx,
@@ -3809,12 +3798,15 @@ mod tests {
                     renderer.retained.invalidate();
                     let mut previous = None;
                     let mut snapshot = None;
-                    for (revision, hover) in [
-                        (1, None),
-                        (2, Some(0)),
-                        (3, Some(19)),
-                        (4, Some(9)),
-                        (5, None),
+                    // One box spans both changed rows, so a jump across the list
+                    // repaints in full.
+                    for (revision, hover, damage) in [
+                        (1, None, "full"),
+                        (2, Some(0), "partial"),
+                        (3, Some(1), "partial"),
+                        (4, Some(19), "full"),
+                        (5, Some(18), "partial"),
+                        (6, None, "partial"),
                     ] {
                         let scene = make_scene(
                             hover,
@@ -3844,10 +3836,7 @@ mod tests {
                             actual, expected,
                             "normal ranks mode={mode:?} fraction={fraction} appearance={appearance:?} hover={hover:?}"
                         );
-                        assert_eq!(
-                            renderer.retained.last_damage(),
-                            if revision == 1 { "full" } else { "partial" }
-                        );
+                        assert_eq!(renderer.retained.last_damage(), damage);
                         if let Some(previous) = &previous {
                             assert_ne!(&actual, previous, "hover pixels must visibly change");
                         }

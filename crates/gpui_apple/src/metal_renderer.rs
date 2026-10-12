@@ -295,10 +295,6 @@ fn split_rounded_opaque_quad(quad: &Quad) -> Option<[Quad; 5]> {
     ])
 }
 
-/// Largest share of the viewport a frame repaints partially
-/// (partial redraw); a larger change repaints everything.
-const PARTIAL_REDRAW_MAX_AREA: f64 = 0.5;
-
 /// How a frame reaches the drawable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FrameMode {
@@ -1061,19 +1057,10 @@ impl MetalRenderer {
                 Damage::Full
             }
         };
-        let viewport_area = f64::from(width.max(1)) * f64::from(height.max(1));
         let partial = match damage {
             Damage::Full => None,
             Damage::Reuse => Some(FrameMode::Copy),
-            // One scissor covers every damaged region.
-            Damage::Partial(regions) => regions
-                .into_iter()
-                .reduce(DamageRect::union)
-                .filter(|region| {
-                    f64::from(region.width) * f64::from(region.height)
-                        <= viewport_area * PARTIAL_REDRAW_MAX_AREA
-                })
-                .map(FrameMode::Partial),
+            Damage::Partial(region) => Some(FrameMode::Partial(region)),
         };
         let follows_large_change = mem::replace(&mut self.previous_change_large, partial.is_none());
         match partial {

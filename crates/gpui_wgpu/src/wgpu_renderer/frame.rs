@@ -84,14 +84,14 @@ pub(super) fn render_to_view(
             .ensure_damage_clear(&device);
     }
     // Partial regions replay batches independently. Reserve bounded duplicate uploads and clear quads.
-    if let Damage::Partial(regions) = &retained.damage {
+    if let Damage::Partial(region) = &retained.damage {
         let device = renderer.resources().device.clone();
         renderer
             .resources_mut()
             .pipelines
             .ensure_damage_clear(&device);
         let transport = renderer.resources().instances.transport();
-        let requirements = FrameRequirements::for_partial_scene(scene, regions, transport);
+        let requirements = FrameRequirements::for_partial_scene(scene, *region, transport);
         let bytes = requirements.storage_bytes;
         let batches = requirements.instance_batches;
         let device = renderer.resources().device.clone();
@@ -473,23 +473,17 @@ impl FrameRequirements {
         }
     }
 
-    fn for_partial_scene(
-        scene: &Scene,
-        regions: &[DamageRect],
-        transport: InstanceTransport,
-    ) -> Self {
+    fn for_partial_scene(scene: &Scene, region: DamageRect, transport: InstanceTransport) -> Self {
         let mut requirements = Self::scene_metadata(scene);
         // Encoding prepends a clear and skips nonintersecting batches. Either
-        // change alters the alignment of every following type, and regions share
-        // one arena cursor. An origin-zero full-frame estimate cannot be scaled.
-        for &region in regions {
-            requirements.reserve(std::mem::size_of::<Quad>(), 1, transport);
-            for command in scene.render_commands() {
-                if let RenderCommand::Batch(batch) = command
-                    && batch_intersects(scene, batch, region)
-                {
-                    requirements.reserve_batch(batch, transport);
-                }
+        // changes the alignment of every following type, so a full-frame
+        // estimate can't be reused.
+        requirements.reserve(std::mem::size_of::<Quad>(), 1, transport);
+        for command in scene.render_commands() {
+            if let RenderCommand::Batch(batch) = command
+                && batch_intersects(scene, batch, region)
+            {
+                requirements.reserve_batch(batch, transport);
             }
         }
         requirements
@@ -563,7 +557,7 @@ mod planning_tests {
     use super::*;
 
     #[test]
-    fn partial_alignment_includes_clear_and_shared_region_cursor() {
+    fn partial_alignment_includes_the_clear() {
         let transport = InstanceTransport::StorageBuffer;
         let sequence = [
             (std::mem::size_of::<Shadow>(), 1),
@@ -593,14 +587,6 @@ mod planning_tests {
         assert_eq!(partial.storage_bytes, 2728);
         assert_eq!(partial.instance_batches, 9);
         assert!(partial.storage_bytes > old_estimate);
-        // A second region starts at the first region's actual ending offset.
-        // It cannot restart an origin-zero estimate or merely double it.
-        partial.reserve(std::mem::size_of::<Quad>(), 1, transport);
-        for &(stride, count) in &sequence {
-            partial.reserve(stride, count, transport);
-        }
-        assert_eq!(partial.instance_batches, 18);
-        assert_eq!(partial.storage_bytes, 5456);
     }
 
     #[test]
@@ -629,42 +615,29 @@ mod planning_tests {
             });
         }
         scene.finish();
-        let regions = [
-            DamageRect {
-                x: 0,
-                y: 0,
-                width: 5,
-                height: 5,
-            },
-            DamageRect {
-                x: 24,
-                y: 24,
-                width: 5,
-                height: 5,
-            },
-            DamageRect {
-                x: 60,
-                y: 60,
-                width: 5,
-                height: 5,
-            },
-        ];
+        let region = |x, y| DamageRect {
+            x,
+            y,
+            width: 5,
+            height: 5,
+        };
         for transport in [
             InstanceTransport::StorageBuffer,
             InstanceTransport::DataTexture,
         ] {
-            let requirements = FrameRequirements::for_partial_scene(&scene, &regions, transport);
-            assert_eq!(
-                requirements.instance_batches, 5,
-                "three clears plus two intersecting batches"
-            );
-            let expected_bytes = match transport {
-                InstanceTransport::StorageBuffer => 1240,
-                InstanceTransport::DataTexture => 1272,
-            };
-            assert_eq!(requirements.storage_bytes, expected_bytes);
+            // The clear, then only the batch under the region: the second quad's.
+            let requirements =
+                FrameRequirements::for_partial_scene(&scene, region(24, 24), transport);
+            let mut expected = FrameRequirements::default();
+            expected.reserve(std::mem::size_of::<Quad>(), 1, transport);
+            expected.reserve(std::mem::size_of::<Quad>(), 1, transport);
+            assert_eq!(requirements.instance_batches, 2);
+            assert_eq!(requirements.storage_bytes, expected.storage_bytes);
             assert!(!requirements.uses_path_target);
             assert!(!requirements.uses_offscreen_target);
+            // A region over neither quad replays only the clear.
+            let empty = FrameRequirements::for_partial_scene(&scene, region(60, 60), transport);
+            assert_eq!(empty.instance_batches, 1);
         }
     }
 }
@@ -768,12 +741,7 @@ impl<'a> FrameEncoder<'a> {
     fn encode_commands(&mut self) -> DrawResult {
         match std::mem::replace(&mut self.damage, Damage::Reuse) {
             Damage::Reuse => Ok(()),
-            Damage::Partial(regions) => {
-                for region in regions {
-                    self.encode_region(Some(region))?;
-                }
-                Ok(())
-            }
+            Damage::Partial(region) => self.encode_region(Some(region)),
             Damage::Full => self.encode_region(None),
         }
     }

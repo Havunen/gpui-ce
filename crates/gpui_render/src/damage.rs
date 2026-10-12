@@ -2,8 +2,9 @@
 //! changes.
 //!
 //! Each frame hashes, per 64 px tile, everything painted into that tile in
-//! painter order. Tiles whose hash changed repaint, merged into at most eight
-//! rectangles. A primitive's global draw order is left out of its hash: GPUI
+//! painter order. The bounding box of the tiles whose hash changed repaints,
+//! or the whole frame when it covers over half. A primitive's global draw
+//! order is left out of its hash: GPUI
 //! raises it for everything painted over a new primitive (a hovered row's
 //! content over its highlight), which moves that content in the sorted scene
 //! without changing any other tile.
@@ -13,7 +14,6 @@ use gpui::{
     ScaledPixels, Scene, Shadow, SubpixelSprite, TransformationMatrix, Underline, point, size,
 };
 
-const MAX_REGIONS: usize = 8;
 const DAMAGE_TILE_SIZE: u32 = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,26 +45,6 @@ impl DamageRect {
     pub fn intersects(self, bounds: Bounds<ScaledPixels>) -> bool {
         !self.bounds().intersect(&bounds).is_empty()
     }
-
-    /// The smallest rectangle covering both.
-    pub fn union(self, other: Self) -> Self {
-        let x = self.x.min(other.x);
-        let y = self.y.min(other.y);
-        Self {
-            x,
-            y,
-            width: self
-                .x
-                .saturating_add(self.width)
-                .max(other.x.saturating_add(other.width))
-                - x,
-            height: self
-                .y
-                .saturating_add(self.height)
-                .max(other.y.saturating_add(other.height))
-                - y,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,8 +54,8 @@ pub enum Damage {
     Full,
     /// The retained scene already matches the new scene.
     Reuse,
-    /// Clear and redraw each region with all intersecting painter batches.
-    Partial(Vec<DamageRect>),
+    /// Clear and redraw this region with all intersecting painter batches.
+    Partial(DamageRect),
 }
 
 impl Damage {
@@ -280,7 +260,7 @@ impl SceneSnapshot {
             .map(|(next, old)| next != old)
             .collect();
         let columns = self.width.div_ceil(DAMAGE_TILE_SIZE);
-        tile_regions(&dirty, columns, self.width, self.height)
+        dirty_bounds(&dirty, columns, self.width, self.height)
     }
 }
 
@@ -358,59 +338,36 @@ fn tile_spans(region: DamageRect, columns: u32) -> impl Iterator<Item = usize> {
     (top..bottom).flat_map(move |y| (left..right).map(move |x| (y * columns + x) as usize))
 }
 
-fn tile_regions(dirty: &[bool], columns: u32, width: u32, height: u32) -> Damage {
-    let mut regions: Vec<DamageRect> = Vec::new();
-    let rows = height.div_ceil(DAMAGE_TILE_SIZE);
-    for y in 0..rows {
-        let mut x = 0;
-        while x < columns {
-            if !dirty[(y * columns + x) as usize] {
-                x += 1;
-                continue;
-            }
-            let start = x;
-            while x < columns && dirty[(y * columns + x) as usize] {
-                x += 1;
-            }
-            let region = DamageRect {
-                x: start * DAMAGE_TILE_SIZE,
-                y: y * DAMAGE_TILE_SIZE,
-                width: (x * DAMAGE_TILE_SIZE).min(width) - start * DAMAGE_TILE_SIZE,
-                height: DAMAGE_TILE_SIZE.min(height - y * DAMAGE_TILE_SIZE),
-            };
-            if let Some(previous) = regions.iter_mut().find(|previous| {
-                previous.x == region.x
-                    && previous.width == region.width
-                    && previous.y + previous.height == region.y
-            }) {
-                previous.height += region.height;
-            } else {
-                regions.push(region);
-                if regions.len() > MAX_REGIONS {
-                    return Damage::Full;
-                }
-            }
-        }
-    }
-    if regions.is_empty() {
+/// The tile-aligned box around every dirty tile, clipped to the target, or a
+/// full redraw when it covers over half of it.
+fn dirty_bounds(dirty: &[bool], columns: u32, width: u32, height: u32) -> Damage {
+    let mut tiles = (0..dirty.len() as u32)
+        .filter(|&tile| dirty[tile as usize])
+        .map(|tile| (tile % columns, tile / columns));
+    let Some((x, y)) = tiles.next() else {
         return Damage::Reuse;
+    };
+    let (mut left, mut right, mut bottom) = (x, x, y);
+    for (x, y) in tiles {
+        left = left.min(x);
+        right = right.max(x);
+        bottom = y;
     }
-    let area: u128 = regions
-        .iter()
-        .map(|r| r.width as u128 * r.height as u128)
-        .sum();
-    if area * 100 > width as u128 * height as u128 * 40 {
+    let (x, y) = (left * DAMAGE_TILE_SIZE, y * DAMAGE_TILE_SIZE);
+    let region = DamageRect {
+        x,
+        y,
+        width: ((right + 1) * DAMAGE_TILE_SIZE).min(width) - x,
+        height: ((bottom + 1) * DAMAGE_TILE_SIZE).min(height) - y,
+    };
+    if 2 * u64::from(region.width) * u64::from(region.height) > u64::from(width) * u64::from(height)
+    {
         Damage::Full
     } else {
-        Damage::Partial(regions)
+        Damage::Partial(region)
     }
 }
 
-// Glyph badges can introduce a whole run, rather than a single primitive. Only
-// finite glyphs survive capture, and an exact following
-// anchor preserves the unchanged painter sequence. Keep old/new runs separate:
-// a union spanning distant rows could merge both full-width row fills into one
-// unnecessarily large damage rectangle.
 fn shadow_geometry(shadow: &Shadow) -> Bounds<ScaledPixels> {
     if shadow.inset.is_enabled() {
         shadow.element_bounds
@@ -550,9 +507,9 @@ mod tests {
         SceneSnapshot::capture(&finished(primitives), 1, 512, 1024).unwrap()
     }
 
-    fn regions(damage: Damage) -> Vec<DamageRect> {
+    fn region(damage: Damage) -> DamageRect {
         match damage {
-            Damage::Partial(regions) => regions,
+            Damage::Partial(region) => region,
             other => panic!("expected partial damage, got {other:?}"),
         }
     }
@@ -620,8 +577,8 @@ mod tests {
             ..small
         };
         assert_eq!(
-            regions(with(recoloured).compare(&with(small))),
-            [rect(64, 0, 64, 64)]
+            region(with(recoloured).compare(&with(small))),
+            rect(64, 0, 64, 64)
         );
         // A move repaints where the quad was and where it is.
         let moved = Quad {
@@ -629,15 +586,15 @@ mod tests {
             ..small
         };
         assert_eq!(
-            regions(with(moved).compare(&with(small))),
-            [rect(64, 0, 64, 64), rect(192, 256, 64, 64)]
+            region(with(moved).compare(&with(small))),
+            rect(64, 0, 192, 320)
         );
         // The antialias fringe reaches across a tile edge.
         let edge = Quad {
             bounds: bounds(100.0, 64.5, 10.0, 10.0),
             ..small
         };
-        assert_eq!(regions(with(edge).compare(&base)), [rect(64, 0, 64, 128)]);
+        assert_eq!(region(with(edge).compare(&base)), rect(64, 0, 64, 128));
         // Content masks clip what a primitive can touch.
         let clipped = Quad {
             bounds: bounds(0.0, 0.0, 300.0, 300.0),
@@ -647,7 +604,7 @@ mod tests {
             },
             ..small
         };
-        assert_eq!(regions(with(clipped).compare(&base)), [rect(0, 0, 64, 64)]);
+        assert_eq!(region(with(clipped).compare(&base)), rect(0, 0, 64, 64));
     }
 
     #[test]
@@ -665,8 +622,8 @@ mod tests {
         );
         // Swapping overlapping quads changes which one is on top.
         assert_eq!(
-            regions(frame([background, b, a, far]).compare(&first)),
-            [rect(0, 0, 64, 64)]
+            region(frame([background, b, a, far]).compare(&first)),
+            rect(0, 0, 64, 64)
         );
         // A quad slid under one end of a long bar raises the bar's draw order,
         // but only the tile it was slid into changes.
@@ -674,8 +631,8 @@ mod tests {
         let under = quad(bounds(20.0, 195.0, 20.0, 20.0), gpui::red());
         let alone = capture([background.into(), bar.into()]);
         assert_eq!(
-            regions(capture([background.into(), under.into(), bar.into()]).compare(&alone)),
-            [rect(0, 192, 64, 64)]
+            region(capture([background.into(), under.into(), bar.into()]).compare(&alone)),
+            rect(0, 192, 64, 64)
         );
     }
 
@@ -721,19 +678,21 @@ mod tests {
     }
 
     #[test]
-    fn hovering_another_row_repaints_only_both_rows() {
+    fn hovering_the_next_row_repaints_only_both_rows() {
         for subpixel in [false, true] {
-            let first = rows(Some(0), subpixel);
+            let first = rows(Some(3), subpixel);
             // The hover moved both rows' content in the sorted scene, but only
             // their own tiles changed.
             assert_eq!(
-                regions(rows(Some(19), subpixel).compare(&first)),
-                [rect(0, 0, 512, 64), rect(0, 768, 512, 64)]
+                region(rows(Some(4), subpixel).compare(&first)),
+                rect(0, 128, 512, 128)
             );
             assert_eq!(
-                regions(rows(None, subpixel).compare(&first)),
-                [rect(0, 0, 512, 64)]
+                region(rows(None, subpixel).compare(&first)),
+                rect(0, 128, 512, 64)
             );
+            // One box spans both rows, so a jump across most of the list repaints in full.
+            assert_eq!(rows(Some(19), subpixel).compare(&first), Damage::Full);
         }
     }
 
@@ -755,8 +714,8 @@ mod tests {
             })
         };
         assert_eq!(
-            regions(capture([fading(1.5)]).compare(&capture([fading(1.25)]))),
-            [rect(0, 0, 128, 128)]
+            region(capture([fading(1.5)]).compare(&capture([fading(1.25)]))),
+            rect(0, 0, 128, 128)
         );
         let edge = |color: Hsla| {
             let quad = Quad {
@@ -769,8 +728,8 @@ mod tests {
             SceneSnapshot::capture(&finished([quad.into()]), 1, 501, 999).unwrap()
         };
         assert_eq!(
-            regions(edge(gpui::black()).compare(&edge(gpui::white()))),
-            [rect(448, 960, 53, 39)]
+            region(edge(gpui::black()).compare(&edge(gpui::white()))),
+            rect(448, 960, 53, 39)
         );
     }
 
@@ -818,8 +777,8 @@ mod tests {
         // tile row below.
         let moved = capture([blurred_shadow(80.0).into()]);
         assert_eq!(
-            regions(moved.compare(&capture([blurred_shadow(72.0).into()]))),
-            [rect(0, 64, 128, 128)]
+            region(moved.compare(&capture([blurred_shadow(72.0).into()]))),
+            rect(0, 64, 128, 128)
         );
     }
 
@@ -832,12 +791,9 @@ mod tests {
                 path(x, 600.0, gpui::white()).into(),
             ])
         };
-        let regions = regions(frame(300.0).compare(&frame(100.0)));
-        let covers = |x: u32, y: u32| {
-            regions
-                .iter()
-                .any(|r| r.x <= x && x < r.x + r.width && r.y <= y && y < r.y + r.height)
-        };
+        let r = region(frame(300.0).compare(&frame(100.0)));
+        let covers =
+            |x: u32, y: u32| r.x <= x && x < r.x + r.width && r.y <= y && y < r.y + r.height;
         // Old and new blur extents, and old and new paths.
         assert!(covers(90, 110) && covers(130, 110) && covers(290, 110) && covers(330, 110));
         assert!(covers(105, 605) && covers(305, 605));
@@ -861,8 +817,8 @@ mod tests {
         };
         // At 45 degrees the corners reach past x and y 64 into three more tiles.
         assert_eq!(
-            regions(sprite(std::f32::consts::FRAC_PI_4).compare(&sprite(0.0))),
-            [rect(0, 0, 128, 128)]
+            region(sprite(std::f32::consts::FRAC_PI_4).compare(&sprite(0.0))),
+            rect(0, 0, 128, 128)
         );
     }
 
@@ -882,12 +838,12 @@ mod tests {
     fn paths_hash_their_paint_vertices_and_rasterization_group() {
         let alone = capture([path(8.25, 8.25, gpui::white()).into()]);
         assert_eq!(
-            regions(capture([path(8.25, 8.25, gpui::black()).into()]).compare(&alone)),
-            [rect(0, 0, 64, 64)]
+            region(capture([path(8.25, 8.25, gpui::black()).into()]).compare(&alone)),
+            rect(0, 0, 64, 64)
         );
         assert_eq!(
-            regions(capture([path(8.5, 8.25, gpui::white()).into()]).compare(&alone)),
-            [rect(0, 0, 64, 64)]
+            region(capture([path(8.5, 8.25, gpui::white()).into()]).compare(&alone)),
+            rect(0, 0, 64, 64)
         );
         // A path joining the batch changes how the first one rasterizes too.
         let joined = finished([
@@ -899,10 +855,7 @@ mod tests {
             [RenderCommand::Batch(PrimitiveBatch::Paths { range, .. })] if range.len() == 2
         ));
         let joined = SceneSnapshot::capture(&joined, 1, 512, 1024).unwrap();
-        assert_eq!(
-            regions(joined.compare(&alone)),
-            [rect(0, 0, 64, 64), rect(384, 0, 64, 64)]
-        );
+        assert_eq!(region(joined.compare(&alone)), rect(0, 0, 448, 64));
     }
 
     #[test]
@@ -961,31 +914,26 @@ mod tests {
     }
 
     #[test]
-    fn tile_regions_merge_runs_and_fail_closed_on_budgets() {
-        let columns = 16;
-        let mut dirty = vec![false; columns * columns];
-        for y in (0..columns).step_by(2).take(8) {
-            dirty[y * columns] = true;
-        }
-        dirty[2] = true;
-        assert_eq!(
-            tile_regions(&dirty, columns as u32, 1024, 1024),
-            Damage::Full
-        );
-        let mut dirty = vec![false; 8 * 16];
-        for value in &mut dirty[..8 * 8] {
-            *value = true;
-        }
-        assert_eq!(tile_regions(&dirty, 8, 512, 1024), Damage::Full);
-        // Horizontal tiles form one run, then vertically merge before the region cap.
+    fn dirty_tiles_repaint_as_one_box_clipped_to_the_target_up_to_half_of_it() {
+        let tile = |x: usize, y: usize| y * 16 + x;
         let mut dirty = vec![false; 16 * 16];
-        for value in &mut dirty[..4 * 16] {
-            *value = true;
-        }
+        assert_eq!(dirty_bounds(&dirty, 16, 1000, 1000), Damage::Reuse);
+        dirty[tile(2, 1)] = true;
+        dirty[tile(6, 5)] = true;
         assert_eq!(
-            tile_regions(&dirty, 16, 1024, 1024),
-            Damage::Partial(vec![rect(0, 0, 1024, 256)])
+            dirty_bounds(&dirty, 16, 1000, 1000),
+            Damage::Partial(rect(128, 64, 320, 320))
         );
+        let mut corner = vec![false; 16 * 16];
+        corner[tile(15, 15)] = true;
+        assert_eq!(
+            dirty_bounds(&corner, 16, 1000, 1000),
+            Damage::Partial(rect(960, 960, 40, 40))
+        );
+        let mut half = vec![false; 16 * 16];
+        half[tile(0, 0)] = true;
+        half[tile(15, 8)] = true;
+        assert_eq!(dirty_bounds(&half, 16, 1000, 1000), Damage::Full);
     }
 
     #[test]

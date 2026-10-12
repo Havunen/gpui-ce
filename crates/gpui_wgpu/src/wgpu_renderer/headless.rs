@@ -1498,7 +1498,7 @@ mod path_target_tests {
                 let glyph = retained_tiled_glyph(&full, mode)?;
                 assert_eq!(glyph, retained_tiled_glyph(&retained, mode)?);
                 let first = tiled_history_scene(Some(0), fraction, glyph, mode);
-                let last = tiled_history_scene(Some(19), fraction, glyph, mode);
+                let last = tiled_history_scene(Some(1), fraction, glyph, mode);
                 let first_snapshot =
                     gpui_render::damage::SceneSnapshot::capture(&first, 1, 512, 1024).unwrap();
                 let last_snapshot =
@@ -1512,17 +1512,21 @@ mod path_target_tests {
                 );
                 let mut previous = None;
                 let mut revision = 0;
-                for (index, row) in [
-                    None,
-                    None,
-                    Some(0),
-                    Some(0),
-                    Some(19),
-                    Some(18),
-                    Some(1),
-                    Some(1),
-                    None,
-                    None,
+                // One box spans every changed tile. A jump across the list repaints
+                // in full, and so does starting or ending a hover: that raises the
+                // draw order of the strip crossing every row, which moves it among
+                // paints it doesn't touch, so all its tiles repaint.
+                for (index, (row, damage)) in [
+                    (None, "full"),
+                    (None, "reuse"),
+                    (Some(0), "full"),
+                    (Some(0), "reuse"),
+                    (Some(1), "partial"),
+                    (Some(2), "partial"),
+                    (Some(19), "full"),
+                    (Some(18), "partial"),
+                    (None, "full"),
+                    (None, "reuse"),
                 ]
                 .into_iter()
                 .enumerate()
@@ -1536,13 +1540,7 @@ mod path_target_tests {
                         &mut retained,
                         &scene,
                         revision,
-                        if index == 0 {
-                            "full"
-                        } else if row == previous {
-                            "reuse"
-                        } else {
-                            "partial"
-                        },
+                        damage,
                         &format!(
                             "tiled history mode={mode:?}, transparent={transparent}, fraction={fraction}, step={index}, row={row:?}"
                         ),
