@@ -125,7 +125,8 @@ impl BlurUniforms {
     }
 }
 
-#[derive(Clone, Copy)]
+/// A rectangle in physical target pixels: a scissor, or a partial frame's damage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScissorRectangle {
     pub x: u32,
     pub y: u32,

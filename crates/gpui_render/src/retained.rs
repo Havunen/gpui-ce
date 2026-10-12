@@ -15,13 +15,16 @@ use std::{
 pub struct RetainedScene {
     snapshot: Option<SceneSnapshot>,
     revision: Option<u64>,
-    atlas_generation: u64,
+    /// Tiles of a replaced snapshot, reused by the next capture.
+    spare: Vec<u64>,
 }
 
 impl RetainedScene {
     /// Forget the retained frame, so the next one repaints everything.
     pub fn forget(&mut self) {
-        self.snapshot = None;
+        if let Some(snapshot) = self.snapshot.take() {
+            self.spare = snapshot.tiles;
+        }
         self.revision = None;
     }
 
@@ -29,7 +32,7 @@ impl RetainedScene {
     /// to keep once it succeeds: none when the frame repeats the retained scene.
     /// `None` when the scene can't be retained.
     pub fn plan(
-        &self,
+        &mut self,
         scene: &Scene,
         revision: u64,
         atlas_generation: u64,
@@ -37,12 +40,13 @@ impl RetainedScene {
         height: u32,
     ) -> Option<(Damage, Option<SceneSnapshot>)> {
         if self.revision == Some(revision)
-            && self.atlas_generation == atlas_generation
-            && self.snapshot.is_some()
+            && (self.snapshot.as_ref())
+                .is_some_and(|kept| kept.atlas_generation == atlas_generation)
         {
             return Some((Damage::Reuse, None));
         }
-        let snapshot = SceneSnapshot::capture(scene, atlas_generation, width, height)?;
+        let tiles = std::mem::take(&mut self.spare);
+        let snapshot = SceneSnapshot::capture(scene, atlas_generation, width, height, tiles)?;
         let damage = match &self.snapshot {
             Some(previous) => snapshot.compare(previous),
             None => Damage::Full,
@@ -51,17 +55,11 @@ impl RetainedScene {
     }
 
     /// Record a frame drawn from [`Self::plan`] as the retained one.
-    pub fn complete(
-        &mut self,
-        snapshot: Option<SceneSnapshot>,
-        revision: u64,
-        atlas_generation: u64,
-    ) {
-        if snapshot.is_some() {
-            self.snapshot = snapshot;
+    pub fn complete(&mut self, snapshot: Option<SceneSnapshot>, revision: u64) {
+        if let Some(replaced) = snapshot.and_then(|snapshot| self.snapshot.replace(snapshot)) {
+            self.spare = replaced.tiles;
         }
         self.revision = Some(revision);
-        self.atlas_generation = atlas_generation;
     }
 }
 
@@ -142,7 +140,7 @@ mod tests {
         let red = scene(gpui::red());
         let (damage, snapshot) = retained.plan(&red, 1, 1, 200, 200).unwrap();
         assert_eq!(damage, Damage::Full);
-        retained.complete(snapshot, 1, 1);
+        retained.complete(snapshot, 1);
         // The same revision reuses the target without capturing the scene again.
         assert!(matches!(
             retained.plan(&red, 1, 1, 200, 200),
@@ -164,13 +162,26 @@ mod tests {
         let mut retained = RetainedScene::default();
         let red = scene(gpui::red());
         let (_, snapshot) = retained.plan(&red, 1, 1, 200, 200).unwrap();
-        retained.complete(snapshot, 1, 1);
-        retained.complete(None, 1, 1);
+        retained.complete(snapshot, 1);
+        retained.complete(None, 1);
         // An identical scene under a new revision still matches the kept snapshot.
         assert!(matches!(
             retained.plan(&red, 2, 1, 200, 200),
             Some((Damage::Reuse, Some(_)))
         ));
+    }
+
+    #[test]
+    fn a_replaced_snapshot_lends_its_tiles_to_the_next_capture() {
+        let mut retained = RetainedScene::default();
+        let (_, first) = retained.plan(&scene(gpui::red()), 1, 1, 200, 200).unwrap();
+        let first_tiles = first.as_ref().unwrap().tiles.as_ptr();
+        retained.complete(first, 1);
+        let (_, second) = retained.plan(&scene(gpui::blue()), 2, 1, 200, 200).unwrap();
+        retained.complete(second, 2);
+        // The second frame replaced the first, whose buffer holds the third capture.
+        let (_, third) = retained.plan(&scene(gpui::red()), 3, 1, 200, 200).unwrap();
+        assert_eq!(third.unwrap().tiles.as_ptr(), first_tiles);
     }
 
     #[test]

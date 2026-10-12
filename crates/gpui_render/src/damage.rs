@@ -8,7 +8,7 @@
 //! raises it for everything painted over a new primitive (a hovered row's
 //! content over its highlight), which moves that content in the sorted scene
 //! without changing any other tile.
-use crate::blur::GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS;
+use crate::blur::{GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS, ScissorRectangle};
 use gpui::{
     Bounds, ContentMask, MonochromeSprite, PolychromeSprite, PrimitiveBatch, Quad, RenderCommand,
     ScaledPixels, Scene, Shadow, SubpixelSprite, TransformationMatrix, Underline, point, size,
@@ -16,20 +16,7 @@ use gpui::{
 
 const DAMAGE_TILE_SIZE: u32 = 64;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-/// A clipped damage rectangle in physical target pixels.
-pub struct DamageRect {
-    /// Left target coordinate.
-    pub x: u32,
-    /// Top target coordinate.
-    pub y: u32,
-    /// Rectangle width.
-    pub width: u32,
-    /// Rectangle height.
-    pub height: u32,
-}
-
-impl DamageRect {
+impl ScissorRectangle {
     /// Convert integer target coordinates to GPUI scene bounds.
     pub fn bounds(self) -> Bounds<ScaledPixels> {
         Bounds {
@@ -47,7 +34,7 @@ impl DamageRect {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// How much of a retained frame the next frame repaints.
 pub enum Damage {
     /// The whole scene must be rendered normally.
@@ -55,7 +42,7 @@ pub enum Damage {
     /// The retained scene already matches the new scene.
     Reuse,
     /// Clear and redraw this region with all intersecting painter batches.
-    Partial(DamageRect),
+    Partial(ScissorRectangle),
 }
 
 impl Damage {
@@ -78,9 +65,9 @@ fn finite_bounds(bounds: Bounds<ScaledPixels>) -> bool {
         && bounds.size.height.0 >= 0.0
 }
 
-fn rectangle(bounds: Bounds<ScaledPixels>, width: u32, height: u32) -> DamageRect {
+fn rectangle(bounds: Bounds<ScaledPixels>, width: u32, height: u32) -> ScissorRectangle {
     if bounds.is_empty() {
-        return DamageRect {
+        return ScissorRectangle {
             x: 0,
             y: 0,
             width: 0,
@@ -92,7 +79,7 @@ fn rectangle(bounds: Bounds<ScaledPixels>, width: u32, height: u32) -> DamageRec
     let y = (bounds.top().0.floor() - 1.0).max(0.0).min(height as f32) as u32;
     let right = (bounds.right().0.ceil() + 1.0).max(0.0).min(width as f32) as u32;
     let bottom = (bounds.bottom().0.ceil() + 1.0).max(0.0).min(height as f32) as u32;
-    DamageRect {
+    ScissorRectangle {
         x,
         y,
         width: right.saturating_sub(x),
@@ -103,18 +90,24 @@ fn rectangle(bounds: Bounds<ScaledPixels>, width: u32, height: u32) -> DamageRec
 /// What a finished frame painted into each tile of its target.
 #[derive(Clone, Debug)]
 pub struct SceneSnapshot {
-    tiles: Vec<u64>,
-    atlas_generation: u64,
+    pub(crate) tiles: Vec<u64>,
+    pub(crate) atlas_generation: u64,
     width: u32,
     height: u32,
 }
 
 impl SceneSnapshot {
-    /// Hash a finished scene into the tiles of a `width` by `height` target.
-    /// `None` for what partial redraw can't follow: an empty target, surfaces
-    /// (which change without the scene), filters (which sample outside their
-    /// bounds) and non-finite geometry.
-    pub fn capture(scene: &Scene, atlas_generation: u64, width: u32, height: u32) -> Option<Self> {
+    /// Hash a finished scene into the tiles of a `width` by `height` target,
+    /// reusing `tiles`' allocation. `None` for what partial redraw can't follow:
+    /// an empty target, surfaces (which change without the scene), filters
+    /// (which sample outside their bounds) and non-finite geometry.
+    pub fn capture(
+        scene: &Scene,
+        atlas_generation: u64,
+        width: u32,
+        height: u32,
+        mut tiles: Vec<u64>,
+    ) -> Option<Self> {
         if width == 0
             || height == 0
             || !scene.surfaces.is_empty()
@@ -125,7 +118,8 @@ impl SceneSnapshot {
         }
         let columns = width.div_ceil(DAMAGE_TILE_SIZE);
         let rows = height.div_ceil(DAMAGE_TILE_SIZE);
-        let mut tiles = vec![SEED; columns as usize * rows as usize];
+        tiles.clear();
+        tiles.resize(columns as usize * rows as usize, SEED);
         // Mixes `hash` into every tile the clipped, antialiased geometry touches.
         let mut paint =
             |geometry: Bounds<ScaledPixels>, mask: &ContentMask<ScaledPixels>, hash: u64| {
@@ -253,14 +247,12 @@ impl SceneSnapshot {
         {
             return Damage::Full;
         }
-        let dirty: Vec<bool> = self
-            .tiles
-            .iter()
-            .zip(&previous.tiles)
-            .map(|(next, old)| next != old)
-            .collect();
+        let dirty = (self.tiles.iter().zip(&previous.tiles))
+            .enumerate()
+            .filter(|(_, (next, old))| next != old)
+            .map(|(tile, _)| tile as u32);
         let columns = self.width.div_ceil(DAMAGE_TILE_SIZE);
-        dirty_bounds(&dirty, columns, self.width, self.height)
+        dirty_bounds(dirty, columns, self.width, self.height)
     }
 }
 
@@ -324,7 +316,7 @@ fn sprite_geometry(
     (finite && finite_bounds(bounds)).then(|| transformed(bounds, matrix))
 }
 
-fn tile_spans(region: DamageRect, columns: u32) -> impl Iterator<Item = usize> {
+fn tile_spans(region: ScissorRectangle, columns: u32) -> impl Iterator<Item = usize> {
     let left = region.x / DAMAGE_TILE_SIZE;
     let top = region.y / DAMAGE_TILE_SIZE;
     let right = region
@@ -340,10 +332,9 @@ fn tile_spans(region: DamageRect, columns: u32) -> impl Iterator<Item = usize> {
 
 /// The tile-aligned box around every dirty tile, clipped to the target, or a
 /// full redraw when it covers over half of it.
-fn dirty_bounds(dirty: &[bool], columns: u32, width: u32, height: u32) -> Damage {
-    let mut tiles = (0..dirty.len() as u32)
-        .filter(|&tile| dirty[tile as usize])
-        .map(|tile| (tile % columns, tile / columns));
+/// The box around the dirty tiles, given in ascending order.
+fn dirty_bounds(dirty: impl Iterator<Item = u32>, columns: u32, width: u32, height: u32) -> Damage {
+    let mut tiles = dirty.map(|tile| (tile % columns, tile / columns));
     let Some((x, y)) = tiles.next() else {
         return Damage::Reuse;
     };
@@ -354,7 +345,7 @@ fn dirty_bounds(dirty: &[bool], columns: u32, width: u32, height: u32) -> Damage
         bottom = y;
     }
     let (x, y) = (left * DAMAGE_TILE_SIZE, y * DAMAGE_TILE_SIZE);
-    let region = DamageRect {
+    let region = ScissorRectangle {
         x,
         y,
         width: ((right + 1) * DAMAGE_TILE_SIZE).min(width) - x,
@@ -407,7 +398,7 @@ fn transformed(
 }
 
 /// Whether a current painter batch can affect a damage rectangle.
-pub fn batch_intersects(scene: &Scene, batch: &PrimitiveBatch, region: DamageRect) -> bool {
+pub fn batch_intersects(scene: &Scene, batch: &PrimitiveBatch, region: ScissorRectangle) -> bool {
     let visible = |bounds: Bounds<ScaledPixels>, mask: Bounds<ScaledPixels>| {
         region.intersects(bounds.intersect(&mask).dilate(ScaledPixels(1.0)))
     };
@@ -452,7 +443,7 @@ pub fn batch_intersects(scene: &Scene, batch: &PrimitiveBatch, region: DamageRec
 
 /// Make the fill that resets `region` to the target's raw RGBA clear colour
 /// before the intersecting painter batches replay.
-pub fn clear_quad(region: DamageRect, clear_color: [f32; 4]) -> Quad {
+pub fn clear_quad(region: ScissorRectangle, clear_color: [f32; 4]) -> Quad {
     let [r, g, b, a] = clear_color;
     Quad {
         bounds: region.bounds(),
@@ -504,18 +495,18 @@ mod tests {
 
     /// Hashes `primitives` for a 512 by 1024 target.
     fn capture(primitives: impl IntoIterator<Item = Primitive>) -> SceneSnapshot {
-        SceneSnapshot::capture(&finished(primitives), 1, 512, 1024).unwrap()
+        SceneSnapshot::capture(&finished(primitives), 1, 512, 1024, Vec::new()).unwrap()
     }
 
-    fn region(damage: Damage) -> DamageRect {
+    fn region(damage: Damage) -> ScissorRectangle {
         match damage {
             Damage::Partial(region) => region,
             other => panic!("expected partial damage, got {other:?}"),
         }
     }
 
-    fn rect(x: u32, y: u32, width: u32, height: u32) -> DamageRect {
-        DamageRect {
+    fn rect(x: u32, y: u32, width: u32, height: u32) -> ScissorRectangle {
+        ScissorRectangle {
             x,
             y,
             width,
@@ -725,7 +716,7 @@ mod tests {
                 },
                 ..quad(bounds(495.0, 992.0, 20.0, 20.0), color)
             };
-            SceneSnapshot::capture(&finished([quad.into()]), 1, 501, 999).unwrap()
+            SceneSnapshot::capture(&finished([quad.into()]), 1, 501, 999, Vec::new()).unwrap()
         };
         assert_eq!(
             region(edge(gpui::black()).compare(&edge(gpui::white()))),
@@ -854,29 +845,29 @@ mod tests {
             joined.render_commands(),
             [RenderCommand::Batch(PrimitiveBatch::Paths { range, .. })] if range.len() == 2
         ));
-        let joined = SceneSnapshot::capture(&joined, 1, 512, 1024).unwrap();
+        let joined = SceneSnapshot::capture(&joined, 1, 512, 1024, Vec::new()).unwrap();
         assert_eq!(region(joined.compare(&alone)), rect(0, 0, 448, 64));
     }
 
     #[test]
     fn targets_atlases_and_unsupported_scenes_repaint_everything() {
         let plain = finished([quad(bounds(0.0, 10.0, 200.0, 20.0), gpui::white()).into()]);
-        let first = SceneSnapshot::capture(&plain, 1, 512, 1024).unwrap();
+        let first = SceneSnapshot::capture(&plain, 1, 512, 1024, Vec::new()).unwrap();
         // Sprites refer to atlas tiles, which a new generation may have reused.
-        let reallocated = SceneSnapshot::capture(&plain, 2, 512, 1024).unwrap();
+        let reallocated = SceneSnapshot::capture(&plain, 2, 512, 1024, Vec::new()).unwrap();
         assert_eq!(reallocated.compare(&first), Damage::Full);
-        let resized = SceneSnapshot::capture(&plain, 1, 511, 1024).unwrap();
+        let resized = SceneSnapshot::capture(&plain, 1, 511, 1024, Vec::new()).unwrap();
         assert_eq!(resized.compare(&first), Damage::Full);
-        assert!(SceneSnapshot::capture(&plain, 1, 0, 1024).is_none());
+        assert!(SceneSnapshot::capture(&plain, 1, 0, 1024, Vec::new()).is_none());
         let rejected = |change: &dyn Fn(&mut Scene)| {
             let mut scene = finished([
                 quad(bounds(0.0, 10.0, 200.0, 20.0), gpui::white()).into(),
                 blurred_shadow(100.0).into(),
                 glyph(1, 40.0, 40.0, false),
             ]);
-            assert!(SceneSnapshot::capture(&scene, 1, 512, 1024).is_some());
+            assert!(SceneSnapshot::capture(&scene, 1, 512, 1024, Vec::new()).is_some());
             change(&mut scene);
-            assert!(SceneSnapshot::capture(&scene, 1, 512, 1024).is_none());
+            assert!(SceneSnapshot::capture(&scene, 1, 512, 1024, Vec::new()).is_none());
         };
         rejected(&|scene| {
             scene.surfaces.push(gpui::PaintSurface {
@@ -915,25 +906,16 @@ mod tests {
 
     #[test]
     fn dirty_tiles_repaint_as_one_box_clipped_to_the_target_up_to_half_of_it() {
-        let tile = |x: usize, y: usize| y * 16 + x;
-        let mut dirty = vec![false; 16 * 16];
-        assert_eq!(dirty_bounds(&dirty, 16, 1000, 1000), Damage::Reuse);
-        dirty[tile(2, 1)] = true;
-        dirty[tile(6, 5)] = true;
+        let bounds = |tiles: &[(u32, u32)]| {
+            dirty_bounds(tiles.iter().map(|(x, y)| y * 16 + x), 16, 1000, 1000)
+        };
+        assert_eq!(bounds(&[]), Damage::Reuse);
         assert_eq!(
-            dirty_bounds(&dirty, 16, 1000, 1000),
+            bounds(&[(2, 1), (6, 5)]),
             Damage::Partial(rect(128, 64, 320, 320))
         );
-        let mut corner = vec![false; 16 * 16];
-        corner[tile(15, 15)] = true;
-        assert_eq!(
-            dirty_bounds(&corner, 16, 1000, 1000),
-            Damage::Partial(rect(960, 960, 40, 40))
-        );
-        let mut half = vec![false; 16 * 16];
-        half[tile(0, 0)] = true;
-        half[tile(15, 8)] = true;
-        assert_eq!(dirty_bounds(&half, 16, 1000, 1000), Damage::Full);
+        assert_eq!(bounds(&[(15, 15)]), Damage::Partial(rect(960, 960, 40, 40)));
+        assert_eq!(bounds(&[(0, 0), (15, 8)]), Damage::Full);
     }
 
     #[test]

@@ -8,8 +8,9 @@ use gpui::{
     FilterRenderTarget, MAX_FILTER_GROUP_DEPTH, MonochromeSprite, PolychromeSprite, PrimitiveBatch,
     Quad, RenderCommand, Scene, Shadow, SubpixelSprite, Underline,
 };
+use gpui_render::blur::ScissorRectangle;
 use gpui_render::blur::{FilterCompositeClip, FilterCompositeParameters};
-use gpui_render::damage::{Damage, DamageRect, batch_intersects, clear_quad};
+use gpui_render::damage::{Damage, batch_intersects, clear_quad};
 use gpui_render::shaders::{
     common::{FontRasterizationUniforms, GlobalUniforms, ShaderBool},
     interface as shader_interface,
@@ -30,7 +31,7 @@ pub(super) fn render_to_view(
     } else {
         0
     };
-    let retained = renderer.retained.prepare(
+    let mut retained = renderer.retained.prepare(
         scene,
         atlas_generation,
         renderer.target.width(),
@@ -79,7 +80,7 @@ pub(super) fn render_to_view(
     // texture that reappears after an intervening primitive and recreate its platform view.
     renderer.retain_surface_cache(&scene.surfaces);
 
-    let retained_blit = retained.blit.filter(|_| retained_copy.is_none());
+    let retained_blit = retained.blit.take().filter(|_| retained_copy.is_none());
     #[cfg(test)]
     {
         renderer.last_retained_presentation = if retained_copy.is_some() {
@@ -90,7 +91,6 @@ pub(super) fn render_to_view(
             "direct"
         };
     }
-    let damage_kind = retained.damage.kind();
     let result = FrameEncoder::new(
         renderer,
         scene,
@@ -100,13 +100,7 @@ pub(super) fn render_to_view(
         retained_copy,
     )
     .encode(readback);
-    renderer.retained.complete(
-        retained.snapshot,
-        retained.scene_revision,
-        retained.atlas_generation,
-        damage_kind,
-        result.is_ok(),
-    );
+    renderer.retained.complete(retained, result.is_ok());
     match result {
         Ok(command_buffer) => {
             let submission = renderer.resources().queue.submit([command_buffer]);
@@ -444,7 +438,11 @@ impl FrameRequirements {
         }
     }
 
-    fn for_partial_scene(scene: &Scene, region: DamageRect, transport: InstanceTransport) -> Self {
+    fn for_partial_scene(
+        scene: &Scene,
+        region: ScissorRectangle,
+        transport: InstanceTransport,
+    ) -> Self {
         let mut requirements = Self::scene_metadata(scene);
         // Encoding prepends a clear and skips nonintersecting batches. Either
         // changes the alignment of every following type, so a full-frame
@@ -586,7 +584,7 @@ mod planning_tests {
             });
         }
         scene.finish();
-        let region = |x, y| DamageRect {
+        let region = |x, y| ScissorRectangle {
             x,
             y,
             width: 5,
@@ -719,7 +717,7 @@ impl<'a> FrameEncoder<'a> {
             Damage::Full => self.encode_region(None),
         }
     }
-    fn encode_region(&mut self, region: Option<DamageRect>) -> DrawResult {
+    fn encode_region(&mut self, region: Option<ScissorRectangle>) -> DrawResult {
         let mut pass = begin_scene_render_pass(
             self.renderer,
             &mut self.encoder,
@@ -877,7 +875,7 @@ fn begin_scene_render_pass<'a>(
     label: &'a str,
     target: &'a wgpu::TextureView,
     load: wgpu::LoadOp<wgpu::Color>,
-    region: Option<DamageRect>,
+    region: Option<ScissorRectangle>,
 ) -> wgpu::RenderPass<'a> {
     let mut pass = begin_color_render_pass(encoder, label, target, load);
     if let Some(region) = region {

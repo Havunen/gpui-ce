@@ -14,7 +14,7 @@ use gpui_render::{
         BlurAxis, BlurKernel, BlurUniforms, GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS, ScissorRectangle,
         downsampled_dimension,
     },
-    damage::{Damage, DamageRect, clear_quad},
+    damage::{Damage, clear_quad},
     path_types::{self, PathRasterizationVertex},
     retained::RetainedScene,
     shaders::{
@@ -268,7 +268,7 @@ enum FrameMode {
     Retained,
     /// Only this region is rendered into the retained texture, over the
     /// previous frame, which is then copied.
-    Partial(DamageRect),
+    Partial(ScissorRectangle),
     /// Unchanged since the previous frame: the retained texture is copied.
     Copy,
 }
@@ -1014,8 +1014,7 @@ impl MetalRenderer {
             .plan(scene, revision, atlas_generation, width, height);
         let damage = match plan {
             Some((damage, snapshot)) => {
-                self.retained_scene
-                    .complete(snapshot, revision, atlas_generation);
+                self.retained_scene.complete(snapshot, revision);
                 damage
             }
             None => {
@@ -1063,12 +1062,7 @@ impl MetalRenderer {
                 );
             }
             FrameMode::Retained | FrameMode::Copy => None,
-            FrameMode::Partial(region) => Some(ScissorRectangle {
-                x: region.x,
-                y: region.y,
-                width: region.width,
-                height: region.height,
-            }),
+            FrameMode::Partial(region) => Some(region),
         };
         self.update_intermediate_texture_size(viewport_size);
         let retained = self.retained_texture(viewport_size);
@@ -2249,15 +2243,7 @@ impl MetalRenderer {
         scene_uniforms: &SceneUniforms,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
-        let quad = clear_quad(
-            DamageRect {
-                x: region.x,
-                y: region.y,
-                width: region.width,
-                height: region.height,
-            },
-            [0., 0., 0., alpha],
-        );
+        let quad = clear_quad(region, [0., 0., 0., alpha]);
         align_offset(instance_offset);
         let next_offset = *instance_offset + mem::size_of::<Quad>();
         if next_offset > instance_buffer.size {

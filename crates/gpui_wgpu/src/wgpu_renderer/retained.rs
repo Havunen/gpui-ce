@@ -35,7 +35,6 @@ pub(super) struct RetainedPlan {
     pub damage: Damage,
     pub snapshot: Option<SceneSnapshot>,
     pub scene_revision: u64,
-    pub atlas_generation: u64,
 }
 impl RetainedFrame {
     pub fn new() -> Self {
@@ -96,7 +95,6 @@ impl RetainedFrame {
             damage: Damage::Full,
             snapshot: None,
             scene_revision: context.scene_revision,
-            atlas_generation: atlas,
         };
         if !self.enabled {
             return full();
@@ -210,25 +208,15 @@ impl RetainedFrame {
             damage,
             snapshot,
             scene_revision: context.scene_revision,
-            atlas_generation: atlas,
         }
     }
-    pub fn complete(
-        &mut self,
-        snapshot: Option<SceneSnapshot>,
-        revision: u64,
-        atlas: u64,
-        damage_kind: &'static str,
-        success: bool,
-    ) {
+    pub fn complete(&mut self, plan: RetainedPlan, success: bool) {
         #[cfg(test)]
         {
-            self.last_damage = damage_kind;
+            self.last_damage = plan.damage.kind();
         }
-        #[cfg(not(test))]
-        let _ = damage_kind;
         if success {
-            self.scene.complete(snapshot, revision, atlas);
+            self.scene.complete(plan.snapshot, plan.scene_revision);
         } else {
             self.invalidate();
         }

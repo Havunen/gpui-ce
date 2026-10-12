@@ -11,9 +11,9 @@ use gpui_render::{
     artifacts::{Dx11DrawConstants, Dx11DrawConstantsBinding},
     blur::{
         BlurAxis, BlurKernel, BlurUniforms, FilterCompositeClip,
-        GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS, downsampled_dimension,
+        GAUSSIAN_CUTOFF_STANDARD_DEVIATIONS, ScissorRectangle, downsampled_dimension,
     },
-    damage::{Damage, DamageRect, batch_intersects, clear_quad},
+    damage::{Damage, batch_intersects, clear_quad},
     path_types::{PathRasterizationVertex, PathSprite},
     shaders::{
         common::{FontRasterizationUniforms, GlobalUniforms, ShaderBool, SurfaceColorFormat},
@@ -387,8 +387,8 @@ impl DirectXRenderer {
         self.retained.invalidate();
     }
 
-    fn full_scissor(&self) -> DamageRect {
-        DamageRect {
+    fn full_scissor(&self) -> ScissorRectangle {
+        ScissorRectangle {
             x: 0,
             y: 0,
             width: self.width,
@@ -2436,7 +2436,7 @@ fn set_rasterizer_state(device: &ID3D11Device, device_context: &ID3D11DeviceCont
     Ok(())
 }
 
-fn set_scissor(context: &ID3D11DeviceContext, rect: DamageRect) {
+fn set_scissor(context: &ID3D11DeviceContext, rect: ScissorRectangle) {
     let native = RECT {
         left: rect.x as i32,
         top: rect.y as i32,
@@ -3851,7 +3851,8 @@ mod tests {
                             mode == GlyphRenderMode::Subpixel,
                             fraction,
                         );
-                        let next = SceneSnapshot::capture(&scene, 1, 512, 1024).unwrap();
+                        let next =
+                            SceneSnapshot::capture(&scene, 1, 512, 1024, Vec::new()).unwrap();
                         if revision == 3 {
                             // The hover raises a row's draw order; only its tiles change.
                             let old = snapshot.as_ref().unwrap();

@@ -1522,9 +1522,11 @@ mod path_target_tests {
                 let first = tiled_history_scene(Some(0), fraction, glyph, mode);
                 let last = tiled_history_scene(Some(1), fraction, glyph, mode);
                 let first_snapshot =
-                    gpui_render::damage::SceneSnapshot::capture(&first, 1, 512, 1024).unwrap();
+                    gpui_render::damage::SceneSnapshot::capture(&first, 1, 512, 1024, Vec::new())
+                        .unwrap();
                 let last_snapshot =
-                    gpui_render::damage::SceneSnapshot::capture(&last, 1, 512, 1024).unwrap();
+                    gpui_render::damage::SceneSnapshot::capture(&last, 1, 512, 1024, Vec::new())
+                        .unwrap();
                 assert!(
                     matches!(
                         last_snapshot.compare(&first_snapshot),
