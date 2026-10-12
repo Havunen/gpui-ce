@@ -17,6 +17,7 @@ struct Target {
     _reservation: GpuMemoryReservation,
 }
 pub(super) struct RetainedFrame {
+    /// Always on; tests switch it off to render full-redraw references.
     enabled: bool,
     target: Option<Target>,
     scene: RetainedScene,
@@ -33,7 +34,7 @@ pub(super) struct RetainedPlan {
 impl RetainedFrame {
     pub fn new() -> Self {
         Self {
-            enabled: gpu::partial_redraw_enabled(),
+            enabled: true,
             target: None,
             scene: RetainedScene::default(),
             #[cfg(test)]

@@ -946,8 +946,10 @@ mod path_target_tests {
         let mut renderer =
             WgpuRenderer::new_headless(&context, size(DevicePixels(64), DevicePixels(64)))?;
         renderer.retained.enable_for_tests();
-        #[cfg(target_os = "windows")]
-        renderer.target.disable_retained_copy_for_tests();
+        // A surface without COPY_DST blits on DX12 too.
+        renderer
+            .target
+            .update_surface_copy_support(wgpu::TextureUsages::RENDER_ATTACHMENT, &[]);
         let mut scene = Scene::default();
         scene.finish();
         for revision in 1..=3 {
@@ -1028,7 +1030,6 @@ mod path_target_tests {
                     renderer.rebuild_pipelines();
                     renderer.update_transparency(transparent);
                 }
-                retained.target.enable_retained_copy_for_tests();
                 assert!(retained.target.retained_copy_enabled());
                 let glyph = retained_glyph_tile(&full)?;
                 assert_eq!(glyph, retained_glyph_tile(&retained)?);
@@ -1114,9 +1115,13 @@ mod path_target_tests {
                 assert_eq!(retained.last_retained_presentation, "copy");
 
                 let _scope = gpui::profiler::gpu::set_gpu_frame_context(true, revision);
-                retained.target.disable_retained_copy_for_tests();
+                // A texture made while the surface lacked COPY_DST.
+                let copy = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST;
+                retained
+                    .target
+                    .update_surface_copy_support(wgpu::TextureUsages::RENDER_ATTACHMENT, &[format]);
                 let target = retained.create_offscreen_target();
-                retained.target.enable_retained_copy_for_tests();
+                retained.target.update_surface_copy_support(copy, &[format]);
                 assert!(
                     !target
                         .texture
@@ -1161,10 +1166,7 @@ mod path_target_tests {
                     "replacement without copy support",
                 )?;
                 assert_eq!(retained.last_retained_presentation, "blit");
-                retained.target.update_surface_copy_support(
-                    wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST,
-                    &[format],
-                );
+                retained.target.update_surface_copy_support(copy, &[format]);
                 assert_retained_rgba(
                     &mut full,
                     &mut retained,

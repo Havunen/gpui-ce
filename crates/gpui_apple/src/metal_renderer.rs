@@ -496,9 +496,6 @@ pub struct MetalRenderer {
     path_intermediate_msaa_texture: Option<metal::Texture>,
     /// Resolve targets for path prepass layers after the first.
     path_layer_textures: Vec<metal::Texture>,
-    /// Off with `GPUI_GPU_EXPERIMENTS=no-partial-redraw`: every frame renders
-    /// straight to the drawable.
-    partial_redraw: bool,
     // Offscreen scene target (the scene is rendered here, then blitted to the drawable, so blur
     // passes can sample already-painted content), the half-res ping/pong blur targets, and a
     // full-res target for content-filter groups.
@@ -801,7 +798,6 @@ impl MetalRenderer {
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_layer_textures: Vec::new(),
-            partial_redraw: gpu::partial_redraw_enabled(),
             scene_color_texture: None,
             blur_ping_texture: None,
             blur_pong_texture: None,
@@ -1003,7 +999,7 @@ impl MetalRenderer {
     fn frame_mode(&mut self, scene: &Scene, viewport_size: Size<DevicePixels>) -> FrameMode {
         // Synchronous presents (live resize, window activation, display
         // requests from the layer) always repaint everything.
-        if !self.partial_redraw || self.presents_with_transaction {
+        if self.presents_with_transaction {
             self.forget_previous_frame();
             return FrameMode::Direct;
         }
@@ -4033,12 +4029,10 @@ mod tests {
         };
         for opaque in [true, false] {
             let mut renderer = headless_renderer();
-            renderer.partial_redraw = true;
             renderer.opaque = opaque;
             // Full redraws from a renderer of their own, so nothing a partial
             // frame skips is left behind in shared intermediate textures.
             let mut reference = headless_renderer();
-            reference.partial_redraw = false;
             reference.opaque = opaque;
             let tile = spinner(&renderer);
             assert_eq!(

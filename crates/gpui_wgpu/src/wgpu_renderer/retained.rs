@@ -44,7 +44,7 @@ impl RetainedFrame {
                 target_os = "windows",
                 target_os = "linux",
                 target_os = "freebsd"
-            )) && gpu::partial_redraw_enabled(),
+            )),
             target: None,
             scene: RetainedScene::default(),
             #[cfg(test)]

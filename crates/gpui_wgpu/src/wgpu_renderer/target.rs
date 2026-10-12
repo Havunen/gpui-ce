@@ -12,7 +12,6 @@ pub(super) struct RenderTarget {
     needs_redraw: bool,
     copy_backend_supported: bool,
     copy_surface_supported: bool,
-    copy_requested: bool,
     pub(super) clear_color: wgpu::Color,
 }
 
@@ -106,7 +105,6 @@ impl RenderTarget {
             needs_redraw: false,
             copy_backend_supported: cfg!(target_os = "windows") && backend == wgpu::Backend::Dx12,
             copy_surface_supported,
-            copy_requested: gpui::profiler::gpu::partial_redraw_enabled(),
             clear_color: clear_color(requested.transparent),
         };
         target.refresh_copy_usage();
@@ -143,7 +141,8 @@ impl RenderTarget {
         true
     }
 
-    fn retained_copy_supported(&self) -> bool {
+    /// Whether the retained frame reaches the swapchain by copy rather than blit.
+    pub(super) fn retained_copy_enabled(&self) -> bool {
         self.copy_backend_supported
             && self.copy_surface_supported
             // The formats the copy is verified with.
@@ -152,10 +151,6 @@ impl RenderTarget {
                 wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm
             )
             && super::retained::alpha_supported(self.config.alpha_mode)
-    }
-
-    pub(super) fn retained_copy_enabled(&self) -> bool {
-        self.copy_requested && self.retained_copy_supported()
     }
 
     fn refresh_copy_usage(&mut self) {
@@ -173,22 +168,6 @@ impl RenderTarget {
     ) {
         self.copy_surface_supported =
             usages.contains(wgpu::TextureUsages::COPY_DST) && formats.contains(&self.config.format);
-        self.refresh_copy_usage();
-    }
-
-    #[cfg(all(test, target_os = "windows"))]
-    pub(super) fn enable_retained_copy_for_tests(&mut self) {
-        assert!(
-            self.retained_copy_supported(),
-            "copy tests require a supported DX12 target"
-        );
-        self.copy_requested = true;
-        self.refresh_copy_usage();
-    }
-
-    #[cfg(all(test, target_os = "windows"))]
-    pub(super) fn disable_retained_copy_for_tests(&mut self) {
-        self.copy_requested = false;
         self.refresh_copy_usage();
     }
 
@@ -398,7 +377,6 @@ mod tests {
             needs_redraw: false,
             copy_backend_supported: true,
             copy_surface_supported: true,
-            copy_requested: true,
             clear_color: wgpu::Color::TRANSPARENT,
         };
         let mut caps = wgpu::SurfaceCapabilities {
