@@ -3727,50 +3727,33 @@ mod tests {
         );
     }
 
-    /// Path batches separated by other primitives, both overlapping (one
-    /// layer each) and disjoint (sharing a layer), plus more overlapping
-    /// batches than layers so the frame falls back to per-batch passes.
-    fn path_layer_scenes() -> Vec<(&'static str, Scene)> {
-        let mut scenes = Vec::new();
-
-        // Fill, a quad over it, then an outline over both (the repo tab).
+    /// Path batches separated by other primitives: a fill, a quad over it and
+    /// an outline over both (the repo tab), which need a layer each, and
+    /// disjoint rows that share one. Each of the `hidden` transparent batches
+    /// over the fill changes no pixel but needs a layer of its own.
+    fn path_layer_scene(hidden: usize) -> Scene {
         let mut scene = Scene::default();
         scene.insert_primitive(triangle(4.0, 4.0, 40.0, 0.1, 1.0));
         scene.insert_primitive(quad(rect(14.0, 14.0, 12.0, 8.0), 0.6, 1.0));
         scene.insert_primitive(triangle(10.0, 10.0, 36.0, 0.3, 0.7));
-        // Disjoint batches far away, each over its own quad.
         for row in 0..4 {
             let y = 60.0 + row as f32 * 22.0;
             scene.insert_primitive(quad(rect(70.0, y, 30.0, 20.0), 0.5, 1.0));
             scene.insert_primitive(triangle(72.0, y + 2.0, 16.0, 0.05 * row as f32, 0.9));
             scene.insert_primitive(quad(rect(80.0, y + 4.0, 6.0, 6.0), 0.9, 0.5));
         }
-        scene.finish();
-        scenes.push(("overlapping and disjoint batches", scene));
-
-        // Five stacked batches over the same spot exceed the layer limit.
-        let mut scene = Scene::default();
-        for index in 0..5 {
-            let offset = index as f32 * 3.0;
-            scene.insert_primitive(triangle(
-                8.0 + offset,
-                8.0 + offset,
-                40.0,
-                0.15 * index as f32,
-                0.8,
-            ));
-            scene.insert_primitive(quad(rect(20.0 + offset, 20.0 + offset, 8.0, 8.0), 0.7, 0.6));
+        for index in 0..hidden {
+            scene.insert_primitive(quad(rect(14.0, 14.0, 12.0, 8.0), 0.6, 0.0));
+            scene.insert_primitive(triangle(6.0 + index as f32, 6.0, 40.0, 0.2, 0.0));
         }
         scene.finish();
-        scenes.push(("more overlapping batches than layers", scene));
-        scenes
+        scene
     }
 
     #[test]
     fn path_prepass_plans_layers_by_sampled_region() {
         let size = size(DevicePixels(160), DevicePixels(160));
-        let scenes = path_layer_scenes();
-        let plan = plan_path_prepass(&scenes[0].1, size).expect("fits in the layer limit");
+        let plan = plan_path_prepass(&path_layer_scene(0), size).expect("fits in the layer limit");
         assert_eq!(plan.layers.len(), 2, "the outline overlaps the fill");
         let batches: usize = plan.layers.iter().map(|layer| layer.batches.len()).sum();
         assert!(batches >= 3, "disjoint rows share layers: {batches}");
@@ -3779,9 +3762,19 @@ mod tests {
             assert_eq!(layer.extent.0 % 32, 0);
         }
         assert!(
-            plan_path_prepass(&scenes[1].1, size).is_none(),
-            "five stacked batches fall back"
+            plan_path_prepass(&path_layer_scene(2), size).is_none(),
+            "two more stacked batches exceed the layer limit"
         );
+    }
+
+    #[test]
+    fn path_prepass_draws_what_per_batch_passes_draw() {
+        let size = size(DevicePixels(160), DevicePixels(160));
+        let mut renderer = headless_renderer();
+        let prepass = (renderer.render_scene_to_image(&path_layer_scene(0), size)).unwrap();
+        // Past the layer limit, the same visible paths draw batch by batch.
+        let per_batch = (renderer.render_scene_to_image(&path_layer_scene(2), size)).unwrap();
+        assert_same_pixels(&per_batch, &prepass, "path prepass");
     }
 
     #[test]
