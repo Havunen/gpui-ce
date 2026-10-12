@@ -205,7 +205,7 @@ impl WgpuHeadlessRenderer {
             &mut self.renderer,
             scene,
             &target.view,
-            Some(&target.texture),
+            &target.texture,
             None,
         )
         .ok_or_else(|| anyhow::anyhow!("failed to render headless scene"))?;
@@ -777,11 +777,11 @@ mod path_target_tests {
             &resting,
             1,
             "full",
-            "shipping flags off",
+            "retained off",
         )?;
         assert!(
             retained.resources().pipelines.damage_clear_quads.is_none(),
-            "default rendering must not create the experimental clear PSO"
+            "full frames must not create the damage-clear PSO"
         );
         retained.retained.enable_for_tests();
         {
@@ -1137,23 +1137,7 @@ mod path_target_tests {
                 )?;
                 assert_eq!(retained.last_retained_presentation, "copy");
 
-                // A view-only caller cannot safely infer its underlying texture.
-                let target = retained.create_offscreen_target();
                 let _scope = gpui::profiler::gpu::set_gpu_frame_context(true, revision);
-                let submission = super::super::frame::render_to_view(
-                    &mut retained,
-                    &scene,
-                    &target.view,
-                    None,
-                    Some(target.readback_copy()),
-                )
-                .unwrap();
-                assert_eq!(
-                    retained.read_offscreen_target(&target, submission)?,
-                    full.render_to_image(&scene)?
-                );
-                assert_eq!(retained.last_retained_presentation, "blit");
-
                 retained.target.disable_retained_copy_for_tests();
                 let target = retained.create_offscreen_target();
                 retained.target.enable_retained_copy_for_tests();
@@ -1167,7 +1151,7 @@ mod path_target_tests {
                     &mut retained,
                     &scene,
                     &target.view,
-                    Some(&target.texture),
+                    &target.texture,
                     Some(target.readback_copy()),
                 )
                 .unwrap();

@@ -26,7 +26,6 @@ mod platform;
 pub use platform::RecoveryPending;
 mod resources;
 mod retained;
-mod retained_copy;
 mod settings;
 mod surfaces;
 mod target;
@@ -299,7 +298,7 @@ impl WgpuRenderer {
             driver_info: self.adapter_info.driver_info.clone(),
         }
     }
-    /// Release the experimental retained frame when a window is deactivated.
+    /// Release the retained frame when a window is deactivated.
     pub fn release_retained_frame(&mut self) {
         self.retained.invalidate();
     }
@@ -315,7 +314,7 @@ impl WgpuRenderer {
         texture: &wgpu::Texture,
         view: &wgpu::TextureView,
     ) -> bool {
-        frame::render_to_view(self, scene, view, Some(texture), None).is_some()
+        frame::render_to_view(self, scene, view, texture, None).is_some()
     }
 
     #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
@@ -329,7 +328,7 @@ impl WgpuRenderer {
             self,
             scene,
             frame_view,
-            Some(readback.texture),
+            readback.texture,
             Some(readback),
         )
     }

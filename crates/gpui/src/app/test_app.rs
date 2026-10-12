@@ -641,7 +641,6 @@ mod tests {
             window.simulate_mouse_move(point(px(10. + x as f32), px(10.)));
         }
         window.simulate_request_frame(RequestFrameOptions::default());
-        // Published without any experiment flag in the environment.
         let drawn = platform_window.last_frame_context().scene_revision;
         assert!(drawn > 0);
         // Fast input re-presents the unchanged scene, which keeps its revision.

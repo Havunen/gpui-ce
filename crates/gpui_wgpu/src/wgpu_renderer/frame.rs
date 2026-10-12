@@ -20,7 +20,7 @@ pub(super) fn render_to_view(
     renderer: &mut WgpuRenderer,
     scene: &Scene,
     frame_view: &wgpu::TextureView,
-    frame_texture: Option<&wgpu::Texture>,
+    frame_texture: &wgpu::Texture,
     readback: Option<ReadbackCopy<'_>>,
 ) -> Option<wgpu::SubmissionIndex> {
     if !begin_frame(renderer) {
@@ -39,31 +39,22 @@ pub(super) fn render_to_view(
         renderer.target.retained_copy_enabled(),
         renderer.resources.as_ref()?,
         renderer.target.format(),
-        renderer.target.configuration().alpha_mode,
+        renderer.target.alpha_mode(),
         renderer.target.clear_color(),
     );
     let transport = renderer.resources().instances.transport();
     let requirements = FrameRequirements::for_damage(scene, &retained.damage, transport);
     let mut targets = PreparedTargets::prepare(renderer, scene, frame_view, &requirements)?;
-    let retained_copy = if renderer.target.retained_copy_enabled() && targets.offscreen.is_none() {
-        retained
-            .copy_texture
-            .as_ref()
-            .zip(frame_texture)
-            .filter(|(source, destination)| {
-                super::retained_copy::compatible(
-                    source,
-                    destination,
-                    renderer.target.format(),
-                    renderer.target.width(),
-                    renderer.target.height(),
-                    renderer.target.alpha_mode(),
-                )
-            })
-            .map(|(source, destination)| (source.clone(), destination.clone()))
-    } else {
-        None
-    };
+    // The retained texture matches the target by construction. The frame
+    // texture may not: it can predate a resize or lack COPY_DST.
+    let retained_copy = (retained.copy_texture.take())
+        .filter(|source| {
+            targets.offscreen.is_none()
+                && frame_texture.usage().contains(wgpu::TextureUsages::COPY_DST)
+                && frame_texture.size() == source.size()
+                && frame_texture.format() == source.format()
+        })
+        .map(|source| (source, frame_texture.clone()));
     if let Some(view) = &retained.view {
         targets.active = view.clone();
         // Create the overwrite-clear PSO with the target's first full frame, so

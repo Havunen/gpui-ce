@@ -101,10 +101,7 @@ impl RetainedFrame {
         }
         let bytes = retained_bytes(format, width, height);
         if !context.interactive
-            || !matches!(
-                alpha_mode,
-                wgpu::CompositeAlphaMode::Opaque | wgpu::CompositeAlphaMode::PreMultiplied
-            )
+            || !alpha_supported(alpha_mode)
             // The damage-clear Quad must reproduce the raw target clear exactly.
             // Colored translucent clears would be premultiplied again by its shader;
             // arbitrary opaque colors also lack an exact HSL round-trip proof.
@@ -231,6 +228,14 @@ fn retained_clear_supported(clear: wgpu::Color) -> bool {
     (black && clear.a.is_finite() && (0.0..=1.0).contains(&clear.a)) || opaque_white
 }
 
+/// The alpha modes partial redraw is verified with, copied or blitted.
+pub(super) fn alpha_supported(alpha: wgpu::CompositeAlphaMode) -> bool {
+    matches!(
+        alpha,
+        wgpu::CompositeAlphaMode::Opaque | wgpu::CompositeAlphaMode::PreMultiplied
+    )
+}
+
 fn retained_bytes(format: wgpu::TextureFormat, width: u32, height: u32) -> Option<u64> {
     if width == 0
         || height == 0
@@ -276,6 +281,14 @@ mod tests {
             a: -0.25,
             ..wgpu::Color::BLACK
         }));
+    }
+
+    #[test]
+    fn only_opaque_and_premultiplied_targets_retain() {
+        assert!(alpha_supported(wgpu::CompositeAlphaMode::Opaque));
+        assert!(alpha_supported(wgpu::CompositeAlphaMode::PreMultiplied));
+        assert!(!alpha_supported(wgpu::CompositeAlphaMode::PostMultiplied));
+        assert!(!alpha_supported(wgpu::CompositeAlphaMode::Inherit));
     }
 
     #[test]

@@ -143,11 +143,15 @@ impl RenderTarget {
         true
     }
 
-    pub(super) fn retained_copy_supported(&self) -> bool {
+    fn retained_copy_supported(&self) -> bool {
         self.copy_backend_supported
             && self.copy_surface_supported
-            && super::retained_copy::format_supported(self.config.format)
-            && super::retained_copy::alpha_supported(self.config.alpha_mode)
+            // The formats the copy is verified with.
+            && matches!(
+                self.config.format,
+                wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm
+            )
+            && super::retained::alpha_supported(self.config.alpha_mode)
     }
 
     pub(super) fn retained_copy_enabled(&self) -> bool {
