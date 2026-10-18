@@ -3136,6 +3136,8 @@ pub enum DragMoveRefresh {
 
 /// Contains state associated with an active drag operation, started by dragging an element
 /// within the window or by dragging into the app from the underlying platform.
+#[derive(derive_setters::Setters)]
+#[setters(generate = false)]
 pub struct AnyDrag {
     /// The view used to render this drag
     pub view: AnyView,
@@ -3145,12 +3147,14 @@ pub struct AnyDrag {
 
     /// This is used to render the dragged item in the same place
     /// on the original element that the drag was initiated
+    #[setters(generate, rename = "offset")]
     pub cursor_offset: Point<Pixels>,
 
     /// Which views to invalidate when the pointer moves.
     pub move_refresh: DragMoveRefresh,
 
     /// The cursor style to use while dragging
+    #[setters(generate)]
     pub cursor_style: Option<CursorStyle>,
 
     /// Resolves the payload to offer the platform if the drag leaves the window.
@@ -3170,21 +3174,9 @@ impl AnyDrag {
         }
     }
 
-    /// Assigns the offset of the view from the cursor when dragging begins.
-    pub fn offset(mut self, offset: Point<Pixels>) -> Self {
-        self.cursor_offset = offset;
-        self
-    }
-
     /// Assigns which views to invalidate when the pointer moves during this drag.
     pub fn move_refresh(mut self, refresh: DragMoveRefresh) -> Self {
         self.move_refresh = refresh;
-        self
-    }
-
-    /// Assigns the style of the cursor while dragging is active.
-    pub fn cursor_style(mut self, style: Option<CursorStyle>) -> Self {
-        self.cursor_style = style;
         self
     }
 
