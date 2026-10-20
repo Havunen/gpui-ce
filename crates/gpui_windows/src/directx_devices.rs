@@ -7,7 +7,41 @@ use crate::bindings::Windows::Win32::{
 use anyhow::{Context, Result};
 use gpui_util::ResultExt;
 use itertools::Itertools;
+use parking_lot::Mutex;
+use std::sync::Arc;
 use windows_core::Interface;
+
+/// DX11 is optional until renderer selection actually needs it. The vsync thread
+/// observes this same slot so it also sees devices created by a later window.
+pub(crate) type SharedDirectXDevices = Arc<LazyDirectXDevices>;
+
+pub(crate) struct LazyDirectXDevices<T = DirectXDevices>(Mutex<Option<T>>);
+
+impl<T> Default for LazyDirectXDevices<T> {
+    fn default() -> Self {
+        Self(Mutex::new(None))
+    }
+}
+
+impl<T: Clone> LazyDirectXDevices<T> {
+    pub(crate) fn get(&self) -> Option<T> {
+        self.0.lock().clone()
+    }
+
+    pub(crate) fn get_or_try_init(&self, create: impl FnOnce() -> Result<T>) -> Result<T> {
+        let mut devices = self.0.lock();
+        if devices.is_none() {
+            *devices = Some(create()?);
+        }
+        Ok(devices.as_ref().unwrap().clone())
+    }
+
+    pub(crate) fn replace(&self, devices: T) {
+        // Release the slot lock before dropping the old COM references.
+        let previous = self.0.lock().replace(devices);
+        drop(previous);
+    }
+}
 
 pub(crate) fn try_to_recover_from_device_lost<T>(mut f: impl FnMut() -> Result<T>) -> Result<T> {
     (0..5)
@@ -107,7 +141,7 @@ fn debug_layer_requested(mode: &str, debug_build: bool) -> Option<bool> {
 }
 
 #[inline]
-fn get_dxgi_factory(debug_layer_available: bool) -> Result<IDXGIFactory6> {
+pub(crate) fn get_dxgi_factory(debug_layer_available: bool) -> Result<IDXGIFactory6> {
     let factory_flag = if debug_layer_available {
         DXGI_CREATE_FACTORY_DEBUG
     } else {

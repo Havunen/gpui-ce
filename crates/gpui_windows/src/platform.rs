@@ -65,7 +65,7 @@ pub(crate) struct WindowsPlatformState {
     /// Shared with each window to coordinate draws across windows on the UI
     /// thread; see [`DrawCoordinator`].
     pub(crate) draw_coordinator: Rc<DrawCoordinator>,
-    directx_devices: RefCell<Option<DirectXDevices>>,
+    directx_devices: SharedDirectXDevices,
 }
 
 #[derive(Default)]
@@ -81,7 +81,7 @@ struct PlatformCallbacks {
 }
 
 impl WindowsPlatformState {
-    fn new(directx_devices: Option<DirectXDevices>) -> Self {
+    fn new() -> Self {
         let callbacks = PlatformCallbacks::default();
         let jump_list = JumpList::new();
         let current_cursor = load_cursor(CursorStyle::Arrow);
@@ -92,7 +92,7 @@ impl WindowsPlatformState {
             current_cursor: Cell::new(current_cursor),
             cursor_visible: Arc::new(AtomicBool::new(true)),
             draw_coordinator: Rc::new(DrawCoordinator::new()),
-            directx_devices: RefCell::new(directx_devices),
+            directx_devices: Default::default(),
             menus: RefCell::new(Vec::new()),
         }
     }
@@ -110,22 +110,8 @@ impl WindowsPlatform {
                 .ok()
                 .context("unable to initialize Windows OLE")?;
         }
-        let (directx_devices, text_system) = if !headless {
-            let devices = DirectXDevices::new().context("Creating DirectX devices")?;
-            let text_system = Arc::new(
-                DirectWriteTextSystem::new(&devices)
-                    .context("Error creating DirectWriteTextSystem")?,
-            );
-
-            (Some(devices), text_system)
-        } else {
-            let text_system = Arc::new(
-                DirectWriteTextSystem::new_headless()
-                    .context("Error creating headless DirectWriteTextSystem")?,
-            );
-
-            (None, text_system)
-        };
+        let text_system =
+            Arc::new(DirectWriteTextSystem::new().context("Error creating DirectWriteTextSystem")?);
         let (main_sender, main_receiver) = PriorityQueueReceiver::new();
         let validation_number = if usize::BITS == 64 {
             rand::random::<u64>() as usize
@@ -141,7 +127,6 @@ impl WindowsPlatform {
             validation_number,
             main_sender: Some(main_sender),
             main_receiver: Some(main_receiver),
-            directx_devices,
             dispatcher: None,
         };
         let result = unsafe {
@@ -241,7 +226,7 @@ impl WindowsPlatform {
             main_receiver: self.inner.main_receiver.clone(),
             platform_window_handle: self.handle,
             disable_direct_composition: self.disable_direct_composition,
-            directx_devices: self.inner.state.directx_devices.borrow().clone().unwrap(),
+            directx_devices: self.inner.state.directx_devices.clone(),
             renderer_context: self.renderer_context.clone(),
             invalidate_devices: self.invalidate_devices.clone(),
             draw_coordinator: self.inner.state.draw_coordinator.clone(),
@@ -310,10 +295,7 @@ impl WindowsPlatform {
     }
 
     fn begin_vsync_thread(&self) {
-        let Some(directx_devices) = self.inner.state.directx_devices.borrow().clone() else {
-            return;
-        };
-        let mut directx_device = directx_devices;
+        let directx_devices = self.inner.state.directx_devices.clone();
         let platform_window: SafeHwnd = self.handle.into();
         let validation_number = self.inner.validation_number;
         let all_windows = Arc::downgrade(&self.raw_window_handles);
@@ -326,31 +308,38 @@ impl WindowsPlatform {
                 let vsync_provider = VSyncProvider::new();
                 loop {
                     vsync_provider.wait_for_vsync();
-                    if check_device_lost(&directx_device.device)
-                        || invalidate_devices.fetch_and(false, Ordering::Acquire)
-                    {
-                        if let Err(err) = handle_gpu_device_lost(
-                            &mut directx_device,
-                            platform_window.as_raw(),
-                            validation_number,
-                            &all_windows,
-                            &text_system,
-                        ) {
-                            panic!("Device lost: {err}");
-                        }
-                    }
-                    let Some(all_windows) = all_windows.upgrade() else {
+                    let Some(windows) = all_windows.upgrade() else {
                         break;
                     };
-                    for hwnd in all_windows.read().iter() {
-                        unsafe {
-                            let _ = RedrawWindow(
-                                Some(hwnd.as_raw()),
-                                None,
-                                None,
-                                RDW_INVALIDATE as u32,
-                            );
-                        }
+                    // Snapshot on every tick: the first DX11 window can open
+                    // after this thread starts. No slot lock crosses SendMessage.
+                    if let Err(err) = run_vsync_tick(
+                        || directx_devices.get(),
+                        &invalidate_devices,
+                        |devices| check_device_lost(&devices.device),
+                        |devices| {
+                            handle_gpu_device_lost(
+                                devices,
+                                platform_window.as_raw(),
+                                validation_number,
+                                &all_windows,
+                                &text_system,
+                            )
+                        },
+                        || {
+                            for hwnd in windows.read().iter() {
+                                unsafe {
+                                    let _ = RedrawWindow(
+                                        Some(hwnd.as_raw()),
+                                        None,
+                                        None,
+                                        RDW_INVALIDATE as u32,
+                                    );
+                                }
+                            }
+                        },
+                    ) {
+                        panic!("Device lost: {err}");
                     }
                 }
             })
@@ -967,7 +956,7 @@ impl Platform for WindowsPlatform {
 
 impl WindowsPlatformInner {
     fn new(context: &mut PlatformWindowCreateContext) -> Result<Rc<Self>> {
-        let state = WindowsPlatformState::new(context.directx_devices.take());
+        let state = WindowsPlatformState::new();
         Ok(Rc::new(Self {
             state,
             raw_window_handles: context.raw_window_handles.clone(),
@@ -1177,8 +1166,7 @@ impl WindowsPlatformInner {
     fn handle_device_lost(&self, lparam: LPARAM) -> Option<isize> {
         let directx_devices = lparam.0 as *const DirectXDevices;
         let directx_devices = unsafe { &*directx_devices };
-        self.state.directx_devices.borrow_mut().take();
-        *self.state.directx_devices.borrow_mut() = Some(directx_devices.clone());
+        self.state.directx_devices.replace(directx_devices.clone());
 
         Some(0)
     }
@@ -1219,7 +1207,7 @@ pub(crate) struct WindowCreationInfo {
     pub(crate) main_receiver: PriorityQueueReceiver<RunnableVariant>,
     pub(crate) platform_window_handle: HWND,
     pub(crate) disable_direct_composition: bool,
-    pub(crate) directx_devices: DirectXDevices,
+    pub(crate) directx_devices: SharedDirectXDevices,
     pub(crate) renderer_context: RendererContext,
     /// Flag to instruct the `VSyncProvider` thread to invalidate the directx devices
     /// as resizing them has failed, causing us to have lost at least the render target.
@@ -1234,7 +1222,6 @@ struct PlatformWindowCreateContext {
     validation_number: usize,
     main_sender: Option<PriorityQueueSender<RunnableVariant>>,
     main_receiver: Option<PriorityQueueReceiver<RunnableVariant>>,
-    directx_devices: Option<DirectXDevices>,
     dispatcher: Option<Arc<WindowsDispatcher>>,
 }
 
@@ -1459,6 +1446,28 @@ fn should_auto_hide_scrollbars() -> Result<bool> {
     Ok(ui_settings.AutoHideScrollBars()?)
 }
 
+/// Every window needs redraw ticks, including DX12 windows without a DX11
+/// support device. Recovery only applies to an existing DX11 device snapshot.
+fn run_vsync_tick<D>(
+    get_devices: impl FnOnce() -> Option<D>,
+    invalidate_devices: &AtomicBool,
+    needs_recovery: impl FnOnce(&D) -> bool,
+    recover: impl FnOnce(&mut D) -> Result<()>,
+    redraw: impl FnOnce(),
+) -> Result<()> {
+    // A stale invalidation must not create DX11 devices in a DX12-only process.
+    // Consume it before taking the snapshot: an invalidation from a device
+    // created after an empty snapshot must remain pending for the next tick.
+    let invalidated = invalidate_devices.swap(false, Ordering::Acquire);
+    if let Some(mut devices) = get_devices() {
+        if needs_recovery(&devices) || invalidated {
+            recover(&mut devices)?;
+        }
+    }
+    redraw();
+    Ok(())
+}
+
 fn check_device_lost(device: &ID3D11Device) -> bool {
     let device_state = unsafe { device.GetDeviceRemovedReason().ok() };
     match device_state {
@@ -1600,10 +1609,146 @@ unsafe extern "system" fn window_procedure(
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::{OsStr, OsString};
+    use std::{
+        cell::Cell,
+        ffi::{OsStr, OsString},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
 
-    use super::{encode_restart_arguments, read_from_clipboard, write_to_clipboard};
+    use super::{
+        WindowsPlatform, encode_restart_arguments, read_from_clipboard, run_vsync_tick,
+        write_to_clipboard,
+    };
+    use crate::{LazyDirectXDevices, WindowsRendererOptions};
     use gpui::ClipboardItem;
+
+    #[test]
+    fn windowed_and_headless_platforms_start_without_dx11_devices() -> anyhow::Result<()> {
+        for headless in [false, true] {
+            let platform =
+                WindowsPlatform::new_with_renderer(headless, WindowsRendererOptions::default())?;
+            assert!(platform.inner.state.directx_devices.get().is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn vsync_without_dx11_redraws_and_consumes_stale_invalidation() {
+        let invalidated = AtomicBool::new(true);
+        let redraws = Cell::new(0);
+        for _ in 0..2 {
+            run_vsync_tick::<u8>(
+                || None,
+                &invalidated,
+                |_| panic!("DX12 does not need DX11 loss checks"),
+                |_| panic!("a stale flag must not create DX11 devices"),
+                || redraws.set(redraws.get() + 1),
+            )
+            .unwrap();
+            assert!(!invalidated.load(Ordering::Relaxed));
+        }
+        assert_eq!(redraws.get(), 2);
+    }
+
+    #[test]
+    fn vsync_observes_late_devices_and_publishes_recovery_before_redraw() {
+        let devices = Arc::new(LazyDirectXDevices::<u8>::default());
+        let vsync_devices = devices.clone();
+        let invalidated = AtomicBool::new(false);
+        let checks = Cell::new(0);
+        let recoveries = Cell::new(0);
+        let redraws = Cell::new(0);
+        for tick in 0..3 {
+            if tick == 1 {
+                devices.get_or_try_init(|| Ok(11)).unwrap();
+            }
+            if tick == 2 {
+                invalidated.store(true, Ordering::Relaxed);
+            }
+            run_vsync_tick(
+                || vsync_devices.get(),
+                &invalidated,
+                |_| {
+                    checks.set(checks.get() + 1);
+                    false
+                },
+                |device| {
+                    recoveries.set(recoveries.get() + 1);
+                    *device += 1;
+                    // Mirrors the platform notification before window recovery.
+                    devices.replace(*device);
+                    Ok(())
+                },
+                || {
+                    assert_eq!(vsync_devices.get(), [None, Some(11), Some(12)][tick]);
+                    redraws.set(redraws.get() + 1);
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(checks.get(), 2);
+        assert_eq!(recoveries.get(), 1);
+        assert_eq!(redraws.get(), 3);
+        assert!(!invalidated.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn failed_device_recovery_does_not_publish_or_redraw() {
+        let devices = LazyDirectXDevices::<u8>::default();
+        devices.get_or_try_init(|| Ok(11)).unwrap();
+        let invalidated = AtomicBool::new(true);
+        assert!(
+            run_vsync_tick(
+                || devices.get(),
+                &invalidated,
+                |_| true,
+                |_| anyhow::bail!("device recreation failed"),
+                || panic!("failed recovery must not redraw"),
+            )
+            .is_err()
+        );
+        assert_eq!(devices.get(), Some(11));
+        assert!(!invalidated.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn vsync_preserves_invalidation_published_after_an_empty_snapshot() {
+        let devices = LazyDirectXDevices::<u8>::default();
+        let invalidated = AtomicBool::new(false);
+        run_vsync_tick(
+            || {
+                let snapshot = devices.get();
+                // Simulate the UI creating its first DX11 window immediately
+                // after the vsync thread observed an empty slot.
+                devices.get_or_try_init(|| Ok(11)).unwrap();
+                invalidated.store(true, Ordering::Release);
+                snapshot
+            },
+            &invalidated,
+            |_| panic!("the snapshot is empty"),
+            |_| panic!("recovery must wait for the next snapshot"),
+            || {},
+        )
+        .unwrap();
+        assert!(invalidated.load(Ordering::Relaxed));
+        let recovered = Cell::new(false);
+        run_vsync_tick(
+            || devices.get(),
+            &invalidated,
+            |_| false,
+            |_| {
+                recovered.set(true);
+                Ok(())
+            },
+            || {},
+        )
+        .unwrap();
+        assert!(recovered.get());
+        assert!(!invalidated.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn test_encode_restart_arguments() {

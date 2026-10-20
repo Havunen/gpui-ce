@@ -22,6 +22,10 @@ mod filters;
 mod frame;
 #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
 mod headless;
+#[cfg(all(test, feature = "test-support", not(target_family = "wasm")))]
+mod lazy_filter_tests;
+#[cfg(all(test, feature = "test-support", not(target_family = "wasm")))]
+mod lazy_smoothing_tests;
 mod path_types;
 mod pipelines;
 mod platform;
