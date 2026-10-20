@@ -1294,7 +1294,12 @@ impl WindowsWindowInner {
             .borrow_mut()
             .handle_device_lost(&devices)
         {
-            panic!("Device lost: {err}");
+            // This window cannot draw until its resources exist again. Ask the VSync
+            // thread to recreate the devices instead of taking the process down.
+            log::error!("Recreating window resources after a device loss failed: {err:#}");
+            self.state
+                .invalidate_devices
+                .store(true, std::sync::atomic::Ordering::Release);
         }
         // Make sure the first `draw_window` after recovery (whether it comes
         // from the forced WM_GPUI_FORCE_UPDATE_WINDOW or a stray WM_PAINT in

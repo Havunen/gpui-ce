@@ -14,7 +14,7 @@ path = "src/gpui_windows.rs"
 
 [features]
 default = ["gpui/default"]
-test-support = ["gpui/test-support"]
+test-support = ["gpui/test-support", "gpui_wgpu?/test-support"]
 windows-wgpu = ["dep:gpui_wgpu"]
 screen-capture = ["gpui/screen-capture"]
 

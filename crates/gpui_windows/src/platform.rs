@@ -339,11 +339,16 @@ impl WindowsPlatform {
                             }
                         },
                     ) {
-                        panic!("Device lost: {err}");
+                        // The device stays lost, so a later tick retries recovery. Back
+                        // off: each attempt already waits for the driver and recreates
+                        // every window's resources.
+                        log::error!("DirectX device recovery failed; retrying: {err:#}");
+                        std::thread::sleep(std::time::Duration::from_secs(1));
                     }
                 }
             })
-            .unwrap();
+            .context("Starting the VSync thread")
+            .log_err();
     }
 }
 

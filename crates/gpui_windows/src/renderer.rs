@@ -23,7 +23,9 @@ pub enum WindowsRendererEvent {
         backend: WindowsRendererBackend,
         overridden: bool,
     },
-    /// Called on the foreground thread, outside GPU locks, before fallback or fatal handling.
+    /// Called on the foreground thread, outside GPU locks, before falling back to DX11.
+    /// A `runtime` failure switches the failing window to DX11 in place; later windows
+    /// also start on DX11, and a `Selected` event follows once the window has switched.
     Failed { message: String, runtime: bool },
 }
 
@@ -86,6 +88,12 @@ impl RendererContext {
         }
     }
 
+    /// After a DX12 window fell back at runtime, later windows start on DX11.
+    #[cfg(feature = "windows-wgpu")]
+    fn use_dx11_for_new_windows(&self) {
+        self.0.backend.set(Some(WindowsRendererBackend::Dx11));
+    }
+
     fn failed(&self, message: String, runtime: bool) {
         if !self.0.overridden && !self.0.failure_reported.replace(true) {
             log::warn!("DX12 unavailable: {message}");
@@ -116,7 +124,7 @@ impl RendererContext {
         hwnd: HWND,
         devices: &SharedDirectXDevices,
         disable_composition: bool,
-    ) -> Result<WindowRenderer> {
+    ) -> Result<Backend> {
         self.create_with_devices(
             devices,
             || DirectXDevices::new().context("Creating DirectX devices"),
@@ -125,16 +133,14 @@ impl RendererContext {
                 #[cfg(feature = "windows-wgpu")]
                 {
                     Dx12Renderer::new(hwnd, self.clone())
-                        .map(|renderer| WindowRenderer::Dx12(Box::new(renderer)))
+                        .map(|renderer| Backend::Dx12(Box::new(renderer)))
                 }
                 #[cfg(not(feature = "windows-wgpu"))]
                 {
                     bail!("DX12 renderer is unavailable in this build")
                 }
             },
-            |devices| {
-                DirectXRenderer::new(hwnd, devices, disable_composition).map(WindowRenderer::Dx11)
-            },
+            |devices| DirectXRenderer::new(hwnd, devices, disable_composition).map(Backend::Dx11),
         )
     }
 
@@ -281,27 +287,93 @@ fn dx12_supported() -> Result<bool> {
     result
 }
 
-pub(crate) enum WindowRenderer {
+/// A window's renderer. A DX12 window whose renderer fails at runtime switches to DX11
+/// in place instead of taking the process down.
+pub(crate) struct WindowRenderer {
+    backend: Backend,
+    #[cfg(feature = "windows-wgpu")]
+    fallback: Dx11Fallback,
+    /// gpui keeps the atlas a window returned when it opened. A DX12 window returns this
+    /// one, which follows the window to DX11.
+    #[cfg(feature = "windows-wgpu")]
+    atlas: Option<Arc<SwitchableAtlas>>,
+    /// Set by a fallback: the next frame must render everything into the DX11 atlas.
+    #[cfg(feature = "windows-wgpu")]
+    force_redraw: bool,
+}
+
+enum Backend {
     Dx11(DirectXRenderer),
     #[cfg(feature = "windows-wgpu")]
     Dx12(Box<Dx12Renderer>),
+    /// DX12 failed and DX11 could not replace it: the window no longer draws.
+    #[cfg(feature = "windows-wgpu")]
+    Unavailable {
+        atlas: Arc<dyn PlatformAtlas>,
+    },
+}
+
+/// What a DX12 window needs to create its DX11 replacement.
+#[cfg(feature = "windows-wgpu")]
+struct Dx11Fallback {
+    hwnd: HWND,
+    devices: SharedDirectXDevices,
+    disable_composition: bool,
+    /// The last size requested for the window, which a new renderer must adopt.
+    size: Option<Size<DevicePixels>>,
+}
+
+#[cfg(feature = "windows-wgpu")]
+impl Dx11Fallback {
+    fn create(&self) -> Result<DirectXRenderer> {
+        let devices = self
+            .devices
+            .get_or_try_init(|| DirectXDevices::new().context("Creating DirectX devices"))?;
+        let mut renderer = DirectXRenderer::new(self.hwnd, &devices, self.disable_composition)?;
+        if let Some(size) = self.size {
+            renderer.resize(size)?;
+        }
+        Ok(renderer)
+    }
 }
 
 impl WindowRenderer {
-    pub(crate) fn release_retained_frame(&mut self) {
-        match self {
-            Self::Dx11(renderer) => renderer.release_retained_frame(),
-            #[cfg(feature = "windows-wgpu")]
-            Self::Dx12(renderer) => renderer.renderer.release_retained_frame(),
-        }
-    }
     pub(crate) fn new(
         hwnd: HWND,
         devices: &SharedDirectXDevices,
         disable_composition: bool,
         context: &RendererContext,
     ) -> Result<Self> {
-        context.create_window(hwnd, devices, disable_composition)
+        let backend = context.create_window(hwnd, devices, disable_composition)?;
+        Ok(Self {
+            #[cfg(feature = "windows-wgpu")]
+            atlas: match &backend {
+                Backend::Dx12(renderer) => Some(SwitchableAtlas::new(
+                    renderer.renderer.sprite_atlas().clone(),
+                )),
+                _ => None,
+            },
+            backend,
+            #[cfg(feature = "windows-wgpu")]
+            fallback: Dx11Fallback {
+                hwnd,
+                devices: devices.clone(),
+                disable_composition,
+                size: None,
+            },
+            #[cfg(feature = "windows-wgpu")]
+            force_redraw: false,
+        })
+    }
+
+    pub(crate) fn release_retained_frame(&mut self) {
+        match &mut self.backend {
+            Backend::Dx11(renderer) => renderer.release_retained_frame(),
+            #[cfg(feature = "windows-wgpu")]
+            Backend::Dx12(renderer) => renderer.renderer.release_retained_frame(),
+            #[cfg(feature = "windows-wgpu")]
+            Backend::Unavailable { .. } => {}
+        }
     }
 
     pub(crate) fn draw(
@@ -309,122 +381,110 @@ impl WindowRenderer {
         scene: &Scene,
         appearance: WindowBackgroundAppearance,
     ) -> Result<()> {
-        match self {
-            Self::Dx11(renderer) => renderer.draw(scene, appearance),
+        match &mut self.backend {
+            Backend::Dx11(renderer) => renderer.draw(scene, appearance),
+            // DX12 windows are always opaque. A non-opaque appearance would reconfigure
+            // the swap chain and rebuild every pipeline when the window first draws.
             #[cfg(feature = "windows-wgpu")]
-            Self::Dx12(renderer) => {
-                if !renderer
-                    .prepare_frame()
-                    .unwrap_or_else(|error| panic!("{error:#}"))
-                {
-                    // Recovery runs before the next frame's layout/paint, where
-                    // rebuilding cached scenes can use the replacement atlas.
-                    return Ok(());
+            Backend::Dx12(renderer) => {
+                if let Err(error) = renderer.draw(scene, appearance) {
+                    self.fall_back_to_dx11(error);
                 }
-                renderer
-                    .renderer
-                    .update_transparency(!appearance.is_opaque());
-                if !renderer
-                    .check_device()
-                    .unwrap_or_else(|error| panic!("{error:#}"))
-                {
-                    return Ok(());
-                }
-                renderer.renderer.draw(scene);
-                renderer.force_redraw |= renderer.renderer.needs_redraw();
                 Ok(())
             }
+            #[cfg(feature = "windows-wgpu")]
+            Backend::Unavailable { .. } => Ok(()),
         }
     }
 
     pub(crate) fn resize(&mut self, size: Size<DevicePixels>) -> Result<()> {
-        match self {
-            Self::Dx11(renderer) => renderer.resize(size),
+        #[cfg(feature = "windows-wgpu")]
+        {
+            self.fallback.size = Some(size);
+        }
+        match &mut self.backend {
+            Backend::Dx11(renderer) => renderer.resize(size),
             #[cfg(feature = "windows-wgpu")]
-            Self::Dx12(renderer) => {
-                renderer
-                    .startup_resize
-                    .resize(size, |size| renderer.renderer.update_drawable_size(size));
+            Backend::Dx12(renderer) => {
+                renderer.resize(size);
                 Ok(())
             }
+            #[cfg(feature = "windows-wgpu")]
+            Backend::Unavailable { .. } => Ok(()),
         }
     }
 
     pub(crate) fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
-        match self {
-            Self::Dx11(renderer) => renderer.sprite_atlas(),
+        #[cfg(feature = "windows-wgpu")]
+        if let Some(atlas) = &self.atlas {
+            return atlas.clone();
+        }
+        match &self.backend {
+            Backend::Dx11(renderer) => renderer.sprite_atlas(),
             #[cfg(feature = "windows-wgpu")]
-            Self::Dx12(renderer) => renderer.renderer.sprite_atlas().clone(),
+            Backend::Dx12(renderer) => renderer.renderer.sprite_atlas().clone(),
+            #[cfg(feature = "windows-wgpu")]
+            Backend::Unavailable { atlas } => atlas.clone(),
         }
     }
 
     pub(crate) fn gpu_specs(&self) -> Result<GpuSpecs> {
-        match self {
-            Self::Dx11(renderer) => renderer.gpu_specs(),
+        match &self.backend {
+            Backend::Dx11(renderer) => renderer.gpu_specs(),
             #[cfg(feature = "windows-wgpu")]
-            Self::Dx12(renderer) => Ok(renderer.renderer.gpu_specs()),
+            Backend::Dx12(renderer) => Ok(renderer.renderer.gpu_specs()),
+            #[cfg(feature = "windows-wgpu")]
+            Backend::Unavailable { .. } => bail!("this window's renderer is unavailable"),
         }
     }
 
     pub(crate) fn handle_device_lost(&mut self, devices: &DirectXDevices) -> Result<()> {
-        match self {
-            Self::Dx11(renderer) => renderer.handle_device_lost(devices),
+        match &mut self.backend {
+            Backend::Dx11(renderer) => renderer.handle_device_lost(devices),
             // DX11 support-device recovery does not invalidate DX12 textures.
             #[cfg(feature = "windows-wgpu")]
-            Self::Dx12(_) => Ok(()),
+            Backend::Dx12(_) | Backend::Unavailable { .. } => Ok(()),
         }
     }
 
     pub(crate) fn mark_drawable(&mut self) {
-        match self {
-            Self::Dx11(renderer) => renderer.mark_drawable(),
+        match &mut self.backend {
+            Backend::Dx11(renderer) => renderer.mark_drawable(),
             #[cfg(feature = "windows-wgpu")]
-            Self::Dx12(_) => {}
+            Backend::Dx12(_) | Backend::Unavailable { .. } => {}
         }
     }
 
     pub(crate) fn take_force_redraw(&mut self) -> bool {
-        match self {
-            Self::Dx11(_) => false,
+        match &mut self.backend {
+            #[cfg(not(feature = "windows-wgpu"))]
+            Backend::Dx11(_) => false,
             #[cfg(feature = "windows-wgpu")]
-            Self::Dx12(renderer) => {
-                if let Some(error) = renderer.renderer.terminal_error() {
-                    renderer.context.failed(error.clone(), true);
-                    panic!("DX12 rendering failed: {error}");
+            Backend::Dx11(_) => std::mem::take(&mut self.force_redraw),
+            #[cfg(feature = "windows-wgpu")]
+            Backend::Dx12(renderer) => match renderer.take_force_redraw() {
+                Ok(force_redraw) => force_redraw,
+                Err(error) => {
+                    self.fall_back_to_dx11(error);
+                    std::mem::take(&mut self.force_redraw)
                 }
-                if renderer.renderer.device_lost() {
-                    if let Err(error) = renderer.renderer.recover(&renderer.window) {
-                        if error.is::<gpui_wgpu::RecoveryPending>() {
-                            return false;
-                        }
-                        if renderer
-                            .context
-                            .failed_recovery(&mut renderer.failed_window_recoveries, &error)
-                        {
-                            panic!("DX12 recovery failed after three attempts: {error:#}");
-                        }
-                        return false;
-                    }
-                    renderer.context.0.failed_recoveries.set(0);
-                    renderer.failed_window_recoveries = 0;
-                    renderer.force_redraw = true;
-                }
-                std::mem::take(&mut renderer.force_redraw)
-            }
+            },
+            #[cfg(feature = "windows-wgpu")]
+            Backend::Unavailable { .. } => false,
         }
     }
 
     #[cfg(feature = "windows-wgpu")]
     pub(crate) fn gpu_context_info(&self) -> Option<gpui_wgpu::WgpuContextHandle> {
-        match self {
-            Self::Dx11(_) => None,
-            Self::Dx12(renderer) => renderer.renderer.gpu_context_info(),
+        match &self.backend {
+            Backend::Dx12(renderer) => renderer.renderer.gpu_context_info(),
+            Backend::Dx11(_) | Backend::Unavailable { .. } => None,
         }
     }
 
     #[cfg(feature = "windows-wgpu")]
     pub(crate) fn destroy(&mut self) {
-        if let Self::Dx12(renderer) = self {
+        if let Backend::Dx12(renderer) = &mut self.backend {
             // Closing a hidden window must also save a confirmed failure that has not
             // reached the foreground frame callback yet.
             if let Some(error) = renderer.renderer.terminal_error() {
@@ -434,25 +494,133 @@ impl WindowRenderer {
         }
     }
 
+    /// Replaces a failed DX12 renderer with DX11 for the rest of this window's life, and
+    /// makes later windows start on DX11. The application hears about the failure through
+    /// [`WindowsRendererEvent::Failed`] and can persist the DX11 preference.
+    #[cfg(feature = "windows-wgpu")]
+    fn fall_back_to_dx11(&mut self, error: String) {
+        let atlas = self.sprite_atlas();
+        let Backend::Dx12(mut dx12) =
+            std::mem::replace(&mut self.backend, Backend::Unavailable { atlas })
+        else {
+            return;
+        };
+        log::error!("DX12 rendering failed; switching this window to DX11: {error}");
+        let context = dx12.context.clone();
+        context.failed(error, true);
+        context.use_dx11_for_new_windows();
+        // DX11 creates its own swap chain and DirectComposition target for this window,
+        // so DX12 must release both first.
+        dx12.renderer.destroy();
+        drop(dx12);
+        match self.fallback.create() {
+            Ok(mut renderer) => {
+                if let Some(atlas) = &self.atlas {
+                    atlas.replace(renderer.sprite_atlas());
+                }
+                renderer.mark_drawable();
+                context.emit(WindowsRendererEvent::Selected {
+                    backend: WindowsRendererBackend::Dx11,
+                    overridden: context.0.overridden,
+                });
+                self.backend = Backend::Dx11(renderer);
+                self.force_redraw = true;
+            }
+            Err(error) => {
+                log::error!(
+                    "DX11 could not replace DX12; this window can no longer draw: {error:#}"
+                )
+            }
+        }
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn render_to_image(
         &mut self,
         scene: &Scene,
         appearance: WindowBackgroundAppearance,
     ) -> Result<image::RgbaImage> {
-        match self {
-            Self::Dx11(renderer) => renderer.render_to_image(scene, appearance),
+        match &mut self.backend {
+            Backend::Dx11(renderer) => renderer.render_to_image(scene, appearance),
             #[cfg(all(feature = "windows-wgpu", feature = "test-support"))]
-            Self::Dx12(renderer) => {
+            Backend::Dx12(renderer) => {
                 anyhow::ensure!(
-                    renderer.prepare_frame()?,
+                    renderer.prepare_frame().map_err(anyhow::Error::msg)?,
                     "render_to_image unavailable while recovering from a lost device"
                 );
                 renderer.renderer.render_to_image(scene)
             }
             #[cfg(all(feature = "windows-wgpu", not(feature = "test-support")))]
-            Self::Dx12(_) => bail!("WGPU readback requires test-support"),
+            Backend::Dx12(_) => bail!("WGPU readback requires test-support"),
+            #[cfg(feature = "windows-wgpu")]
+            Backend::Unavailable { .. } => bail!("this window's renderer is unavailable"),
         }
+    }
+}
+
+/// The atlas a DX12 window gives gpui. When the window falls back to DX11 it forwards to
+/// the DX11 atlas, and its generation jumps past every earlier one, so gpui discards
+/// frames built from DX12 tiles and rasterizes again.
+#[cfg(feature = "windows-wgpu")]
+pub(crate) struct SwitchableAtlas {
+    current: parking_lot::RwLock<Arc<dyn PlatformAtlas>>,
+    /// Generations already reported by replaced atlases.
+    generation_base: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "windows-wgpu")]
+impl SwitchableAtlas {
+    fn new(atlas: Arc<dyn PlatformAtlas>) -> Arc<Self> {
+        // PlatformWindow's atlas API requires Arc. Like the atlases it forwards to, this
+        // one stays on the UI thread.
+        #[allow(clippy::arc_with_non_send_sync)]
+        Arc::new(Self {
+            current: parking_lot::RwLock::new(atlas),
+            generation_base: Default::default(),
+        })
+    }
+
+    fn replace(&self, atlas: Arc<dyn PlatformAtlas>) {
+        use std::sync::atomic::Ordering;
+        let mut current = self.current.write();
+        let base = self.generation_base.load(Ordering::Relaxed) + current.generation() + 1;
+        self.generation_base.store(base, Ordering::Relaxed);
+        *current = atlas;
+    }
+}
+
+#[cfg(feature = "windows-wgpu")]
+impl PlatformAtlas for SwitchableAtlas {
+    fn get_or_insert_with<'a>(
+        &self,
+        key: &gpui::AtlasKey,
+        build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, std::borrow::Cow<'a, [u8]>)>>,
+    ) -> Result<Option<gpui::AtlasTile>> {
+        self.current.read().get_or_insert_with(key, build)
+    }
+
+    fn get_or_insert_glyph_with(
+        &self,
+        params: &gpui::RenderGlyphParams,
+        build: &mut dyn FnMut() -> Result<gpui::ValidatedRasterizedGlyph>,
+    ) -> Result<gpui::GlyphAtlasEntry> {
+        self.current.read().get_or_insert_glyph_with(params, build)
+    }
+
+    fn remove(&self, key: &gpui::AtlasKey) {
+        self.current.read().remove(key)
+    }
+
+    fn generation(&self) -> u64 {
+        let current = self.current.read();
+        self.generation_base
+            .load(std::sync::atomic::Ordering::Relaxed)
+            + current.generation()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn contains(&self, key: &gpui::AtlasKey) -> bool {
+        self.current.read().contains(key)
     }
 }
 
@@ -465,6 +633,7 @@ pub(crate) struct Dx12Renderer {
     context: RendererContext,
     // A different window recovering successfully must not grant this window unlimited retries.
     failed_window_recoveries: u8,
+    warned_non_opaque: bool,
 }
 
 /// Native window creation can deliver several sizes before GPUI has a scene.
@@ -487,44 +656,89 @@ impl StartupResize {
         }
     }
 
-    fn prepare_frame(&mut self, available: bool, apply: impl FnOnce(Size<DevicePixels>)) -> bool {
-        if !available {
-            return false;
-        }
-        if let Some(size) = self.pending_size.take() {
-            apply(size);
-        }
+    /// Starts rendering, returning the size to configure first, if any.
+    fn start(&mut self) -> Option<Size<DevicePixels>> {
         self.started = true;
-        true
+        self.pending_size.take()
     }
 }
 
 #[cfg(feature = "windows-wgpu")]
 impl Dx12Renderer {
-    /// Failed or pending recovery leaves the latest requested size queued until
-    /// the replacement is usable. Never configure a surface on a lost device.
-    fn prepare_frame(&mut self) -> Result<bool> {
-        let available = self.check_device()?;
-        if !self
-            .startup_resize
-            .prepare_frame(available, |size| self.renderer.update_drawable_size(size))
-        {
-            return Ok(false);
+    /// Draws a frame, or returns why DX12 can no longer render this window.
+    fn draw(
+        &mut self,
+        scene: &Scene,
+        appearance: WindowBackgroundAppearance,
+    ) -> Result<(), String> {
+        if !appearance.is_opaque() && !std::mem::replace(&mut self.warned_non_opaque, true) {
+            log::warn!("DX12 windows are opaque; ignoring the {appearance:?} background");
         }
-        // Configuration can itself report a loss or a terminal error. The
-        // target already stores the final size for a subsequent recovery.
-        self.check_device()
+        if !self.prepare_frame()? {
+            // Recovery runs before the next frame's layout/paint, where
+            // rebuilding cached scenes can use the replacement atlas.
+            return Ok(());
+        }
+        self.renderer.draw(scene);
+        self.force_redraw |= self.renderer.needs_redraw();
+        Ok(())
     }
 
-    fn check_device(&self) -> Result<bool> {
+    fn resize(&mut self, size: Size<DevicePixels>) {
+        self.startup_resize
+            .resize(size, |size| self.renderer.update_drawable_size(size));
+    }
+
+    /// Configures the latest startup size once the device can render: a lost device is
+    /// never configured, and failed or pending recovery leaves the size queued.
+    fn prepare_frame(&mut self) -> Result<bool, String> {
+        if !self.check_device()? {
+            return Ok(false);
+        }
+        match self.startup_resize.start() {
+            Some(size) => {
+                self.renderer.update_drawable_size(size);
+                // Configuration can itself report a loss or a terminal error. The
+                // target already stores the final size for a subsequent recovery.
+                self.check_device()
+            }
+            None => Ok(true),
+        }
+    }
+
+    /// `Ok(false)` while the device is lost, `Err` once DX12 can no longer render.
+    fn check_device(&self) -> Result<bool, String> {
         if self.renderer.device_lost() {
             return Ok(false);
         }
-        if let Some(error) = self.renderer.terminal_error() {
-            self.context.failed(error.clone(), true);
-            bail!("DX12 rendering failed: {error}");
+        match self.renderer.terminal_error() {
+            Some(error) => Err(error),
+            None => Ok(true),
         }
-        Ok(true)
+    }
+
+    fn take_force_redraw(&mut self) -> Result<bool, String> {
+        if let Some(error) = self.renderer.terminal_error() {
+            return Err(error);
+        }
+        if self.renderer.device_lost() {
+            if let Err(error) = self.renderer.recover(&self.window) {
+                if !error.is::<gpui_wgpu::RecoveryPending>()
+                    && self
+                        .context
+                        .failed_recovery(&mut self.failed_window_recoveries, &error)
+                {
+                    return Err(format!(
+                        "DX12 recovery failed after three attempts: {error:#}"
+                    ));
+                }
+                return Ok(false);
+            }
+            self.context.0.failed_recoveries.set(0);
+            self.failed_window_recoveries = 0;
+            self.force_redraw = true;
+        }
+        Ok(std::mem::take(&mut self.force_redraw))
     }
 
     fn new(hwnd: HWND, context: RendererContext) -> Result<Self> {
@@ -580,6 +794,7 @@ impl Dx12Renderer {
             force_redraw: false,
             context,
             failed_window_recoveries: 0,
+            warned_non_opaque: false,
         })
     }
 }
@@ -616,46 +831,99 @@ mod tests {
             resize.resize(size, |size| configured.push(size));
         }
         assert!(configured.is_empty());
-        assert!(resize.prepare_frame(true, |size| configured.push(size)));
-        assert_eq!(configured, [final_size]);
-        assert!(resize.prepare_frame(true, |_| panic!("repeated startup resize")));
+        assert_eq!(resize.start(), Some(final_size));
+        assert_eq!(resize.start(), None, "the startup size is configured once");
 
         // Once rendering starts, keep the existing immediate runtime semantics,
         // including requests whose equality/clamping is handled by WGPU.
         for size in [first, first, final_size] {
             resize.resize(size, |size| configured.push(size));
         }
-        assert_eq!(configured, [final_size, first, first, final_size]);
-    }
-
-    #[cfg(feature = "windows-wgpu")]
-    #[test]
-    fn startup_resize_survives_unavailable_frames_and_uses_latest_recovery_size() {
-        let mut resize = StartupResize::default();
-        let first = gpui::size(DevicePixels(800), DevicePixels(600));
-        let recovered = gpui::size(DevicePixels(1600), DevicePixels(1200));
-        resize.resize(first, |_| panic!("startup configure"));
-        for _ in 0..3 {
-            assert!(!resize.prepare_frame(false, |_| panic!("lost-device configure")));
-            assert!(!resize.started);
-            assert_eq!(resize.pending_size, Some(first));
-        }
-        resize.resize(recovered, |_| panic!("configure before recovery"));
-        let mut configured = None;
-        assert!(resize.prepare_frame(true, |size| configured = Some(size)));
-        assert_eq!(configured, Some(recovered));
-        assert!(resize.pending_size.is_none());
+        assert_eq!(configured, [first, first, final_size]);
     }
 
     #[cfg(feature = "windows-wgpu")]
     #[test]
     fn first_frame_without_a_resize_keeps_the_checked_initial_configuration() {
         let mut resize = StartupResize::default();
-        assert!(resize.prepare_frame(true, |_| panic!("no resize was requested")));
+        assert_eq!(resize.start(), None);
         let requested = gpui::size(DevicePixels(320), DevicePixels(240));
         let mut configured = None;
         resize.resize(requested, |size| configured = Some(size));
         assert_eq!(configured, Some(requested));
+    }
+
+    #[cfg(feature = "windows-wgpu")]
+    mod switchable_atlas {
+        use super::*;
+        use gpui::{AtlasKey, AtlasTile, GlyphAtlasEntry, RenderGlyphParams};
+        use std::borrow::Cow;
+
+        /// Records lookups and reports a settable generation.
+        #[derive(Default)]
+        struct FakeAtlas {
+            generation: Cell<u64>,
+            lookups: Cell<usize>,
+        }
+
+        impl PlatformAtlas for FakeAtlas {
+            fn get_or_insert_with<'a>(
+                &self,
+                _key: &AtlasKey,
+                _build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
+            ) -> Result<Option<AtlasTile>> {
+                self.lookups.set(self.lookups.get() + 1);
+                Ok(None)
+            }
+
+            fn get_or_insert_glyph_with(
+                &self,
+                _params: &RenderGlyphParams,
+                _build: &mut dyn FnMut() -> Result<gpui::ValidatedRasterizedGlyph>,
+            ) -> Result<GlyphAtlasEntry> {
+                bail!("unused")
+            }
+
+            fn remove(&self, _key: &AtlasKey) {}
+
+            fn generation(&self) -> u64 {
+                self.generation.get()
+            }
+        }
+
+        fn key() -> AtlasKey {
+            AtlasKey::Image(gpui::RenderImageParams {
+                image_id: gpui::ImageId(1),
+                frame_index: 0,
+            })
+        }
+
+        #[test]
+        #[allow(clippy::arc_with_non_send_sync)]
+        fn forwards_to_the_current_atlas_and_invalidates_every_older_generation() {
+            let dx12 = Arc::new(FakeAtlas::default());
+            dx12.generation.set(41);
+            let atlas = SwitchableAtlas::new(dx12.clone());
+            atlas.get_or_insert_with(&key(), &mut || Ok(None)).unwrap();
+            assert_eq!(dx12.lookups.get(), 1);
+            assert_eq!(atlas.generation(), 41);
+
+            // A fresh DX11 atlas starts at generation 0, below what gpui has seen.
+            let dx11 = Arc::new(FakeAtlas::default());
+            atlas.replace(dx11.clone());
+            let switched = atlas.generation();
+            assert!(
+                switched > 41,
+                "gpui must discard frames built from DX12 tiles"
+            );
+            atlas.get_or_insert_with(&key(), &mut || Ok(None)).unwrap();
+            assert_eq!((dx12.lookups.get(), dx11.lookups.get()), (1, 1));
+
+            dx11.generation.set(3);
+            assert_eq!(atlas.generation(), switched + 3);
+            atlas.replace(Arc::new(FakeAtlas::default()));
+            assert!(atlas.generation() > switched + 3);
+        }
     }
 
     #[cfg(all(feature = "windows-wgpu", feature = "test-support"))]
@@ -670,7 +938,7 @@ mod tests {
                     CreateWindowExW(
                         0,
                         windows_core::w!("STATIC"),
-                        windows_core::w!("gpui dx12 startup resize test"),
+                        windows_core::w!("gpui dx12 renderer test"),
                         WS_OVERLAPPED as u32,
                         0,
                         0,
@@ -685,12 +953,45 @@ mod tests {
                 .ok()?,
             ))
         }
+
+        /// A DX12 window renderer with the same DX11 fallback `WindowRenderer::new` uses.
+        fn renderer(&self, context: &RendererContext) -> Result<WindowRenderer> {
+            let renderer = Dx12Renderer::new(self.0, context.clone())?;
+            Ok(WindowRenderer {
+                atlas: Some(SwitchableAtlas::new(
+                    renderer.renderer.sprite_atlas().clone(),
+                )),
+                backend: Backend::Dx12(Box::new(renderer)),
+                fallback: Dx11Fallback {
+                    hwnd: self.0,
+                    devices: Default::default(),
+                    disable_composition: false,
+                    size: None,
+                },
+                force_redraw: false,
+            })
+        }
+
+        fn destroy(&mut self) {
+            if !self.0.is_invalid() {
+                let _ = unsafe { crate::bindings::Windows::Win32::DestroyWindow(self.0) }.ok();
+                self.0 = HWND::default();
+            }
+        }
     }
 
     #[cfg(all(feature = "windows-wgpu", feature = "test-support"))]
     impl Drop for HiddenDx12Window {
         fn drop(&mut self) {
-            let _ = unsafe { crate::bindings::Windows::Win32::DestroyWindow(self.0) }.ok();
+            self.destroy();
+        }
+    }
+
+    #[cfg(all(feature = "windows-wgpu", feature = "test-support"))]
+    fn dx12(renderer: &mut WindowRenderer) -> &mut Dx12Renderer {
+        match &mut renderer.backend {
+            Backend::Dx12(renderer) => renderer,
+            _ => panic!("expected a DX12 renderer"),
         }
     }
 
@@ -704,19 +1005,16 @@ mod tests {
         let (context, _) = context(WindowsRendererPreference::Auto);
         for first_use_is_draw in [true, false] {
             let window = HiddenDx12Window::new()?;
-            let mut renderer =
-                WindowRenderer::Dx12(Box::new(Dx12Renderer::new(window.0, context.clone())?));
+            let mut renderer = window.renderer(&context)?;
             let mut scene = Scene::default();
             scene.finish();
             renderer.resize(gpui::size(DevicePixels(48), DevicePixels(32)))?;
             renderer.resize(gpui::size(DevicePixels(96), DevicePixels(64)))?;
-            let WindowRenderer::Dx12(dx12) = &mut renderer else {
-                unreachable!()
-            };
             // Bypass only the wrapper to inspect the unchanged checked target.
             // Intermediate WM_SIZE requests must not configure the actual WGPU target.
-            assert_eq!(dx12.renderer.render_to_image(&scene)?.dimensions(), (1, 1));
-            assert!(!dx12.startup_resize.started);
+            let inner = dx12(&mut renderer);
+            assert_eq!(inner.renderer.render_to_image(&scene)?.dimensions(), (1, 1));
+            assert!(!inner.startup_resize.started);
 
             if first_use_is_draw {
                 renderer.draw(&scene, WindowBackgroundAppearance::Opaque)?;
@@ -728,13 +1026,11 @@ mod tests {
                 (96, 64)
             );
             renderer.resize(gpui::size(DevicePixels(80), DevicePixels(40)))?;
-            let WindowRenderer::Dx12(dx12) = &mut renderer else {
-                unreachable!()
-            };
-            assert!(dx12.startup_resize.started);
+            let inner = dx12(&mut renderer);
+            assert!(inner.startup_resize.started);
             // Read the inner target directly: runtime resize must already have applied.
             assert_eq!(
-                dx12.renderer.render_to_image(&scene)?.dimensions(),
+                inner.renderer.render_to_image(&scene)?.dimensions(),
                 (80, 40)
             );
         }
@@ -751,29 +1047,24 @@ mod tests {
         }
         let (context, _) = context(WindowsRendererPreference::Auto);
         let window = HiddenDx12Window::new()?;
-        let mut renderer =
-            WindowRenderer::Dx12(Box::new(Dx12Renderer::new(window.0, context.clone())?));
+        let mut renderer = window.renderer(&context)?;
         renderer.resize(gpui::size(DevicePixels(48), DevicePixels(32)))?;
-        let WindowRenderer::Dx12(dx12) = &mut renderer else {
-            unreachable!()
-        };
+        let inner = dx12(&mut renderer);
         // An absent shared context exercises the real stabilization wait without
         // destroying a device or depending on a hardware driver reset.
         let shared_context = context.0.gpu.borrow_mut().take();
-        let recovery = dx12.renderer.recover(&dx12.window);
+        let recovery = inner.renderer.recover(&inner.window);
         *context.0.gpu.borrow_mut() = shared_context;
         assert!(recovery.unwrap_err().is::<gpui_wgpu::RecoveryPending>());
-        assert!(!dx12.startup_resize.started);
+        assert!(!inner.startup_resize.started);
         assert_eq!(
-            dx12.startup_resize.pending_size,
+            inner.startup_resize.pending_size,
             Some(gpui::size(DevicePixels(48), DevicePixels(32)))
         );
         renderer.resize(gpui::size(DevicePixels(112), DevicePixels(72)))?;
-        let WindowRenderer::Dx12(dx12) = &mut renderer else {
-            unreachable!()
-        };
-        dx12.renderer.recover(&dx12.window)?;
-        assert!(!dx12.startup_resize.started);
+        let inner = dx12(&mut renderer);
+        inner.renderer.recover(&inner.window)?;
+        assert!(!inner.startup_resize.started);
         let mut scene = Scene::default();
         scene.finish();
         assert_eq!(
@@ -782,6 +1073,158 @@ mod tests {
                 .dimensions(),
             (112, 72)
         );
+        Ok(())
+    }
+
+    #[cfg(all(feature = "windows-wgpu", feature = "test-support"))]
+    fn white_quad_scene() -> Scene {
+        let bounds = gpui::Bounds::new(
+            gpui::point(gpui::ScaledPixels(8.0), gpui::ScaledPixels(8.0)),
+            gpui::size(gpui::ScaledPixels(32.0), gpui::ScaledPixels(24.0)),
+        );
+        let mut scene = Scene::default();
+        scene.insert_primitive(gpui::Quad {
+            bounds,
+            content_mask: gpui::ContentMask {
+                bounds,
+                ..Default::default()
+            },
+            background: gpui::white().into(),
+            ..Default::default()
+        });
+        scene.finish();
+        scene
+    }
+
+    /// A DX12 failure that used to panic now replaces the window's renderer with DX11
+    /// in place: same atlas object for gpui, a newer atlas generation, one forced frame,
+    /// the application told, and later windows starting on DX11.
+    #[cfg(all(feature = "windows-wgpu", feature = "test-support"))]
+    #[test]
+    fn native_dx12_terminal_errors_switch_the_window_to_dx11_without_panicking() -> Result<()> {
+        if !dx12_supported()? {
+            eprintln!("Skipping native DX12 fallback test: no hardware DX12 adapter");
+            return Ok(());
+        }
+        for failure_seen_by_draw in [true, false] {
+            let (context, events) = context(WindowsRendererPreference::Auto);
+            let window = HiddenDx12Window::new()?;
+            let mut renderer = window.renderer(&context)?;
+            renderer.resize(gpui::size(DevicePixels(64), DevicePixels(48)))?;
+            renderer.draw(&white_quad_scene(), WindowBackgroundAppearance::Opaque)?;
+            let atlas = renderer.sprite_atlas();
+            let generation = atlas.generation();
+
+            dx12(&mut renderer)
+                .renderer
+                .inject_terminal_error_for_tests("injected DX12 failure");
+            if failure_seen_by_draw {
+                renderer.draw(&white_quad_scene(), WindowBackgroundAppearance::Opaque)?;
+                assert!(
+                    renderer.take_force_redraw(),
+                    "the switch forces one full frame"
+                );
+            } else {
+                assert!(
+                    renderer.take_force_redraw(),
+                    "the switch forces one full frame"
+                );
+            }
+            assert!(!renderer.take_force_redraw());
+
+            assert!(matches!(renderer.backend, Backend::Dx11(_)));
+            assert!(Arc::ptr_eq(&atlas, &renderer.sprite_atlas()));
+            assert!(renderer.sprite_atlas().generation() > generation);
+            assert_eq!(
+                context.0.backend.get(),
+                Some(WindowsRendererBackend::Dx11),
+                "later windows must start on DX11"
+            );
+            let events = events.borrow();
+            assert!(events.iter().any(|event| matches!(
+                event,
+                WindowsRendererEvent::Failed { message, runtime: true } if message.contains("injected DX12 failure")
+            )));
+            assert!(matches!(
+                events.last(),
+                Some(WindowsRendererEvent::Selected {
+                    backend: WindowsRendererBackend::Dx11,
+                    ..
+                })
+            ));
+            drop(events);
+
+            // The replacement draws at the window's size.
+            renderer.draw(&white_quad_scene(), WindowBackgroundAppearance::Opaque)?;
+            let image = renderer
+                .render_to_image(&white_quad_scene(), WindowBackgroundAppearance::Opaque)?;
+            assert_eq!(image.dimensions(), (64, 48));
+            assert_eq!(image.get_pixel(20, 16).0, [255; 4]);
+            assert!(renderer.gpu_specs().is_ok());
+        }
+        Ok(())
+    }
+
+    /// If DX11 cannot replace DX12 either, the window stops drawing but nothing panics.
+    #[cfg(all(feature = "windows-wgpu", feature = "test-support"))]
+    #[test]
+    fn native_failed_dx11_fallback_leaves_an_inert_window_without_panicking() -> Result<()> {
+        if !dx12_supported()? {
+            eprintln!("Skipping native DX12 fallback test: no hardware DX12 adapter");
+            return Ok(());
+        }
+        let (context, _) = context(WindowsRendererPreference::Auto);
+        let mut window = HiddenDx12Window::new()?;
+        let mut renderer = window.renderer(&context)?;
+        let atlas = renderer.sprite_atlas();
+        dx12(&mut renderer)
+            .renderer
+            .inject_terminal_error_for_tests("injected DX12 failure");
+        // DX11 cannot create a swap chain for a destroyed window.
+        window.destroy();
+        renderer.draw(&white_quad_scene(), WindowBackgroundAppearance::Opaque)?;
+        assert!(matches!(renderer.backend, Backend::Unavailable { .. }));
+        renderer.draw(&white_quad_scene(), WindowBackgroundAppearance::Opaque)?;
+        renderer.resize(gpui::size(DevicePixels(32), DevicePixels(32)))?;
+        assert!(!renderer.take_force_redraw());
+        assert!(renderer.gpu_specs().is_err());
+        assert!(Arc::ptr_eq(&atlas, &renderer.sprite_atlas()));
+        assert!(
+            renderer
+                .render_to_image(&white_quad_scene(), WindowBackgroundAppearance::Opaque)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    /// DX12 windows stay opaque: a transparent background must neither reconfigure the
+    /// surface nor rebuild pipelines.
+    #[cfg(all(feature = "windows-wgpu", feature = "test-support"))]
+    #[test]
+    fn native_dx12_windows_ignore_non_opaque_backgrounds() -> Result<()> {
+        if !dx12_supported()? {
+            eprintln!("Skipping native DX12 opacity test: no hardware DX12 adapter");
+            return Ok(());
+        }
+        let (context, _) = context(WindowsRendererPreference::Auto);
+        let window = HiddenDx12Window::new()?;
+        let mut renderer = window.renderer(&context)?;
+        renderer.resize(gpui::size(DevicePixels(64), DevicePixels(48)))?;
+        renderer.draw(&white_quad_scene(), WindowBackgroundAppearance::Opaque)?;
+        let opaque =
+            renderer.render_to_image(&white_quad_scene(), WindowBackgroundAppearance::Opaque)?;
+        for appearance in [
+            WindowBackgroundAppearance::Transparent,
+            WindowBackgroundAppearance::Blurred,
+        ] {
+            renderer.draw(&white_quad_scene(), appearance)?;
+            assert!(matches!(renderer.backend, Backend::Dx12(_)));
+            assert_eq!(
+                renderer.render_to_image(&white_quad_scene(), appearance)?,
+                opaque,
+                "{appearance:?} must render exactly like an opaque window"
+            );
+        }
         Ok(())
     }
 
