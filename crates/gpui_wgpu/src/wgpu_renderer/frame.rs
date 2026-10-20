@@ -65,12 +65,11 @@ pub(super) fn render_to_view(
         renderer.target.request_redraw();
         return None;
     }
-    let mut targets = PreparedTargets::prepare(renderer, scene, frame_view, &requirements)?;
     // The retained texture matches the target by construction. The frame
     // texture may not: it can predate a resize or lack COPY_DST.
     let retained_copy = (retained.copy_texture.take())
         .filter(|source| {
-            targets.offscreen.is_none()
+            !requirements.planned.uses_offscreen_target
                 && frame_texture
                     .usage()
                     .contains(wgpu::TextureUsages::COPY_DST)
@@ -78,6 +77,27 @@ pub(super) fn render_to_view(
                 && frame_texture.format() == source.format()
         })
         .map(|source| (source, frame_texture.clone()));
+    let retained_blit = retained.blit.take().filter(|_| retained_copy.is_none());
+    // A retained frame can require a shader copy even when there are no scene
+    // filters (for example when the surface lacks COPY_DST). Decide only after
+    // checking the actual copy target, and include zero-blur opacity groups.
+    if requirements.planned.uses_offscreen_target || retained_blit.is_some() {
+        let resources = renderer.resources_mut();
+        if let Err(error) = resources.pipelines.prepare_filters(&resources.device) {
+            let message = format!("creating filter pipelines: {error}");
+            if matches!(
+                error,
+                wgpu::Error::OutOfMemory { .. } | wgpu::Error::Internal { .. }
+            ) {
+                *renderer.faults.fatal_error.lock().unwrap() = Some(message.clone());
+            }
+            *renderer.faults.pending_error.lock().unwrap() = Some(message);
+            renderer.retained.complete(retained, false);
+            renderer.target.request_redraw();
+            return None;
+        }
+    }
+    let mut targets = PreparedTargets::prepare(renderer, scene, frame_view, &requirements)?;
     if let Some(view) = &retained.view {
         targets.active = view.clone();
         // Create the overwrite-clear PSO with the target's first full frame, so
@@ -93,8 +113,6 @@ pub(super) fn render_to_view(
     // Prune once against the complete scene. Doing this inside each draw batch would evict a
     // texture that reappears after an intervening primitive and recreate its platform view.
     renderer.retain_surface_cache(&scene.surfaces);
-
-    let retained_blit = retained.blit.take().filter(|_| retained_copy.is_none());
     #[cfg(test)]
     {
         renderer.last_retained_presentation = if retained_copy.is_some() {
