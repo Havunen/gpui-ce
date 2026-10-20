@@ -165,7 +165,11 @@ impl WgpuRenderer {
         );
         let resources = self.resources();
         let pipeline = if uniforms.corner_smoothing > 0.0 {
-            &resources.pipelines.smoothed_blur_composite
+            resources
+                .pipelines
+                .smoothed_blur_composite
+                .as_ref()
+                .expect("smoothed blur prepared before encoding")
         } else {
             &resources.pipelines.blur_composite
         };
