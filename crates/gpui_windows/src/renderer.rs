@@ -313,17 +313,22 @@ impl WindowRenderer {
             Self::Dx11(renderer) => renderer.draw(scene, appearance),
             #[cfg(feature = "windows-wgpu")]
             Self::Dx12(renderer) => {
-                renderer
-                    .renderer
-                    .update_transparency(!appearance.is_opaque());
-                if renderer.renderer.device_lost() {
+                if !renderer
+                    .prepare_frame()
+                    .unwrap_or_else(|error| panic!("{error:#}"))
+                {
                     // Recovery runs before the next frame's layout/paint, where
                     // rebuilding cached scenes can use the replacement atlas.
                     return Ok(());
                 }
-                if let Some(error) = renderer.renderer.terminal_error() {
-                    renderer.context.failed(error.clone(), true);
-                    panic!("DX12 rendering failed: {error}");
+                renderer
+                    .renderer
+                    .update_transparency(!appearance.is_opaque());
+                if !renderer
+                    .check_device()
+                    .unwrap_or_else(|error| panic!("{error:#}"))
+                {
+                    return Ok(());
                 }
                 renderer.renderer.draw(scene);
                 renderer.force_redraw |= renderer.renderer.needs_redraw();
@@ -337,7 +342,9 @@ impl WindowRenderer {
             Self::Dx11(renderer) => renderer.resize(size),
             #[cfg(feature = "windows-wgpu")]
             Self::Dx12(renderer) => {
-                renderer.renderer.update_drawable_size(size);
+                renderer
+                    .startup_resize
+                    .resize(size, |size| renderer.renderer.update_drawable_size(size));
                 Ok(())
             }
         }
@@ -436,7 +443,13 @@ impl WindowRenderer {
         match self {
             Self::Dx11(renderer) => renderer.render_to_image(scene, appearance),
             #[cfg(all(feature = "windows-wgpu", feature = "test-support"))]
-            Self::Dx12(renderer) => renderer.renderer.render_to_image(scene),
+            Self::Dx12(renderer) => {
+                anyhow::ensure!(
+                    renderer.prepare_frame()?,
+                    "render_to_image unavailable while recovering from a lost device"
+                );
+                renderer.renderer.render_to_image(scene)
+            }
             #[cfg(all(feature = "windows-wgpu", not(feature = "test-support")))]
             Self::Dx12(_) => bail!("WGPU readback requires test-support"),
         }
@@ -446,6 +459,7 @@ impl WindowRenderer {
 #[cfg(feature = "windows-wgpu")]
 pub(crate) struct Dx12Renderer {
     renderer: gpui_wgpu::WgpuRenderer,
+    startup_resize: StartupResize,
     window: crate::SafeHwnd,
     force_redraw: bool,
     context: RendererContext,
@@ -453,8 +467,66 @@ pub(crate) struct Dx12Renderer {
     failed_window_recoveries: u8,
 }
 
+/// Native window creation can deliver several sizes before GPUI has a scene.
+/// Keep the checked initial surface configuration, then configure only the
+/// latest size when rendering starts. This state outlives GPU resource recovery.
+#[cfg(feature = "windows-wgpu")]
+#[derive(Default)]
+struct StartupResize {
+    started: bool,
+    pending_size: Option<Size<DevicePixels>>,
+}
+
+#[cfg(feature = "windows-wgpu")]
+impl StartupResize {
+    fn resize(&mut self, size: Size<DevicePixels>, apply: impl FnOnce(Size<DevicePixels>)) {
+        if self.started {
+            apply(size);
+        } else {
+            self.pending_size = Some(size);
+        }
+    }
+
+    fn prepare_frame(&mut self, available: bool, apply: impl FnOnce(Size<DevicePixels>)) -> bool {
+        if !available {
+            return false;
+        }
+        if let Some(size) = self.pending_size.take() {
+            apply(size);
+        }
+        self.started = true;
+        true
+    }
+}
+
 #[cfg(feature = "windows-wgpu")]
 impl Dx12Renderer {
+    /// Failed or pending recovery leaves the latest requested size queued until
+    /// the replacement is usable. Never configure a surface on a lost device.
+    fn prepare_frame(&mut self) -> Result<bool> {
+        let available = self.check_device()?;
+        if !self
+            .startup_resize
+            .prepare_frame(available, |size| self.renderer.update_drawable_size(size))
+        {
+            return Ok(false);
+        }
+        // Configuration can itself report a loss or a terminal error. The
+        // target already stores the final size for a subsequent recovery.
+        self.check_device()
+    }
+
+    fn check_device(&self) -> Result<bool> {
+        if self.renderer.device_lost() {
+            return Ok(false);
+        }
+        if let Some(error) = self.renderer.terminal_error() {
+            self.context.failed(error.clone(), true);
+            bail!("DX12 rendering failed: {error}");
+        }
+        Ok(true)
+    }
+
     fn new(hwnd: HWND, context: RendererContext) -> Result<Self> {
         use crate::bindings::Windows::Win32::*;
         use gpui_wgpu::{
@@ -503,6 +575,7 @@ impl Dx12Renderer {
         );
         Ok(Self {
             renderer,
+            startup_resize: StartupResize::default(),
             window,
             force_redraw: false,
             context,
@@ -530,6 +603,186 @@ mod tests {
         )
         .unwrap();
         (context, events)
+    }
+
+    #[cfg(feature = "windows-wgpu")]
+    #[test]
+    fn startup_resizes_configure_only_the_latest_size_then_resize_immediately() {
+        let mut resize = StartupResize::default();
+        let mut configured = Vec::new();
+        let first = gpui::size(DevicePixels(800), DevicePixels(600));
+        let final_size = gpui::size(DevicePixels(1200), DevicePixels(900));
+        for size in [first, final_size, final_size] {
+            resize.resize(size, |size| configured.push(size));
+        }
+        assert!(configured.is_empty());
+        assert!(resize.prepare_frame(true, |size| configured.push(size)));
+        assert_eq!(configured, [final_size]);
+        assert!(resize.prepare_frame(true, |_| panic!("repeated startup resize")));
+
+        // Once rendering starts, keep the existing immediate runtime semantics,
+        // including requests whose equality/clamping is handled by WGPU.
+        for size in [first, first, final_size] {
+            resize.resize(size, |size| configured.push(size));
+        }
+        assert_eq!(configured, [final_size, first, first, final_size]);
+    }
+
+    #[cfg(feature = "windows-wgpu")]
+    #[test]
+    fn startup_resize_survives_unavailable_frames_and_uses_latest_recovery_size() {
+        let mut resize = StartupResize::default();
+        let first = gpui::size(DevicePixels(800), DevicePixels(600));
+        let recovered = gpui::size(DevicePixels(1600), DevicePixels(1200));
+        resize.resize(first, |_| panic!("startup configure"));
+        for _ in 0..3 {
+            assert!(!resize.prepare_frame(false, |_| panic!("lost-device configure")));
+            assert!(!resize.started);
+            assert_eq!(resize.pending_size, Some(first));
+        }
+        resize.resize(recovered, |_| panic!("configure before recovery"));
+        let mut configured = None;
+        assert!(resize.prepare_frame(true, |size| configured = Some(size)));
+        assert_eq!(configured, Some(recovered));
+        assert!(resize.pending_size.is_none());
+    }
+
+    #[cfg(feature = "windows-wgpu")]
+    #[test]
+    fn first_frame_without_a_resize_keeps_the_checked_initial_configuration() {
+        let mut resize = StartupResize::default();
+        assert!(resize.prepare_frame(true, |_| panic!("no resize was requested")));
+        let requested = gpui::size(DevicePixels(320), DevicePixels(240));
+        let mut configured = None;
+        resize.resize(requested, |size| configured = Some(size));
+        assert_eq!(configured, Some(requested));
+    }
+
+    #[cfg(all(feature = "windows-wgpu", feature = "test-support"))]
+    struct HiddenDx12Window(HWND);
+
+    #[cfg(all(feature = "windows-wgpu", feature = "test-support"))]
+    impl HiddenDx12Window {
+        fn new() -> Result<Self> {
+            use crate::bindings::Windows::Win32::{CreateWindowExW, WS_OVERLAPPED};
+            Ok(Self(
+                unsafe {
+                    CreateWindowExW(
+                        0,
+                        windows_core::w!("STATIC"),
+                        windows_core::w!("gpui dx12 startup resize test"),
+                        WS_OVERLAPPED as u32,
+                        0,
+                        0,
+                        200,
+                        100,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                }
+                .ok()?,
+            ))
+        }
+    }
+
+    #[cfg(all(feature = "windows-wgpu", feature = "test-support"))]
+    impl Drop for HiddenDx12Window {
+        fn drop(&mut self) {
+            let _ = unsafe { crate::bindings::Windows::Win32::DestroyWindow(self.0) }.ok();
+        }
+    }
+
+    #[cfg(all(feature = "windows-wgpu", feature = "test-support"))]
+    #[test]
+    fn native_dx12_first_draw_and_readback_use_latest_startup_size() -> Result<()> {
+        if !dx12_supported()? {
+            eprintln!("Skipping native DX12 resize test: no hardware DX12 adapter");
+            return Ok(());
+        }
+        let (context, _) = context(WindowsRendererPreference::Auto);
+        for first_use_is_draw in [true, false] {
+            let window = HiddenDx12Window::new()?;
+            let mut renderer =
+                WindowRenderer::Dx12(Box::new(Dx12Renderer::new(window.0, context.clone())?));
+            let mut scene = Scene::default();
+            scene.finish();
+            renderer.resize(gpui::size(DevicePixels(48), DevicePixels(32)))?;
+            renderer.resize(gpui::size(DevicePixels(96), DevicePixels(64)))?;
+            let WindowRenderer::Dx12(dx12) = &mut renderer else {
+                unreachable!()
+            };
+            // Bypass only the wrapper to inspect the unchanged checked target.
+            // Intermediate WM_SIZE requests must not configure the actual WGPU target.
+            assert_eq!(dx12.renderer.render_to_image(&scene)?.dimensions(), (1, 1));
+            assert!(!dx12.startup_resize.started);
+
+            if first_use_is_draw {
+                renderer.draw(&scene, WindowBackgroundAppearance::Opaque)?;
+            }
+            assert_eq!(
+                renderer
+                    .render_to_image(&scene, WindowBackgroundAppearance::Opaque)?
+                    .dimensions(),
+                (96, 64)
+            );
+            renderer.resize(gpui::size(DevicePixels(80), DevicePixels(40)))?;
+            let WindowRenderer::Dx12(dx12) = &mut renderer else {
+                unreachable!()
+            };
+            assert!(dx12.startup_resize.started);
+            // Read the inner target directly: runtime resize must already have applied.
+            assert_eq!(
+                dx12.renderer.render_to_image(&scene)?.dimensions(),
+                (80, 40)
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "windows-wgpu", feature = "test-support"))]
+    #[test]
+    fn native_dx12_startup_resize_survives_pending_recovery_and_resource_replacement() -> Result<()>
+    {
+        if !dx12_supported()? {
+            eprintln!("Skipping native DX12 recovery test: no hardware DX12 adapter");
+            return Ok(());
+        }
+        let (context, _) = context(WindowsRendererPreference::Auto);
+        let window = HiddenDx12Window::new()?;
+        let mut renderer =
+            WindowRenderer::Dx12(Box::new(Dx12Renderer::new(window.0, context.clone())?));
+        renderer.resize(gpui::size(DevicePixels(48), DevicePixels(32)))?;
+        let WindowRenderer::Dx12(dx12) = &mut renderer else {
+            unreachable!()
+        };
+        // An absent shared context exercises the real stabilization wait without
+        // destroying a device or depending on a hardware driver reset.
+        let shared_context = context.0.gpu.borrow_mut().take();
+        let recovery = dx12.renderer.recover(&dx12.window);
+        *context.0.gpu.borrow_mut() = shared_context;
+        assert!(recovery.unwrap_err().is::<gpui_wgpu::RecoveryPending>());
+        assert!(!dx12.startup_resize.started);
+        assert_eq!(
+            dx12.startup_resize.pending_size,
+            Some(gpui::size(DevicePixels(48), DevicePixels(32)))
+        );
+        renderer.resize(gpui::size(DevicePixels(112), DevicePixels(72)))?;
+        let WindowRenderer::Dx12(dx12) = &mut renderer else {
+            unreachable!()
+        };
+        dx12.renderer.recover(&dx12.window)?;
+        assert!(!dx12.startup_resize.started);
+        let mut scene = Scene::default();
+        scene.finish();
+        assert_eq!(
+            renderer
+                .render_to_image(&scene, WindowBackgroundAppearance::Opaque)?
+                .dimensions(),
+            (112, 72)
+        );
+        Ok(())
     }
 
     #[test]
