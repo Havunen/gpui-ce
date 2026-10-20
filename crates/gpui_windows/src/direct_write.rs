@@ -70,16 +70,10 @@ struct FontDataOwner {
 }
 
 impl DirectWriteTextSystem {
-    pub(crate) fn new(directx_devices: &DirectXDevices) -> Result<Self> {
-        Self::new_inner(Some(directx_devices))
-    }
-
-    pub(crate) fn new_headless() -> Result<Self> {
-        Self::new_inner(None)
-    }
-
-    fn new_inner(directx_devices: Option<&DirectXDevices>) -> Result<Self> {
-        let renderer = Arc::new(RwLock::new(DirectWriteGlyphRenderer::new(directx_devices)?));
+    pub(crate) fn new() -> Result<Self> {
+        // Glyph rasterization uses software WIC/D2D targets and does not need a
+        // renderer device, whether the application is windowed or headless.
+        let renderer = Arc::new(RwLock::new(DirectWriteGlyphRenderer::new()?));
         let parley = ParleyTextSystem::new_with_rasterizer(
             SystemFonts::Load,
             "Segoe UI",
@@ -176,7 +170,7 @@ impl GlyphRasterizer for SharedDirectWriteRenderer {
 }
 
 impl DirectWriteGlyphRenderer {
-    fn new(_directx_devices: Option<&DirectXDevices>) -> Result<Self> {
+    fn new() -> Result<Self> {
         let factory: IDWriteFactory5 = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }
             .context("creating the DirectWrite factory")?;
         let variable_factory = factory.cast().ok();
@@ -962,7 +956,7 @@ mod tests {
 
     #[test]
     fn fixed_fonts_cover_native_modes_instances_and_empty_glyphs() -> Result<()> {
-        let system = DirectWriteTextSystem::new_headless()?;
+        let system = DirectWriteTextSystem::new()?;
         system.add_fonts(vec![
             Cow::Borrowed(*gpui_fonts::IBM_PLEX),
             Cow::Borrowed(*gpui_fonts::SOURCE_SERIF),
@@ -1098,7 +1092,7 @@ mod tests {
             *gpui_fonts::IBM_PLEX_ITALIC,
         ]);
         let source = FontDataBlob::from(collection);
-        let mut renderer = DirectWriteGlyphRenderer::new(None)?;
+        let mut renderer = DirectWriteGlyphRenderer::new()?;
         renderer.load_face(RasterFace {
             font_id: FontId(1),
             source_id: source.id(),
@@ -1124,8 +1118,7 @@ mod tests {
 
     #[test]
     fn native_color_survives_device_recovery() -> Result<()> {
-        let devices = DirectXDevices::new()?;
-        let system = DirectWriteTextSystem::new(&devices)?;
+        let system = DirectWriteTextSystem::new()?;
         let font_id = system.font_id(&font("Segoe UI Emoji"))?;
         let glyph_id = system
             .glyph_for_char(font_id, '😀')
@@ -1338,7 +1331,7 @@ mod tests {
 
     #[test]
     fn color_fallback_bakes_foreground_and_bitmap_fonts_keep_portable_routing() -> Result<()> {
-        let system = DirectWriteTextSystem::new_headless()?;
+        let system = DirectWriteTextSystem::new()?;
         system.add_fonts(vec![Cow::Borrowed(*gpui_fonts::IBM_PLEX)])?;
         let font_id = system.font_id(&font("IBM Plex Sans"))?;
         let glyph_id = system.glyph_for_char(font_id, 'A').unwrap();
@@ -1367,7 +1360,7 @@ mod tests {
             );
         }
 
-        let bitmap_system = DirectWriteTextSystem::new_headless()?;
+        let bitmap_system = DirectWriteTextSystem::new()?;
         bitmap_system.add_fonts(vec![Cow::Borrowed(*gpui_fonts::NOTO_COLOR_EMOJI)])?;
         let font_id = bitmap_system.font_id(&font("Noto Color Emoji"))?;
         let glyph_id = bitmap_system.glyph_for_char(font_id, '😀').unwrap();
@@ -1661,7 +1654,7 @@ mod tests {
     }
 
     fn color_test_system() -> Result<(DirectWriteTextSystem, FontId)> {
-        let outline_system = DirectWriteTextSystem::new_headless()?;
+        let outline_system = DirectWriteTextSystem::new()?;
         outline_system.add_fonts(vec![Cow::Borrowed(*gpui_fonts::IBM_PLEX)])?;
         let font_id = outline_system.font_id(&font("IBM Plex Sans"))?;
         let mut glyphs = [0; 6];
@@ -1670,7 +1663,7 @@ mod tests {
             glyphs[index] = outline_system.glyph_for_char(font_id, character).unwrap().0 as u16;
         }
 
-        let system = DirectWriteTextSystem::new_headless()?;
+        let system = DirectWriteTextSystem::new()?;
         system.add_fonts(vec![Cow::Owned(test_color_font(glyphs))])?;
         let font_id = system.font_id(&font("IBM Plex Sans"))?;
 

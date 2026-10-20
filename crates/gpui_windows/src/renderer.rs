@@ -1,6 +1,6 @@
 //! Process-wide Windows renderer selection. Storage belongs to the application.
-use crate::{DirectXDevices, DirectXRenderer, HWND};
-use anyhow::{Result, bail};
+use crate::{DirectXDevices, DirectXRenderer, HWND, LazyDirectXDevices, SharedDirectXDevices};
+use anyhow::{Context as _, Result, bail};
 use gpui::{DevicePixels, GpuSpecs, PlatformAtlas, Scene, Size, WindowBackgroundAppearance};
 use std::{cell::Cell, rc::Rc, sync::Arc};
 
@@ -114,11 +114,13 @@ impl RendererContext {
     fn create_window(
         &self,
         hwnd: HWND,
-        devices: &DirectXDevices,
+        devices: &SharedDirectXDevices,
         disable_composition: bool,
     ) -> Result<WindowRenderer> {
-        self.create_with(
-            || dx12_supported(devices),
+        self.create_with_devices(
+            devices,
+            || DirectXDevices::new().context("Creating DirectX devices"),
+            dx12_supported,
             || {
                 #[cfg(feature = "windows-wgpu")]
                 {
@@ -130,8 +132,26 @@ impl RendererContext {
                     bail!("DX12 renderer is unavailable in this build")
                 }
             },
-            || DirectXRenderer::new(hwnd, devices, disable_composition).map(WindowRenderer::Dx11),
+            |devices| {
+                DirectXRenderer::new(hwnd, devices, disable_composition).map(WindowRenderer::Dx11)
+            },
         )
+    }
+
+    fn create_with_devices<D: Clone, T>(
+        &self,
+        devices: &LazyDirectXDevices<D>,
+        create_devices: impl FnOnce() -> Result<D>,
+        probe: impl FnOnce() -> Result<bool>,
+        dx12: impl FnOnce() -> Result<T>,
+        dx11: impl FnOnce(&D) -> Result<T>,
+    ) -> Result<T> {
+        self.create_with(probe, dx12, || {
+            // Successful DX12 selection never acquires a DX11 device. Release
+            // the slot lock before creating a renderer or emitting callbacks.
+            let devices = devices.get_or_try_init(create_devices)?;
+            dx11(&devices)
+        })
     }
 
     fn create_with<T>(
@@ -191,12 +211,12 @@ impl RendererContext {
 }
 
 #[cfg(not(feature = "windows-wgpu"))]
-fn dx12_supported(_: &DirectXDevices) -> Result<bool> {
+fn dx12_supported() -> Result<bool> {
     Ok(false)
 }
 
 #[cfg(feature = "windows-wgpu")]
-fn dx12_supported(devices: &DirectXDevices) -> Result<bool> {
+fn dx12_supported() -> Result<bool> {
     use crate::bindings::Windows::Win32::*;
     use windows_core::{GUID, HRESULT, Interface};
     // System32-only loading avoids an application-local DLL influencing the support probe.
@@ -224,8 +244,10 @@ fn dx12_supported(devices: &DirectXDevices) -> Result<bool> {
         ) -> HRESULT;
         let probe: Probe = unsafe { std::mem::transmute(raw) };
         let iid = GUID::from_u128(0x189819f1_1db6_4b57_be54_1821339b85f7);
+        // Capability probing requires a DXGI factory, not a D3D11 device/context.
+        let factory = crate::directx_devices::get_dxgi_factory(false)?;
         for index in 0.. {
-            let adapter: IDXGIAdapter1 = match unsafe { devices.dxgi_factory.EnumAdapters(index) } {
+            let adapter: IDXGIAdapter1 = match unsafe { factory.EnumAdapters(index) } {
                 Ok(adapter) => adapter.cast()?,
                 Err(error) if error.code() == DXGI_ERROR_NOT_FOUND => break,
                 Err(error) => return Err(error.into()),
@@ -275,7 +297,7 @@ impl WindowRenderer {
     }
     pub(crate) fn new(
         hwnd: HWND,
-        devices: &DirectXDevices,
+        devices: &SharedDirectXDevices,
         disable_composition: bool,
         context: &RendererContext,
     ) -> Result<Self> {
@@ -476,7 +498,7 @@ impl Dx12Renderer {
             },
         ));
         log::info!(
-            "Windows renderer: WGPU DX12, adapter={:?}; DX11 retained for text/support services",
+            "Windows renderer: WGPU DX12, adapter={:?}; DX11 devices deferred until needed",
             info.adapter_info()
         );
         Ok(Self {
@@ -508,6 +530,131 @@ mod tests {
         )
         .unwrap();
         (context, events)
+    }
+
+    #[test]
+    fn dx12_windows_never_initialize_dx11_devices() {
+        let (context, _) = context(WindowsRendererPreference::Auto);
+        let devices = LazyDirectXDevices::<u8>::default();
+        for _ in 0..2 {
+            assert_eq!(
+                context
+                    .create_with_devices(
+                        &devices,
+                        || panic!("DX11 device creation on a DX12 path"),
+                        || Ok(true),
+                        || Ok(12),
+                        |_| panic!("DX11 renderer on a DX12 path"),
+                    )
+                    .unwrap(),
+                12
+            );
+            assert!(devices.get().is_none());
+        }
+    }
+
+    #[cfg(feature = "windows-wgpu")]
+    #[test]
+    fn forced_dx12_failure_does_not_initialize_dx11_devices() {
+        let context =
+            RendererContext::with_override(WindowsRendererOptions::default(), Some("wgpu-dx12"))
+                .unwrap();
+        let devices = LazyDirectXDevices::<u8>::default();
+        assert!(
+            context
+                .create_with_devices(
+                    &devices,
+                    || panic!("forced DX12 must not create fallback devices"),
+                    || panic!("forced DX12 must not probe"),
+                    || Err::<(), _>(anyhow::anyhow!("DX12 initialization failed")),
+                    |_| panic!("forced DX12 must not fall back"),
+                )
+                .is_err()
+        );
+        assert!(devices.get().is_none());
+    }
+
+    #[test]
+    fn fallback_device_creation_is_retryable_and_shared_across_windows() {
+        let (context, _) = context(WindowsRendererPreference::Auto);
+        let devices = LazyDirectXDevices::<u8>::default();
+        let attempts = Cell::new(0);
+        let create_devices = || {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() == 1 {
+                bail!("DX11 device initialization failed");
+            }
+            Ok(11)
+        };
+        assert!(
+            context
+                .create_with_devices(
+                    &devices,
+                    create_devices,
+                    || Ok(true),
+                    || Err::<u8, _>(anyhow::anyhow!("DX12 surface failed")),
+                    |device| Ok(*device),
+                )
+                .is_err()
+        );
+        assert!(devices.get().is_none());
+        assert_eq!(attempts.get(), 1);
+
+        // A failed factory is not cached. Once it succeeds, every subsequent
+        // window uses the shared device without probing or creating another.
+        for _ in 0..2 {
+            assert_eq!(
+                context
+                    .create_with_devices(
+                        &devices,
+                        create_devices,
+                        || panic!("fallback choice should be shared"),
+                        || panic!("fallback must remain DX11"),
+                        |device| Ok(*device),
+                    )
+                    .unwrap(),
+                11
+            );
+        }
+        assert_eq!(attempts.get(), 2);
+    }
+
+    #[test]
+    fn native_dx11_device_is_created_on_demand_and_reused() -> Result<()> {
+        use windows_core::Interface;
+
+        // Exercise both explicit DX11 and automatic fallback with real devices.
+        for preference in [
+            WindowsRendererPreference::Dx11,
+            WindowsRendererPreference::Auto,
+        ] {
+            let (context, _) = context(preference);
+            let devices = LazyDirectXDevices::default();
+            let attempts = Cell::new(0);
+            let mut first = None;
+            for _ in 0..2 {
+                let device = context.create_with_devices(
+                    &devices,
+                    || {
+                        attempts.set(attempts.get() + 1);
+                        DirectXDevices::with_debug_layer(false)
+                    },
+                    || Ok(false),
+                    || panic!("DX12 should not be selected"),
+                    |devices| {
+                        unsafe { devices.device.GetDeviceRemovedReason().ok()? };
+                        Ok(devices.device.clone())
+                    },
+                )?;
+                if let Some(first) = first {
+                    assert_eq!(device.as_raw(), first);
+                } else {
+                    first = Some(device.as_raw());
+                }
+            }
+            assert_eq!(attempts.get(), 1);
+        }
+        Ok(())
     }
 
     #[test]
@@ -564,9 +711,8 @@ mod tests {
     #[cfg(feature = "windows-wgpu")]
     #[test]
     fn native_support_probe_does_not_construct_a_wgpu_context() {
-        let devices = DirectXDevices::with_debug_layer(false).unwrap();
         let (context, _) = context(WindowsRendererPreference::Auto);
-        dx12_supported(&devices).unwrap();
+        dx12_supported().unwrap();
         assert!(context.0.gpu.borrow().is_none());
     }
     #[test]

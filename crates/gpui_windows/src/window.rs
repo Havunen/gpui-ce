@@ -106,7 +106,7 @@ pub(crate) struct WindowsWindowInner {
 impl WindowsWindowState {
     fn new(
         hwnd: HWND,
-        directx_devices: &DirectXDevices,
+        directx_devices: &SharedDirectXDevices,
         renderer_context: &RendererContext,
         window_params: &CREATESTRUCTW,
         current_cursor: Option<HCURSOR>,
@@ -413,7 +413,7 @@ struct WindowCreateContext {
     platform_window_handle: HWND,
     appearance: WindowAppearance,
     disable_direct_composition: bool,
-    directx_devices: DirectXDevices,
+    directx_devices: SharedDirectXDevices,
     renderer_context: RendererContext,
     invalidate_devices: Arc<AtomicBool>,
     draw_coordinator: Rc<DrawCoordinator>,
