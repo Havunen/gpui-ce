@@ -660,6 +660,17 @@ impl WgpuContext {
             );
         }
 
+        // DX12 pipelines are created from bytecode compiled at build time, which skips FXC:
+        // seconds of shader compilation per startup. Without passthrough WGPU compiles them.
+        if adapter.get_info().backend == wgpu::Backend::Dx12
+            && !gpui_render::artifacts::DX12_SHADERS.is_empty()
+            && adapter
+                .features()
+                .contains(wgpu::Features::PASSTHROUGH_SHADERS)
+        {
+            required_features |= wgpu::Features::PASSTHROUGH_SHADERS;
+        }
+
         let color_texture_format = Self::select_color_texture_format(adapter)?;
 
         let baseline = match renderer_tier {

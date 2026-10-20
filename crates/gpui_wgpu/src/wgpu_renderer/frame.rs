@@ -3,7 +3,6 @@ use super::{
     buffers::{InstanceTransport, InstanceUpload},
     filters::{FILTER_UNIFORMS_PER_COMPOSITE, FrameUniformRequirements},
     path_types,
-    pipelines::SmoothingRequirements,
 };
 use gpui::{
     FilterRenderTarget, MonochromeSprite, PolychromeSprite, PrimitiveBatch, Quad, RenderCommand,
@@ -46,30 +45,12 @@ pub(super) fn render_to_view(
     );
     let transport = renderer.resources().instances.transport();
     let requirements = FrameRequirements::for_damage(scene, &retained.damage, transport);
-    let resources = renderer.resources_mut();
-    if let Err(error) = resources
-        .pipelines
-        .prepare_smoothing(&resources.device, requirements.smoothing)
-    {
-        let message = format!("creating smoothing pipelines: {error}");
-        if matches!(
-            error,
-            wgpu::Error::OutOfMemory { .. } | wgpu::Error::Internal { .. }
-        ) {
-            *renderer.faults.fatal_error.lock().unwrap() = Some(message.clone());
-        }
-        // Let the next begin_frame consume this error. Handling it here and
-        // clearing the slot would reset the retry counter at the next frame.
-        *renderer.faults.pending_error.lock().unwrap() = Some(message);
-        renderer.retained.complete(retained, false);
-        renderer.target.request_redraw();
-        return None;
-    }
+    let mut targets = PreparedTargets::prepare(renderer, scene, frame_view, &requirements)?;
     // The retained texture matches the target by construction. The frame
     // texture may not: it can predate a resize or lack COPY_DST.
     let retained_copy = (retained.copy_texture.take())
         .filter(|source| {
-            !requirements.planned.uses_offscreen_target
+            targets.offscreen.is_none()
                 && frame_texture
                     .usage()
                     .contains(wgpu::TextureUsages::COPY_DST)
@@ -77,27 +58,6 @@ pub(super) fn render_to_view(
                 && frame_texture.format() == source.format()
         })
         .map(|source| (source, frame_texture.clone()));
-    let retained_blit = retained.blit.take().filter(|_| retained_copy.is_none());
-    // A retained frame can require a shader copy even when there are no scene
-    // filters (for example when the surface lacks COPY_DST). Decide only after
-    // checking the actual copy target, and include zero-blur opacity groups.
-    if requirements.planned.uses_offscreen_target || retained_blit.is_some() {
-        let resources = renderer.resources_mut();
-        if let Err(error) = resources.pipelines.prepare_filters(&resources.device) {
-            let message = format!("creating filter pipelines: {error}");
-            if matches!(
-                error,
-                wgpu::Error::OutOfMemory { .. } | wgpu::Error::Internal { .. }
-            ) {
-                *renderer.faults.fatal_error.lock().unwrap() = Some(message.clone());
-            }
-            *renderer.faults.pending_error.lock().unwrap() = Some(message);
-            renderer.retained.complete(retained, false);
-            renderer.target.request_redraw();
-            return None;
-        }
-    }
-    let mut targets = PreparedTargets::prepare(renderer, scene, frame_view, &requirements)?;
     if let Some(view) = &retained.view {
         targets.active = view.clone();
         // Create the overwrite-clear PSO with the target's first full frame, so
@@ -113,6 +73,8 @@ pub(super) fn render_to_view(
     // Prune once against the complete scene. Doing this inside each draw batch would evict a
     // texture that reappears after an intervening primitive and recreate its platform view.
     renderer.retain_surface_cache(&scene.surfaces);
+
+    let retained_blit = retained.blit.take().filter(|_| retained_copy.is_none());
     #[cfg(test)]
     {
         renderer.last_retained_presentation = if retained_copy.is_some() {
@@ -255,14 +217,14 @@ pub(super) fn handle_gpu_error(renderer: &mut WgpuRenderer, error: String) -> bo
         "GPU error during frame (failure {} of 10): {error}",
         renderer.faults.consecutive_failed_frames
     );
+    // Other integrations reset the count at their cleanup below, so only the strict
+    // Windows integration gets here. It decides what a terminal error means; the
+    // renderer itself never takes the process down.
     if renderer.faults.consecutive_failed_frames > 10 {
-        if renderer.reports_terminal_errors() {
-            renderer.faults.terminal_error = Some(format!(
-                "too many consecutive GPU errors; last error: {error}"
-            ));
-            return false;
-        }
-        panic!("too many consecutive GPU errors; last error: {error}");
+        renderer.faults.terminal_error = Some(format!(
+            "too many consecutive GPU errors; last error: {error}"
+        ));
+        return false;
     }
     if renderer.faults.consecutive_failed_frames > 5 && !renderer.faults.cleaned_up_failed_frames {
         if let Some(resources) = renderer.resources.as_mut() {
@@ -421,7 +383,6 @@ pub(super) struct FrameRequirements {
     instance_batches: u64,
     pub(super) uniforms: FrameUniformRequirements,
     planned: ScenePlanRequirements,
-    smoothing: SmoothingRequirements,
 }
 
 impl FrameRequirements {
@@ -440,10 +401,10 @@ impl FrameRequirements {
         let mut requirements = Self::scene_metadata(scene);
 
         for command in scene.render_commands() {
-            if let RenderCommand::Batch(batch) = command {
-                requirements.reserve_batch(batch, transport);
-            }
-            requirements.include_filter_smoothing(scene, command);
+            let RenderCommand::Batch(batch) = command else {
+                continue;
+            };
+            requirements.reserve_batch(batch, transport);
         }
         debug_assert_eq!(
             requirements.instance_batches as usize,
@@ -483,38 +444,13 @@ impl FrameRequirements {
         // estimate can't be reused.
         requirements.reserve(std::mem::size_of::<Quad>(), 1, transport);
         for command in scene.render_commands() {
-            if let RenderCommand::Batch(batch) = command {
-                if !batch_intersects(scene, batch, region) {
-                    continue;
-                }
+            if let RenderCommand::Batch(batch) = command
+                && batch_intersects(scene, batch, region)
+            {
                 requirements.reserve_batch(batch, transport);
             }
-            requirements.include_filter_smoothing(scene, command);
         }
         requirements
-    }
-
-    fn include_filter_smoothing(&mut self, scene: &Scene, command: &RenderCommand) {
-        if self.smoothing.blur_composite {
-            return;
-        }
-        self.smoothing.blur_composite = match command {
-            RenderCommand::Batch(PrimitiveBatch::BackdropFilters(range)) => scene.backdrop_filters
-                [range.clone()]
-            .iter()
-            .any(|filter| filter.corner_smoothing > 0.0 && filter.max_blur_radius() > 0.0),
-            RenderCommand::EndFilter {
-                boundary_index,
-                target: FilterRenderTarget::Isolated(_),
-                ..
-            } => {
-                let boundary = &scene.filter_boundaries[*boundary_index];
-                // Isolated groups composite even without blur (for example, opacity
-                // groups), and select the smoothing variant from this value alone.
-                boundary.corner_smoothing > 0.0
-            }
-            _ => false,
-        };
     }
 
     fn reserve(&mut self, element_size: usize, count: usize, transport: InstanceTransport) {
@@ -532,12 +468,10 @@ impl FrameRequirements {
 
     fn reserve_batch(&mut self, batch: &PrimitiveBatch, transport: InstanceTransport) {
         match batch {
-            PrimitiveBatch::Shadows { range, smoothed } => {
-                self.smoothing.shadows |= *smoothed && !range.is_empty();
+            PrimitiveBatch::Shadows { range, .. } => {
                 self.reserve(std::mem::size_of::<Shadow>(), range.len(), transport)
             }
-            PrimitiveBatch::Quads { range, smoothed } => {
-                self.smoothing.quads |= *smoothed && !range.is_empty();
+            PrimitiveBatch::Quads { range, .. } => {
                 self.reserve(std::mem::size_of::<Quad>(), range.len(), transport)
             }
             PrimitiveBatch::Paths {
@@ -569,16 +503,11 @@ impl FrameRequirements {
                 range.len(),
                 transport,
             ),
-            PrimitiveBatch::PolychromeSprites {
-                range, smoothed, ..
-            } => {
-                self.smoothing.polychrome_sprites |= *smoothed && !range.is_empty();
-                self.reserve(
-                    std::mem::size_of::<PolychromeSprite>(),
-                    range.len(),
-                    transport,
-                )
-            }
+            PrimitiveBatch::PolychromeSprites { range, .. } => self.reserve(
+                std::mem::size_of::<PolychromeSprite>(),
+                range.len(),
+                transport,
+            ),
             PrimitiveBatch::Paths { .. }
             | PrimitiveBatch::Surfaces(_)
             | PrimitiveBatch::BackdropFilters(_)
@@ -670,99 +599,15 @@ mod planning_tests {
             assert_eq!(requirements.storage_bytes, expected.storage_bytes);
             assert!(!requirements.planned.uses_path_target);
             assert!(!requirements.planned.uses_offscreen_target);
-            assert!(requirements.smoothing.quads);
-            assert_eq!(
-                FrameRequirements::for_partial_scene(&scene, region(2, 2), transport).smoothing,
-                SmoothingRequirements::default(),
-                "an ordinary batch must not prepare the distant smoothing pipeline"
-            );
             // A region over neither quad replays only the clear.
             let empty = FrameRequirements::for_partial_scene(&scene, region(60, 60), transport);
             assert_eq!(empty.instance_batches, 1);
-            assert_eq!(empty.smoothing, SmoothingRequirements::default());
             // A frame uploads once, sized by its damage; a reused frame uploads nothing.
             let partial =
                 FrameRequirements::for_damage(&scene, &Damage::Partial(region(24, 24)), transport);
             assert_eq!(partial.storage_bytes, requirements.storage_bytes);
             let reuse = FrameRequirements::for_damage(&scene, &Damage::Reuse, transport);
             assert_eq!((reuse.storage_bytes, reuse.instance_batches), (0, 0));
-            assert_eq!(reuse.smoothing, SmoothingRequirements::default());
-        }
-    }
-
-    #[test]
-    fn smoothing_planner_includes_backdrop_and_isolated_filter_composites() {
-        use gpui::{
-            BackdropFilter, Bounds, ContentMask, Corners, FilterBoundary, ScaledFilter,
-            ScaledPixels, point, size,
-        };
-        let bounds = Bounds::new(
-            point(ScaledPixels(0.0), ScaledPixels(0.0)),
-            size(ScaledPixels(40.0), ScaledPixels(40.0)),
-        );
-        let content_mask = ContentMask {
-            bounds,
-            ..Default::default()
-        };
-        for isolated in [false, true] {
-            for (smoothing, radius, expected) in
-                [(0.0, 4.0, false), (0.7, 0.0, isolated), (0.7, 4.0, true)]
-            {
-                let mut scene = Scene::default();
-                let filters = smallvec::smallvec![ScaledFilter::Blur(ScaledPixels(radius))];
-                if isolated {
-                    let boundary = FilterBoundary {
-                        order: 0,
-                        bounds,
-                        content_mask,
-                        corner_radii: Corners::all(ScaledPixels(8.0)),
-                        corner_smoothing: smoothing,
-                        filters,
-                        opacity: 1.0,
-                        is_start: true,
-                    };
-                    scene.insert_primitive(boundary.clone());
-                    scene.raise_order_floor();
-                    scene.insert_primitive(Quad {
-                        bounds,
-                        content_mask,
-                        background: gpui::white().into(),
-                        ..Default::default()
-                    });
-                    scene.raise_order_floor();
-                    scene.insert_primitive(FilterBoundary {
-                        is_start: false,
-                        ..boundary
-                    });
-                } else {
-                    scene.insert_primitive(BackdropFilter {
-                        order: 0,
-                        bounds,
-                        content_mask,
-                        corner_radii: Corners::all(ScaledPixels(8.0)),
-                        corner_smoothing: smoothing,
-                        filters,
-                        opacity: 1.0,
-                    });
-                }
-                scene.finish();
-                let required =
-                    FrameRequirements::for_scene(&scene, InstanceTransport::StorageBuffer);
-                assert_eq!(
-                    required.smoothing.blur_composite, expected,
-                    "isolated={isolated}, smoothing={smoothing}, radius={radius}"
-                );
-                assert!(!required.smoothing.quads);
-                assert_eq!(
-                    FrameRequirements::for_damage(
-                        &scene,
-                        &Damage::Reuse,
-                        InstanceTransport::StorageBuffer
-                    )
-                    .smoothing,
-                    SmoothingRequirements::default()
-                );
-            }
         }
     }
 }

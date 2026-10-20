@@ -42,10 +42,7 @@ impl WgpuRenderer {
     ) -> frame::DrawResult {
         let pipelines = &self.resources().pipelines;
         let pipeline = if smoothed {
-            pipelines
-                .smoothed_quads
-                .as_ref()
-                .expect("smoothed quads prepared before encoding")
+            &pipelines.smoothed_quads
         } else {
             &pipelines.quads
         };
@@ -61,10 +58,7 @@ impl WgpuRenderer {
     ) -> frame::DrawResult {
         let pipelines = &self.resources().pipelines;
         let pipeline = if smoothed {
-            pipelines
-                .smoothed_shadows
-                .as_ref()
-                .expect("smoothed shadows prepared before encoding")
+            &pipelines.smoothed_shadows
         } else {
             &pipelines.shadows
         };
@@ -131,10 +125,7 @@ impl WgpuRenderer {
         let texture = self.atlas.get_texture_info(texture_id);
         let pipelines = &self.resources().pipelines;
         let pipeline = if smoothed {
-            pipelines
-                .smoothed_polychrome_sprites
-                .as_ref()
-                .expect("smoothed sprites prepared before encoding")
+            &pipelines.smoothed_polychrome_sprites
         } else {
             &pipelines.polychrome_sprites
         };
