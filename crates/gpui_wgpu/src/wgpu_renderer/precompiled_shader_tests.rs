@@ -140,12 +140,30 @@ mod hlsl_capture {
             *INSTALLED.get_or_init(|| log::set_logger(&Capture).is_ok()),
             "another logger owns this test process; wgpu-hal's HLSL cannot be captured"
         );
+        /// Restores the log level and stops capturing even if `f` panics, so later
+        /// tests neither format every debug log nor feed a stale capture.
+        struct Armed(log::LevelFilter);
+        impl Drop for Armed {
+            fn drop(&mut self) {
+                log::set_max_level(self.0);
+                CAPTURED
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+            }
+        }
+
         *CAPTURED.lock().unwrap() = Some((std::thread::current().id(), Vec::new()));
-        let previous = log::max_level();
+        let armed = Armed(log::max_level());
         log::set_max_level(log::LevelFilter::Debug);
         f();
-        log::set_max_level(previous);
-        let (_, messages) = CAPTURED.lock().unwrap().take().unwrap();
+        let messages = CAPTURED
+            .lock()
+            .unwrap()
+            .as_mut()
+            .map(|(_, messages)| std::mem::take(messages))
+            .unwrap_or_default();
+        drop(armed);
         messages
             .into_iter()
             .filter_map(|message| {

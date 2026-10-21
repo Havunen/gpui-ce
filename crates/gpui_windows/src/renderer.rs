@@ -94,6 +94,15 @@ impl RendererContext {
         self.0.backend.set(Some(WindowsRendererBackend::Dx11));
     }
 
+    /// Releases the shared DX12 device once no renderer uses it. Every DX12 renderer
+    /// holds a reference to the context, and no new one is created after a fallback.
+    #[cfg(feature = "windows-wgpu")]
+    fn release_unused_gpu_context(&self) {
+        if Rc::strong_count(&self.0.gpu) == 1 {
+            *self.0.gpu.borrow_mut() = None;
+        }
+    }
+
     fn failed(&self, message: String, runtime: bool) {
         if !self.0.overridden && !self.0.failure_reported.replace(true) {
             log::warn!("DX12 unavailable: {message}");
@@ -195,14 +204,14 @@ impl RendererContext {
                         format!("DX12 initialization failed: {error:#}"),
                         !first_auto,
                     );
-                    if !first_auto {
+                    // A forced renderer reports its failure rather than falling back.
+                    if self.0.overridden {
                         return Err(error);
                     }
-                    // The failed renderer has dropped its surface/resources. Release the shared device too.
+                    // Like a running window that fails, this and later windows use DX11.
+                    // The failed renderer has dropped its surface and resources already.
                     #[cfg(feature = "windows-wgpu")]
-                    {
-                        *self.0.gpu.borrow_mut() = None;
-                    }
+                    self.release_unused_gpu_context();
                     self.0.backend.set(Some(WindowsRendererBackend::Dx11));
                 }
             }
@@ -306,10 +315,13 @@ enum Backend {
     Dx11(DirectXRenderer),
     #[cfg(feature = "windows-wgpu")]
     Dx12(Box<Dx12Renderer>),
-    /// DX12 failed and DX11 could not replace it: the window no longer draws.
+    /// DX12 failed and DX11 could not replace it yet. The window does not draw until a
+    /// retry, due at `retry_at`, creates DX11.
     #[cfg(feature = "windows-wgpu")]
     Unavailable {
         atlas: Arc<dyn PlatformAtlas>,
+        retry_at: std::time::Instant,
+        retry_delay: std::time::Duration,
     },
 }
 
@@ -319,6 +331,7 @@ struct Dx11Fallback {
     hwnd: HWND,
     devices: SharedDirectXDevices,
     disable_composition: bool,
+    context: RendererContext,
     /// The last size requested for the window, which a new renderer must adopt.
     size: Option<Size<DevicePixels>>,
 }
@@ -359,6 +372,7 @@ impl WindowRenderer {
                 hwnd,
                 devices: devices.clone(),
                 disable_composition,
+                context: context.clone(),
                 size: None,
             },
             #[cfg(feature = "windows-wgpu")]
@@ -424,7 +438,7 @@ impl WindowRenderer {
             #[cfg(feature = "windows-wgpu")]
             Backend::Dx12(renderer) => renderer.renderer.sprite_atlas().clone(),
             #[cfg(feature = "windows-wgpu")]
-            Backend::Unavailable { atlas } => atlas.clone(),
+            Backend::Unavailable { atlas, .. } => atlas.clone(),
         }
     }
 
@@ -470,7 +484,12 @@ impl WindowRenderer {
                 }
             },
             #[cfg(feature = "windows-wgpu")]
-            Backend::Unavailable { .. } => false,
+            Backend::Unavailable { retry_at, .. } => {
+                if std::time::Instant::now() >= *retry_at {
+                    self.retry_dx11();
+                }
+                std::mem::take(&mut self.force_redraw)
+            }
         }
     }
 
@@ -500,9 +519,12 @@ impl WindowRenderer {
     #[cfg(feature = "windows-wgpu")]
     fn fall_back_to_dx11(&mut self, error: String) {
         let atlas = self.sprite_atlas();
-        let Backend::Dx12(mut dx12) =
-            std::mem::replace(&mut self.backend, Backend::Unavailable { atlas })
-        else {
+        let unavailable = Backend::Unavailable {
+            atlas,
+            retry_at: std::time::Instant::now(),
+            retry_delay: std::time::Duration::from_secs(1),
+        };
+        let Backend::Dx12(mut dx12) = std::mem::replace(&mut self.backend, unavailable) else {
             return;
         };
         log::error!("DX12 rendering failed; switching this window to DX11: {error}");
@@ -513,12 +535,29 @@ impl WindowRenderer {
         // so DX12 must release both first.
         dx12.renderer.destroy();
         drop(dx12);
+        context.release_unused_gpu_context();
+        self.retry_dx11();
+    }
+
+    /// Creates the DX11 renderer that replaces a failed DX12 one. A failure, such as an
+    /// adapter still resetting after a device removal, is retried later with a backoff.
+    #[cfg(feature = "windows-wgpu")]
+    fn retry_dx11(&mut self) {
+        let Backend::Unavailable {
+            retry_at,
+            retry_delay,
+            ..
+        } = &mut self.backend
+        else {
+            return;
+        };
         match self.fallback.create() {
             Ok(mut renderer) => {
                 if let Some(atlas) = &self.atlas {
                     atlas.replace(renderer.sprite_atlas());
                 }
                 renderer.mark_drawable();
+                let context = &self.fallback.context;
                 context.emit(WindowsRendererEvent::Selected {
                     backend: WindowsRendererBackend::Dx11,
                     overridden: context.0.overridden,
@@ -528,8 +567,10 @@ impl WindowRenderer {
             }
             Err(error) => {
                 log::error!(
-                    "DX11 could not replace DX12; this window can no longer draw: {error:#}"
-                )
+                    "DX11 could not replace DX12 yet; retrying in {retry_delay:?}: {error:#}"
+                );
+                *retry_at = std::time::Instant::now() + *retry_delay;
+                *retry_delay = (*retry_delay * 2).min(std::time::Duration::from_secs(30));
             }
         }
     }
@@ -966,6 +1007,7 @@ mod tests {
                     hwnd: self.0,
                     devices: Default::default(),
                     disable_composition: false,
+                    context: context.clone(),
                     size: None,
                 },
                 force_redraw: false,
@@ -1140,6 +1182,10 @@ mod tests {
                 Some(WindowsRendererBackend::Dx11),
                 "later windows must start on DX11"
             );
+            assert!(
+                context.0.gpu.borrow().is_none(),
+                "no DX12 renderer remains, so the shared DX12 device must be released"
+            );
             let events = events.borrow();
             assert!(events.iter().any(|event| matches!(
                 event,
@@ -1162,6 +1208,65 @@ mod tests {
             assert_eq!(image.get_pixel(20, 16).0, [255; 4]);
             assert!(renderer.gpu_specs().is_ok());
         }
+        Ok(())
+    }
+
+    /// A DX11 replacement that cannot be created yet, as while an adapter resets, is
+    /// retried with a backoff until the window draws again.
+    #[cfg(all(feature = "windows-wgpu", feature = "test-support"))]
+    #[test]
+    fn native_failed_dx11_replacement_is_retried_until_it_succeeds() -> Result<()> {
+        if !dx12_supported()? {
+            eprintln!("Skipping native DX12 fallback test: no hardware DX12 adapter");
+            return Ok(());
+        }
+        let (context, events) = context(WindowsRendererPreference::Auto);
+        let window = HiddenDx12Window::new()?;
+        let mut renderer = window.renderer(&context)?;
+        renderer.resize(gpui::size(DevicePixels(64), DevicePixels(48)))?;
+        // DX11 cannot create a swap chain for a window that no longer exists.
+        let mut unusable = HiddenDx12Window::new()?;
+        unusable.destroy();
+        renderer.fallback.hwnd = unusable.0;
+        dx12(&mut renderer)
+            .renderer
+            .inject_terminal_error_for_tests("injected DX12 failure");
+        renderer.draw(&white_quad_scene(), WindowBackgroundAppearance::Opaque)?;
+        let Backend::Unavailable {
+            retry_at,
+            retry_delay,
+            ..
+        } = &mut renderer.backend
+        else {
+            panic!("DX11 creation must have failed");
+        };
+        assert!(*retry_at > std::time::Instant::now(), "retries back off");
+        assert_eq!(*retry_delay, std::time::Duration::from_secs(2));
+        // Not due yet: nothing is retried and nothing is drawn.
+        assert!(!renderer.take_force_redraw());
+        assert!(matches!(renderer.backend, Backend::Unavailable { .. }));
+
+        // The window is usable again and the retry is due.
+        renderer.fallback.hwnd = window.0;
+        if let Backend::Unavailable { retry_at, .. } = &mut renderer.backend {
+            *retry_at = std::time::Instant::now();
+        }
+        assert!(
+            renderer.take_force_redraw(),
+            "the replacement forces a full frame"
+        );
+        assert!(matches!(renderer.backend, Backend::Dx11(_)));
+        assert!(matches!(
+            events.borrow().last(),
+            Some(WindowsRendererEvent::Selected {
+                backend: WindowsRendererBackend::Dx11,
+                ..
+            })
+        ));
+        let image =
+            renderer.render_to_image(&white_quad_scene(), WindowBackgroundAppearance::Opaque)?;
+        assert_eq!(image.dimensions(), (64, 48));
+        assert_eq!(image.get_pixel(20, 16).0, [255; 4]);
         Ok(())
     }
 
@@ -1458,6 +1563,48 @@ mod tests {
             assert_eq!(context.0.backend.get(), Some(WindowsRendererBackend::Dx11));
         }
     }
+    /// A later window whose DX12 initialization fails falls back to DX11, as a running
+    /// window does, and so do the windows after it.
+    #[test]
+    fn later_dx12_initialization_failures_fall_back_to_dx11() {
+        let (context, events) = context(WindowsRendererPreference::Auto);
+        assert_eq!(
+            context
+                .create_with(|| Ok(true), || Ok(12), || panic!("DX11"))
+                .unwrap(),
+            12
+        );
+        assert_eq!(
+            context
+                .create_with(
+                    || panic!("second probe"),
+                    || Err::<u8, _>(anyhow::anyhow!("DX12 initialization failed")),
+                    || Ok(11),
+                )
+                .unwrap(),
+            11
+        );
+        assert_eq!(
+            context
+                .create_with(|| panic!("third probe"), || panic!("DX12 again"), || Ok(11))
+                .unwrap(),
+            11
+        );
+        let events = events.borrow();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, WindowsRendererEvent::Failed { runtime: true, .. }))
+        );
+        assert!(matches!(
+            events.last(),
+            Some(WindowsRendererEvent::Selected {
+                backend: WindowsRendererBackend::Dx11,
+                ..
+            })
+        ));
+    }
+
     #[test]
     fn dx12_success_reuses_selection_and_runtime_failure_is_notified_once() {
         let (context, events) = context(WindowsRendererPreference::Auto);

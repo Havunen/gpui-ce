@@ -66,6 +66,8 @@ pub struct WindowsWindowState {
     /// and when a forced render was requested while another draw was in
     /// progress and had to be deferred.
     pub force_render_pending: Cell<bool>,
+    /// Consecutive device-loss recoveries this window's renderer failed to complete.
+    pub failed_device_recoveries: Cell<u8>,
 
     pub click_state: ClickState,
     pub current_cursor: Cell<Option<HCURSOR>>,
@@ -174,6 +176,7 @@ impl WindowsWindowState {
             hovered: Cell::new(hovered),
             renderer: RefCell::new(renderer),
             force_render_pending: Cell::new(false),
+            failed_device_recoveries: Cell::new(0),
             click_state,
             current_cursor: Cell::new(current_cursor),
             cursor_visible,
