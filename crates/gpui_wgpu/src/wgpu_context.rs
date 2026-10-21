@@ -167,7 +167,7 @@ impl SoftwareAdapterPolicy {
     }
 }
 
-struct CreatedDevice {
+pub(crate) struct CreatedDevice {
     device: wgpu::Device,
     queue: wgpu::Queue,
     dual_source_blending: bool,
@@ -604,7 +604,7 @@ impl WgpuContext {
         Ok(PreparedWebGraphics { context, surface })
     }
 
-    fn from_created_device(
+    pub(crate) fn from_created_device(
         instance: wgpu::Instance,
         adapter: wgpu::Adapter,
         device: CreatedDevice,
@@ -638,7 +638,7 @@ impl WgpuContext {
         })
     }
 
-    async fn create_device(
+    pub(crate) async fn create_device(
         adapter: &wgpu::Adapter,
         extra_requirements: Option<&WgpuDeviceRequirements>,
     ) -> anyhow::Result<CreatedDevice> {

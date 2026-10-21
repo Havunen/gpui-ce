@@ -12,12 +12,15 @@ use gpui_render::{
     shaders::interface as shader,
 };
 
-/// A DX12 device whose WGPU compiles with FXC, as the build does, so WGPU's generated
-/// HLSL targets the same shader model as the artifacts.
-fn fxc_device(passthrough: bool) -> anyhow::Result<(wgpu::Adapter, wgpu::Device)> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+/// A DX12 instance whose WGPU compiles exactly as the build does: with FXC, so its HLSL
+/// targets the artifacts' shader model, and without `InstanceFlags::DEBUG`, which debug
+/// builds enable and which adds `D3DCOMPILE_SKIP_OPTIMIZATION`. Its WGSL pipelines then
+/// run the same optimized bytecode as the artifacts, so a pixel difference between the
+/// two is a binding or layout mismatch, never two compilations rounding differently.
+fn fxc_instance() -> wgpu::Instance {
+    wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::DX12,
-        flags: wgpu::InstanceFlags::default(),
+        flags: wgpu::InstanceFlags::default() - wgpu::InstanceFlags::DEBUG,
         backend_options: wgpu::BackendOptions {
             dx12: wgpu::Dx12BackendOptions {
                 shader_compiler: wgpu::Dx12Compiler::Fxc,
@@ -27,7 +30,11 @@ fn fxc_device(passthrough: bool) -> anyhow::Result<(wgpu::Adapter, wgpu::Device)
         },
         memory_budget_thresholds: Default::default(),
         display: None,
-    });
+    })
+}
+
+fn fxc_device(passthrough: bool) -> anyhow::Result<(wgpu::Adapter, wgpu::Device)> {
+    let instance = fxc_instance();
     let adapter = gpui::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         force_fallback_adapter: false,
@@ -444,6 +451,27 @@ mod rendering {
         }
     }
 
+    /// A headless context created as `WgpuContext::new_headless` creates one, on the
+    /// instance that compiles as the build does (see `fxc_instance`).
+    fn context() -> anyhow::Result<WgpuContext> {
+        let instance = fxc_instance();
+        let adapter = gpui::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+        }))?;
+        let device = gpui::block_on(WgpuContext::create_device(&adapter, None))?;
+        let context = WgpuContext::from_created_device(instance, adapter, device)?;
+        assert!(
+            context
+                .device
+                .features()
+                .contains(wgpu::Features::PASSTHROUGH_SHADERS),
+            "WgpuContext must request passthrough shaders on DX12"
+        );
+        Ok(context)
+    }
+
     /// One renderer per shader source, sharing a device.
     fn renderers(context: &WgpuContext) -> anyhow::Result<(WgpuRenderer, WgpuRenderer)> {
         let target = size(DevicePixels(SIZE), DevicePixels(SIZE));
@@ -801,15 +829,7 @@ mod rendering {
     #[test]
     fn precompiled_pipelines_render_exactly_like_runtime_compiled_ones() -> anyhow::Result<()> {
         let _gpu_test_guard = crate::test_gpu::guard();
-        let context = WgpuContext::new_headless(None)?;
-        anyhow::ensure!(context.adapter.get_info().backend == wgpu::Backend::Dx12);
-        assert!(
-            context
-                .device
-                .features()
-                .contains(wgpu::Features::PASSTHROUGH_SHADERS),
-            "WgpuContext must request passthrough shaders on DX12"
-        );
+        let context = context()?;
         let (mut precompiled, mut compiled) = renderers(&context)?;
         let tiles = atlas_tiles(&precompiled)?;
         let compiled_tiles = atlas_tiles(&compiled)?;
@@ -841,8 +861,7 @@ mod rendering {
     fn precompiled_retained_partial_frames_and_blits_match_runtime_compiled() -> anyhow::Result<()>
     {
         let _gpu_test_guard = crate::test_gpu::guard();
-        let context = WgpuContext::new_headless(None)?;
-        anyhow::ensure!(context.adapter.get_info().backend == wgpu::Backend::Dx12);
+        let context = context()?;
         let (mut precompiled, mut compiled) = renderers(&context)?;
         let _frame = gpui::profiler::gpu::set_gpu_frame_context(true, 1);
         let frame = |row: usize| {
@@ -902,8 +921,7 @@ mod rendering {
     #[test]
     fn rejected_bytecode_renders_through_the_wgsl_fallback() -> anyhow::Result<()> {
         let _gpu_test_guard = crate::test_gpu::guard();
-        let context = WgpuContext::new_headless(None)?;
-        anyhow::ensure!(context.adapter.get_info().backend == wgpu::Backend::Dx12);
+        let context = context()?;
         let (mut precompiled, mut fallback) = renderers(&context)?;
         let mut rejected = DX12_SHADERS.to_vec();
         for shader in &mut rejected {
