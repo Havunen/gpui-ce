@@ -31,6 +31,11 @@ mod tests;
 
 impl WgpuRenderer {
     /// Creates a renderer whose surface and GPU context follow the native window lifetime.
+    ///
+    /// `WGPU_BACKEND` restricts automatic backend selection. For example, `gl`
+    /// selects only OpenGL/GLES, without initializing Vulkan or DX12. A comma-separated
+    /// list allows fallback within that set, in the platform's usual preference order.
+    /// Explicit constructors such as `new_dx12` take precedence over this variable.
     #[cfg(not(target_family = "wasm"))]
     pub fn new<W>(
         gpu_context: GpuContext,
