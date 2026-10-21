@@ -2,6 +2,7 @@ use anyhow::{Context as _, anyhow};
 use x11rb::connection::RequestConnection;
 
 use crate::linux::X11ClientStatePtr;
+use crate::linux::renderer::RendererContext;
 use gpui::{
     AnyWindowHandle, Bounds, Decorations, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers,
     Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
@@ -272,6 +273,7 @@ pub struct X11WindowState {
     bounds: Bounds<Pixels>,
     scale_factor: f32,
     renderer: WgpuRenderer,
+    renderer_context: RendererContext,
     display: Rc<dyn PlatformDisplay>,
     input_handler: Option<PlatformInputHandler>,
     appearance: WindowAppearance,
@@ -451,7 +453,7 @@ impl X11WindowState {
         handle: AnyWindowHandle,
         client: X11ClientStatePtr,
         executor: ForegroundExecutor,
-        gpu_context: gpui_wgpu::GpuContext,
+        renderer_context: RendererContext,
         compositor_gpu: Option<CompositorGpuHint>,
         gpu_requirements: Option<gpui_wgpu::WgpuDeviceRequirements>,
         params: WindowParams,
@@ -768,8 +770,7 @@ impl X11WindowState {
                     transparent: false,
                     preferred_present_mode: None,
                 };
-                WgpuRenderer::new(
-                    gpu_context,
+                renderer_context.create_renderer(
                     &raw_window,
                     config,
                     compositor_gpu,
@@ -835,6 +836,7 @@ impl X11WindowState {
                 bounds: bounds.to_pixels(scale_factor),
                 scale_factor,
                 renderer,
+                renderer_context,
                 atoms: *atoms,
                 input_handler: None,
                 active: false,
@@ -927,7 +929,7 @@ impl X11Window {
         handle: AnyWindowHandle,
         client: X11ClientStatePtr,
         executor: ForegroundExecutor,
-        gpu_context: gpui_wgpu::GpuContext,
+        renderer_context: RendererContext,
         compositor_gpu: Option<CompositorGpuHint>,
         gpu_requirements: Option<gpui_wgpu::WgpuDeviceRequirements>,
         params: WindowParams,
@@ -947,7 +949,7 @@ impl X11Window {
                 handle,
                 client,
                 executor,
-                gpu_context,
+                renderer_context,
                 compositor_gpu,
                 gpu_requirements,
                 params,
@@ -1713,7 +1715,8 @@ impl PlatformWindow for X11Window {
             .map(|ref_cell| {
                 let state = ref_cell.borrow();
                 state
-                    .gpu_context
+                    .renderer_context
+                    .gpu()
                     .borrow()
                     .as_ref()
                     .is_some_and(|ctx| ctx.supports_dual_source_blending())
@@ -1830,7 +1833,7 @@ impl PlatformWindow for X11Window {
                 visual_id: inner.visual_id,
             };
             match inner.renderer.recover(&raw_window) {
-                Ok(()) => {}
+                Ok(()) => inner.renderer_context.notify_selected(),
                 Err(err) => {
                     log::warn!("GPU recovery failed, will retry on next frame: {err}");
                 }

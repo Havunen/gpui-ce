@@ -30,6 +30,50 @@ pub(crate) enum NativeBackend {
     Gl,
 }
 
+#[cfg(not(target_family = "wasm"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeBackendSelection {
+    Allowed(wgpu::Backends),
+    #[cfg(target_os = "windows")]
+    WindowsDx12,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl NativeBackendSelection {
+    pub(crate) fn try_initialize<T>(
+        self,
+        operation: &'static str,
+        attempt: impl FnMut(NativeBackend) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        match self {
+            Self::Allowed(backends) => {
+                NativeBackend::try_with_backends(operation, backends, attempt)
+            }
+            #[cfg(target_os = "windows")]
+            Self::WindowsDx12 => {
+                let mut attempt = attempt;
+                attempt(NativeBackend::Dx12)
+            }
+        }
+    }
+
+    pub(crate) fn explicit_backend(self) -> Option<NativeBackend> {
+        match self {
+            Self::Allowed(_) => None,
+            #[cfg(target_os = "windows")]
+            Self::WindowsDx12 => Some(NativeBackend::Dx12),
+        }
+    }
+
+    pub(crate) fn allows(self, backend: wgpu::Backend) -> bool {
+        match self {
+            Self::Allowed(backends) => backends.contains(backend.into()),
+            #[cfg(target_os = "windows")]
+            Self::WindowsDx12 => backend == wgpu::Backend::Dx12,
+        }
+    }
+}
+
 /// A WGPU instance paired with the single native API it was created to load.
 ///
 /// Keeping the backend token attached prevents later initialization stages from
@@ -103,7 +147,7 @@ impl NativeBackend {
             Self::PREFERENCE
                 .iter()
                 .any(|&backend| allowed.contains(backend.into())),
-            "cannot initialize {operation}: WGPU_BACKEND enables no supported native backend ({allowed:?})"
+            "cannot initialize {operation}: backend selection enables no supported native backend ({allowed:?})"
         );
         let mut failures = SmallVec::<[NativeBackendFailure; 3]>::new();
         // Filter before invoking the attempt: even creating an instance can load a
@@ -1073,7 +1117,63 @@ fn parse_pci_id(id: &str) -> anyhow::Result<u32> {
 
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
-    use super::{NativeBackend, SoftwareAdapterPolicy, parse_pci_id};
+    use super::{NativeBackend, NativeBackendSelection, SoftwareAdapterPolicy, parse_pci_id};
+
+    #[test]
+    #[cfg(not(target_vendor = "apple"))]
+    fn configured_backend_selection_never_attempts_another_api() {
+        for (allowed, expected) in [
+            (wgpu::Backends::GL, NativeBackend::Gl),
+            (wgpu::Backends::VULKAN, NativeBackend::Vulkan),
+        ] {
+            let selection = NativeBackendSelection::Allowed(allowed);
+            for succeeds in [false, true] {
+                let mut attempted = Vec::new();
+                let result = selection.try_initialize("test window context", |backend| {
+                    attempted.push(backend);
+                    anyhow::ensure!(succeeds, "driver unavailable");
+                    Ok(backend)
+                });
+                assert_eq!(result.is_ok(), succeeds);
+                if let Ok(selected) = result {
+                    assert_eq!(selected, expected);
+                }
+                assert_eq!(attempted, [expected]);
+                assert_eq!(selection.explicit_backend(), None);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_vendor = "apple"))]
+    fn configured_backend_selection_rejects_a_shared_context_using_another_api() {
+        let gl = NativeBackendSelection::Allowed(wgpu::Backends::GL);
+        assert!(gl.allows(wgpu::Backend::Gl));
+        assert!(!gl.allows(wgpu::Backend::Vulkan));
+        let vulkan = NativeBackendSelection::Allowed(wgpu::Backends::VULKAN);
+        assert!(vulkan.allows(wgpu::Backend::Vulkan));
+        assert!(!vulkan.allows(wgpu::Backend::Gl));
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn explicit_dx12_selection_remains_strict() {
+        let selection = NativeBackendSelection::WindowsDx12;
+        let mut attempted = Vec::new();
+        assert!(
+            selection
+                .try_initialize::<()>("test window context", |backend| {
+                    attempted.push(backend);
+                    anyhow::bail!("DX12 unavailable")
+                })
+                .is_err()
+        );
+        assert_eq!(attempted, [NativeBackend::Dx12]);
+        assert_eq!(selection.explicit_backend(), Some(NativeBackend::Dx12));
+        assert!(selection.allows(wgpu::Backend::Dx12));
+        assert!(!selection.allows(wgpu::Backend::Vulkan));
+        assert!(!selection.allows(wgpu::Backend::Gl));
+    }
 
     #[test]
     fn native_backend_fallbacks_are_individually_initialized() {

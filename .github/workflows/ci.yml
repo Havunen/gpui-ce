@@ -132,6 +132,16 @@ jobs:
           LIBGL_ALWAYS_SOFTWARE: "1"
         run: cargo test --locked -p gpui_ce_wgpu --features test-support --test headless_primitives --target ${{ matrix.target }} -- --test-threads=1
 
+      - name: Run native X11 OpenGL renderer test
+        if: matrix.runner == 'ubuntu-24.04' && matrix.target == 'x86_64-unknown-linux-gnu'
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: |
+          sudo apt-get install -y xvfb
+          xvfb-run -a env -u WGPU_BACKEND -u WAYLAND_DISPLAY -u ZED_HEADLESS \
+            cargo test --locked -p gpui_ce_linux --no-default-features --features x11 \
+            --test linux_renderer --target ${{ matrix.target }} -- --ignored --test-threads=1
+
       - name: Run release DX12 shader tests
         if: matrix.runner == 'windows-2025'
         run: cargo test --locked -p gpui_ce_wgpu --release --features test-support,custom-gpu,wgpu-surfaces --lib precompiled_shader_tests --target ${{ matrix.target }} -- --test-threads=1

@@ -57,13 +57,14 @@ use crate::linux::{
 };
 use crate::linux::{LinuxCommon, LinuxKeyboardLayout, X11Window, modifiers_from_xinput_info};
 
+use crate::linux::renderer::{LinuxRendererOptions, RendererContext};
 use gpui::{
     AnyWindowHandle, Bounds, ClipboardItem, CursorStyle, DisplayId, FileDropEvent, Keystroke,
     Modifiers, ModifiersChangedEvent, MouseButton, Pixels, PlatformDisplay, PlatformInput,
     PlatformKeyboardLayout, PlatformWindow, Point, RequestFrameOptions, ScrollDelta, Size,
     TouchPhase, WindowButtonLayout, WindowParams, point, px,
 };
-use gpui_wgpu::{CompositorGpuHint, GpuContext};
+use gpui_wgpu::CompositorGpuHint;
 
 /// Value for DeviceId parameters which selects all devices.
 pub(crate) const XINPUT_ALL_DEVICES: xinput::DeviceId = 0;
@@ -264,7 +265,7 @@ pub struct X11ClientState {
     pub(crate) current_count: usize,
     pub(crate) pinch_scale: f32,
 
-    pub(crate) gpu_context: GpuContext,
+    pub(crate) renderer_context: RendererContext,
     pub(crate) compositor_gpu: Option<CompositorGpuHint>,
     pub(crate) gpu_requirements: Option<gpui_wgpu::WgpuDeviceRequirements>,
 
@@ -393,10 +394,11 @@ impl X11ClientStatePtr {
 pub(crate) struct X11Client(pub(crate) Rc<RefCell<X11ClientState>>);
 
 impl X11Client {
-    pub(crate) fn new() -> anyhow::Result<Self> {
+    pub(crate) fn new(options: LinuxRendererOptions) -> anyhow::Result<Self> {
         let event_loop = EventLoop::try_new()?;
 
         let (common, main_receiver, wake_receiver) = LinuxCommon::new(event_loop.get_signal());
+        let renderer_context = RendererContext::new(options, common.foreground_executor.clone());
 
         let handle = event_loop.handle();
 
@@ -612,7 +614,7 @@ impl X11Client {
             last_location: Point::new(px(0.0), px(0.0)),
             current_count: 0,
             pinch_scale: 1.0,
-            gpu_context: Rc::new(RefCell::new(None)),
+            renderer_context,
             compositor_gpu,
             gpu_requirements: None,
             scale_factor,
@@ -1830,7 +1832,7 @@ impl LinuxClient for X11Client {
             handle,
             X11ClientStatePtr(Rc::downgrade(&self.0)),
             state.common.foreground_executor.clone(),
-            state.gpu_context.clone(),
+            state.renderer_context.clone(),
             compositor_gpu,
             gpu_requirements,
             params,
@@ -1866,6 +1868,7 @@ impl LinuxClient for X11Client {
         };
 
         state.windows.insert(x_window, window_ref);
+        state.renderer_context.notify_selected();
         Ok(Box::new(window))
     }
 

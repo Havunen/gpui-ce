@@ -44,6 +44,7 @@ x11 = [
   "x11-clipboard",
   "filedescriptor",
   "open",
+  "gpui/x11",
 ]
 
 

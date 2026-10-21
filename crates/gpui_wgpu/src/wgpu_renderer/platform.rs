@@ -5,7 +5,10 @@ use std::sync::Arc;
 use gpui::Scene;
 
 #[cfg(not(target_family = "wasm"))]
-use crate::{CompositorGpuHint, NativeBackend, SoftwareAdapterPolicy, WgpuDeviceRequirements};
+use crate::{
+    CompositorGpuHint, NativeBackend, NativeBackendSelection, SoftwareAdapterPolicy,
+    WgpuDeviceRequirements,
+};
 use crate::{WgpuAtlas, WgpuContext};
 
 #[cfg(not(target_family = "wasm"))]
@@ -47,6 +50,28 @@ impl WgpuRenderer {
     where
         W: HasWindowHandle + HasDisplayHandle + std::fmt::Debug + Send + Sync + Clone + 'static,
     {
+        Self::new_with_backends(
+            gpu_context,
+            window,
+            config,
+            compositor_gpu,
+            extra_requirements,
+            wgpu::Backends::from_env().unwrap_or_else(wgpu::Backends::all),
+        )
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub fn new_with_backends<W>(
+        gpu_context: GpuContext,
+        window: &W,
+        config: WgpuSurfaceConfig,
+        compositor_gpu: Option<CompositorGpuHint>,
+        extra_requirements: Option<WgpuDeviceRequirements>,
+        backends: wgpu::Backends,
+    ) -> anyhow::Result<Self>
+    where
+        W: HasWindowHandle + HasDisplayHandle + std::fmt::Debug + Send + Sync + Clone + 'static,
+    {
         let window_handle = window
             .window_handle()
             .map_err(|error| anyhow::anyhow!("failed to get window handle: {error}"))?;
@@ -57,7 +82,7 @@ impl WgpuRenderer {
             config,
             compositor_gpu,
             extra_requirements,
-            None,
+            NativeBackendSelection::Allowed(backends),
         )
     }
 
@@ -83,7 +108,7 @@ impl WgpuRenderer {
             config,
             compositor_gpu,
             extra_requirements,
-            Some(NativeBackend::Dx12),
+            NativeBackendSelection::WindowsDx12,
         )
     }
 
@@ -103,7 +128,9 @@ impl WgpuRenderer {
             config,
             None,
             extra_requirements,
-            None,
+            NativeBackendSelection::Allowed(
+                wgpu::Backends::from_env().unwrap_or_else(wgpu::Backends::all),
+            ),
         )
     }
 
@@ -115,11 +142,12 @@ impl WgpuRenderer {
         config: WgpuSurfaceConfig,
         compositor_gpu: Option<CompositorGpuHint>,
         extra_requirements: Option<WgpuDeviceRequirements>,
-        backend: Option<NativeBackend>,
+        selection: NativeBackendSelection,
     ) -> anyhow::Result<Self> {
         let mut context_slot = gpu_context.borrow_mut();
         let (context, surface) = match context_slot.as_mut() {
             Some(context) => {
+                check_context_backend(context, selection)?;
                 let surface = create_surface(&context.instance, surface_target)?;
                 context.check_compatible_with_surface(&surface)?;
                 (context, surface)
@@ -129,18 +157,18 @@ impl WgpuRenderer {
                     display,
                     surface_target,
                     compositor_gpu,
-                    if backend.is_some() {
+                    if selection.explicit_backend().is_some() {
                         SoftwareAdapterPolicy::Reject
                     } else {
                         SoftwareAdapterPolicy::Allow
                     },
                     extra_requirements.as_ref(),
-                    backend,
+                    selection,
                 )?;
                 (context_slot.insert(context), surface)
             }
         };
-        let mut renderer = initialize_checked(context, backend, || {
+        let mut renderer = initialize_checked(context, selection.explicit_backend(), || {
             Self::new_internal(
                 Some(Rc::clone(&gpu_context)),
                 context,
@@ -151,7 +179,7 @@ impl WgpuRenderer {
                 Arc::new(WgpuAtlas::from_context(context)),
             )
         })?;
-        renderer.native_backend = backend;
+        renderer.native_backend = selection;
         Ok(renderer)
     }
 
@@ -388,33 +416,35 @@ impl WgpuRenderer {
             surface
         } else {
             let context_slot = gpu_context.borrow();
-            let instance = &context_slot
+            let context = context_slot
                 .as_ref()
-                .expect("a recovered context must exist")
-                .instance;
-            create_surface(instance, surface_target)?
+                .expect("a recovered context must exist");
+            check_context_backend(context, self.native_backend)?;
+            create_surface(&context.instance, surface_target)?
         };
 
         let config = self.target.recovery_config();
         let gpu_context = Rc::clone(gpu_context);
         let context_slot = gpu_context.borrow();
         let context = context_slot.as_ref().expect("context should exist");
+        check_context_backend(context, self.native_backend)?;
         self.resources = None;
 
         let font_rasterization = self.rendering_params.font_rasterization;
         let subpixel_order = self.subpixel_order;
-        let mut recovered = initialize_checked(context, self.native_backend, || {
-            self.atlas.handle_device_lost(context);
-            Self::new_internal(
-                Some(Rc::clone(&gpu_context)),
-                context,
-                Some(surface),
-                config,
-                self.compositor_gpu,
-                self.extra_requirements.clone(),
-                Arc::clone(&self.atlas),
-            )
-        })?;
+        let mut recovered =
+            initialize_checked(context, self.native_backend.explicit_backend(), || {
+                self.atlas.handle_device_lost(context);
+                Self::new_internal(
+                    Some(Rc::clone(&gpu_context)),
+                    context,
+                    Some(surface),
+                    config,
+                    self.compositor_gpu,
+                    self.extra_requirements.clone(),
+                    Arc::clone(&self.atlas),
+                )
+            })?;
         recovered.native_backend = self.native_backend;
         recovered.set_font_rasterization_settings(font_rasterization);
         recovered.set_subpixel_order(subpixel_order);
@@ -465,6 +495,23 @@ impl NativeSurfaceTarget {
 type DisplayHandleSource<'a> = &'a dyn Fn() -> Option<Box<dyn wgpu::wgt::WgpuHasDisplayHandle>>;
 
 #[cfg(not(target_family = "wasm"))]
+fn check_context_backend(
+    context: &WgpuContext,
+    selection: NativeBackendSelection,
+) -> anyhow::Result<()> {
+    let backend = match context.backend() {
+        crate::WgpuBackend::Gl => wgpu::Backend::Gl,
+        crate::WgpuBackend::Native(backend) => backend,
+        crate::WgpuBackend::BrowserWebGpu => wgpu::Backend::BrowserWebGpu,
+    };
+    anyhow::ensure!(
+        selection.allows(backend),
+        "shared GPU context uses {backend:?}, excluded by {selection:?}"
+    );
+    Ok(())
+}
+
+#[cfg(not(target_family = "wasm"))]
 // Startup and recovery both reject invalid resources before declaring the renderer usable.
 fn initialize_checked<T>(
     context: &WgpuContext,
@@ -496,6 +543,58 @@ fn initialize_checked<T>(
         anyhow::bail!("DX12 renderer initialization failed: {error}");
     }
     result
+}
+
+#[cfg(all(test, feature = "test-support", target_os = "linux"))]
+mod backend_selection_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn recovery_rejects_an_excluded_shared_backend_before_creating_a_surface() {
+        let context = WgpuContext::new_headless(None).unwrap();
+        let (allowed, excluded) = match context.backend() {
+            crate::WgpuBackend::Native(wgpu::Backend::Vulkan) => {
+                (wgpu::Backends::VULKAN, wgpu::Backends::GL)
+            }
+            crate::WgpuBackend::Native(wgpu::Backend::Gl) => {
+                (wgpu::Backends::GL, wgpu::Backends::VULKAN)
+            }
+            backend => panic!("unexpected Linux backend: {backend:?}"),
+        };
+        let mut renderer = WgpuRenderer::new_headless(
+            &context,
+            gpui::size(gpui::DevicePixels(4), gpui::DevicePixels(4)),
+        )
+        .unwrap();
+        let original_device = renderer.resources().device.clone();
+        let gpu = Rc::new(RefCell::new(Some(context)));
+        renderer.context = Some(gpu.clone());
+        renderer.native_backend = NativeBackendSelection::Allowed(excluded);
+        let target = NativeSurfaceTarget::Window(raw_window_handle::RawWindowHandle::Web(
+            raw_window_handle::WebWindowHandle::new(0),
+        ));
+        let error = renderer
+            .recover_target(&|| panic!("must reuse the shared context"), target)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("shared GPU context uses"),
+            "{error:#}"
+        );
+        assert!(error.to_string().contains("excluded by"), "{error:#}");
+        assert!(Arc::ptr_eq(&original_device, &renderer.resources().device));
+        assert!(Arc::ptr_eq(
+            &original_device,
+            &gpu.borrow().as_ref().unwrap().device
+        ));
+
+        renderer.native_backend = NativeBackendSelection::Allowed(allowed);
+        let error = renderer
+            .recover_target(&|| panic!("must reuse the shared context"), target)
+            .unwrap_err();
+        assert!(!error.to_string().contains("excluded by"), "{error:#}");
+        assert!(Arc::ptr_eq(&original_device, &renderer.resources().device));
+    }
 }
 
 #[cfg(all(test, feature = "test-support", target_os = "windows"))]
@@ -585,7 +684,7 @@ fn initialize_context_and_surface(
     compositor_gpu: Option<CompositorGpuHint>,
     adapter_policy: SoftwareAdapterPolicy,
     extra_requirements: Option<&WgpuDeviceRequirements>,
-    backend: Option<NativeBackend>,
+    selection: NativeBackendSelection,
 ) -> anyhow::Result<(WgpuContext, wgpu::Surface<'static>)> {
     let attempt = |backend: NativeBackend| {
         let instance = backend.instance(display());
@@ -599,10 +698,7 @@ fn initialize_context_and_surface(
         )?;
         Ok((context, surface))
     };
-    match backend {
-        Some(backend) => attempt(backend),
-        None => NativeBackend::try_in_preference_order("a GPU context for the window", attempt),
-    }
+    selection.try_initialize("a GPU context for the window", attempt)
 }
 
 #[cfg(not(target_family = "wasm"))]

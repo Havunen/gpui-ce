@@ -4,6 +4,7 @@ mod dispatcher;
 mod headless;
 mod keyboard;
 mod platform;
+pub(crate) mod renderer;
 mod system_notifications;
 #[cfg(feature = "wayland")]
 mod wayland;
@@ -26,6 +27,15 @@ use std::rc::Rc;
 
 /// Returns the default platform implementation for the current OS.
 pub fn current_platform(headless: bool) -> Rc<dyn gpui::Platform> {
+    current_platform_with_renderer(headless, renderer::LinuxRendererOptions::default())
+}
+
+pub fn current_platform_with_renderer(
+    headless: bool,
+    options: renderer::LinuxRendererOptions,
+) -> Rc<dyn gpui::Platform> {
+    #[cfg(not(any(feature = "wayland", feature = "x11")))]
+    let _ = options;
     #[cfg(feature = "x11")]
     use anyhow::Context as _;
 
@@ -38,12 +48,12 @@ pub fn current_platform(headless: bool) -> Rc<dyn gpui::Platform> {
     match gpui::guess_compositor() {
         #[cfg(feature = "wayland")]
         "Wayland" => Rc::new(LinuxPlatform {
-            inner: WaylandClient::new(),
+            inner: WaylandClient::new(options),
         }),
 
         #[cfg(feature = "x11")]
         "X11" => Rc::new(LinuxPlatform {
-            inner: X11Client::new()
+            inner: X11Client::new(options)
                 .context("Failed to initialize X11 client.")
                 .unwrap(),
         }),

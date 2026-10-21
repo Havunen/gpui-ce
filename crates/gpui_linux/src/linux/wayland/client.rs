@@ -88,6 +88,7 @@ use super::{
     window::{ImeInput, WaylandWindowStatePtr},
 };
 
+use crate::linux::renderer::{LinuxRendererOptions, RendererContext};
 use crate::linux::{
     DOUBLE_CLICK_INTERVAL, LinuxClient, LinuxCommon, LinuxKeyboardLayout, PIPE_READ_TIMEOUT,
     SCROLL_LINES, capslock_from_xkb, cursor_style_to_icon_names, get_xkb_compose_state,
@@ -111,7 +112,7 @@ use gpui::{
     PlatformKeyboardLayout, PlatformWindow, Point, ScrollDelta, ScrollWheelEvent, SharedString,
     Size, TouchPhase, WindowButtonLayout, WindowKind, WindowParams, point, profiler, px, size,
 };
-use gpui_wgpu::{CompositorGpuHint, GpuContext};
+use gpui_wgpu::CompositorGpuHint;
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1,
 };
@@ -376,7 +377,7 @@ pub struct Output {
 pub(crate) struct WaylandClientState {
     serial_tracker: SerialTracker,
     globals: Globals,
-    pub gpu_context: GpuContext,
+    pub renderer_context: RendererContext,
     pub compositor_gpu: Option<CompositorGpuHint>,
     pub gpu_requirements: Option<gpui_wgpu::WgpuDeviceRequirements>,
     wl_seat: wl_seat::WlSeat, // TODO: Multi seat support
@@ -869,7 +870,7 @@ fn wl_output_version(version: u32) -> u32 {
 }
 
 impl WaylandClient {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(options: LinuxRendererOptions) -> Self {
         let startup_activation_token = take_startup_activation_token_from_environment();
         let conn = Connection::connect_to_env().unwrap();
 
@@ -941,7 +942,7 @@ impl WaylandClient {
             .unwrap();
 
         let compositor_gpu = detect_compositor_gpu();
-        let gpu_context = Rc::new(RefCell::new(None));
+        let renderer_context = RendererContext::new(options, common.foreground_executor.clone());
 
         let (frame_ping, frame_ping_source) =
             calloop::ping::make_ping().expect("Failed to create the frame ping");
@@ -1018,7 +1019,7 @@ impl WaylandClient {
         let state = Rc::new(RefCell::new(WaylandClientState {
             serial_tracker: SerialTracker::new(),
             globals,
-            gpu_context,
+            renderer_context,
             compositor_gpu,
             gpu_requirements: None,
             wl_seat: seat,
@@ -1203,7 +1204,7 @@ impl LinuxClient for WaylandClient {
         let (window, surface_id) = WaylandWindow::new(
             handle,
             state.globals.clone(),
-            state.gpu_context.clone(),
+            state.renderer_context.clone(),
             compositor_gpu,
             gpu_requirements,
             WaylandClientStatePtr(Rc::downgrade(&self.0)),
@@ -1219,6 +1220,7 @@ impl LinuxClient for WaylandClient {
             window.0.regenerate_icons(&state.icon_sizes);
         }
         state.windows.insert(surface_id, window.0.clone());
+        state.renderer_context.notify_selected();
 
         Ok(Box::new(window))
     }

@@ -262,7 +262,7 @@ mod failure_tests {
         }
         assert_eq!(renderer.faults.consecutive_failed_frames, 0);
         assert!(renderer.terminal_error().is_none());
-        renderer.native_backend = Some(crate::NativeBackend::Dx12);
+        renderer.native_backend = crate::NativeBackendSelection::WindowsDx12;
         for _ in 0..6 {
             handle_gpu_error(&mut renderer, "injected validation failure".into());
         }
