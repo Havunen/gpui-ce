@@ -35,16 +35,6 @@ pub fn application_with_windows_renderer(options: WindowsRendererOptions) -> gpu
     ))
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
-pub use gpui_linux::{
-    LinuxRendererBackend, LinuxRendererEvent, LinuxRendererOptions, LinuxRendererPreference,
-};
-
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
-pub fn application_with_linux_renderer(options: LinuxRendererOptions) -> gpui::Application {
-    gpui::Application::with_platform(gpui_linux::current_platform_with_renderer(false, options))
-}
-
 pub fn headless() -> gpui::Application {
     gpui::Application::with_platform(current_platform(true))
 }

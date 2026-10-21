@@ -4,10 +4,7 @@ mod linux;
 pub(crate) use gpui::collections;
 pub(crate) use gpui_util as util;
 
-pub use linux::renderer::{
-    LinuxRendererBackend, LinuxRendererEvent, LinuxRendererOptions, LinuxRendererPreference,
-};
-pub use linux::{current_platform, current_platform_with_renderer};
+pub use linux::current_platform;
 
 /// Access the X11 file clipboard without opening a Wayland data source (WSLg).
 #[cfg(feature = "x11")]

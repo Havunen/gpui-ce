@@ -117,47 +117,6 @@ It's mostly API compatible with upstream, but that is changing!
 ## Setup
 View the [setup guide](SETUP.md) for installation instructions.
 
-## Linux renderer selection
-
-Linux and FreeBSD applications can select a renderer before opening a window:
-
-```rust
-use gpui_platform::{LinuxRendererOptions, LinuxRendererPreference};
-
-let application = gpui_platform::application_with_linux_renderer(LinuxRendererOptions {
-    preference: LinuxRendererPreference::Gl,
-    on_event: None,
-});
-```
-
-`Auto` tries Vulkan, then OpenGL/GLES. `Vulkan` and `Gl` permit only that API,
-including during GPU recovery. `application()` uses `Auto`. Renderer selection
-belongs to the application instance; changing it requires a new application.
-
-`WGPU_BACKEND` overrides the application preference and is read once when the
-Linux renderer policy is created. For example, `gl` permits only OpenGL/GLES,
-while `gl,vulkan` permits both in the usual Vulkan-first order. An override that
-enables no supported native API fails without initializing a graphics driver.
-
-`LinuxRendererOptions::on_event` receives
-`LinuxRendererEvent::Selected { backend, overridden }` after a window is registered
-and after successful GPU recovery. The backend identifies the actual Vulkan or
-OpenGL/GLES device. Callbacks run later on the foreground executor, outside
-platform, window, and GPU borrows; applications can use them to update renderer
-status or show that `WGPU_BACKEND` overrides their settings.
-
-For platform implementations, `gpui_wgpu::WgpuRenderer::new_with_backends` accepts
-an exact resolved backend mask and retains it through recovery. It does not read
-`WGPU_BACKEND`; callers resolve environment precedence before using it. The
-existing `WgpuRenderer::new` constructor resolves `WGPU_BACKEND` automatically.
-
-Run the native renderer regression inside an X11 or Wayland session with OpenGL
-available:
-
-```sh
-env -u WGPU_BACKEND cargo test --locked -p gpui_ce_linux --test linux_renderer -- --ignored --test-threads=1
-```
-
 ## FAQ
 - Q: What is our AI Policy?
   A: We follow the [Rust Foundation's internal AI usage policy](https://rustfoundation.org/policy/internal-ai-usage-policy/). GPUI-CE is a framework "Made by Humans". We value community participation and take time to understand contributors' intentions and offer guidance.

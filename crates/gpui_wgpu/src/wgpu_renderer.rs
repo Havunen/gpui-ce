@@ -65,7 +65,7 @@ pub struct WgpuRenderer {
     #[allow(dead_code)]
     context: Option<GpuContext>,
     #[cfg(not(target_family = "wasm"))]
-    native_backend: crate::NativeBackendSelection,
+    native_backend: Option<crate::NativeBackend>,
     /// Compositor GPU hint for adapter selection (unused on WASM).
     #[allow(dead_code)]
     compositor_gpu: Option<CompositorGpuHint>,
@@ -138,7 +138,7 @@ impl WgpuRenderer {
         Ok(Self {
             context: gpu_context,
             #[cfg(not(target_family = "wasm"))]
-            native_backend: crate::NativeBackendSelection::Allowed(wgpu::Backends::all()),
+            native_backend: None,
             compositor_gpu,
             extra_requirements,
             resources: Some(resources),
@@ -184,7 +184,7 @@ impl WgpuRenderer {
     pub(super) fn reports_terminal_errors(&self) -> bool {
         #[cfg(target_os = "windows")]
         {
-            self.native_backend == crate::NativeBackendSelection::WindowsDx12
+            self.native_backend == Some(crate::NativeBackend::Dx12)
         }
         #[cfg(not(target_os = "windows"))]
         {

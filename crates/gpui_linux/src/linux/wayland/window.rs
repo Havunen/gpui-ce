@@ -36,7 +36,6 @@ use wayland_protocols::{
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur;
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 
-use crate::linux::renderer::RendererContext;
 use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
 use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
 use gpui::{
@@ -118,7 +117,6 @@ pub struct WaylandWindowState {
     display: Option<(ObjectId, Output)>,
     globals: Globals,
     renderer: WgpuRenderer,
-    renderer_context: RendererContext,
     bounds: Bounds<Pixels>,
     scale: f32,
     input_handler: Option<PlatformInputHandler>,
@@ -563,7 +561,7 @@ impl WaylandWindowState {
         viewport: Option<wp_viewport::WpViewport>,
         client: WaylandClientStatePtr,
         globals: Globals,
-        renderer_context: RendererContext,
+        gpu_context: gpui_wgpu::GpuContext,
         compositor_gpu: Option<CompositorGpuHint>,
         gpu_requirements: Option<gpui_wgpu::WgpuDeviceRequirements>,
         options: WindowParams,
@@ -588,7 +586,8 @@ impl WaylandWindowState {
                 // Prefer Mailbox to avoid blocking. Falls back to FIFO if Mailbox is unsupported.
                 preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
             };
-            renderer_context.create_renderer(
+            WgpuRenderer::new(
+                gpu_context,
                 &raw_window,
                 config,
                 compositor_gpu,
@@ -635,7 +634,6 @@ impl WaylandWindowState {
             outputs: HashMap::default(),
             display: None,
             renderer,
-            renderer_context,
             bounds: options.bounds,
             scale: 1.0,
             input_handler: None,
@@ -877,7 +875,7 @@ impl WaylandWindow {
     pub fn new(
         handle: AnyWindowHandle,
         globals: Globals,
-        renderer_context: RendererContext,
+        gpu_context: gpui_wgpu::GpuContext,
         compositor_gpu: Option<CompositorGpuHint>,
         gpu_requirements: Option<gpui_wgpu::WgpuDeviceRequirements>,
         client: WaylandClientStatePtr,
@@ -916,7 +914,7 @@ impl WaylandWindow {
                 viewport,
                 client,
                 globals,
-                renderer_context,
+                gpu_context,
                 compositor_gpu,
                 gpu_requirements,
                 params,
@@ -2021,8 +2019,7 @@ impl PlatformWindow for WaylandWindow {
         let client = self.borrow().client.get_client();
         let state = client.borrow();
         state
-            .renderer_context
-            .gpu()
+            .gpu_context
             .borrow()
             .as_ref()
             .is_some_and(|ctx| ctx.supports_dual_source_blending())
@@ -2124,7 +2121,7 @@ impl PlatformWindow for WaylandWindow {
                     .cast::<std::ffi::c_void>(),
             };
             match state.renderer.recover(&raw_window) {
-                Ok(()) => state.renderer_context.notify_selected(),
+                Ok(()) => {}
                 Err(err) => {
                     log::warn!("GPU recovery failed, will retry on next frame: {err}");
                 }
