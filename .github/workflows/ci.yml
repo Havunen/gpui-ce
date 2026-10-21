@@ -94,9 +94,11 @@ jobs:
             pkg-config \
             libasound2-dev \
             libdrm-dev \
+            libegl1-mesa-dev \
             libfontconfig1-dev \
             libfreetype6-dev \
             libgbm-dev \
+            libgles2-mesa-dev \
             libssl-dev \
             libva-dev \
             libvulkan-dev \
@@ -115,13 +117,24 @@ jobs:
 
       - name: Run tests
         # Keep the unresolved native access-violation workaround on Windows only.
-        run: cargo test --workspace --lib --tests --target ${{ matrix.target }} ${{ (runner.os == 'macOS' || runner.os == 'Windows') && '--features gpui_ce_wgpu/test-support' || '' }} -- ${{ runner.os == 'Windows' && '--test-threads=1' || '' }}
+        run: cargo test --workspace --lib --tests --target ${{ matrix.target }} ${{ (runner.os == 'macOS' || runner.os == 'Windows') && '--features gpui_ce_wgpu/test-support,gpui_ce_wgpu/custom-gpu,gpui_ce_wgpu/wgpu-surfaces' || '' }} -- ${{ runner.os == 'Windows' && '--test-threads=1' || '' }}
 
       - name: Run Vulkan shader rendering tests
         if: runner.os == 'Linux'
         env:
           GPUI_REQUIRE_VULKAN_TESTS: "1"
         run: cargo test -p gpui_ce_wgpu --features test-support --lib vulkan --target ${{ matrix.target }} -- --test-threads=1
+
+      - name: Run OpenGL primitive rendering tests
+        if: matrix.runner == 'ubuntu-24.04' && matrix.target == 'x86_64-unknown-linux-gnu'
+        env:
+          WGPU_BACKEND: gl
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: cargo test --locked -p gpui_ce_wgpu --features test-support --test headless_primitives --target ${{ matrix.target }} -- --test-threads=1
+
+      - name: Run release DX12 shader tests
+        if: matrix.runner == 'windows-2025'
+        run: cargo test --locked -p gpui_ce_wgpu --release --features test-support,custom-gpu,wgpu-surfaces --lib precompiled_shader_tests --target ${{ matrix.target }} -- --test-threads=1
 
       - name: Run profiler tests
         run: |
@@ -244,7 +257,12 @@ jobs:
             runner: windows-2025
             target: x86_64-pc-windows-msvc
             check_targets: --all-targets
-            cargo_args: --features gpui_ce_windows/windows-wgpu
+            cargo_args: --features gpui_ce_windows/windows-wgpu,gpui_ce_wgpu/custom-gpu,gpui_ce_wgpu/wgpu-surfaces
+          - name: macOS 14 aarch64 WGPU
+            runner: macos-14
+            target: aarch64-apple-darwin
+            check_targets: --all-targets
+            cargo_args: --features gpui_ce_platform/macos-wgpu,gpui_ce_wgpu/custom-gpu,gpui_ce_wgpu/wgpu-surfaces
 
     steps:
       - name: Checkout
@@ -301,6 +319,23 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: ${{ matrix.target_linker || '' }}
           PKG_CONFIG_ALLOW_CROSS: "1"
         run: cargo check --workspace ${{ matrix.check_targets }} --target ${{ matrix.target }} ${{ matrix.cargo_args }}
+
+  web:
+    name: WebGPU and WebGL2 compilation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: wasm32-unknown-unknown
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: Check browser backend
+        run: cargo check --locked -p gpui_ce_web -p gpui_ce_platform --target wasm32-unknown-unknown
+      - name: Check shared-memory web example
+        working-directory: crates/gpui_web/examples/hello_web
+        run: cargo check --target wasm32-unknown-unknown
 
   # Components live in their own repository. Check current main against this
   # checkout, but make drift visible as annotations rather than a merge gate.
