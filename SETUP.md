@@ -43,3 +43,11 @@ Use the equivalent packages on other distributions. Desktop examples need a grap
 ## Windows
 
 Use Rust's MSVC toolchain with the Visual Studio C++ build tools and a Windows SDK. Follow Microsoft's [Rust development setup guide](https://learn.microsoft.com/en-us/windows/dev-environment/rust/setup).
+
+## Web
+
+The [web example](crates/gpui_web/examples/hello_web) declares its nightly Rust toolchain. Run `cargo check --target wasm32-unknown-unknown` from that directory so Cargo loads its shared-memory and standard-library build settings.
+
+## Custom GPU controls
+
+Enable the `custom-gpu` feature on `gpui_ce_wgpu` and import wgpu types through `gpui_ce_wgpu::wgpu`. A different wgpu version produces incompatible Rust types for GPUI's device, queue and textures. See the [custom GPU example](crates/gpui_wgpu/examples/custom_gpu.rs).
