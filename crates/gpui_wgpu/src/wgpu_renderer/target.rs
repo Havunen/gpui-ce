@@ -91,6 +91,7 @@ impl RenderTarget {
             config: wgpu::SurfaceConfiguration {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                 format,
+                color_space: wgpu::SurfaceColorSpace::Auto,
                 width,
                 height,
                 present_mode,
@@ -363,6 +364,7 @@ mod tests {
             config: wgpu::SurfaceConfiguration {
                 usage: Usage::RENDER_ATTACHMENT | Usage::COPY_DST,
                 format: wgpu::TextureFormat::Bgra8Unorm,
+                color_space: wgpu::SurfaceColorSpace::Auto,
                 width: 201,
                 height: 103,
                 present_mode: wgpu::PresentMode::Fifo,
@@ -381,6 +383,10 @@ mod tests {
         };
         let mut caps = wgpu::SurfaceCapabilities {
             formats: vec![wgpu::TextureFormat::Bgra8Unorm],
+            format_capabilities: vec![wgpu::SurfaceFormatCapabilities {
+                format: wgpu::TextureFormat::Bgra8Unorm,
+                color_spaces: wgpu::SurfaceColorSpaces::SRGB,
+            }],
             present_modes: vec![wgpu::PresentMode::Fifo],
             alpha_modes: vec![Alpha::Opaque, Alpha::Inherit],
             usages: Usage::RENDER_ATTACHMENT | Usage::COPY_DST,

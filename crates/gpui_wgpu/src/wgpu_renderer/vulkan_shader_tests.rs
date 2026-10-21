@@ -320,7 +320,7 @@ fn vulkan_surface_bindings_and_dynamic_offsets_match_runtime_wgsl() -> anyhow::R
             .map_async(wgpu::MapMode::Read, move |result| tx.send(result).unwrap());
         device.poll(wgpu::PollType::wait_indefinitely())?;
         rx.recv()??;
-        let pixels = readback.slice(..).get_mapped_range().to_vec();
+        let pixels = readback.slice(..).get_mapped_range()?.to_vec();
         readback.unmap();
         Ok(pixels)
     };

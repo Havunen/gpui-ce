@@ -38,6 +38,7 @@ fn fxc_device(passthrough: bool) -> anyhow::Result<(wgpu::Adapter, wgpu::Device)
     let adapter = gpui::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         force_fallback_adapter: false,
+        apply_limit_buckets: false,
         compatible_surface: None,
     }))?;
     let mut required_features = wgpu::Features::empty();
@@ -431,6 +432,7 @@ mod rendering {
         let adapter = gpui::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::LowPower,
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
             compatible_surface: None,
         }))?;
         let device = gpui::block_on(WgpuContext::create_device(&adapter, None))?;

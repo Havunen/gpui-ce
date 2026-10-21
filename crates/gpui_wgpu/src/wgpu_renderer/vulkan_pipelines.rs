@@ -15,21 +15,25 @@ pub(super) fn create_pipeline(
         device.push_error_scope(wgpu::ErrorFilter::Validation),
         device.push_error_scope(wgpu::ErrorFilter::Internal),
     ];
-    let module = |words: &'static [u32]| {
+    let module = |words: &'static [u32], entry_point: &'static str| {
         // SAFETY: these are validated, build-generated Naga shaders using the same
-        // descriptor layout and coordinate convention as wgpu-hal 29's Vulkan backend.
+        // descriptor layout and coordinate convention as wgpu-hal 30's Vulkan backend.
         // The build emits portable SPIR-V with bounds checks and bounded loops. Tests
         // compare every pipeline's output with WGPU's normal WGSL translation path.
         unsafe {
             device.create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
                 label: Some(specification.label),
+                entry_points: std::borrow::Cow::Borrowed(&[wgpu::PassthroughShaderEntryPoint {
+                    name: std::borrow::Cow::Borrowed(entry_point),
+                    workgroup_size: (0, 0, 0),
+                }]),
                 spirv: Some(std::borrow::Cow::Borrowed(words)),
                 ..Default::default()
             })
         }
     };
-    let vertex = module(shader.vertex.words);
-    let fragment = module(shader.fragment.words);
+    let vertex = module(shader.vertex.words, shader.vertex.entry_point);
+    let fragment = module(shader.fragment.words, shader.fragment.entry_point);
     let pipeline = create_render_pipeline(
         device,
         specification,

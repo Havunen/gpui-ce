@@ -249,23 +249,6 @@ pub struct PreparedWebGraphics {
     pub surface: wgpu::Surface<'static>,
 }
 
-/// wgpu-core refuses to create a surface when neither the instance nor the surface
-/// target carries a display handle, and `SurfaceTarget::Canvas` always passes `None`.
-/// The WebGL2 backend never reads the handle (WebGPU bypasses wgpu-core entirely), so
-/// a unit web display handle on the instance satisfies the check.
-#[cfg(target_family = "wasm")]
-#[derive(Debug)]
-struct WebDisplaySource;
-
-#[cfg(target_family = "wasm")]
-impl raw_window_handle::HasDisplayHandle for WebDisplaySource {
-    fn display_handle(
-        &self,
-    ) -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
-        Ok(raw_window_handle::DisplayHandle::web())
-    }
-}
-
 #[derive(Clone, Copy)]
 pub struct CompositorGpuHint {
     pub vendor_id: u32,
@@ -524,6 +507,7 @@ impl WgpuContext {
                     power_preference: wgpu::PowerPreference::LowPower,
                     compatible_surface: None,
                     force_fallback_adapter: false,
+                    apply_limit_buckets: false,
                 }))
                 .map_err(|error| {
                     anyhow::anyhow!("failed to request headless GPU adapter: {error}")
@@ -592,7 +576,7 @@ impl WgpuContext {
             flags: wgpu::InstanceFlags::default(),
             backend_options: wgpu::BackendOptions::default(),
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
-            display: Some(Box::new(WebDisplaySource)),
+            display: None,
         };
         let instance = if preference == WebBackendPreference::Auto {
             wgpu::util::new_instance_with_webgpu_detection(descriptor).await
@@ -610,6 +594,7 @@ impl WgpuContext {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
+                apply_limit_buckets: false,
             })
             .await
             .map_err(|error| {
@@ -922,6 +907,7 @@ impl WgpuContext {
         let test_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: caps.formats[0],
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width: 64,
             height: 64,
             present_mode: wgpu::PresentMode::Fifo,

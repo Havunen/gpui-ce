@@ -671,19 +671,23 @@ fn create_precompiled_render_pipeline(
         device.push_error_scope(wgpu::ErrorFilter::Validation),
         device.push_error_scope(wgpu::ErrorFilter::Internal),
     ];
-    let module = |bytecode: &'static [u8]| {
+    let module = |bytecode: &'static [u8], entry_point: &'static str| {
         // SAFETY: the bytecode is FXC's output for the HLSL WGPU generates for this exact
         // pipeline layout; tests compare that HLSL with WGPU's own and render both ways.
         unsafe {
             device.create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
                 label: Some(specification.label),
+                entry_points: std::borrow::Cow::Borrowed(&[wgpu::PassthroughShaderEntryPoint {
+                    name: std::borrow::Cow::Borrowed(entry_point),
+                    workgroup_size: (0, 0, 0),
+                }]),
                 dxil: Some(std::borrow::Cow::Borrowed(bytecode)),
                 ..Default::default()
             })
         }
     };
-    let vertex = module(shader.vertex.bytecode);
-    let fragment = module(shader.fragment.bytecode);
+    let vertex = module(shader.vertex.bytecode, shader.vertex.entry_point);
+    let fragment = module(shader.fragment.bytecode, shader.fragment.entry_point);
     let pipeline = create_render_pipeline(
         device,
         specification,

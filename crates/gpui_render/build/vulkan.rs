@@ -1,4 +1,4 @@
-//! Portable SPIR-V for wgpu-hal 29's Vulkan pipeline layouts.
+//! Portable SPIR-V for wgpu-hal 30's Vulkan pipeline layouts.
 //!
 //! Keep this in sync with Vulkan's `create_bind_group_layout`, `create_pipeline_layout`
 //! and Naga options when updating WGPU. Passthrough skips WGPU's shader validation.

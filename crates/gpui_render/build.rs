@@ -1305,7 +1305,7 @@ fn write_dx11_bytecode(
 //
 // Passthrough bytecode must use exactly the registers of the root signature WGPU builds
 // from each pipeline layout. Rather than writing HLSL by hand, generate it the way
-// wgpu-hal 29's DX12 backend does (`Device::create_pipeline_layout` and
+// wgpu-hal 30's DX12 backend does (`Device::create_pipeline_layout` and
 // `Device::load_shader`): the same Naga version, module, options and entry points. The
 // `gpui_wgpu` tests compare every artifact with the HLSL WGPU itself generates and
 // render each pipeline both ways, so a WGPU or Naga upgrade cannot drift silently.
@@ -1343,7 +1343,7 @@ fn wgpu_data_group(layout: shaders::interface::DataLayout) -> Option<(&'static s
     }
 }
 
-/// The Naga HLSL options wgpu-hal 29 derives for a pipeline layout of these groups, in
+/// The Naga HLSL options wgpu-hal 30 derives for a pipeline layout of these groups, in
 /// order. Registers are assigned per group in binding order: table CBVs/SRVs first, then
 /// the group's sampler index buffer, then root CBVs for dynamic-offset uniforms. Every
 /// WGPU pipeline layout also reserves the special-constants CBV after all groups.
@@ -1442,6 +1442,11 @@ fn dx12_hlsl_options(groups: [(&[ReflectedBinding], Option<u32>); 2]) -> naga::b
         sampler_buffer_binding_map,
         external_texture_binding_map: Default::default(),
         force_loop_bounding: true,
+        task_dispatch_limits: Some(naga::back::TaskDispatchLimits {
+            max_mesh_workgroups_per_dim: 0,
+            max_mesh_workgroups_total: 0,
+        }),
+        mesh_shader_primitive_indices_clamp: true,
         ray_query_initialization_tracking: true,
     }
 }

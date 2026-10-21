@@ -111,7 +111,15 @@ impl WgpuRenderer {
             .map_err(|error| anyhow::anyhow!("offscreen readback callback dropped: {error}"))?
             .map_err(|error| anyhow::anyhow!("failed to map offscreen readback: {error}"))?;
 
-        let mapped = target.readback.slice(..).get_mapped_range();
+        let mapped = match target.readback.slice(..).get_mapped_range() {
+            Ok(mapped) => mapped,
+            Err(error) => {
+                target.readback.unmap();
+                return Err(anyhow::anyhow!(
+                    "failed to access offscreen readback: {error}"
+                ));
+            }
+        };
         let mut pixels = Vec::with_capacity(bytes_per_row as usize * height as usize);
         for row in mapped.chunks_exact(target.padded_bytes_per_row as usize) {
             pixels.extend_from_slice(&row[..bytes_per_row as usize]);

@@ -217,7 +217,7 @@ impl WgpuRenderer {
             .create_view(&wgpu::TextureViewDescriptor::default());
         let rendered = self.render_to_texture(scene, &frame.texture, &view);
         if rendered {
-            frame.present();
+            self.resources().queue.present(frame);
         } else {
             // Vulkan's native swapchain cannot release an acquired image just
             // by dropping it. Repeated failed frames would exhaust its images
