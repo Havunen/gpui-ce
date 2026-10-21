@@ -523,6 +523,7 @@ impl WgpuPipelines {
 /// the Vulkan driver still compiles it to the GPU's machine code when creating a pipeline.
 pub(super) struct PipelineShaders {
     /// Build-time DX12 bytecode, tried before WGSL. Empty unless the device accepts it.
+    #[cfg(any(target_os = "windows", test))]
     precompiled: &'static [Dx12Shader],
     #[cfg(all(not(target_family = "wasm"), not(target_vendor = "apple")))]
     vulkan: &'static [gpui_render::artifacts::VulkanShader],
@@ -564,9 +565,10 @@ impl PipelineShaders {
         shaders
     }
 
-    pub(super) fn new(precompiled: &'static [Dx12Shader], tier: RendererTier) -> Self {
+    pub(super) fn new(_precompiled: &'static [Dx12Shader], tier: RendererTier) -> Self {
         Self {
-            precompiled,
+            #[cfg(any(target_os = "windows", test))]
+            precompiled: _precompiled,
             #[cfg(all(not(target_family = "wasm"), not(target_vendor = "apple")))]
             vulkan: &[],
             base_source: match tier {
