@@ -13,14 +13,14 @@ use gpui_render::{
 };
 
 /// A DX12 instance whose WGPU compiles exactly as the build does: with FXC, so its HLSL
-/// targets the artifacts' shader model, and without `InstanceFlags::DEBUG`, which debug
-/// builds enable and which adds `D3DCOMPILE_SKIP_OPTIMIZATION`. Its WGSL pipelines then
-/// run the same optimized bytecode as the artifacts, so a pixel difference between the
-/// two is a binding or layout mismatch, never two compilations rounding differently.
+/// targets the artifacts' shader model, and with gpui's default instance flags, which
+/// `gpui_render/build.rs` mirrors. Its WGSL pipelines then run the same bytecode as the
+/// artifacts, so a pixel difference between the two is a binding or layout mismatch,
+/// never two compilations rounding differently.
 fn fxc_instance() -> wgpu::Instance {
     wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::DX12,
-        flags: wgpu::InstanceFlags::default() - wgpu::InstanceFlags::DEBUG,
+        flags: wgpu::InstanceFlags::default(),
         backend_options: wgpu::BackendOptions {
             dx12: wgpu::Dx12BackendOptions {
                 shader_compiler: wgpu::Dx12Compiler::Fxc,
@@ -243,8 +243,28 @@ fn build_has_dx12_bytecode_for_every_wgpu_pipeline() {
                 shader.label
             );
             assert_eq!(entry, hlsl_entry, "{} {stage} entry point", shader.label);
+            // WGPU compiles with `D3DCOMPILE_DEBUG`, which embeds an `SPDB` chunk, exactly
+            // when debug assertions are on. Bytecode compiled otherwise runs differently
+            // than WGPU's own would in this build.
+            assert_eq!(
+                dxbc_chunks(bytecode).iter().any(|chunk| *chunk == b"SPDB"),
+                cfg!(debug_assertions),
+                "{} {stage}: compiled with other FXC flags than WGPU uses in this build",
+                shader.label
+            );
         }
     }
+}
+
+/// The four-character codes of a DXBC container's chunks.
+fn dxbc_chunks(bytecode: &[u8]) -> Vec<&[u8]> {
+    let u32_at = |offset: usize| {
+        u32::from_le_bytes(bytecode[offset..offset + 4].try_into().unwrap()) as usize
+    };
+    (0..u32_at(28))
+        .map(|chunk| u32_at(32 + 4 * chunk))
+        .map(|offset| &bytecode[offset..offset + 4])
+        .collect()
 }
 
 /// The artifacts must be exactly the HLSL this WGPU generates for gpui's layouts. A WGPU,

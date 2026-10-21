@@ -1300,9 +1300,23 @@ fn write_dx11_bytecode(
 // `gpui_wgpu` tests compare every artifact with the HLSL WGPU itself generates and
 // render each pipeline both ways, so a WGPU or Naga upgrade cannot drift silently.
 
-/// wgpu-hal's FXC flags outside of `InstanceFlags::DEBUG`.
+/// wgpu-hal's FXC flags for this build. gpui uses `InstanceFlags::default()`, which sets
+/// `DEBUG` exactly when debug assertions are on, and wgpu-hal then compiles with
+/// `D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION`. Matching it keeps the artifacts the
+/// bytecode WGPU itself would compile in the same build, so precompiling changes only
+/// when shaders compile, never what runs: Windows Server 2022's WARP, for one, loses the
+/// device on the optimized smoothed-corner shaders that debug builds never ran before.
 #[cfg(windows)]
-const D3DCOMPILE_ENABLE_STRICTNESS: u32 = 1 << 11;
+fn dx12_fxc_flags() -> u32 {
+    const D3DCOMPILE_DEBUG: u32 = 1 << 0;
+    const D3DCOMPILE_SKIP_OPTIMIZATION: u32 = 1 << 2;
+    const D3DCOMPILE_ENABLE_STRICTNESS: u32 = 1 << 11;
+    if std::env::var_os("CARGO_CFG_DEBUG_ASSERTIONS").is_some() {
+        D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION
+    } else {
+        D3DCOMPILE_ENABLE_STRICTNESS
+    }
+}
 
 /// The data group each WGPU pipeline binds, and its dynamic-offset uniform, exactly as
 /// `WgpuBindGroupLayouts::new` declares them for the modern tier.
@@ -1594,6 +1608,7 @@ fn write_dx12_bytecode(
     out_dir: &std::path::Path,
     pipelines: &[(&shaders::interface::Pipeline, Dx12Stage, Dx12Stage)],
 ) -> bool {
+    let flags = dx12_fxc_flags();
     let stages = pipelines
         .iter()
         .flat_map(|(pipeline, vertex, fragment)| {
@@ -1614,13 +1629,8 @@ fn write_dx12_bytecode(
                     .get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
                     .copied()
                 {
-                    let bytecode = d3d_compile(
-                        &stage.hlsl,
-                        label,
-                        &stage.entry_point,
-                        profile,
-                        D3DCOMPILE_ENABLE_STRICTNESS,
-                    );
+                    let bytecode =
+                        d3d_compile(&stage.hlsl, label, &stage.entry_point, profile, flags);
                     write_bytes(out_dir, &format!("{label}.dx12.{profile}.dxbc"), &bytecode);
                 }
             });
