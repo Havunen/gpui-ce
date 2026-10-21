@@ -9619,7 +9619,7 @@ mod tests {
                         div()
                             .size(px(20.))
                             .on_drop(|_: &(), _, _| {})
-                            .group_drag_over::<()>("drop-group", |style| {
+                            .group_drag_over_style::<()>("drop-group", |style| {
                                 style.bg(drag_over_highlight())
                             }),
                     ),
