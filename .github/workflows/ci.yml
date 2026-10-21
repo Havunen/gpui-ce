@@ -117,6 +117,12 @@ jobs:
         # Keep the unresolved native access-violation workaround on Windows only.
         run: cargo test --workspace --lib --tests --target ${{ matrix.target }} ${{ (runner.os == 'macOS' || runner.os == 'Windows') && '--features gpui_ce_wgpu/test-support' || '' }} -- ${{ runner.os == 'Windows' && '--test-threads=1' || '' }}
 
+      - name: Run Vulkan shader rendering tests
+        if: runner.os == 'Linux'
+        env:
+          GPUI_REQUIRE_VULKAN_TESTS: "1"
+        run: cargo test -p gpui_ce_wgpu --features test-support --lib vulkan --target ${{ matrix.target }} -- --test-threads=1
+
       - name: Run profiler tests
         run: |
           cargo test -p gpui-ce --features profiler --lib profiler:: --target ${{ matrix.target }} -- ${{ runner.os == 'Windows' && '--test-threads=1' || '' }}

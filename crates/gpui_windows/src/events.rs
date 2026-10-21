@@ -19,6 +19,9 @@ pub(crate) const WM_GPUI_KEYDOWN: i32 = WM_USER + 8;
 pub(crate) const WM_GPUI_END_SESSION: i32 = WM_USER + 9;
 
 const SIZE_MOVE_LOOP_TIMER_ID: usize = 1;
+/// How many times one window may ask for new devices after failing to recreate its
+/// resources. Each request also rebuilds every other window's resources.
+const MAX_DEVICE_RECOVERY_REQUESTS: u8 = 3;
 
 /// Coordinates window draws on the UI thread. Owned by the platform and
 /// shared with every window (like `WindowsPlatformState::cursor_visible`),
@@ -1288,13 +1291,34 @@ impl WindowsWindowInner {
     fn handle_device_lost(&self, lparam: LPARAM) -> Option<isize> {
         let devices = lparam.0 as *const DirectXDevices;
         let devices = unsafe { &*devices };
-        if let Err(err) = self
+        match self
             .state
             .renderer
             .borrow_mut()
             .handle_device_lost(&devices)
         {
-            panic!("Device lost: {err}");
+            Ok(()) => self.state.failed_device_recoveries.set(0),
+            Err(err) => {
+                // This window cannot draw until its resources exist again. Ask the VSync
+                // thread to recreate the devices instead of taking the process down, but
+                // only a few times: each attempt also rebuilds every other window.
+                let failures = self.state.failed_device_recoveries.get().saturating_add(1);
+                self.state.failed_device_recoveries.set(failures);
+                if failures <= MAX_DEVICE_RECOVERY_REQUESTS {
+                    log::error!(
+                        "Recreating window resources failed \
+                         ({failures} of {MAX_DEVICE_RECOVERY_REQUESTS}): {err:#}"
+                    );
+                    self.state
+                        .invalidate_devices
+                        .store(true, std::sync::atomic::Ordering::Release);
+                } else {
+                    log::error!(
+                        "Recreating window resources failed again; \
+                         waiting for the next device loss: {err:#}"
+                    );
+                }
+            }
         }
         // Make sure the first `draw_window` after recovery (whether it comes
         // from the forced WM_GPUI_FORCE_UPDATE_WINDOW or a stray WM_PAINT in

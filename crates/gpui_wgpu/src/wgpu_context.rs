@@ -85,10 +85,33 @@ impl NativeBackend {
 
     pub(crate) fn try_in_preference_order<T>(
         operation: &'static str,
+        attempt: impl FnMut(Self) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        Self::try_with_backends(
+            operation,
+            wgpu::Backends::from_env().unwrap_or_else(wgpu::Backends::all),
+            attempt,
+        )
+    }
+
+    fn try_with_backends<T>(
+        operation: &'static str,
+        allowed: wgpu::Backends,
         mut attempt: impl FnMut(Self) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
+        anyhow::ensure!(
+            Self::PREFERENCE
+                .iter()
+                .any(|&backend| allowed.contains(backend.into())),
+            "cannot initialize {operation}: WGPU_BACKEND enables no supported native backend ({allowed:?})"
+        );
         let mut failures = SmallVec::<[NativeBackendFailure; 3]>::new();
-        for &backend in Self::PREFERENCE {
+        // Filter before invoking the attempt: even creating an instance can load a
+        // driver. In particular, WGPU_BACKEND=gl must never initialize Vulkan.
+        for &backend in Self::PREFERENCE
+            .iter()
+            .filter(|&&backend| allowed.contains(backend.into()))
+        {
             match attempt(backend) {
                 Ok(value) => return Ok(value),
                 Err(source) => failures.push(NativeBackendFailure { backend, source }),
@@ -167,7 +190,7 @@ impl SoftwareAdapterPolicy {
     }
 }
 
-struct CreatedDevice {
+pub(crate) struct CreatedDevice {
     device: wgpu::Device,
     queue: wgpu::Queue,
     dual_source_blending: bool,
@@ -485,6 +508,9 @@ impl WgpuContext {
     }
 
     /// Creates a native device without a presentation surface.
+    ///
+    /// `WGPU_BACKEND` restricts backend selection before any driver is initialized;
+    /// `gl` selects OpenGL/GLES without attempting Vulkan or DX12.
     #[cfg(not(target_family = "wasm"))]
     pub fn new_headless(
         extra_requirements: Option<&WgpuDeviceRequirements>,
@@ -604,7 +630,7 @@ impl WgpuContext {
         Ok(PreparedWebGraphics { context, surface })
     }
 
-    fn from_created_device(
+    pub(crate) fn from_created_device(
         instance: wgpu::Instance,
         adapter: wgpu::Adapter,
         device: CreatedDevice,
@@ -638,7 +664,7 @@ impl WgpuContext {
         })
     }
 
-    async fn create_device(
+    pub(crate) async fn create_device(
         adapter: &wgpu::Adapter,
         extra_requirements: Option<&WgpuDeviceRequirements>,
     ) -> anyhow::Result<CreatedDevice> {
@@ -658,6 +684,22 @@ impl WgpuContext {
                 "Dual-source blending not available on this GPU. \
                 Subpixel text antialiasing will be disabled."
             );
+        }
+
+        // Use build-time bytecode when this backend has artifacts. Other devices keep
+        // WGPU's runtime WGSL translation path.
+        let has_precompiled_shaders = match adapter.get_info().backend {
+            wgpu::Backend::Dx12 => !gpui_render::artifacts::DX12_SHADERS.is_empty(),
+            wgpu::Backend::Vulkan => !gpui_render::artifacts::VULKAN_SHADERS.is_empty(),
+            _ => false,
+        };
+        if has_precompiled_shaders
+            && renderer_tier == RendererTier::Modern
+            && adapter
+                .features()
+                .contains(wgpu::Features::PASSTHROUGH_SHADERS)
+        {
+            required_features |= wgpu::Features::PASSTHROUGH_SHADERS;
         }
 
         let color_texture_format = Self::select_color_texture_format(adapter)?;
@@ -1076,10 +1118,14 @@ mod tests {
     #[test]
     fn native_backend_fallback_preserves_ordered_failures() {
         let mut attempted = Vec::new();
-        let error = NativeBackend::try_in_preference_order::<()>("test context", |backend| {
-            attempted.push(backend);
-            anyhow::bail!("unavailable")
-        })
+        let error = NativeBackend::try_with_backends::<()>(
+            "test context",
+            wgpu::Backends::all(),
+            |backend| {
+                attempted.push(backend);
+                anyhow::bail!("unavailable")
+            },
+        )
         .unwrap_err();
 
         assert_eq!(attempted, NativeBackend::PREFERENCE);
@@ -1090,6 +1136,64 @@ mod tests {
                 .find(&format!("{backend:?}: unavailable"))
                 .expect("each backend failure should be reported in preference order");
             previous += index;
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_vendor = "apple"))]
+    fn explicit_gl_never_attempts_another_backend() {
+        for name in ["gl", "gles", "OpenGL"] {
+            for succeeds in [true, false] {
+                let mut attempted = Vec::new();
+                let result = NativeBackend::try_with_backends(
+                    "test context",
+                    wgpu::Backends::from_comma_list(name),
+                    |backend| {
+                        attempted.push(backend);
+                        anyhow::ensure!(succeeds, "GL unavailable");
+                        Ok(backend)
+                    },
+                );
+                assert_eq!(attempted, [NativeBackend::Gl]);
+                assert_eq!(result.is_ok(), succeeds);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_vendor = "apple"))]
+    fn backend_filter_preserves_fallback_order_and_stops_on_success() {
+        let mut attempted = Vec::new();
+        let selected = NativeBackend::try_with_backends(
+            "test context",
+            wgpu::Backends::from_comma_list("gl,vulkan"),
+            |backend| {
+                attempted.push(backend);
+                anyhow::ensure!(backend == NativeBackend::Gl, "Vulkan unavailable");
+                Ok(backend)
+            },
+        )
+        .unwrap();
+        assert_eq!(attempted, [NativeBackend::Vulkan, NativeBackend::Gl]);
+        assert_eq!(selected, NativeBackend::Gl);
+
+        attempted.clear();
+        NativeBackend::try_with_backends("test context", wgpu::Backends::all(), |backend| {
+            attempted.push(backend);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(attempted, &NativeBackend::PREFERENCE[..1]);
+    }
+
+    #[test]
+    fn unsupported_backend_filter_does_not_initialize_any_backend() {
+        for allowed in [wgpu::Backends::empty(), wgpu::Backends::BROWSER_WEBGPU] {
+            let error = NativeBackend::try_with_backends::<()>("test context", allowed, |_| {
+                panic!("an excluded backend must not be initialized")
+            })
+            .unwrap_err();
+            assert!(error.to_string().contains("no supported native backend"));
         }
     }
 

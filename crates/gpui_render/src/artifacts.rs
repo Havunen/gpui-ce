@@ -148,6 +148,55 @@ pub struct NativeShader {
 
 include!(concat!(env!("OUT_DIR"), "/native_shaders.rs"));
 
+/// One stage of a [`Dx12Shader`].
+#[derive(Clone, Copy, Debug)]
+pub struct Dx12ShaderStage {
+    /// The HLSL entry point the bytecode was compiled from.
+    pub entry_point: &'static str,
+    /// Shader model 5.1 DXBC.
+    pub bytecode: &'static [u8],
+}
+
+/// DX12 bytecode for one WGPU pipeline, compiled at build time from the HLSL that
+/// WGPU's DX12 backend generates for this pipeline's layout.
+///
+/// [`DX12_SHADERS`] is empty unless the build targeted Windows from a Windows host,
+/// in which case WGPU compiles its DX12 shaders at runtime.
+#[derive(Clone, Copy, Debug)]
+pub struct Dx12Shader {
+    /// The [`crate::shaders::interface::Pipeline`] label this pipeline implements.
+    pub label: &'static str,
+    pub vertex: Dx12ShaderStage,
+    pub fragment: Dx12ShaderStage,
+}
+
+/// One stage of a [`Dx12ShaderHlsl`].
+#[derive(Clone, Copy, Debug)]
+pub struct Dx12HlslStage {
+    pub entry_point: &'static str,
+    pub source: &'static str,
+}
+
+/// The HLSL each [`Dx12Shader`] was compiled from. Tests compare it with the HLSL
+/// WGPU generates at runtime; nothing else should need it.
+#[derive(Clone, Copy, Debug)]
+pub struct Dx12ShaderHlsl {
+    pub label: &'static str,
+    pub vertex: Dx12HlslStage,
+    pub fragment: Dx12HlslStage,
+}
+
+include!(concat!(env!("OUT_DIR"), "/dx12_shaders.rs"));
+
+#[path = "vulkan_artifacts.rs"]
+mod vulkan;
+pub use vulkan::{VULKAN_SHADERS, VulkanShader, VulkanShaderStage};
+
+/// The precompiled DX12 shader for the pipeline with `label`, if this build has one.
+pub fn dx12_shader(label: &str) -> Option<&'static Dx12Shader> {
+    DX12_SHADERS.iter().find(|shader| shader.label == label)
+}
+
 #[cfg(test)]
 mod tests {
     use super::BASE_DOWNLEVEL_WGSL;

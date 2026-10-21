@@ -22,13 +22,15 @@ mod filters;
 mod frame;
 #[cfg(all(feature = "test-support", not(target_family = "wasm")))]
 mod headless;
-#[cfg(all(test, feature = "test-support", not(target_family = "wasm")))]
-mod lazy_filter_tests;
-#[cfg(all(test, feature = "test-support", not(target_family = "wasm")))]
-mod lazy_smoothing_tests;
 mod path_types;
 mod pipelines;
 mod platform;
+#[cfg(all(test, not(target_family = "wasm"), not(target_vendor = "apple")))]
+mod precompiled_shader_test_support;
+#[cfg(all(test, target_os = "windows"))]
+mod precompiled_shader_tests;
+#[cfg(all(test, not(target_family = "wasm"), not(target_vendor = "apple")))]
+mod vulkan_shader_tests;
 pub use platform::RecoveryPending;
 mod resources;
 mod retained;
@@ -172,6 +174,12 @@ impl WgpuRenderer {
             .or_else(|| self.faults.fatal_error.lock().unwrap().clone())
     }
 
+    /// Reports `message` as a terminal error, as persistent GPU failures do.
+    #[cfg(feature = "test-support")]
+    pub fn inject_terminal_error_for_tests(&mut self, message: impl Into<String>) {
+        self.faults.terminal_error = Some(message.into());
+    }
+
     // Only the strict Windows integration delegates fatal handling to its application.
     pub(super) fn reports_terminal_errors(&self) -> bool {
         #[cfg(target_os = "windows")]
@@ -250,6 +258,7 @@ impl WgpuRenderer {
             self.rendering_params.path_sample_count,
             self.dual_source_blending,
             resources.renderer_tier,
+            self.adapter_info.backend,
         );
     }
 

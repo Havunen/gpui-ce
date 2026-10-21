@@ -106,7 +106,7 @@ impl WgpuRenderer {
         self.draw_filter_pass(
             encoder,
             "blur_downsample",
-            &self.resources().pipelines.filter_pipelines().downsample,
+            &self.resources().pipelines.blur_downsample,
             &horizontal_target,
             source,
             BlurUniforms::downsample([full_width as f32, full_height as f32], blur_size),
@@ -116,7 +116,7 @@ impl WgpuRenderer {
         self.draw_filter_pass(
             encoder,
             "blur_horizontal",
-            &self.resources().pipelines.filter_pipelines().blur,
+            &self.resources().pipelines.blur,
             &vertical_target,
             &horizontal_target,
             BlurUniforms::gaussian(BlurAxis::Horizontal, blur_size, kernel),
@@ -126,7 +126,7 @@ impl WgpuRenderer {
         self.draw_filter_pass(
             encoder,
             "blur_vertical",
-            &self.resources().pipelines.filter_pipelines().blur,
+            &self.resources().pipelines.blur,
             &horizontal_target,
             &vertical_target,
             BlurUniforms::gaussian(BlurAxis::Vertical, blur_size, kernel),
@@ -165,13 +165,9 @@ impl WgpuRenderer {
         );
         let resources = self.resources();
         let pipeline = if uniforms.corner_smoothing > 0.0 {
-            resources
-                .pipelines
-                .smoothed_blur_composite
-                .as_ref()
-                .expect("smoothed blur prepared before encoding")
+            &resources.pipelines.smoothed_blur_composite
         } else {
-            &resources.pipelines.filter_pipelines().composite
+            &resources.pipelines.blur_composite
         };
 
         self.draw_filter_pass(
@@ -241,7 +237,7 @@ impl WgpuRenderer {
         self.draw_filter_pass(
             encoder,
             "scene_blit",
-            &self.resources().pipelines.filter_pipelines().downsample,
+            &self.resources().pipelines.blur_downsample,
             frame_view,
             source,
             BlurUniforms::copy(size),
@@ -265,8 +261,7 @@ impl WgpuRenderer {
             frame_view,
             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
         );
-        let pipeline = &resources.pipelines.filter_pipelines().downsample;
-        pass.set_pipeline(pipeline);
+        pass.set_pipeline(&resources.pipelines.blur_downsample);
         pass.set_bind_group(
             shader_interface::GLOBAL_BIND_GROUP,
             &resources.globals_bind_group,
@@ -277,6 +272,9 @@ impl WgpuRenderer {
             bind_group,
             &[uniform_offset],
         );
-        pass.draw(0..pipeline.fixed_vertex_count(), 0..1);
+        pass.draw(
+            0..resources.pipelines.blur_downsample.fixed_vertex_count(),
+            0..1,
+        );
     }
 }

@@ -26,6 +26,7 @@ naga = { version = "=29.0.4", features = [
   "glsl-out",
   "hlsl-out",
   "msl-out",
+  "spv-out",
   "wgsl-in",
 ] }
 naga-old = { package = "naga", version = "24.0.0", features = [
@@ -36,4 +37,4 @@ gpui = { path = "../gpui", version = "0.2.2", package = "gpui-ce", default-featu
 wgsl-rs.workspace = true
 
 [dev-dependencies]
-naga = { version = "=29.0.4", features = ["wgsl-in"] }
+naga = { version = "=29.0.4", features = ["wgsl-in", "spv-in"] }

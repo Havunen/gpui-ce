@@ -306,6 +306,7 @@ impl WindowsPlatform {
             .name("VSyncProvider".to_owned())
             .spawn(move || {
                 let vsync_provider = VSyncProvider::new();
+                let mut recovery_backoff = RecoveryBackoff::default();
                 loop {
                     vsync_provider.wait_for_vsync();
                     let Some(windows) = all_windows.upgrade() else {
@@ -313,7 +314,7 @@ impl WindowsPlatform {
                     };
                     // Snapshot on every tick: the first DX11 window can open
                     // after this thread starts. No slot lock crosses SendMessage.
-                    if let Err(err) = run_vsync_tick(
+                    let tick = run_vsync_tick(
                         || directx_devices.get(),
                         &invalidate_devices,
                         |devices| check_device_lost(&devices.device),
@@ -338,12 +339,14 @@ impl WindowsPlatform {
                                 }
                             }
                         },
-                    ) {
-                        panic!("Device lost: {err}");
+                    );
+                    if let Some(delay) = recovery_backoff.next(tick) {
+                        std::thread::sleep(delay);
                     }
                 }
             })
-            .unwrap();
+            .context("Starting the VSync thread")
+            .log_err();
     }
 }
 
@@ -1446,6 +1449,31 @@ fn should_auto_hide_scrollbars() -> Result<bool> {
     Ok(ui_settings.AutoHideScrollBars()?)
 }
 
+/// Spaces out DX11 device recovery attempts that keep failing. The device stays lost,
+/// so a later tick retries, but each attempt waits for the driver and recreates every
+/// window's resources: back off from one second to half a minute.
+#[derive(Default)]
+struct RecoveryBackoff {
+    failures: u32,
+}
+
+impl RecoveryBackoff {
+    const MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// How long to wait after a tick, if it failed.
+    fn next(&mut self, tick: Result<()>) -> Option<std::time::Duration> {
+        let Err(error) = tick else {
+            self.failures = 0;
+            return None;
+        };
+        let delay =
+            std::time::Duration::from_secs(1u64 << self.failures.min(5)).min(Self::MAX_DELAY);
+        self.failures = self.failures.saturating_add(1);
+        log::error!("DirectX device recovery failed; retrying in {delay:?}: {error:#}");
+        Some(delay)
+    }
+}
+
 /// Every window needs redraw ticks, including DX12 windows without a DX11
 /// support device. Recovery only applies to an existing DX11 device snapshot.
 fn run_vsync_tick<D>(
@@ -1619,8 +1647,8 @@ mod tests {
     };
 
     use super::{
-        WindowsPlatform, encode_restart_arguments, read_from_clipboard, run_vsync_tick,
-        write_to_clipboard,
+        RecoveryBackoff, WindowsPlatform, encode_restart_arguments, read_from_clipboard,
+        run_vsync_tick, write_to_clipboard,
     };
     use crate::{LazyDirectXDevices, WindowsRendererOptions};
     use gpui::ClipboardItem;
@@ -1693,6 +1721,18 @@ mod tests {
         assert_eq!(recoveries.get(), 1);
         assert_eq!(redraws.get(), 3);
         assert!(!invalidated.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn failed_device_recoveries_back_off_up_to_half_a_minute_and_reset() {
+        let mut backoff = RecoveryBackoff::default();
+        let failed = || Err(anyhow::anyhow!("device recreation failed"));
+        let delays = (0..8)
+            .map(|_| backoff.next(failed()).unwrap().as_secs())
+            .collect::<Vec<_>>();
+        assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30, 30]);
+        assert_eq!(backoff.next(Ok(())), None);
+        assert_eq!(backoff.next(failed()).unwrap().as_secs(), 1);
     }
 
     #[test]
