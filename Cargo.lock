@@ -1683,15 +1683,6 @@ dependencies = [
 
 [[package]]
 name = "dirs"
-version = "6.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
-dependencies = [
- "dirs-sys",
-]
-
-[[package]]
-name = "dirs"
 version = "7.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d57d423b3c82e89b9a24ca3091fee61f456a26edbd28d26c65906f4bc1dcd8f"
@@ -2087,14 +2078,14 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 [[package]]
 name = "font-kit"
 version = "0.14.3-1"
-source = "git+https://github.com/Havunen/font-kit?rev=cc6f86949e40ef3a5e9b2063f8127cdcb72d7ac4#cc6f86949e40ef3a5e9b2063f8127cdcb72d7ac4"
+source = "git+https://github.com/Havunen/font-kit?rev=78fcc88851d7b84e5631c47b99e78d44f20a01a4#78fcc88851d7b84e5631c47b99e78d44f20a01a4"
 dependencies = [
  "bitflags 2.13.2",
  "byteorder",
  "core-foundation",
  "core-graphics",
  "core-text",
- "dirs 6.0.0",
+ "dirs",
  "dwrote",
  "float-ord",
  "freetype-sys",
@@ -2979,7 +2970,7 @@ dependencies = [
  "async-fs",
  "async_zip",
  "command-fds",
- "dirs 7.0.0",
+ "dirs",
  "dunce",
  "futures",
  "futures-lite",
@@ -6366,7 +6357,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys",

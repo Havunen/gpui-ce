@@ -1,6 +1,6 @@
 # Development setup
 
-Install Git, then install Rust through [rustup](https://rustup.rs). GPUI-CE requires Rust 1.95 or newer, as specified in [Cargo.toml](crates/gpui/Cargo.toml). Add the formatting and linting tools:
+Install Git, then install Rust through [rustup](https://rustup.rs). GPUI-CE requires Rust 1.99 or newer, as specified in [Cargo.toml](crates/gpui/Cargo.toml). Add the formatting and linting tools:
 
 ```sh
 rustup component add rustfmt clippy
