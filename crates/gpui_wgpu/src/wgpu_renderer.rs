@@ -25,8 +25,12 @@ mod headless;
 mod path_types;
 mod pipelines;
 mod platform;
+#[cfg(all(test, not(target_family = "wasm"), not(target_vendor = "apple")))]
+mod precompiled_shader_test_support;
 #[cfg(all(test, target_os = "windows"))]
 mod precompiled_shader_tests;
+#[cfg(all(test, not(target_family = "wasm"), not(target_vendor = "apple")))]
+mod vulkan_shader_tests;
 pub use platform::RecoveryPending;
 mod resources;
 mod retained;

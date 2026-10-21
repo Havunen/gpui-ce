@@ -188,6 +188,10 @@ pub struct Dx12ShaderHlsl {
 
 include!(concat!(env!("OUT_DIR"), "/dx12_shaders.rs"));
 
+#[path = "vulkan_artifacts.rs"]
+mod vulkan;
+pub use vulkan::{VULKAN_SHADERS, VulkanShader, VulkanShaderStage};
+
 /// The precompiled DX12 shader for the pipeline with `label`, if this build has one.
 pub fn dx12_shader(label: &str) -> Option<&'static Dx12Shader> {
     DX12_SHADERS.iter().find(|shader| shader.label == label)

@@ -660,10 +660,15 @@ impl WgpuContext {
             );
         }
 
-        // DX12 pipelines are created from bytecode compiled at build time, which skips FXC:
-        // seconds of shader compilation per startup. Without passthrough WGPU compiles them.
-        if adapter.get_info().backend == wgpu::Backend::Dx12
-            && !gpui_render::artifacts::DX12_SHADERS.is_empty()
+        // Use build-time bytecode when this backend has artifacts. Other devices keep
+        // WGPU's runtime WGSL translation path.
+        let has_precompiled_shaders = match adapter.get_info().backend {
+            wgpu::Backend::Dx12 => !gpui_render::artifacts::DX12_SHADERS.is_empty(),
+            wgpu::Backend::Vulkan => !gpui_render::artifacts::VULKAN_SHADERS.is_empty(),
+            _ => false,
+        };
+        if has_precompiled_shaders
+            && renderer_tier == RendererTier::Modern
             && adapter
                 .features()
                 .contains(wgpu::Features::PASSTHROUGH_SHADERS)

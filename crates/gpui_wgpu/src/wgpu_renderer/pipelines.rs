@@ -12,6 +12,10 @@ use gpui_render::{
 };
 use std::{num::NonZeroU64, sync::OnceLock};
 
+#[cfg(all(not(target_family = "wasm"), not(target_vendor = "apple")))]
+#[path = "vulkan_pipelines.rs"]
+mod vulkan;
+
 /// Group-1 payload: a storage buffer on modern tiers, a data texture plus per-batch
 /// range uniform on downlevel.
 pub(super) enum InstanceBindingSource<'a> {
@@ -96,7 +100,7 @@ impl WgpuRenderPipeline {
         self.specification.label
     }
 
-    /// Whether this pipeline was created from build-time DX12 bytecode.
+    /// Whether this pipeline was created from build-time shader bytecode.
     #[cfg(test)]
     pub(super) fn is_precompiled(&self) -> bool {
         self.precompiled
@@ -515,9 +519,13 @@ impl WgpuPipelines {
 /// each corner-smoothed pipeline. The build compiles the HLSL WGPU would generate, so
 /// pipelines start from that bytecode and only driver PSO creation remains. Any pipeline
 /// whose bytecode the device rejects falls back to WGSL, compiled by WGPU as before.
+/// Vulkan likewise uses build-time SPIR-V to skip WGSL validation and translation;
+/// the Vulkan driver still compiles it to the GPU's machine code when creating a pipeline.
 pub(super) struct PipelineShaders {
     /// Build-time DX12 bytecode, tried before WGSL. Empty unless the device accepts it.
     precompiled: &'static [Dx12Shader],
+    #[cfg(all(not(target_family = "wasm"), not(target_vendor = "apple")))]
+    vulkan: &'static [gpui_render::artifacts::VulkanShader],
     base_source: &'static str,
     // Translated and validated only when some pipeline needs WGSL.
     base: OnceLock<wgpu::ShaderModule>,
@@ -525,7 +533,7 @@ pub(super) struct PipelineShaders {
 }
 
 impl PipelineShaders {
-    /// Precompiled bytecode applies only to a DX12 device created with passthrough
+    /// Precompiled bytecode applies only to a matching device created with passthrough
     /// shaders, which `WgpuContext` requests when this build has the bytecode.
     pub(super) fn for_device(
         device: &wgpu::Device,
@@ -538,12 +546,29 @@ impl PipelineShaders {
             && device
                 .features()
                 .contains(wgpu::Features::PASSTHROUGH_SHADERS);
-        Self::new(if precompiled { DX12_SHADERS } else { &[] }, tier)
+        let shaders = Self::new(if precompiled { DX12_SHADERS } else { &[] }, tier);
+        #[cfg(all(not(target_family = "wasm"), not(target_vendor = "apple")))]
+        let shaders = Self {
+            vulkan: if backend == wgpu::Backend::Vulkan
+                && tier == RendererTier::Modern
+                && device
+                    .features()
+                    .contains(wgpu::Features::PASSTHROUGH_SHADERS)
+            {
+                gpui_render::artifacts::VULKAN_SHADERS
+            } else {
+                &[]
+            },
+            ..shaders
+        };
+        shaders
     }
 
     pub(super) fn new(precompiled: &'static [Dx12Shader], tier: RendererTier) -> Self {
         Self {
             precompiled,
+            #[cfg(all(not(target_family = "wasm"), not(target_vendor = "apple")))]
+            vulkan: &[],
             base_source: match tier {
                 RendererTier::Modern => BASE_WGSL,
                 // GLES lacks vertex-stage storage; the dialect reads the data texture.
@@ -556,6 +581,10 @@ impl PipelineShaders {
 
     #[cfg(test)]
     pub(super) fn is_precompiled(&self) -> bool {
+        #[cfg(all(not(target_family = "wasm"), not(target_vendor = "apple")))]
+        if !self.vulkan.is_empty() {
+            return true;
+        }
         !self.precompiled.is_empty()
     }
 
@@ -573,6 +602,22 @@ impl PipelineShaders {
             .iter()
             .find(|shader| shader.label == specification.label)
             && let Some(pipeline) = create_precompiled_render_pipeline(
+                device,
+                specification,
+                layout,
+                color_target,
+                sample_count,
+                shader,
+            )
+        {
+            return pipeline;
+        }
+        #[cfg(all(not(target_family = "wasm"), not(target_vendor = "apple")))]
+        if let Some(shader) = self
+            .vulkan
+            .iter()
+            .find(|shader| shader.label == specification.label)
+            && let Some(pipeline) = vulkan::create_pipeline(
                 device,
                 specification,
                 layout,

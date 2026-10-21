@@ -1,7 +1,7 @@
 //! Build-time shader pipeline.
 //!
 //! Compiles the Rust-authored shaders in `src/shaders` into one artifact per dialect
-//! (WebGpu WGSL, downlevel WGSL for WebGL2/GLES, HLSL/DXBC, GLSL, and MSL) and validates each
+//! (WebGpu WGSL, downlevel WGSL for WebGL2/GLES, HLSL/DXBC, SPIR-V, GLSL, and MSL) and validates each
 //! against the Naga versions its consumers require. Dialect gaps close via mechanical
 //! transforms here, never per-backend hand edits.
 
@@ -10,6 +10,9 @@
 mod path_types;
 #[path = "src/shaders/mod.rs"]
 mod shaders;
+
+#[path = "build/vulkan.rs"]
+mod vulkan;
 
 #[cfg(windows)]
 #[rustfmt::skip]
@@ -98,6 +101,7 @@ struct StorageArray {
 
 fn main() {
     println!("cargo:rerun-if-changed=src/shaders");
+    println!("cargo:rerun-if-changed=build/vulkan.rs");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR must be set"));
 
@@ -216,6 +220,12 @@ fn main() {
         },
     ];
     let reflected = write_interface(&out_dir, &layouts, &downlevel_layouts);
+    vulkan::write_shaders(
+        &out_dir,
+        &base.source,
+        &subpixel_dual_source.source,
+        &reflected,
+    );
     write_native_shaders(&out_dir);
     write_dx12_shaders(
         &out_dir,
@@ -1320,7 +1330,7 @@ fn dx12_fxc_flags() -> u32 {
 
 /// The data group each WGPU pipeline binds, and its dynamic-offset uniform, exactly as
 /// `WgpuBindGroupLayouts::new` declares them for the modern tier.
-fn dx12_data_group(layout: shaders::interface::DataLayout) -> Option<(&'static str, Option<u32>)> {
+fn wgpu_data_group(layout: shaders::interface::DataLayout) -> Option<(&'static str, Option<u32>)> {
     use shaders::interface::{DATA_BUFFER_BINDING, DataLayout};
     match layout {
         DataLayout::Instances => Some(("INSTANCE_BINDINGS", None)),
@@ -1521,7 +1531,7 @@ fn write_dx12_shaders(
     let global = &reflected["GLOBAL_BINDINGS"];
     let mut pipelines = Vec::new();
     for pipeline in shaders::interface::ALL {
-        let (data_group, dynamic_uniform) = dx12_data_group(pipeline.data_layout)
+        let (data_group, dynamic_uniform) = wgpu_data_group(pipeline.data_layout)
             .unwrap_or_else(|| panic!("{} has no WGPU pipeline layout", pipeline.label));
         let (module, info) = match pipeline.data_layout {
             shaders::interface::DataLayout::SubpixelSprites => &subpixel,
