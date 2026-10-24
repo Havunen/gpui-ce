@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Image, shadow, and filter painting methods now require a `corner_smoothing` argument, `PaintQuad` gains a `corner_smoothing` field. [#338](https://github.com/gpui-ce/gpui-ce/pull/338)
 - Removed `Deferred::with_priority` in favor of the existing `Deferred::priority` method. [#245](https://github.com/gpui-ce/gpui-ce/pull/245)
 - Replaced `asset_source` with new `AssetRegistry` API. [#259](https://github.com/gpui-ce/gpui-ce/pull/259)
+- `PathPromptOptions` gains a `directory` field, the folder an Open dialog starts in (`None` keeps the platform default).
 
 ### Additions
 - Changelog established.

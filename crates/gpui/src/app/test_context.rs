@@ -1213,7 +1213,7 @@ mod tests {
         SystemNotificationResponse, TestAppContext,
     };
     use std::cell::RefCell;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::rc::Rc;
 
     #[gpui::test]
@@ -1366,6 +1366,7 @@ mod tests {
                 directories: true,
                 multiple: true,
                 prompt: None,
+                directory: Some(PathBuf::from("/start")),
             })
         });
         assert!(cx.did_prompt_for_paths());
@@ -1375,6 +1376,7 @@ mod tests {
             let selected = selected.clone();
             move |options| {
                 assert!(options.multiple);
+                assert_eq!(options.directory.as_deref(), Some(Path::new("/start")));
                 Some(selected)
             }
         });
@@ -1392,6 +1394,7 @@ mod tests {
                 directories: false,
                 multiple: false,
                 prompt: None,
+                directory: None,
             })
         });
 

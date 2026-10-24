@@ -1328,6 +1328,10 @@ fn file_open_dialog(
         dialog_options |= FOS_PICKFOLDERS;
     }
 
+    if let Some(directory) = &options.directory {
+        set_dialog_folder(&folder_dialog, directory)?;
+    }
+
     unsafe {
         folder_dialog.SetOptions(dialog_options).ok()?;
 
@@ -1360,6 +1364,32 @@ fn file_open_dialog(
     Ok(Some(paths))
 }
 
+/// Opens the dialog in `directory`; a folder that doesn't resolve keeps the default.
+fn set_dialog_folder(dialog: &IFileDialog, directory: &Path) -> Result<()> {
+    if directory.as_os_str().is_empty() {
+        return Ok(());
+    }
+    let Some(full_path) = directory
+        .canonicalize()
+        .context("failed to canonicalize directory")
+        .log_err()
+    else {
+        return Ok(());
+    };
+    let full_path = dunce::simplified(&full_path);
+    let full_path_string = full_path.display().to_string();
+    let path_item: IShellItem =
+        unsafe { SHCreateItemFromParsingName(&HSTRING::from(full_path_string), None)? };
+    unsafe {
+        dialog
+            .SetFolder(&path_item)
+            .ok()
+            .context("failed to set dialog folder")
+            .log_err()
+    };
+    Ok(())
+}
+
 fn file_save_dialog(
     directory: PathBuf,
     suggested_name: Option<String>,
@@ -1367,24 +1397,7 @@ fn file_save_dialog(
 ) -> Result<Option<PathBuf>> {
     let dialog: IFileSaveDialog =
         unsafe { CoCreateInstance(&FileSaveDialog, None, CLSCTX_ALL as u32)? };
-    if !directory.to_string_lossy().is_empty()
-        && let Some(full_path) = directory
-            .canonicalize()
-            .context("failed to canonicalize directory")
-            .log_err()
-    {
-        let full_path = dunce::simplified(&full_path);
-        let full_path_string = full_path.display().to_string();
-        let path_item: IShellItem =
-            unsafe { SHCreateItemFromParsingName(&HSTRING::from(full_path_string), None)? };
-        unsafe {
-            dialog
-                .SetFolder(&path_item)
-                .ok()
-                .context("failed to set dialog folder")
-                .log_err()
-        };
-    }
+    set_dialog_folder(&dialog, &directory)?;
 
     if let Some(suggested_name) = suggested_name {
         unsafe {
