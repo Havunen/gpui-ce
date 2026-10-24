@@ -410,6 +410,11 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
                 } else {
                     "Open File"
                 };
+                // The portal takes the folder as a C string, so one with a NUL
+                // byte falls back to the default folder.
+                let current_folder = options
+                    .directory
+                    .filter(|directory| !directory.as_os_str().as_encoded_bytes().contains(&0));
 
                 let request = match ashpd::desktop::file_chooser::OpenFileRequest::default()
                     .identifier(identifier.await)
@@ -418,6 +423,8 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
                     .accept_label(options.prompt.as_ref().map(gpui::SharedString::as_str))
                     .multiple(options.multiple)
                     .directory(options.directories)
+                    .current_folder::<PathBuf>(current_folder)
+                    .expect("folders with NUL bytes were filtered out")
                     .send()
                     .await
                 {

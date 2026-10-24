@@ -817,6 +817,11 @@ impl Platform for MacPlatform {
 
                     panel.setCanCreateDirectories(true);
                     panel.setResolvesAliases(false);
+                    if let Some(directory) = &options.directory {
+                        let path = ns_string(directory.to_string_lossy().as_ref());
+                        let url = NSURL::fileURLWithPath_isDirectory(&path, true);
+                        panel.setDirectoryURL(Some(&url));
+                    }
                     let panel_for_callback = panel.clone();
                     let done_tx = Cell::new(Some(done_tx));
                     let block = RcBlock::new(move |response: objc2_app_kit::NSModalResponse| {
