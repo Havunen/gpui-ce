@@ -22,6 +22,10 @@ permissions:
 jobs:
   # cargo-audit: vulnerability scanning (advisory DB)
   cargo-audit:
+    permissions:
+      contents: read
+      checks: write
+      issues: write
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
