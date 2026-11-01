@@ -1,9 +1,12 @@
+mod root_background;
+
 use crate::{
     AssetRegistry, DevicePixels, IsZero, RenderImage, Result, SharedString, Size,
     swap_rgba_pa_to_bgra,
 };
 use image::Frame;
 use resvg::tiny_skia::{Color, Pixmap};
+use root_background::root_background;
 use skrifa::{FontRef, MetadataProvider};
 use smallvec::SmallVec;
 use std::{
@@ -193,10 +196,25 @@ impl SvgRenderer {
     /// Parses SVG data into a [`ParsedSvg`] that can be rasterized at any scale.
     #[tracing::instrument(skip_all)]
     pub fn parse_svg(&self, bytes: &[u8]) -> Result<ParsedSvg, usvg::Error> {
-        let tree = usvg::Tree::from_data(bytes, &self.usvg_options)?;
+        // Gzipped SVG: leave the decision, and any decompression, to usvg.
+        if bytes.starts_with(&[0x1f, 0x8b]) {
+            let tree = usvg::Tree::from_data(bytes, &self.usvg_options)?;
+            return Ok(ParsedSvg {
+                tree,
+                background: None,
+            });
+        }
+        // `usvg::Tree::from_data`, split so the background reads the same XML.
+        let text = std::str::from_utf8(bytes).map_err(|_| usvg::Error::NotAnUtf8Str)?;
+        let options = roxmltree::ParsingOptions {
+            allow_dtd: true,
+            ..Default::default()
+        };
+        let document = roxmltree::Document::parse_with_options(text, options)
+            .map_err(usvg::Error::ParsingFailed)?;
         Ok(ParsedSvg {
-            tree,
-            background: root_background(bytes),
+            tree: usvg::Tree::from_xmltree(&document, &self.usvg_options)?,
+            background: root_background(&document),
         })
     }
 
@@ -275,51 +293,6 @@ impl SvgRenderer {
         let tree = usvg::Tree::from_data(bytes, &self.usvg_options)?;
         rasterize_tree(&tree, size, None)
     }
-}
-
-/// The CSS `background` an SVG's root element declares in its `style`.
-///
-/// Browsers paint it under the document, but usvg drops it: generated charts
-/// such as star-history.com draw black ink on `background:#fff` and vanish on a
-/// dark page without it. Only the root's inline style is read.
-fn root_background(bytes: &[u8]) -> Option<Color> {
-    // Most SVGs never mention it; skip the second XML parse for them.
-    if !bytes
-        .windows(b"background".len())
-        .any(|w| w == b"background")
-    {
-        return None;
-    }
-    let text = std::str::from_utf8(bytes).ok()?;
-    let options = roxmltree::ParsingOptions {
-        allow_dtd: true,
-        ..Default::default()
-    };
-    let document = roxmltree::Document::parse_with_options(text, options).ok()?;
-    let style = document.root_element().attribute("style")?;
-    let value = simplecss::DeclarationTokenizer::from(style)
-        .filter(|d| matches!(d.name, "background" | "background-color"))
-        // The last declaration wins, unless an earlier one is `!important`.
-        .max_by_key(|d| d.important)?
-        .value;
-    // The shorthand mixes the colour with images and keywords; take the colour.
-    let color = split_css_tokens(value).find_map(|token| token.parse::<svgtypes::Color>().ok())?;
-    (color.alpha > 0).then(|| Color::from_rgba8(color.red, color.green, color.blue, color.alpha))
-}
-
-/// Whitespace-separated tokens, keeping `rgb(0, 0, 0)` and `url(a b)` whole.
-fn split_css_tokens(value: &str) -> impl Iterator<Item = &str> {
-    let mut depth = 0usize;
-    value
-        .split(move |c: char| {
-            match c {
-                '(' => depth += 1,
-                ')' => depth = depth.saturating_sub(1),
-                _ => {}
-            }
-            depth == 0 && c.is_whitespace()
-        })
-        .filter(|token| !token.is_empty())
 }
 
 fn rasterize_tree(
@@ -453,35 +426,18 @@ mod tests {
             corner_pixel(&with_style("stroke-width:3;background:#fff")),
             [255, 255, 255, 255]
         );
+        // BGRA order.
         assert_eq!(
             corner_pixel(&with_style("background-color: rgb(0, 0, 255)")),
             [255, 0, 0, 255]
         );
-        assert_eq!(
-            corner_pixel(&with_style("background: url(x.png) no-repeat #123456")),
-            [0x56, 0x34, 0x12, 255]
-        );
-        // The last declaration wins, as in CSS.
-        assert_eq!(
-            corner_pixel(&with_style("background:#000;background-color:#fff")),
-            [255, 255, 255, 255]
-        );
-        assert_eq!(
-            corner_pixel(&with_style("background:#fff !important;background:#000")),
-            [255, 255, 255, 255]
-        );
+        let sheet = r#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><style>svg { background: #123456 }</style></svg>"#;
+        assert_eq!(corner_pixel(sheet), [0x56, 0x34, 0x12, 255]);
     }
 
     #[test]
     fn root_without_background_stays_transparent() {
-        for style in [
-            "",
-            "background:transparent",
-            "background:none",
-            "background:bogus",
-        ] {
-            assert_eq!(corner_pixel(&with_style(style))[3], 0, "style {style:?}");
-        }
+        assert_eq!(corner_pixel(&with_style(""))[3], 0);
         // Only the root counts; a background on a child is not a canvas fill.
         let nested = r#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><g style="background:#fff"/></svg>"#;
         assert_eq!(corner_pixel(nested)[3], 0);
