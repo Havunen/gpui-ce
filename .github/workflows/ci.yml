@@ -27,15 +27,18 @@ jobs:
           - name: Ubuntu 24.04 x86_64
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+          - name: Ubuntu 26.04 x86_64
+            runner: ubuntu-26.04
+            target: x86_64-unknown-linux-gnu
           - name: Ubuntu 22.04 aarch64
             runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
           - name: Ubuntu 24.04 aarch64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          - name: macOS 14 aarch64
-            runner: macos-14
-            target: aarch64-apple-darwin
+          - name: Ubuntu 26.04 aarch64
+            runner: ubuntu-26.04-arm
+            target: aarch64-unknown-linux-gnu
           - name: macOS 15 x86_64
             runner: macos-15-intel
             target: x86_64-apple-darwin
@@ -131,78 +134,6 @@ jobs:
         run: |
           cargo test -p gpui-ce --features profiler --lib profiler:: --target ${{ matrix.target }} -- ${{ runner.os == 'Windows' && '--test-threads=1' || '' }}
 
-  ubuntu-container-build:
-    name: Ubuntu ${{ matrix.ubuntu_version }} container x86_64
-    runs-on: ubuntu-24.04
-    container:
-      image: ubuntu:${{ matrix.ubuntu_version }}
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        ubuntu_version:
-          - "26.04"
-    env:
-      DEBIAN_FRONTEND: noninteractive
-
-    steps:
-      - name: Install bootstrap and system dependencies
-        run: |
-          apt-get update
-          apt-get install -y \
-            build-essential \
-            ca-certificates \
-            cmake \
-            curl \
-            git \
-            libasound2-dev \
-            libdrm-dev \
-            libfontconfig1-dev \
-            libfreetype6-dev \
-            libgbm-dev \
-            libssl-dev \
-            libva-dev \
-            libvulkan-dev \
-            libwayland-dev \
-            libx11-dev \
-            libx11-xcb-dev \
-            libxcb1-dev \
-            libxkbcommon-dev \
-            libxkbcommon-x11-dev \
-            lld \
-            mesa-vulkan-drivers \
-            pkg-config \
-            zlib1g-dev \
-            zstd
-
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Install Rust toolchain
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- \
-            -y \
-            --profile minimal \
-            --default-toolchain stable \
-            --target x86_64-unknown-linux-gnu
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: v2-rust-container-ubuntu-${{ matrix.ubuntu_version }}-x86_64-unknown-linux-gnu
-          cache-bin: false
-
-      - name: Build workspace
-        run: cargo build --workspace --lib --bins --examples --target x86_64-unknown-linux-gnu
-
-      - name: Run tests
-        run: cargo test --workspace --lib --tests --target x86_64-unknown-linux-gnu
-
-      - name: Run profiler tests
-        run: |
-          cargo test -p gpui-ce --features profiler --lib profiler:: --target x86_64-unknown-linux-gnu
-
   check-target-variations:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
@@ -249,8 +180,8 @@ jobs:
             target: x86_64-pc-windows-msvc
             check_targets: --all-targets
             cargo_args: --features gpui_ce_windows/windows-wgpu,gpui_ce_wgpu/custom-gpu,gpui_ce_wgpu/wgpu-surfaces
-          - name: macOS 14 aarch64 WGPU
-            runner: macos-14
+          - name: macOS 15 aarch64 WGPU
+            runner: macos-15
             target: aarch64-apple-darwin
             check_targets: --all-targets
             cargo_args: --features gpui_ce_platform/macos-wgpu,gpui_ce_wgpu/custom-gpu,gpui_ce_wgpu/wgpu-surfaces
