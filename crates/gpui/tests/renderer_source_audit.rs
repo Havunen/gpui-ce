@@ -264,7 +264,11 @@ fn windows_default_renderer_has_no_wgpu_path() {
         windows["features"]["default"],
         serde_json::json!(["gpui/default"])
     );
-    assert_eq!(platform["features"]["default"], serde_json::json!([]));
+    assert_eq!(
+        platform["features"]["default"],
+        serde_json::json!(["wayland", "x11"]),
+        "gpui_platform defaults must enable the Linux backends but not WGPU on Windows"
+    );
     assert_eq!(
         windows["features"]["windows-wgpu"],
         serde_json::json!(["dep:gpui_wgpu"])
