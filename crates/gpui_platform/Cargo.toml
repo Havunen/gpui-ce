@@ -13,7 +13,12 @@ workspace = true
 path = "src/gpui_platform.rs"
 
 [features]
-default = []
+# Linux apps get both backends unless they opt out with `default-features = false`
+# and pick `wayland` and/or `x11`. The workspace pulls gpui_linux with
+# `default-features = false`, and `gpui/wayland`/`gpui/x11` only reach
+# gpui_platform as a dev-dependency, so this is the only default that reaches
+# downstream apps.
+default = ["wayland", "x11"]
 bench-support = [
   "gpui/bench-support",
   "gpui_apple/bench-support",
