@@ -1,9 +1,12 @@
+mod root_background;
+
 use crate::{
     AssetRegistry, DevicePixels, IsZero, RenderImage, Result, SharedString, Size,
     swap_rgba_pa_to_bgra,
 };
 use image::Frame;
-use resvg::tiny_skia::Pixmap;
+use resvg::tiny_skia::{Color, Pixmap};
+use root_background::root_background;
 use skrifa::{FontRef, MetadataProvider};
 use smallvec::SmallVec;
 use std::{
@@ -101,7 +104,10 @@ pub struct SvgRenderer {
 /// [`SvgRenderer::render_parsed`]. Parsing resolves fonts and converts text
 /// to paths, so callers that need to rasterize the same SVG at multiple
 /// scales should retain this value to avoid re-paying the parse cost.
-pub struct ParsedSvg(usvg::Tree);
+pub struct ParsedSvg {
+    tree: usvg::Tree,
+    background: Option<Color>,
+}
 
 /// The size in which to rasterize the SVG.
 #[derive(Clone, Copy)]
@@ -190,7 +196,26 @@ impl SvgRenderer {
     /// Parses SVG data into a [`ParsedSvg`] that can be rasterized at any scale.
     #[tracing::instrument(skip_all)]
     pub fn parse_svg(&self, bytes: &[u8]) -> Result<ParsedSvg, usvg::Error> {
-        usvg::Tree::from_data(bytes, &self.usvg_options).map(ParsedSvg)
+        // Gzipped SVG: leave the decision, and any decompression, to usvg.
+        if bytes.starts_with(&[0x1f, 0x8b]) {
+            let tree = usvg::Tree::from_data(bytes, &self.usvg_options)?;
+            return Ok(ParsedSvg {
+                tree,
+                background: None,
+            });
+        }
+        // `usvg::Tree::from_data`, split so the background reads the same XML.
+        let text = std::str::from_utf8(bytes).map_err(|_| usvg::Error::NotAnUtf8Str)?;
+        let options = roxmltree::ParsingOptions {
+            allow_dtd: true,
+            ..Default::default()
+        };
+        let document = roxmltree::Document::parse_with_options(text, options)
+            .map_err(usvg::Error::ParsingFailed)?;
+        Ok(ParsedSvg {
+            tree: usvg::Tree::from_xmltree(&document, &self.usvg_options)?,
+            background: root_background(&document),
+        })
     }
 
     /// Rasterizes a previously parsed SVG into an image buffer.
@@ -208,7 +233,7 @@ impl SvgRenderer {
                 SMOOTH_SVG_SCALE_FACTOR,
             ),
         };
-        let pixmap = rasterize_tree(&svg.0, size)?;
+        let pixmap = rasterize_tree(&svg.tree, size, svg.background)?;
         let mut buffer =
             image::ImageBuffer::from_raw(pixmap.width(), pixmap.height(), pixmap.take()).unwrap();
 
@@ -266,11 +291,15 @@ impl SvgRenderer {
 
     fn render_pixmap(&self, bytes: &[u8], size: SvgSize) -> Result<Pixmap, usvg::Error> {
         let tree = usvg::Tree::from_data(bytes, &self.usvg_options)?;
-        rasterize_tree(&tree, size)
+        rasterize_tree(&tree, size, None)
     }
 }
 
-fn rasterize_tree(tree: &usvg::Tree, size: SvgSize) -> Result<Pixmap, usvg::Error> {
+fn rasterize_tree(
+    tree: &usvg::Tree,
+    size: SvgSize,
+    background: Option<Color>,
+) -> Result<Pixmap, usvg::Error> {
     // Cap the size of the rendered pixmap to avoid texture allocation panics
     // Related issue: #56466
     const MAX_SIZE: f32 = 8192.0;
@@ -298,6 +327,9 @@ fn rasterize_tree(tree: &usvg::Tree, size: SvgSize) -> Result<Pixmap, usvg::Erro
     // Render the SVG to a pixmap with the specified width and height.
     let mut pixmap = resvg::tiny_skia::Pixmap::new(width as u32, height as u32)
         .ok_or(usvg::Error::InvalidSize)?;
+    if let Some(background) = background {
+        pixmap.fill(background);
+    }
 
     let transform = resvg::tiny_skia::Transform::from_scale(
         width / svg_size.width(),
@@ -367,6 +399,65 @@ mod tests {
         )?;
 
         assert_eq!(image.size(0), Size::new(DevicePixels(24), DevicePixels(12)));
+        Ok(())
+    }
+
+    // Top-left pixel of an 8x8 render as straight-alpha BGRA.
+    fn corner_pixel(svg: &str) -> [u8; 4] {
+        let renderer = SvgRenderer::new(Arc::new(AssetRegistry::default()));
+        let svg = renderer.parse_svg(svg.as_bytes()).expect("parse svg");
+        let size = Size::new(DevicePixels(8), DevicePixels(8));
+        let image = renderer
+            .render_parsed(&svg, SvgSize::ExactSize(size))
+            .expect("render svg");
+        image.as_bytes(0).expect("frame")[..4].try_into().unwrap()
+    }
+
+    fn with_style(style: &str) -> String {
+        format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8" style="{style}"><rect x="4" y="4" width="4" height="4" fill="red"/></svg>"#
+        )
+    }
+
+    #[test]
+    fn paints_root_css_background() {
+        // star-history.com charts draw black ink on `background:#fff`.
+        assert_eq!(
+            corner_pixel(&with_style("stroke-width:3;background:#fff")),
+            [255, 255, 255, 255]
+        );
+        // BGRA order.
+        assert_eq!(
+            corner_pixel(&with_style("background-color: rgb(0, 0, 255)")),
+            [255, 0, 0, 255]
+        );
+        let sheet = r#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><style>svg { background: #123456 }</style></svg>"#;
+        assert_eq!(corner_pixel(sheet), [0x56, 0x34, 0x12, 255]);
+    }
+
+    #[test]
+    fn root_without_background_stays_transparent() {
+        assert_eq!(corner_pixel(&with_style(""))[3], 0);
+        // Only the root counts; a background on a child is not a canvas fill.
+        let nested = r#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><g style="background:#fff"/></svg>"#;
+        assert_eq!(corner_pixel(nested)[3], 0);
+    }
+
+    #[test]
+    fn alpha_mask_ignores_root_background() -> Result<()> {
+        // `svg()` icons are one-colour masks: a filled canvas would make them squares.
+        let renderer = SvgRenderer::new(Arc::new(AssetRegistry::default()));
+        let size = Size::new(DevicePixels(8), DevicePixels(8));
+        let params = RenderSvgParams {
+            path: SharedString::default(),
+            size,
+        };
+        let svg = with_style("background:#fff");
+        let (_, mask) = renderer
+            .render_alpha_mask(&params, Some(svg.as_bytes()))?
+            .expect("mask");
+        assert_eq!(mask[0], 0);
+        assert_eq!(mask[mask.len() - 1], 255);
         Ok(())
     }
 
