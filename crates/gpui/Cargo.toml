@@ -91,9 +91,12 @@ resvg = { workspace = true, default-features = false, features = [
     "memmap-fonts",
     "raster-images"
 ] }
+roxmltree.workspace = true
 rust-embed = { version = "8.13", optional = true }
 usvg = { workspace = true, default-features = false }
+simplecss.workspace = true
 skrifa.workspace = true
+svgtypes.workspace = true
 schemars.workspace = true
 seahash.workspace = true
 serde.workspace = true

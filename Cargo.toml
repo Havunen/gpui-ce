@@ -262,9 +262,13 @@ pathfinder_geometry = "0.5"
 pin-project = "1"
 raw-window-handle = "0.6"
 resvg = { version = "0.48", default-features = false }
+# usvg's own parsers, for the root CSS background it drops.
+roxmltree = "0.21"
 seahash = "4"
+simplecss = "0.2"
 smol_str = "0.3"
 spin = "0.12"
+svgtypes = "0.16"
 swash = "0.2"
 taffy = { version = "=0.14.0", default-features = false, features = ["std", "taffy_tree", "flexbox", "grid", "block_layout", "calc", "content_size", "detailed_layout_info"] }
 skrifa = "0.48"

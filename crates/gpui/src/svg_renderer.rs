@@ -3,7 +3,7 @@ use crate::{
     swap_rgba_pa_to_bgra,
 };
 use image::Frame;
-use resvg::tiny_skia::Pixmap;
+use resvg::tiny_skia::{Color, Pixmap};
 use skrifa::{FontRef, MetadataProvider};
 use smallvec::SmallVec;
 use std::{
@@ -101,7 +101,10 @@ pub struct SvgRenderer {
 /// [`SvgRenderer::render_parsed`]. Parsing resolves fonts and converts text
 /// to paths, so callers that need to rasterize the same SVG at multiple
 /// scales should retain this value to avoid re-paying the parse cost.
-pub struct ParsedSvg(usvg::Tree);
+pub struct ParsedSvg {
+    tree: usvg::Tree,
+    background: Option<Color>,
+}
 
 /// The size in which to rasterize the SVG.
 #[derive(Clone, Copy)]
@@ -190,7 +193,11 @@ impl SvgRenderer {
     /// Parses SVG data into a [`ParsedSvg`] that can be rasterized at any scale.
     #[tracing::instrument(skip_all)]
     pub fn parse_svg(&self, bytes: &[u8]) -> Result<ParsedSvg, usvg::Error> {
-        usvg::Tree::from_data(bytes, &self.usvg_options).map(ParsedSvg)
+        let tree = usvg::Tree::from_data(bytes, &self.usvg_options)?;
+        Ok(ParsedSvg {
+            tree,
+            background: root_background(bytes),
+        })
     }
 
     /// Rasterizes a previously parsed SVG into an image buffer.
@@ -208,7 +215,7 @@ impl SvgRenderer {
                 SMOOTH_SVG_SCALE_FACTOR,
             ),
         };
-        let pixmap = rasterize_tree(&svg.0, size)?;
+        let pixmap = rasterize_tree(&svg.tree, size, svg.background)?;
         let mut buffer =
             image::ImageBuffer::from_raw(pixmap.width(), pixmap.height(), pixmap.take()).unwrap();
 
@@ -266,11 +273,60 @@ impl SvgRenderer {
 
     fn render_pixmap(&self, bytes: &[u8], size: SvgSize) -> Result<Pixmap, usvg::Error> {
         let tree = usvg::Tree::from_data(bytes, &self.usvg_options)?;
-        rasterize_tree(&tree, size)
+        rasterize_tree(&tree, size, None)
     }
 }
 
-fn rasterize_tree(tree: &usvg::Tree, size: SvgSize) -> Result<Pixmap, usvg::Error> {
+/// The CSS `background` an SVG's root element declares in its `style`.
+///
+/// Browsers paint it under the document, but usvg drops it: generated charts
+/// such as star-history.com draw black ink on `background:#fff` and vanish on a
+/// dark page without it. Only the root's inline style is read.
+fn root_background(bytes: &[u8]) -> Option<Color> {
+    // Most SVGs never mention it; skip the second XML parse for them.
+    if !bytes
+        .windows(b"background".len())
+        .any(|w| w == b"background")
+    {
+        return None;
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    let options = roxmltree::ParsingOptions {
+        allow_dtd: true,
+        ..Default::default()
+    };
+    let document = roxmltree::Document::parse_with_options(text, options).ok()?;
+    let style = document.root_element().attribute("style")?;
+    let value = simplecss::DeclarationTokenizer::from(style)
+        .filter(|d| matches!(d.name, "background" | "background-color"))
+        // The last declaration wins, unless an earlier one is `!important`.
+        .max_by_key(|d| d.important)?
+        .value;
+    // The shorthand mixes the colour with images and keywords; take the colour.
+    let color = split_css_tokens(value).find_map(|token| token.parse::<svgtypes::Color>().ok())?;
+    (color.alpha > 0).then(|| Color::from_rgba8(color.red, color.green, color.blue, color.alpha))
+}
+
+/// Whitespace-separated tokens, keeping `rgb(0, 0, 0)` and `url(a b)` whole.
+fn split_css_tokens(value: &str) -> impl Iterator<Item = &str> {
+    let mut depth = 0usize;
+    value
+        .split(move |c: char| {
+            match c {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            depth == 0 && c.is_whitespace()
+        })
+        .filter(|token| !token.is_empty())
+}
+
+fn rasterize_tree(
+    tree: &usvg::Tree,
+    size: SvgSize,
+    background: Option<Color>,
+) -> Result<Pixmap, usvg::Error> {
     // Cap the size of the rendered pixmap to avoid texture allocation panics
     // Related issue: #56466
     const MAX_SIZE: f32 = 8192.0;
@@ -298,6 +354,9 @@ fn rasterize_tree(tree: &usvg::Tree, size: SvgSize) -> Result<Pixmap, usvg::Erro
     // Render the SVG to a pixmap with the specified width and height.
     let mut pixmap = resvg::tiny_skia::Pixmap::new(width as u32, height as u32)
         .ok_or(usvg::Error::InvalidSize)?;
+    if let Some(background) = background {
+        pixmap.fill(background);
+    }
 
     let transform = resvg::tiny_skia::Transform::from_scale(
         width / svg_size.width(),
@@ -367,6 +426,82 @@ mod tests {
         )?;
 
         assert_eq!(image.size(0), Size::new(DevicePixels(24), DevicePixels(12)));
+        Ok(())
+    }
+
+    // Top-left pixel of an 8x8 render as straight-alpha BGRA.
+    fn corner_pixel(svg: &str) -> [u8; 4] {
+        let renderer = SvgRenderer::new(Arc::new(AssetRegistry::default()));
+        let svg = renderer.parse_svg(svg.as_bytes()).expect("parse svg");
+        let size = Size::new(DevicePixels(8), DevicePixels(8));
+        let image = renderer
+            .render_parsed(&svg, SvgSize::ExactSize(size))
+            .expect("render svg");
+        image.as_bytes(0).expect("frame")[..4].try_into().unwrap()
+    }
+
+    fn with_style(style: &str) -> String {
+        format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8" style="{style}"><rect x="4" y="4" width="4" height="4" fill="red"/></svg>"#
+        )
+    }
+
+    #[test]
+    fn paints_root_css_background() {
+        // star-history.com charts draw black ink on `background:#fff`.
+        assert_eq!(
+            corner_pixel(&with_style("stroke-width:3;background:#fff")),
+            [255, 255, 255, 255]
+        );
+        assert_eq!(
+            corner_pixel(&with_style("background-color: rgb(0, 0, 255)")),
+            [255, 0, 0, 255]
+        );
+        assert_eq!(
+            corner_pixel(&with_style("background: url(x.png) no-repeat #123456")),
+            [0x56, 0x34, 0x12, 255]
+        );
+        // The last declaration wins, as in CSS.
+        assert_eq!(
+            corner_pixel(&with_style("background:#000;background-color:#fff")),
+            [255, 255, 255, 255]
+        );
+        assert_eq!(
+            corner_pixel(&with_style("background:#fff !important;background:#000")),
+            [255, 255, 255, 255]
+        );
+    }
+
+    #[test]
+    fn root_without_background_stays_transparent() {
+        for style in [
+            "",
+            "background:transparent",
+            "background:none",
+            "background:bogus",
+        ] {
+            assert_eq!(corner_pixel(&with_style(style))[3], 0, "style {style:?}");
+        }
+        // Only the root counts; a background on a child is not a canvas fill.
+        let nested = r#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><g style="background:#fff"/></svg>"#;
+        assert_eq!(corner_pixel(nested)[3], 0);
+    }
+
+    #[test]
+    fn alpha_mask_ignores_root_background() -> Result<()> {
+        // `svg()` icons are one-colour masks: a filled canvas would make them squares.
+        let renderer = SvgRenderer::new(Arc::new(AssetRegistry::default()));
+        let size = Size::new(DevicePixels(8), DevicePixels(8));
+        let params = RenderSvgParams {
+            path: SharedString::default(),
+            size,
+        };
+        let svg = with_style("background:#fff");
+        let (_, mask) = renderer
+            .render_alpha_mask(&params, Some(svg.as_bytes()))?
+            .expect("mask");
+        assert_eq!(mask[0], 0);
+        assert_eq!(mask[mask.len() - 1], 255);
         Ok(())
     }
 
