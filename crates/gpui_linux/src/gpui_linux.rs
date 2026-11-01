@@ -1,6 +1,7 @@
 #![cfg(any(target_os = "linux", target_os = "freebsd"))]
 mod linux;
 
+#[cfg(any(feature = "wayland", feature = "x11"))]
 pub(crate) use gpui::collections;
 pub(crate) use gpui_util as util;
 

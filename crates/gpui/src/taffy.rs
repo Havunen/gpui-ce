@@ -910,10 +910,16 @@ impl ToTaffy<taffy::style::Style> for Style {
                 self.size.height == Length::Auto,
             ),
             border: border_widths_to_taffy(&self.border_widths, rem_size, scale_factor),
-            align_items: self.align_items.map(|x| x.into()),
+            align_items: self
+                .align_items
+                .map_or(taffy::style::AlignItems::NORMAL, Into::into),
             align_self: self.align_self.map(|x| x.into()),
-            align_content: self.align_content.map(|x| x.into()),
-            justify_content: self.justify_content.map(|x| x.into()),
+            align_content: self
+                .align_content
+                .map_or(taffy::style::AlignContent::NORMAL, Into::into),
+            justify_content: self
+                .justify_content
+                .map_or(taffy::style::JustifyContent::NORMAL, Into::into),
             gap: self.gap.to_taffy(rem_size, scale_factor),
             flex_direction: self.flex_direction.into(),
             flex_wrap: self.flex_wrap.into(),

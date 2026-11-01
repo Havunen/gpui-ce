@@ -5,13 +5,9 @@ use std::{
     sync::Arc,
 };
 #[cfg(any(feature = "wayland", feature = "x11"))]
-use std::{
-    ffi::OsString,
-    fs::File,
-    io::Read as _,
-    os::fd::{AsFd, AsRawFd},
-    time::Duration,
-};
+use std::{ffi::OsString, fs::File, os::fd::AsFd, time::Duration};
+#[cfg(feature = "wayland")]
+use std::{io::Read as _, os::fd::AsRawFd};
 
 #[cfg(any(feature = "wayland", feature = "x11"))]
 use anyhow::ensure;
@@ -881,10 +877,10 @@ pub(super) fn get_xkb_compose_state(cx: &xkb::Context) -> Option<xkb::compose::S
     state
 }
 
-#[cfg(any(feature = "wayland", feature = "x11"))]
+#[cfg(feature = "wayland")]
 pub(super) const PIPE_READ_TIMEOUT: Duration = Duration::from_secs(4);
 
-#[cfg(any(feature = "wayland", feature = "x11"))]
+#[cfg(feature = "wayland")]
 pub(super) fn read_fd_with_timeout(
     mut fd: filedescriptor::FileDescriptor,
     timeout: Duration,
@@ -1299,12 +1295,11 @@ pub(super) fn compositor_gpu_hint_from_dev_t(dev: u64) -> Option<gpui_wgpu::Comp
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "wayland", feature = "x11")))]
 mod tests {
     use super::*;
     use gpui::{Point, px};
 
-    #[cfg(any(feature = "wayland", feature = "x11"))]
     #[test]
     fn rejects_null_xkb_context() {
         let context = unsafe {
@@ -1339,7 +1334,7 @@ mod tests {
         ),);
     }
 
-    #[cfg(any(feature = "wayland", feature = "x11"))]
+    #[cfg(feature = "wayland")]
     mod read_fd_with_timeout {
         use super::super::{PIPE_READ_TIMEOUT, read_fd_with_timeout};
         use std::io::Write as _;
