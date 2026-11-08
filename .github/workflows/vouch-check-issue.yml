@@ -6,6 +6,7 @@ name: "Vouch - Check Issue"
 
 jobs:
   check:
+    if: github.repository == 'gpui-ce/gpui-ce'
     runs-on: ubuntu-latest
     steps:
       # acquire a token that allows vouch actions to mutate repository

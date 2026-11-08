@@ -101,7 +101,7 @@ use crate::linux::{
         to_shape,
         window::WaylandWindow,
     },
-    xdg_desktop_portal::{Event as XDPEvent, XDPEventSource},
+    xdg_desktop_portal::{Event as XDPEvent, INITIAL_APPEARANCE_TIMEOUT, XDPEventSource},
 };
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, CursorStyle, DevicePixels, DisplayId, ExternalDragPayload,
@@ -909,7 +909,7 @@ impl WaylandClient {
 
         let event_loop = EventLoop::<WaylandClientStatePtr>::try_new().unwrap();
 
-        let (common, main_receiver, wake_receiver) = LinuxCommon::new(event_loop.get_signal());
+        let (mut common, main_receiver, wake_receiver) = LinuxCommon::new(event_loop.get_signal());
 
         let handle = event_loop.handle();
         handle
@@ -972,12 +972,20 @@ impl WaylandClient {
 
         let cursor = Cursor::new(&conn, &globals, 24);
 
+        let mut xdp_event_source = XDPEventSource::new(&common.background_executor);
+        if let Some(appearance) = xdp_event_source.initial_appearance(INITIAL_APPEARANCE_TIMEOUT) {
+            common.appearance = appearance;
+        }
+
         handle
-            .insert_source(XDPEventSource::new(&common.background_executor), {
+            .insert_source(xdp_event_source, {
                 move |event, _, client| match event {
                     XDPEvent::WindowAppearance(appearance) => {
                         if let Some(client) = client.0.upgrade() {
                             let mut client = client.borrow_mut();
+                            if client.common.appearance == appearance {
+                                return;
+                            }
 
                             client.common.appearance = appearance;
 
