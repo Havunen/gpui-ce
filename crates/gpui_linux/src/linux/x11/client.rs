@@ -53,7 +53,7 @@ use crate::linux::{
     open_uri_internal,
     platform::{DOUBLE_CLICK_INTERVAL, SCROLL_LINES},
     reveal_path_internal,
-    xdg_desktop_portal::{Event as XDPEvent, XDPEventSource},
+    xdg_desktop_portal::{Event as XDPEvent, INITIAL_APPEARANCE_TIMEOUT, XDPEventSource},
 };
 use crate::linux::{LinuxCommon, LinuxKeyboardLayout, X11Window, modifiers_from_xinput_info};
 
@@ -396,7 +396,7 @@ impl X11Client {
     pub(crate) fn new() -> anyhow::Result<Self> {
         let event_loop = EventLoop::try_new()?;
 
-        let (common, main_receiver, wake_receiver) = LinuxCommon::new(event_loop.get_signal());
+        let (mut common, main_receiver, wake_receiver) = LinuxCommon::new(event_loop.get_signal());
 
         let handle = event_loop.handle();
 
@@ -572,11 +572,21 @@ impl X11Client {
             )
             .map_err(|err| anyhow!("Failed to initialize X11 event source: {err:?}"))?;
 
+        let mut xdp_event_source = XDPEventSource::new(&common.background_executor);
+        if let Some(appearance) = xdp_event_source.initial_appearance(INITIAL_APPEARANCE_TIMEOUT) {
+            common.appearance = appearance;
+        }
+
         handle
-            .insert_source(XDPEventSource::new(&common.background_executor), {
+            .insert_source(xdp_event_source, {
                 move |event, _, client| match event {
                     XDPEvent::WindowAppearance(appearance) => {
-                        client.with_common(|common| common.appearance = appearance);
+                        let changed = client.with_common(|common| {
+                            std::mem::replace(&mut common.appearance, appearance) != appearance
+                        });
+                        if !changed {
+                            return;
+                        }
                         for window in client.0.borrow_mut().windows.values_mut() {
                             window.window.set_appearance(appearance);
                         }

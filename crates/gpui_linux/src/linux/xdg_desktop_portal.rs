@@ -6,8 +6,15 @@ use ashpd::desktop::settings::{ColorScheme, Settings};
 use calloop::channel::Channel;
 use calloop::{EventSource, Poll, PostAction, Readiness, Token, TokenFactory};
 use smol::stream::StreamExt;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use gpui::{BackgroundExecutor, WindowAppearance};
+
+/// How long startup waits for the portal's color scheme before the first window
+/// opens. The portal usually answers within a few milliseconds; the limit keeps
+/// a missing or slow-to-start portal from holding up launch.
+pub const INITIAL_APPEARANCE_TIMEOUT: Duration = Duration::from_millis(200);
 
 pub enum Event {
     WindowAppearance(WindowAppearance),
@@ -20,11 +27,13 @@ pub enum Event {
 
 pub struct XDPEventSource {
     channel: Channel<Event>,
+    initial_appearance: Option<mpsc::Receiver<WindowAppearance>>,
 }
 
 impl XDPEventSource {
     pub fn new(executor: &BackgroundExecutor) -> Self {
         let (sender, channel) = calloop::channel::channel();
+        let (initial_appearance_sender, initial_appearance) = mpsc::sync_channel(1);
 
         let background = executor.clone();
 
@@ -33,10 +42,11 @@ impl XDPEventSource {
                 let settings = Settings::new().await?;
 
                 if let Ok(initial_appearance) = settings.color_scheme().await {
-                    sender.send(Event::WindowAppearance(
-                        window_appearance_from_color_scheme(initial_appearance),
-                    ))?;
+                    let appearance = window_appearance_from_color_scheme(initial_appearance);
+                    initial_appearance_sender.try_send(appearance).ok();
+                    sender.send(Event::WindowAppearance(appearance))?;
                 }
+                drop(initial_appearance_sender);
                 if let Ok(initial_theme) = settings
                     .read::<String>("org.gnome.desktop.interface", "cursor-theme")
                     .await
@@ -127,7 +137,22 @@ impl XDPEventSource {
             })
             .detach();
 
-        Self { channel }
+        Self {
+            channel,
+            initial_appearance: Some(initial_appearance),
+        }
+    }
+
+    /// Waits up to `timeout` for the portal's first color scheme answer.
+    ///
+    /// Call it before the first window opens. The answer otherwise reaches the
+    /// client through the event loop, which does not run it until the first
+    /// window has already been built and drawn with the default appearance.
+    ///
+    /// Returns `None` when the portal does not answer in time, has no color
+    /// scheme, or the answer was already taken.
+    pub fn initial_appearance(&mut self, timeout: Duration) -> Option<WindowAppearance> {
+        self.initial_appearance.take()?.recv_timeout(timeout).ok()
     }
 }
 
