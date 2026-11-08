@@ -154,7 +154,7 @@ heck = "0.5"
 proc-macro2 = "1"
 syn = { version = "3", features = ["full", "extra-traits", "visit-mut"] }
 quote = "1"
-ashpd = { version = "0.13", default-features = false, features = [
+ashpd = { version = "0.14", default-features = false, features = [
     "async-io",
     "notification",
     "open_uri",
@@ -255,7 +255,7 @@ lyon = "1"
 num_cpus = "1"
 objc2 = "0.6"
 objc2-metal = "0.3"
-oo7 = { version = "0.6", default-features = false }
+oo7 = { version = "0.7", default-features = false }
 open = "5"
 parking = "2"
 pathfinder_geometry = "0.5"
