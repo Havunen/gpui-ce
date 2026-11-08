@@ -66,13 +66,13 @@ pub fn derive_refineable(input: TokenStream) -> TokenStream {
         })
         .collect();
 
-    // Create trait bound that each wrapped type must implement Clone
+    // Add a Clone bound for each wrapped type.
     let type_param_bounds: Vec<WherePredicate> = wrapped_types
         .iter()
         .map(|ty| parse_quote!(#ty: Clone))
         .collect();
 
-    // Append to where_clause or create a new one if it doesn't exist
+    // Append to the existing where clause, or create one.
     let where_clause = match where_clause.cloned() {
         Some(mut where_clause) => {
             where_clause.predicates.extend(type_param_bounds);
@@ -238,20 +238,13 @@ pub fn derive_refineable(input: TokenStream) -> TokenStream {
 
     let refinement_is_empty_conditions: Vec<TokenStream2> = fields
         .iter()
-        .enumerate()
-        .map(|(i, field)| {
+        .map(|field| {
             let name = &field.ident;
 
-            let condition = if is_refineable_field(field) {
+            if is_refineable_field(field) {
                 quote! { self.#name.is_empty() }
             } else {
                 quote! { self.#name.is_none() }
-            };
-
-            if i < fields.len() - 1 {
-                quote! { #condition && }
-            } else {
-                condition
             }
         })
         .collect();
@@ -372,7 +365,7 @@ pub fn derive_refineable(input: TokenStream) -> TokenStream {
     }
 
     let r#gen = quote! {
-        /// A refinable version of [`#ident`], see that documentation for details.
+        /// A refinable version of [`#ident`]. See that type's documentation for details.
         #[derive(Clone)]
         #derive_stream
         pub struct #refinement_ident #impl_generics {
@@ -443,7 +436,7 @@ pub fn derive_refineable(input: TokenStream) -> TokenStream {
             #where_clause
         {
             fn is_empty(&self) -> bool {
-                #( #refinement_is_empty_conditions )*
+                true #( && #refinement_is_empty_conditions )*
             }
         }
 
@@ -470,7 +463,7 @@ pub fn derive_refineable(input: TokenStream) -> TokenStream {
         impl #impl_generics #refinement_ident #ty_generics
             #where_clause
         {
-            /// Returns `true` if all fields are `Some`
+            /// Returns `true` if any field is `Some`.
             pub fn is_some(&self) -> bool {
                 #(
                     if self.#field_names.is_some() {
