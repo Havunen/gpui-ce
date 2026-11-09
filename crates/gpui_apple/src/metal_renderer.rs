@@ -460,12 +460,22 @@ impl InstanceBufferPool {
     }
 }
 
+// Backport of zed-industries/zed#65472 (Steve Shreeve and Anthony Eid),
+// adapted to gpui-ce's metal 0.33 owned drawable wrappers.
+enum DisplayLinkMode {
+    Detached,
+    Attached {
+        drawable: Option<metal::MetalDrawable>,
+    },
+}
+
 pub struct MetalRenderer {
     device: metal::Device,
     layer: Option<metal::MetalLayer>,
     is_apple_gpu: bool,
     is_unified_memory: bool,
     presents_with_transaction: bool,
+    display_link_mode: DisplayLinkMode,
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
     command_queue: CommandQueue,
@@ -770,6 +780,7 @@ impl MetalRenderer {
             device,
             layer,
             presents_with_transaction: false,
+            display_link_mode: DisplayLinkMode::Detached,
             is_apple_gpu,
             is_unified_memory,
             opaque,
@@ -826,6 +837,35 @@ impl MetalRenderer {
 
     pub fn sprite_atlas(&self) -> &Arc<MetalAtlas> {
         &self.sprite_atlas
+    }
+
+    /// Supplies the drawable acquired by the window's Metal display link.
+    /// Clear it after each callback to release an unused frame to the layer.
+    /// Returns an unused drawable when the frame neither drew nor presented.
+    pub fn set_frame_drawable(
+        &mut self,
+        drawable: Option<metal::MetalDrawable>,
+    ) -> Option<metal::MetalDrawable> {
+        match &mut self.display_link_mode {
+            DisplayLinkMode::Attached { drawable: current } => std::mem::replace(current, drawable),
+            DisplayLinkMode::Detached => {
+                debug_assert!(
+                    drawable.is_none(),
+                    "received a display link drawable while detached"
+                );
+                None
+            }
+        }
+    }
+
+    /// While attached, rendering only consumes the display link's drawable.
+    /// Detach only after invalidating the link, before a synchronous draw.
+    pub fn set_display_link_attached(&mut self, attached: bool) {
+        self.display_link_mode = if attached {
+            DisplayLinkMode::Attached { drawable: None }
+        } else {
+            DisplayLinkMode::Detached
+        };
     }
 
     pub fn set_presents_with_transaction(&mut self, presents_with_transaction: bool) {
@@ -955,22 +995,35 @@ impl MetalRenderer {
                 return;
             }
         };
-        let viewport_size = layer.drawable_size();
-        let viewport_size: Size<DevicePixels> = size(
-            (viewport_size.width.ceil() as i32).into(),
-            (viewport_size.height.ceil() as i32).into(),
+        let drawable = match &mut self.display_link_mode {
+            DisplayLinkMode::Attached { drawable } => {
+                let Some(drawable) = drawable.take() else {
+                    log::error!("skipped a frame drawn outside its display link's update");
+                    return;
+                };
+                drawable
+            }
+            DisplayLinkMode::Detached => {
+                let Some(drawable) = layer.next_drawable() else {
+                    log::error!(
+                        "failed to retrieve next drawable, drawable size: {:?}",
+                        layer.drawable_size()
+                    );
+                    self.forget_previous_frame();
+                    return;
+                };
+                drawable.to_owned()
+            }
+        };
+        // A link's drawable may predate a resize of the layer. Its texture is
+        // the actual render target for this update, including intermediate
+        // targets and retained-scene bookkeeping.
+        let texture = drawable.texture();
+        let viewport_size = size(
+            (texture.width() as i32).into(),
+            (texture.height() as i32).into(),
         );
         let mode = self.frame_mode(scene, viewport_size);
-        let drawable = if let Some(drawable) = layer.next_drawable() {
-            drawable
-        } else {
-            log::error!(
-                "failed to retrieve next drawable, drawable size: {:?}",
-                viewport_size
-            );
-            self.forget_previous_frame();
-            return;
-        };
 
         let mut instance_buffer = self.acquire_instance_buffer(scene);
         let command_buffer = match self.draw_frame(
@@ -994,7 +1047,7 @@ impl MetalRenderer {
             command_buffer.wait_until_scheduled();
             drawable.present();
         } else {
-            command_buffer.present_drawable(drawable);
+            command_buffer.present_drawable(&drawable);
             command_buffer.commit();
         }
     }
@@ -2940,6 +2993,79 @@ mod tests {
         pattern_slash, px, solid_background, white,
     };
     use std::borrow::Cow;
+
+    #[test]
+    fn display_link_drawable_dimensions_survive_a_layer_resize() {
+        let mut renderer = MetalRenderer::new(Default::default(), false);
+        let old_size = size(DevicePixels(64), DevicePixels(48));
+        let new_size = size(DevicePixels(128), DevicePixels(96));
+        renderer.update_drawable_size(old_size);
+        let old_drawable = renderer
+            .layer()
+            .unwrap()
+            .next_drawable()
+            .expect("layer supplies the pre-resize drawable")
+            .to_owned();
+        renderer.update_drawable_size(new_size);
+        renderer.set_display_link_attached(true);
+        renderer.set_frame_drawable(Some(old_drawable));
+        let mut scene = Scene::default();
+        scene.finish();
+        renderer.draw(&scene);
+
+        assert_eq!(renderer.intermediate_texture_size, Some(old_size));
+        let retained = renderer.retained_texture.as_ref().expect("retained frame");
+        assert_eq!((retained.width(), retained.height()), (64, 48));
+
+        renderer.set_display_link_attached(false);
+        let new_drawable = renderer
+            .layer()
+            .unwrap()
+            .next_drawable()
+            .expect("layer supplies the post-resize drawable")
+            .to_owned();
+        renderer.set_display_link_attached(true);
+        renderer.set_frame_drawable(Some(new_drawable));
+        renderer.draw(&scene);
+        assert_eq!(renderer.intermediate_texture_size, Some(new_size));
+    }
+
+    #[test]
+    fn display_link_mode_consumes_and_clears_owned_drawables() {
+        let mut renderer = MetalRenderer::new(Default::default(), false);
+        renderer.update_drawable_size(size(DevicePixels(64), DevicePixels(64)));
+        let drawable = renderer
+            .layer()
+            .unwrap()
+            .next_drawable()
+            .expect("window layer supplies a drawable")
+            .to_owned();
+        renderer.set_display_link_attached(true);
+        assert!(
+            renderer
+                .set_frame_drawable(Some(drawable.clone()))
+                .is_none()
+        );
+        let mut scene = Scene::default();
+        scene.finish();
+        renderer.draw(&scene);
+        assert!(matches!(
+            renderer.display_link_mode,
+            DisplayLinkMode::Attached { drawable: None }
+        ));
+        assert!(
+            renderer
+                .set_frame_drawable(Some(drawable.clone()))
+                .is_none()
+        );
+        assert!(renderer.set_frame_drawable(None).is_some());
+        renderer.set_frame_drawable(Some(drawable));
+        renderer.set_display_link_attached(false);
+        assert!(matches!(
+            renderer.display_link_mode,
+            DisplayLinkMode::Detached
+        ));
+    }
 
     #[test]
     fn precompiled_libraries_load_with_their_entry_points() {

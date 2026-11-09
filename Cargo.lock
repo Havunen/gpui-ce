@@ -2569,6 +2569,7 @@ dependencies = [
  "log",
  "metal",
  "objc2 0.6.5",
+ "objc2-foundation 0.3.2",
  "objc2-quartz-core 0.3.2",
  "parking_lot 0.13.0",
  "smallvec",

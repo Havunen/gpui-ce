@@ -1,4 +1,6 @@
-//! Frame pacing for macOS windows, built on `CVDisplayLink`.
+//! Frame pacing for macOS windows. Native Metal uses a per-layer
+//! `CAMetalDisplayLink` on macOS 14+; older systems and WGPU retain the shared
+//! `CVDisplayLink` registry described below.
 //!
 //! CVDisplayLink has no safe teardown: `CVDisplayLinkStop` merely flags the
 //! link's io thread to exit "soon" and returns immediately, and there is no
@@ -55,7 +57,9 @@ use core_graphics::display::CGDirectDisplayID;
 use dispatch2::{
     _dispatch_source_type_data_add, DispatchObject, DispatchQueue, DispatchRetained, DispatchSource,
 };
+use gpui_apple::display_link::MetalFrameSource;
 use gpui_util::ResultExt;
+use std::cell::{Cell, RefCell};
 use std::{
     collections::{BTreeMap, btree_map},
     ffi::c_void,
@@ -224,6 +228,52 @@ fn unsubscribe(display_id: CGDirectDisplayID, subscriber_id: SubscriberId) {
     }
 }
 
+// Backport of zed-industries/zed#65472 (Steve Shreeve and Anthony Eid).
+/// A window's Metal link, shared with GPUI's frame waker outside its lock.
+/// An update with no presentation or further demand pauses the link so idle
+/// windows acquire no drawables. GPUI continues to make every frame decision.
+#[derive(Default)]
+pub struct MetalFrames {
+    source: RefCell<Option<MetalFrameSource>>,
+    woken: Cell<bool>,
+}
+
+impl MetalFrames {
+    #[cfg(not(feature = "wgpu"))]
+    pub fn replace(&self, source: Option<MetalFrameSource>) {
+        *self.source.borrow_mut() = source;
+    }
+
+    #[cfg(not(feature = "wgpu"))]
+    pub fn is_attached(&self) -> bool {
+        self.source.borrow().is_some()
+    }
+
+    pub fn wake(&self) {
+        self.woken.set(true);
+        // A source being replaced starts unpaused, so skipping it is safe.
+        if let Ok(source) = self.source.try_borrow()
+            && let Some(source) = source.as_ref()
+        {
+            source.set_paused(false);
+        }
+    }
+
+    #[cfg(not(feature = "wgpu"))]
+    pub fn begin_frame(&self) {
+        self.woken.set(false);
+    }
+
+    #[cfg(not(feature = "wgpu"))]
+    pub fn end_frame(&self, used_drawable: bool) -> bool {
+        let pause = !used_drawable && !self.woken.get();
+        if pause && let Some(source) = self.source.borrow().as_ref() {
+            source.set_paused(true);
+        }
+        pause
+    }
+}
+
 /// A per-window source of frame requests, paced by the display the window is
 /// on. The wrapped dispatch source coalesces vsync ticks from the display's
 /// io thread and invokes `callback(data)` on the main queue.
@@ -277,6 +327,33 @@ impl Drop for WindowFrameSource {
         // its context points at the window's native view, which may be
         // deallocated after this.
         self.frame_requests.cancel();
+    }
+}
+
+#[cfg(all(test, not(feature = "wgpu")))]
+mod metal_tests {
+    use super::*;
+
+    #[test]
+    fn metal_frames_pause_only_when_gpui_neither_draws_nor_asks_again() {
+        let frames = MetalFrames::default();
+
+        frames.begin_frame();
+        assert!(!frames.end_frame(true), "a frame that drew keeps running");
+
+        frames.begin_frame();
+        frames.wake();
+        assert!(
+            !frames.end_frame(false),
+            "a wake during an update keeps it running"
+        );
+
+        frames.wake();
+        frames.begin_frame();
+        assert!(frames.end_frame(false), "the update served an earlier wake");
+
+        frames.begin_frame();
+        assert!(frames.end_frame(false), "an idle update pauses the link");
     }
 }
 
