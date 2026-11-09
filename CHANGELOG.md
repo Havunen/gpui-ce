@@ -24,6 +24,7 @@ Items are sorted by issue or pull request number.
 ### Fixes
 
 - `ColorExt::blend` diverged from upstream/original behavior [#327](https://github.com/gpui-ce/gpui-ce/issues/327), [#357](https://github.com/gpui-ce/gpui-ce/pull/357)
+- Pace native Metal windows with `CAMetalDisplayLink` on macOS 14+ to avoid synchronous drawable acquisition during display updates. Older macOS versions and WGPU retain `CVDisplayLink`. Backported from [Zed #65472](https://github.com/zed-industries/zed/pull/65472).
 
 ### Security Changes
 
