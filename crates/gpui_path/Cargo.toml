@@ -1,6 +1,6 @@
 [package]
 name = "gpui_ce_path"
-version = "0.2.2"
+version = "0.4.0"
 edition = "2024"
 license = "Apache-2.0"
 publish = true
@@ -19,9 +19,11 @@ anyhow = "1"
 dunce = "1.0"
 serde = { version = "1", features = ["derive", "rc"], optional = true }
 
+[target.'cfg(windows)'.dependencies]
+tendril = "0.5"
+
 [dev-dependencies]
 tempfile = "3.27"
-pretty_assertions = "1.4"
 
 [lints]
 workspace = true
