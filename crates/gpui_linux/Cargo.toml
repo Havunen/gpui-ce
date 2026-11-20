@@ -1,6 +1,6 @@
 [package]
 name = "gpui_ce_linux"
-version = "0.1.0"
+version = "0.4.0"
 description.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -41,7 +41,6 @@ x11 = [
   "x11rb",
   "xkbcommon/x11",
   "xim",
-  "x11-clipboard",
   "filedescriptor",
   "open",
   "gpui/x11",
@@ -58,6 +57,7 @@ image.workspace = true
 futures.workspace = true
 gpui = { workspace = true, default-features = false }
 gpui_util.workspace = true
+gpui_render = { workspace = true, features = ["swash"] }
 gpui_parley = { workspace = true, features = ["system-fonts"] }
 gpui_wgpu = { workspace = true, optional = true }
 itertools.workspace = true
@@ -124,11 +124,10 @@ xim = { workspace = true, features = [
     "x11rb-xcb",
     "x11rb-client",
 ], optional = true }
-x11-clipboard = { workspace = true, optional = true }
 
 [dev-dependencies]
 # XTest drives the pointer in the X11 drag tests.
 x11rb = { workspace = true, features = ["xtest"] }
 
 [package.metadata.cargo-shear]
-ignored = ["bitflags", "x11-clipboard"]
+ignored = ["bitflags"]

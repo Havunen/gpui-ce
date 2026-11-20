@@ -1968,7 +1968,7 @@ mod path_target_tests {
                         assert_eq!(image.get_pixel(150, 85)[3], 255, "opaque interior: {label}");
                     }
                     if index == 0 {
-                        resting_pixels = Some(image.clone());
+                        resting_pixels = Some(image);
                     } else if row.is_none() {
                         assert_eq!(
                             Some(&image),

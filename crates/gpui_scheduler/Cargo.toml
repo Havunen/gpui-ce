@@ -1,6 +1,6 @@
 [package]
 name = "gpui_ce_scheduler"
-version = "0.2.2"
+version = "0.4.0"
 edition = "2024"
 license = "Apache-2.0"
 publish = true
@@ -40,3 +40,6 @@ web-time.workspace = true
 wasm_thread = { workspace = true, features = [
   "es_modules",
 ], optional = true }
+
+[lints]
+workspace = true

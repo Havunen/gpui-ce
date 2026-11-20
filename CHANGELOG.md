@@ -14,16 +14,34 @@ Items are sorted by issue or pull request number.
 
 ### Breaking Changes
 
+- `ParleyTextSystem::new` replaces `new_with_rasterizer`. It takes only a glyph rasterizer, and starts with an empty font catalog. Use `.with_system_fonts()` or `.add_fonts(...)` to load fonts, `.with_system_fallback_family(...)` to set the `.SystemUIFont` fallback, and `.with_fallback_families(...)` to configure general fallbacks. [#399](https://github.com/gpui-ce/gpui-ce/pull/399), [#400](https://github.com/gpui-ce/gpui-ce/pull/400)
+
 ### Additions
 
 - `gpui/wayland` and `gpui/x11` now toggle the corresponding `gpui_platform` flags, so Linux builds can target either backend or both. [#373](https://github.com/gpui-ce/gpui-ce/issues/373), [#379](https://github.com/gpui-ce/gpui-ce/pull/379)
   - `gpui_platform` enables `wayland` and `x11` by default. For one backend, depend on `gpui_platform` with `default-features = false` and pick `wayland` or `x11`.
+- Updated Parley from `0.11` to `0.12.0` and Fontique from `0.11.1` to `0.12.0`. [#389](https://github.com/gpui-ce/gpui-ce/pull/389)
+- Moved `GlyphRasterizer`, `RasterFace`, `FontDataBlob`, `FontVariation`, `FontSynthesis`, and `ColorGlyphKind` from `gpui_parley` to `gpui`. [#399](https://github.com/gpui-ce/gpui-ce/pull/399)
+- Moved `SwashGlyphRasterizer` and `BitmapFallbackGlyphRasterizer` from `gpui_parley` to `gpui_render`, behind a new `swash` feature. [#399](https://github.com/gpui-ce/gpui-ce/pull/399)
 
 ### Removals
+
+- Removed `ParleyTextSystem::new_with_system_font` and `ParleyTextSystem::without_system_fonts`. [#399](https://github.com/gpui-ce/gpui-ce/pull/399)
+- Removed `SystemFonts` enum. Use `.with_system_fonts()` to load operating-system fonts after construction. [#400](https://github.com/gpui-ce/gpui-ce/pull/400)
 
 ### Fixes
 
 - `ColorExt::blend` diverged from upstream/original behavior [#327](https://github.com/gpui-ce/gpui-ce/issues/327), [#357](https://github.com/gpui-ce/gpui-ce/pull/357)
+- Fixed color bitmap glyph opacity and style handling. [#401](https://github.com/gpui-ce/gpui-ce/pull/401)
+  - Glyphs now respect text opacity.
+  - Cleared color channels for fully transparent bitmap glyph pixels.
+  - Rejected unsupported dilation styles for color bitmap glyphs.
+- Swash glyph rasterization now rejects invalid glyph font sizes and scale factors, including overflow or underflow when multiplied. [#404](https://github.com/gpui-ce/gpui-ce/pull/404)
+- Fixed glyph rendering at font size zero to return an empty glyph. [#404](https://github.com/gpui-ce/gpui-ce/pull/404)
+- Added validation of rendered glyph dimensions and pixel-buffer lengths before returning the glyph. [#404](https://github.com/gpui-ce/gpui-ce/pull/404)
+- Enabled fallback to a monochrome outline in the same font when CBDT bitmap decoding fails. Rasterization returns an error if neither source can be rendered. [#404](https://github.com/gpui-ce/gpui-ce/pull/404)
+- macOS now only uses Swash for CBDT color artwork. Other glyph rendering requests use the native renderer. [#405](https://github.com/gpui-ce/gpui-ce/pull/405)
+- Keyed Swash's font cache by source and collection face to prevent stale cache reuse when a `FontId` is reused for different font data or a different collection face. [#406](https://github.com/gpui-ce/gpui-ce/pull/406)
 
 ### Security Changes
 

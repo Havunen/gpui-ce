@@ -1,6 +1,6 @@
 [package]
 name = "gpui_ce_derive_refineable"
-version = "0.2.2"
+version = "0.4.0"
 edition = "2024"
 license = "Apache-2.0"
 publish = true
@@ -16,3 +16,6 @@ doctest = false
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "3", features = ["full", "extra-traits", "visit-mut"] }
+
+[lints]
+workspace = true

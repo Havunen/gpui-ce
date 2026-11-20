@@ -1,0 +1,30 @@
+name: Prepare release PR
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, stable MAJOR.MINOR.PATCH (e.g. 0.4.0)'
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.version }}
+      # Pull requests opened with the default GITHUB_TOKEN do not trigger CI.
+      # Provide a PAT or GitHub App token as RELEASE_PR_TOKEN so the required
+      # checks run on the release PR (see MAINTENANCE.md).
+      GH_TOKEN: ${{ secrets.RELEASE_PR_TOKEN || secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ secrets.RELEASE_PR_TOKEN || secrets.GITHUB_TOKEN }}
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+      - uses: hustcer/setup-nu@1b8faed9a8ff673c8ce0beae243e0b72d0787241 # v3.30
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+      - run: just release-pr-open "$VERSION"
