@@ -241,8 +241,8 @@ jobs:
           PKG_CONFIG_ALLOW_CROSS: "1"
         run: cargo check --workspace ${{ matrix.check_targets }} --target ${{ matrix.target }} ${{ matrix.cargo_args }}
 
-  # Disabled: nothing depends on the web backend, and floating nightly breaks
-  # it (rust-lang/rust#165263). Remove `if: false` to re-enable.
+  # Disabled: nothing depends on the web backend. Remove `if: false` to
+  # re-enable.
   web:
     name: WebGPU and WebGL2 compilation
     if: false
@@ -250,12 +250,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # Pinned: nightly-2026-11-01 rejects gpui_scheduler's recursive
-      # `TaskState` with E0391 "needs async drop" (rust-lang/rust#165263).
-      # Return to floating nightly once a fixed nightly ships.
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
-          toolchain: nightly-2026-10-31
+          toolchain: nightly
           targets: wasm32-unknown-unknown
           components: rust-src
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
