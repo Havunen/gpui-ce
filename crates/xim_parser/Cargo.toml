@@ -20,3 +20,6 @@ bitflags = { workspace = true, default-features = false }
 [dev-dependencies]
 xim-ctext = { path = "../xim_ctext", version = "0.3.0" }
 pretty_assertions = "1"
+
+[lints]
+workspace = true

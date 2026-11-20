@@ -13,3 +13,6 @@ doctest = false
 
 [dependencies]
 derive_refineable = { package = "gpui_ce_derive_refineable", version = "0.4.0", path = "../gpui_derive_refineable" }
+
+[lints]
+workspace = true

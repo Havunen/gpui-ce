@@ -40,3 +40,6 @@ web-time.workspace = true
 wasm_thread = { workspace = true, features = [
   "es_modules",
 ], optional = true }
+
+[lints]
+workspace = true

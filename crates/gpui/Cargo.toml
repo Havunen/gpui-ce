@@ -28,6 +28,8 @@ test-support = [
   "wayland",
   "x11",
   "proptest",
+  "dep:futures-concurrency",
+  "dep:postage",
 ]
 bench-support = ["profiler", "dep:criterion"]
 # Preserve the published feature name while consumers migrate to `bench-support`.
@@ -63,7 +65,7 @@ derive_more.workspace = true
 derive_setters.workspace = true
 etagere.workspace = true
 futures.workspace = true
-futures-concurrency.workspace = true
+futures-concurrency = { workspace = true, optional = true }
 gpui_macros.workspace = true
 gpui_shared_string.workspace = true
 http.workspace = true
@@ -76,7 +78,7 @@ parking.workspace = true
 parking_lot.workspace = true
 palette.workspace = true
 phf.workspace = true
-postage.workspace = true
+postage = { workspace = true, optional = true }
 proptest = { workspace = true, optional = true }
 chrono.workspace = true
 profiling.workspace = true
@@ -92,7 +94,7 @@ resvg = { workspace = true, default-features = false, features = [
     "raster-images"
 ] }
 roxmltree.workspace = true
-rust-embed = { version = "8.13", optional = true }
+rust-embed = { version = "8.14", optional = true }
 usvg = { workspace = true, default-features = false }
 simplecss.workspace = true
 skrifa.workspace = true
@@ -148,6 +150,8 @@ windows-capture = { workspace = true, optional = true }
 windows-core.workspace = true
 
 [dev-dependencies]
+futures-concurrency.workspace = true
+postage.workspace = true
 accesskit_consumer.workspace = true
 backtrace.workspace = true
 smol.workspace = true

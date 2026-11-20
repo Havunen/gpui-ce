@@ -320,10 +320,17 @@ impl PlatformTextLayout for SourceMappedLayout {
         pixel_point: Point<Pixels>,
         line_height: Pixels,
     ) -> Result<usize, usize> {
-        self.inner
+        let hit = self
+            .inner
             .byte_index_from_pixel_point(pixel_point, line_height)
             .map(|idx| self.map.source_index(idx))
-            .map_err(|idx| self.map.source_index(idx))
+            .map_err(|idx| self.map.source_index(idx));
+
+        // An inline box after the last character is no character of the source.
+        match hit {
+            Ok(idx) if idx >= self.source_len => Err(idx),
+            hit => hit,
+        }
     }
 
     fn caret_from_pixel_point(
@@ -496,6 +503,8 @@ struct PreparedBidiText {
     map: SourceMap,
 }
 
+const OBJECT_REPLACEMENT: char = '\u{fffc}';
+
 #[derive(Clone)]
 struct BidiControls {
     start: usize,
@@ -563,6 +572,11 @@ fn prepare_bidi_text(
 
     controls.sort_by_key(|scope| (scope.start, std::cmp::Reverse(scope.end)));
 
+    let mut backend_boxes = inline_boxes.to_vec();
+    let mut box_order = (0..inline_boxes.len()).collect::<Vec<_>>();
+    box_order.sort_by_key(|box_idx| inline_boxes[*box_idx].index);
+    let mut pending_boxes = box_order.as_slice();
+
     let mut prepared = String::new();
     let mut backend_to_source = vec![0];
     let mut source_to_backend = vec![0; text.len() + 1];
@@ -602,6 +616,21 @@ fn prepare_bidi_text(
         }
 
         source_to_backend[source_idx] = prepared.len();
+
+        // Parley lays an in-flow box out in place of an object replacement
+        // character, which the source text does not contain.
+        while let Some((&box_idx, rest)) = pending_boxes.split_first()
+            && inline_boxes[box_idx].index == source_idx
+        {
+            pending_boxes = rest;
+            backend_boxes[box_idx].index = prepared.len();
+            append_synthetic(
+                OBJECT_REPLACEMENT,
+                source_idx,
+                &mut prepared,
+                &mut backend_to_source,
+            );
+        }
 
         if source_idx == text.len() {
             break;
@@ -646,20 +675,12 @@ fn prepare_bidi_text(
             ..style.clone()
         })
         .collect();
-    let inline_boxes = inline_boxes
-        .iter()
-        .map(|inline_box| InlineBoxRequest {
-            index: map.backend_index(inline_box.index),
-            ..*inline_box
-        })
-        .collect();
-
     PreparedBidiText {
         text: prepared,
         runs,
         run_sources,
         text_styles,
-        inline_boxes,
+        inline_boxes: backend_boxes,
         map,
     }
 }
@@ -994,39 +1015,40 @@ impl ParleyLayout {
         (left - right).abs() <= f64::from(f32::EPSILON) * scale * 4.0
     }
 
-    fn caret_stop_index(&self, caret: CaretPosition) -> Option<usize> {
+    /// The stop the caret is on, or else the stop that follows it in visual
+    /// order. An inline box that starts a line has a caret before it, but no
+    /// stop.
+    fn caret_stop_index(&self, caret: CaretPosition) -> std::result::Result<usize, usize> {
         let stops = self.caret_stops.get_or_init(|| {
             Self::collect_caret_stops(&self.layout, self.text.len(), self.graphemes())
         });
         if let Some(idx) = stops.indices.get(&caret).copied() {
-            return Some(idx);
+            return Ok(idx);
         }
 
         let cursor = self.cursor(caret);
         if let Some(idx) = stops.indices.get(&Self::caret_position(cursor)).copied() {
-            return Some(idx);
+            return Ok(idx);
         }
 
         let (block, inline) = Self::cursor_position(&self.layout, cursor);
 
-        let search = stops.stops.binary_search_by(|stop| {
+        let insertion_idx = stops.stops.binary_search_by(|stop| {
             stop.block
                 .total_cmp(&block)
                 .then_with(|| stop.inline.total_cmp(&inline))
-        });
+        })?;
 
-        search.ok().or_else(|| {
-            let insertion_idx = search.unwrap_err();
-            [insertion_idx.checked_sub(1), Some(insertion_idx)]
-                .into_iter()
-                .flatten()
-                .find(|idx| {
-                    stops.stops.get(*idx).is_some_and(|stop| {
-                        Self::same_coordinate(stop.block, block)
-                            && Self::same_coordinate(stop.inline, inline)
-                    })
+        [insertion_idx.checked_sub(1), Some(insertion_idx)]
+            .into_iter()
+            .flatten()
+            .find(|idx| {
+                stops.stops.get(*idx).is_some_and(|stop| {
+                    Self::same_coordinate(stop.block, block)
+                        && Self::same_coordinate(stop.inline, inline)
                 })
-        })
+            })
+            .ok_or(insertion_idx)
     }
 
     fn adjacent_caret_stop(
@@ -1034,16 +1056,13 @@ impl ParleyLayout {
         caret: CaretPosition,
         direction: VisualDirection,
     ) -> Option<ParleyCaretStop> {
-        let index = self.caret_stop_index(caret)?;
-        let caret_stops = self.caret_stops.get()?;
+        let index = match (direction, self.caret_stop_index(caret)) {
+            (VisualDirection::Left, Ok(index) | Err(index)) => index.checked_sub(1)?,
+            (VisualDirection::Right, Ok(index)) => index + 1,
+            (VisualDirection::Right, Err(index)) => index,
+        };
 
-        match direction {
-            VisualDirection::Left => index
-                .checked_sub(1)
-                .and_then(|index| caret_stops.stops.get(index)),
-            VisualDirection::Right => caret_stops.stops.get(index + 1),
-        }
-        .copied()
+        self.caret_stops.get()?.stops.get(index).copied()
     }
 
     fn native_y_for_line(&self, line_index: usize) -> f32 {
@@ -1140,7 +1159,7 @@ impl PlatformTextLayout for ParleyLayout {
     }
 
     fn size(&self) -> Size<Pixels> {
-        let width = if self.text.is_empty() && self.layout.inline_boxes().len() == 0 {
+        let width = if self.text.is_empty() {
             Pixels::ZERO
         } else {
             px(self.layout.width())
@@ -1209,7 +1228,7 @@ impl PlatformTextLayout for ParleyLayout {
             return None;
         }
 
-        if self.text.is_empty() && self.layout.inline_boxes().len() == 0 {
+        if self.text.is_empty() {
             return Some(Bounds::new(
                 point(self.inline_lines[0].origin.x, Pixels::ZERO),
                 size(Pixels::ZERO, line_height),
@@ -1235,7 +1254,7 @@ impl PlatformTextLayout for ParleyLayout {
         caret: CaretPosition,
         direction: VisualDirection,
     ) -> Option<CaretPosition> {
-        if self.text.is_empty() && self.layout.inline_boxes().len() == 0 {
+        if self.text.is_empty() {
             return None;
         }
 
@@ -1850,6 +1869,14 @@ impl ParleyTextSystem {
             .then_some((wrap_width.unwrap_or(Pixels::MAX), line_clamp));
         let source_text_len = text.len();
         let source_runs = runs;
+
+        if inline_boxes
+            .iter()
+            .any(|inline_box| !text.is_char_boundary(inline_box.index))
+        {
+            anyhow::bail!("inline box index does not align with the input text");
+        }
+
         let prepared = prepare_bidi_text(
             text,
             runs,
@@ -1864,7 +1891,10 @@ impl ParleyTextSystem {
         let text_styles = prepared.text_styles.as_slice();
         let inline_boxes = prepared.inline_boxes.as_slice();
         let run_ranges = run_ranges(runs);
-        let line_height = if text.is_empty() {
+        // Placeholders and bidi controls are not content: a paragraph without
+        // source text takes its styles as defaults.
+        let source_is_empty = source_text_len == 0;
+        let line_height = if source_is_empty {
             text_styles
                 .last()
                 .map(|style| style.line_height)
@@ -1902,16 +1932,19 @@ impl ParleyTextSystem {
         let mut layout = if let Some(layout) = self.paragraph_cache.lock().get(&cache_key) {
             layout
         } else {
-            let family_lists =
-                runs.iter()
-                    .map(|run| {
-                        self.font_families(&run.font)
-                            .chain(self.fallback_families.iter().map(|family| {
-                                FontFamilyName::Named(Cow::Borrowed(family.as_str()))
-                            }))
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>();
+            let fallback_families = self
+                .fallback_families
+                .iter()
+                .map(|family| FontFamilyName::Named(Cow::Borrowed(family.as_str())))
+                .collect::<Vec<_>>();
+            let family_lists = runs
+                .iter()
+                .map(|run| {
+                    self.font_families(&run.font)
+                        .chain(fallback_families.iter().cloned())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
             let feature_lists = runs
                 .iter()
                 .map(|run| {
@@ -1973,8 +2006,18 @@ impl ParleyTextSystem {
                 ))));
             }
 
+            // Parley measures every line against the root style's font, and drops
+            // in-flow boxes whose placeholder has no font. The root would otherwise
+            // resolve to whichever generic family the system provides.
+            let root_families = family_lists.first().unwrap_or(&fallback_families);
+            if !root_families.is_empty() {
+                builder.push_default(StyleProperty::FontFamily(FontFamily::from(
+                    root_families.as_slice(),
+                )));
+            }
+
             let mut push_style = |property, range| {
-                if text.is_empty() {
+                if source_is_empty {
                     builder.push_default(property);
                 } else {
                     builder.push(property, range);
@@ -1984,7 +2027,7 @@ impl ParleyTextSystem {
             for (run_index, run) in runs.iter().enumerate() {
                 let descriptor = &run.font;
                 let range = run_ranges[run_index].clone();
-                if range.is_empty() && !text.is_empty() {
+                if range.is_empty() && !source_is_empty {
                     continue;
                 }
 
@@ -2043,10 +2086,6 @@ impl ParleyTextSystem {
             }
 
             for inline_box in inline_boxes {
-                if inline_box.index > text.len() || !text.is_char_boundary(inline_box.index) {
-                    anyhow::bail!("inline box index does not align with the input text");
-                }
-
                 builder.push_inline_box(InlineBox {
                     id: inline_box.id,
                     kind: InlineBoxKind::InFlow,
@@ -2065,6 +2104,26 @@ impl ParleyTextSystem {
 
             layout
         };
+
+        // Parley applies the alignment during line breaking, so it has to be set
+        // first. Empty layouts are aligned by `empty_alignment` below instead.
+        if !text.is_empty() {
+            let alignment = match text_align {
+                TextAlign::Start => Alignment::Start,
+                TextAlign::End => Alignment::End,
+                TextAlign::Left => Alignment::Left,
+                TextAlign::Center => Alignment::Center,
+                TextAlign::Right => Alignment::Right,
+            };
+
+            layout.set_alignment(
+                alignment,
+                AlignmentOptions {
+                    align_when_overflowing: true,
+                    last_line_alignment: None,
+                },
+            );
+        }
 
         if let Some((wrap_width, max_lines)) = wrap {
             if let Some(max_lines) = max_lines {
@@ -2100,7 +2159,7 @@ impl ParleyTextSystem {
 
         // Parley uses an unbounded line width for empty layouts. Align their empty
         // row here so centered and right-aligned carets stay inside the container.
-        let empty_alignment = (text.is_empty() && inline_boxes.is_empty()).then(|| {
+        let empty_alignment = text.is_empty().then(|| {
             let width = alignment_width
                 .or_else(|| wrap.map(|(width, _max_lines)| width))
                 .filter(|width| *width < Pixels::MAX)
@@ -2114,24 +2173,6 @@ impl ParleyTextSystem {
                 _ => Pixels::ZERO,
             }
         });
-
-        if empty_alignment.is_none() {
-            let alignment = match text_align {
-                TextAlign::Start => Alignment::Start,
-                TextAlign::End => Alignment::End,
-                TextAlign::Left => Alignment::Left,
-                TextAlign::Center => Alignment::Center,
-                TextAlign::Right => Alignment::Right,
-            };
-
-            layout.align(
-                alignment,
-                AlignmentOptions {
-                    align_when_overflowing: true,
-                    last_line_alignment: None,
-                },
-            );
-        }
 
         let paragraph_direction = if layout.is_rtl() {
             ResolvedDirection::RightToLeft
@@ -3832,6 +3873,126 @@ mod tests {
         assert_eq!(layout.size.width, px(30.0));
         assert!(layout.size.height >= px(48.0));
         assert_inline_geometry_is_contained(&layout, layout.size.width);
+    }
+
+    fn inline_box_request<'a>(
+        text: &'a str,
+        runs: &'a [TextRun],
+        boxes: &'a [InlineBoxRequest],
+    ) -> InlineLayoutRequest<'a> {
+        InlineLayoutRequest {
+            text_styles: &[],
+            text,
+            runs,
+            boxes,
+            font_size: px(18.0),
+            line_height: px(24.0),
+            text_metrics: InlineTextMetrics {
+                ascent: px(14.0),
+                descent: px(4.0),
+                x_height: px(8.0),
+            },
+            options: TextLayoutOptions {
+                text_align: TextAlign::Left,
+                ..Default::default()
+            },
+            bidi_scopes: &[],
+        }
+    }
+
+    fn inline_box_at(index: usize) -> [InlineBoxRequest; 1] {
+        [InlineBoxRequest {
+            id: 1,
+            index,
+            size: size(px(30.0), px(12.0)),
+            vertical_align: VerticalAlign::Baseline,
+        }]
+    }
+
+    fn layout_with_inline_box(system: &ParleyTextSystem, text: &str, index: usize) -> InlineLayout {
+        let runs = [text_run(text, IBM_PLEX.family)];
+
+        system.layout_inline(inline_box_request(text, &runs, &inline_box_at(index)))
+    }
+
+    #[test]
+    fn characters_after_an_inline_box_keep_their_source_byte_indices() {
+        let system = test_system();
+        let text = "abcd";
+        let layout = layout_with_inline_box(&system, text, 2);
+        let after_box = layout.boxes[0].bounds.right() + px(1.0);
+
+        assert_eq!(layout.layout.visual_lines[0].text_range, 0..text.len());
+        assert_eq!(
+            layout
+                .layout
+                .platform_layout
+                .byte_index_from_pixel_point(point(after_box, px(5.0)), px(24.0)),
+            Ok(2)
+        );
+    }
+
+    #[test]
+    fn caret_moves_right_from_an_inline_box_that_starts_the_text() {
+        let system = test_system();
+        let layout = layout_with_inline_box(&system, "abcd", 0);
+
+        assert_eq!(
+            layout
+                .layout
+                .platform_layout
+                .adjacent_visual_caret(
+                    CaretPosition::attached_to_next_cluster(0),
+                    VisualDirection::Right,
+                )
+                .map(|caret| caret.index),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn point_over_an_inline_box_after_the_last_character_hits_no_character() {
+        let system = test_system();
+        let text = "abcd";
+        let layout = layout_with_inline_box(&system, text, text.len());
+        let over_box = layout.boxes[0].bounds.center().x;
+
+        assert_eq!(
+            layout
+                .layout
+                .platform_layout
+                .byte_index_from_pixel_point(point(over_box, px(5.0)), px(24.0)),
+            Err(text.len())
+        );
+    }
+
+    #[test]
+    fn inline_box_inside_a_character_or_past_the_text_is_rejected() {
+        let system = test_system();
+        let text = "a\u{e9}";
+        let runs = [text_run(text, IBM_PLEX.family)];
+
+        for index in [2, text.len() + 1] {
+            let boxes = inline_box_at(index);
+            let request = inline_box_request(text, &runs, &boxes);
+            let result = system.parley_layout(ParleyLayoutParams {
+                text: TextLayoutRequest {
+                    text: request.text,
+                    font_size: request.font_size,
+                    runs: request.runs,
+                    options: request.options,
+                },
+                inline: Some(ParleyInlineLayoutParams {
+                    boxes: request.boxes,
+                    text_styles: request.text_styles,
+                    line_height: request.line_height,
+                    text_metrics: request.text_metrics,
+                    bidi_scopes: request.bidi_scopes,
+                }),
+            });
+
+            assert!(result.is_err(), "box index {index} in {text:?}");
+        }
     }
 
     fn paragraph_samples() -> [String; 4] {

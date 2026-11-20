@@ -41,7 +41,6 @@ x11 = [
   "x11rb",
   "xkbcommon/x11",
   "xim",
-  "x11-clipboard",
   "filedescriptor",
   "open",
   "gpui/x11",
@@ -125,11 +124,10 @@ xim = { workspace = true, features = [
     "x11rb-xcb",
     "x11rb-client",
 ], optional = true }
-x11-clipboard = { workspace = true, optional = true }
 
 [dev-dependencies]
 # XTest drives the pointer in the X11 drag tests.
 x11rb = { workspace = true, features = ["xtest"] }
 
 [package.metadata.cargo-shear]
-ignored = ["bitflags", "x11-clipboard"]
+ignored = ["bitflags"]

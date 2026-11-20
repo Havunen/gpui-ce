@@ -35,13 +35,9 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
-authors = ["Nathan Sobo <nathan@zed.dev>"]
 description = "A community fork of Zed's GPU-accelerated UI framework"
 publish = true
 license = "Apache-2.0"
-homepage = "https://gpui-ce.github.io/"
-readme = "README.md"
-rust-version = "1.99"
 
 [workspace.dependencies]
 accesskit = { version = "0.25", features = ["enumn"] }
@@ -70,8 +66,8 @@ derive_more = { version = "2.1", features = [
   "not",
 ] }
 dunce = "1.0"
-fontique = { version = "0.12.0", default-features = false }
-parley = { version = "0.12", default-features = false, features = ["std"] }
+fontique = { version = "0.13.0", default-features = false }
+parley = { version = "0.13", default-features = false, features = ["std"] }
 futures = "0.3"
 futures-concurrency = "7.7"
 flume = "0.12"
@@ -262,7 +258,7 @@ parking = "2"
 pathfinder_geometry = "0.5"
 pin-project = "1"
 raw-window-handle = "0.6"
-resvg = { version = "0.49", default-features = false }
+resvg = { version = "0.50", default-features = false }
 # usvg's own parsers, for the root CSS background it drops.
 roxmltree = "0.21"
 seahash = "4"
@@ -272,8 +268,8 @@ spin = "0.12"
 svgtypes = "0.16"
 swash = "0.2"
 taffy = { version = "=0.15.1", default-features = false, features = ["std", "taffy_tree", "flexbox", "grid", "block_layout", "calc", "content_size", "detailed_layout_info"] }
-skrifa = "0.49"
-usvg = { version = "0.49", default-features = false }
+skrifa = "0.50"
+usvg = { version = "0.50", default-features = false }
 waker-fn = "1.2"
 wasm-bindgen-futures = "0.4"
 wasm_thread = "0.3.3"
@@ -287,8 +283,6 @@ web-sys = "0.3"
 windows-numerics = "0.100"
 windows-registry = "0.100"
 windows-version = "0.100"
-x11 = "2.21"
-x11-clipboard = "0.9"
 x11-dl = "2.21"
 x11rb = "0.14"
 xkbcommon = { version = "0.9", default-features = false }
@@ -300,14 +294,12 @@ gpui_linux = { path = "./crates/gpui_linux/", version = "0.4.0", package = "gpui
 gpui_macos = { path = "./crates/gpui_macos/", version = "0.4.0", package = "gpui_ce_macos" }
 gpui_apple = { path = "./crates/gpui_apple/", version = "0.4.0", package = "gpui_ce_apple" }
 gpui_windows = { path = "./crates/gpui_windows/", version = "0.4.0", package = "gpui_ce_windows" }
-gpui_web = { path = "./crates/gpui_web/", version = "0.4.0", package = "gpui_ce_web" }
 gpui_parley = { path = "./crates/gpui_ce_parley/", version = "0.4.0", package = "gpui_ce_parley", default-features = false }
 
 gpui_wgpu = { path = "./crates/gpui_wgpu/", version = "0.4.0", package = "gpui_ce_wgpu" }
 
 gpui_macros = { path = "./crates/gpui_macros/", version = "0.4.0", package = "gpui_ce_macros" }
 gpui_shared_string = { path = "./crates/gpui_shared_string/", version = "0.4.0", package = "gpui_ce_shared_string" }
-gpui_tokio = { path = "./crates/gpui_tokio/", version = "0.4.0", package = "gpui_ce_tokio" }
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "allow" }

@@ -16,3 +16,6 @@ doctest = false
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "3", features = ["full", "extra-traits", "visit-mut"] }
+
+[lints]
+workspace = true

@@ -31,3 +31,6 @@ ahash = { workspace = true, default-features = false, features = ["compile-time-
 x11rb = { version = "0.14", optional = true }
 x11-dl = { workspace = true, optional = true }
 hashbrown = { workspace = true, default-features = false }
+
+[lints]
+workspace = true

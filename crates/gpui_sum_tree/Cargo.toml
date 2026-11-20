@@ -27,3 +27,6 @@ test-support = ["proptest"]
 
 [package.metadata.cargo-shear]
 ignored = ["tracing"]
+
+[lints]
+workspace = true

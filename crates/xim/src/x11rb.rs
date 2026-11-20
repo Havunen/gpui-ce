@@ -705,7 +705,7 @@ fn send_req_impl<C: HasConnection, E: From<ConnectionError> + From<ReplyError>>(
 
     if buf.len() < transport_max {
         if buf.len() > 20 {
-            todo!("multi-CM");
+            unimplemented!("multi-CM");
         }
         buf.resize(20, 0);
         let buf: [u8; 20] = buf.as_slice().try_into().unwrap();

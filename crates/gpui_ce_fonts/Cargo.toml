@@ -11,3 +11,6 @@ repository = "https://github.com/gpui-ce/gpui-ce"
 name = "fonts"
 path = "src/lib.rs"
 doctest = false
+
+[lints]
+workspace = true
