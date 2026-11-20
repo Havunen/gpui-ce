@@ -2792,7 +2792,7 @@ dependencies = [
  "gpui-ce-fonts",
  "gpui_ce_parley",
  "naga 24.0.0",
- "naga 30.0.1",
+ "naga 30.0.2",
  "skrifa 0.50.0",
  "smallvec",
  "swash",
@@ -2903,7 +2903,7 @@ dependencies = [
  "js-sys",
  "log",
  "metal",
- "naga 30.0.1",
+ "naga 30.0.2",
  "objc2 0.6.5",
  "objc2-metal 0.3.2",
  "parking_lot 0.13.0",
@@ -4040,9 +4040,9 @@ dependencies = [
 
 [[package]]
 name = "naga"
-version = "30.0.1"
+version = "30.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a616d2fb8c89516ac2723a581f69d6c18576046bed761bd6b305e5618e6ae130"
+checksum = "fd0dd362bf26c0ffdd143df6da66a25d287e196eff482f117771010b207ad163"
 dependencies = [
  "arrayvec",
  "bit-set 0.10.0",
@@ -7208,9 +7208,9 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 
 [[package]]
 name = "wgpu"
-version = "30.0.1"
+version = "30.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "527ccdf43dd5b2e8676eed9984ce00e2bbb0a1b85b70c1969dcb6cd2eb55ab9e"
+checksum = "146fc3d654250e6207921a66c87534c621bc886c70df83dcf466c1d66813810e"
 dependencies = [
  "arrayvec",
  "bitflags",
@@ -7221,7 +7221,7 @@ dependencies = [
  "hashbrown 0.17.1",
  "js-sys",
  "log",
- "naga 30.0.1",
+ "naga 30.0.2",
  "parking_lot 0.12.5",
  "portable-atomic",
  "profiling",
@@ -7252,7 +7252,7 @@ dependencies = [
  "hashbrown 0.17.1",
  "indexmap",
  "log",
- "naga 30.0.1",
+ "naga 30.0.2",
  "naga-types",
  "once_cell",
  "parking_lot 0.12.5",
@@ -7331,7 +7331,7 @@ dependencies = [
  "libc",
  "libloading",
  "log",
- "naga 30.0.1",
+ "naga 30.0.2",
  "naga-types",
  "ndk-sys",
  "objc2 0.6.5",
@@ -7369,7 +7369,7 @@ version = "30.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "44a62ead68aad7cd40ac9e2cd2b8ec64f32dfbad2765f429b9fb74b8b735869f"
 dependencies = [
- "naga 30.0.1",
+ "naga 30.0.2",
  "wgpu-types",
 ]
 
@@ -7392,11 +7392,11 @@ dependencies = [
 [[package]]
 name = "wgsl-rs"
 version = "0.1.0-beta.6"
-source = "git+https://github.com/schell/wgsl-rs?rev=41bb92d2c76ea08091da11a6b3b6d539c19e7828#41bb92d2c76ea08091da11a6b3b6d539c19e7828"
+source = "git+https://github.com/schell/wgsl-rs?rev=cb6148566c6733ee69d7c530713596189e73c065#cb6148566c6733ee69d7c530713596189e73c065"
 dependencies = [
  "glam",
  "half",
- "naga 30.0.1",
+ "naga 30.0.2",
  "paste",
  "snafu",
  "wgsl-rs-ir",
@@ -7406,12 +7406,12 @@ dependencies = [
 [[package]]
 name = "wgsl-rs-ir"
 version = "0.1.0-beta.6"
-source = "git+https://github.com/schell/wgsl-rs?rev=41bb92d2c76ea08091da11a6b3b6d539c19e7828#41bb92d2c76ea08091da11a6b3b6d539c19e7828"
+source = "git+https://github.com/schell/wgsl-rs?rev=cb6148566c6733ee69d7c530713596189e73c065#cb6148566c6733ee69d7c530713596189e73c065"
 
 [[package]]
 name = "wgsl-rs-macros"
 version = "0.1.0-beta.6"
-source = "git+https://github.com/schell/wgsl-rs?rev=41bb92d2c76ea08091da11a6b3b6d539c19e7828#41bb92d2c76ea08091da11a6b3b6d539c19e7828"
+source = "git+https://github.com/schell/wgsl-rs?rev=cb6148566c6733ee69d7c530713596189e73c065#cb6148566c6733ee69d7c530713596189e73c065"
 dependencies = [
  "itertools 0.14.0",
  "proc-macro2",

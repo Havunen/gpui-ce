@@ -160,8 +160,8 @@ ashpd = { version = "0.14", default-features = false, features = [
 ] }
 libc = "0.2"
 smol = "2"
-wgpu = "=30.0.1"
-wgsl-rs = { git = "https://github.com/schell/wgsl-rs", rev = "41bb92d2c76ea08091da11a6b3b6d539c19e7828", default-features = false, features = [
+wgpu = "=30.0.2"
+wgsl-rs = { git = "https://github.com/schell/wgsl-rs", rev = "cb6148566c6733ee69d7c530713596189e73c065", default-features = false, features = [
   "validation",
   "fast-compile",
 ] }

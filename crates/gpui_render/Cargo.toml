@@ -30,7 +30,7 @@ windows-core.workspace = true
 windows-link.workspace = true
 
 [build-dependencies]
-naga = { version = "=30.0.1", features = [
+naga = { version = "=30.0.2", features = [
   "glsl-out",
   "hlsl-out",
   "msl-out",
@@ -50,7 +50,7 @@ unicode-segmentation.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 gpui_parley = { workspace = true, features = ["test-support"] }
 gpui_fonts = { path = "../gpui_ce_fonts", version = "0.4.0", package = "gpui-ce-fonts" }
-naga = { version = "=30.0.1", features = ["wgsl-in", "spv-in"] }
+naga = { version = "=30.0.2", features = ["wgsl-in", "spv-in"] }
 
 [[bench]]
 name = "glyph_rasterization"
