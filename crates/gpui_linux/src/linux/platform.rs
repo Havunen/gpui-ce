@@ -1,3 +1,19 @@
+use crate::linux::{LinuxDispatcher, PriorityQueueCalloopReceiver};
+use anyhow::{Context as _, anyhow};
+use calloop::{LoopSignal, channel::Sender};
+use futures::channel::oneshot;
+use gpui::{
+    Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DisplayId,
+    ForegroundExecutor, Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions, Platform,
+    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
+    PlatformWindow, Result, RunnableVariant, SharedString, Task, ThermalState, WindowAppearance,
+    WindowButtonLayout, WindowParams,
+};
+#[cfg(any(feature = "wayland", feature = "x11"))]
+use gpui::{Pixels, Point, px};
+use gpui_parley::ParleyTextSystem;
+use gpui_render::SwashGlyphRasterizer;
+use gpui_util::{ResultExt as _, new_std_command};
 use std::{
     env,
     path::{Path, PathBuf},
@@ -11,25 +27,8 @@ use std::{io::Read as _, os::fd::AsRawFd};
 
 #[cfg(any(feature = "wayland", feature = "x11"))]
 use anyhow::ensure;
-use anyhow::{Context as _, anyhow};
-use calloop::{LoopSignal, channel::Sender};
-use futures::channel::oneshot;
-use gpui_util::{ResultExt as _, new_std_command};
 #[cfg(any(feature = "wayland", feature = "x11"))]
 use xkbcommon::xkb::{self, Keycode, Keysym, State};
-
-use crate::linux::{LinuxDispatcher, PriorityQueueCalloopReceiver};
-use gpui::{
-    Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, DisplayId,
-    ForegroundExecutor, Keymap, Menu, MenuItem, OwnedMenu, PathPromptOptions, Platform,
-    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PlatformWindow, Result, RunnableVariant, SharedString, Task, ThermalState, WindowAppearance,
-    WindowButtonLayout, WindowParams,
-};
-#[cfg(any(feature = "wayland", feature = "x11"))]
-use gpui::{Pixels, Point, px};
-use gpui_parley::ParleyTextSystem;
-use gpui_render::SwashGlyphRasterizer;
 
 #[cfg(any(feature = "wayland", feature = "x11"))]
 pub(crate) const SCROLL_LINES: f32 = 3.0;
