@@ -96,6 +96,7 @@ pub(crate) struct PlatformHandlers {
 }
 
 pub(crate) struct LinuxCommon {
+    pub(crate) event_loop_error: Option<gpui::EventLoopError>,
     pub(crate) background_executor: BackgroundExecutor,
     pub(crate) foreground_executor: ForegroundExecutor,
     pub(crate) text_system: Arc<dyn PlatformTextSystem>,
@@ -149,6 +150,7 @@ impl LinuxCommon {
         let background_executor = BackgroundExecutor::new(dispatcher.clone());
 
         let common = LinuxCommon {
+            event_loop_error: None,
             background_executor,
             foreground_executor: ForegroundExecutor::new(dispatcher),
             text_system,
@@ -267,6 +269,10 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
         if let Some(mut fun) = quit {
             fun();
         }
+    }
+
+    fn event_loop_error(&self) -> Option<gpui::EventLoopError> {
+        self.inner.with_common(|common| common.event_loop_error)
     }
 
     fn quit(&self) {

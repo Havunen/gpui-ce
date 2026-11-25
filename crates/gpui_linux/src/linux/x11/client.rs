@@ -2024,7 +2024,13 @@ impl LinuxClient for X11Client {
             return;
         };
 
-        event_loop.run(None, &mut self.clone(), |_| {}).log_err();
+        if event_loop
+            .run(None, &mut self.clone(), |_| {})
+            .log_err()
+            .is_none()
+        {
+            self.with_common(|common| common.event_loop_error = Some(gpui::EventLoopError::X11));
+        }
     }
 
     fn active_window(&self) -> Option<AnyWindowHandle> {

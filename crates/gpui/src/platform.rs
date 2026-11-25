@@ -147,6 +147,15 @@ pub enum MacActivationPolicy {
     Prohibited,
 }
 
+/// The native display backend whose main event loop returned an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventLoopError {
+    /// The X11 event loop failed.
+    X11,
+    /// The Wayland event loop failed.
+    Wayland,
+}
+
 #[expect(missing_docs)]
 pub trait Platform: 'static {
     fn background_executor(&self) -> BackgroundExecutor;
@@ -155,6 +164,11 @@ pub trait Platform: 'static {
 
     fn set_mac_activation_policy(&self, _policy: MacActivationPolicy) {}
     fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>);
+
+    /// The main loop failure, when the backend observed one.
+    fn event_loop_error(&self) -> Option<EventLoopError> {
+        None
+    }
     fn quit(&self);
     fn restart(&self, binary_path: Option<PathBuf>, arguments: Vec<OsString>);
     fn activate(&self, ignoring_other_apps: bool);

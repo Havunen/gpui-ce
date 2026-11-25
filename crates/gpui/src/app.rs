@@ -195,6 +195,11 @@ pub struct ApplicationHandle {
 }
 
 impl ApplicationHandle {
+    /// Returns the backend that failed when the native event loop returned.
+    pub fn event_loop_error(&self) -> Option<crate::EventLoopError> {
+        self.app.borrow().event_loop_error()
+    }
+
     /// Runs `f` with the app context, from outside the platform's run loop.
     ///
     /// Call this each time the external run loop gives GPUI control. Effects queued by `f`,
@@ -1168,6 +1173,11 @@ impl App {
         self.foreground_executor.spawn(futures).detach();
 
         self.quitting = false;
+    }
+
+    /// The main event loop failure, also available to shutdown observers.
+    pub fn event_loop_error(&self) -> Option<crate::EventLoopError> {
+        self.platform.event_loop_error()
     }
 
     /// Returns the keyboard layout that is active now.

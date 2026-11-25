@@ -1327,13 +1327,19 @@ impl LinuxClient for WaylandClient {
             .take()
             .expect("App is already running");
 
-        event_loop
+        if event_loop
             .run(
                 None,
                 &mut WaylandClientStatePtr(Rc::downgrade(&self.0)),
                 |_| {},
             )
-            .log_err();
+            .log_err()
+            .is_none()
+        {
+            self.with_common(|common| {
+                common.event_loop_error = Some(gpui::EventLoopError::Wayland)
+            });
+        }
     }
 
     fn write_to_primary(&self, item: gpui::ClipboardItem) {
