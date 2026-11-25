@@ -3323,6 +3323,47 @@ mod tests {
 
     static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
+    #[test]
+    fn copying_text_keeps_dispatching_while_the_clipboard_reader_is_paused() {
+        let (socket, _compositor) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut event_loop = EventLoop::try_new().unwrap();
+        let mut clipboard = Clipboard::new(
+            Connection::from_socket(socket).unwrap(),
+            event_loop.handle(),
+        );
+        let text = "selected text\n".repeat(128 * 1024);
+        clipboard.set(gpui::ClipboardItem::new_string(text.clone()));
+
+        let (read, write) = std::io::pipe().unwrap();
+        let (resume, paused) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            // Closing the pipe on timeout also releases a regressed blocking writer.
+            paused
+                .recv_timeout(Duration::from_secs(3))
+                .expect("clipboard send blocked the event loop");
+            read_fd_with_timeout(
+                filedescriptor::FileDescriptor::new(read),
+                Duration::from_secs(3),
+            )
+            .unwrap()
+        });
+        clipboard.send("text/plain".into(), write.into());
+        let mut state = WaylandClientStatePtr(Weak::new());
+        event_loop.dispatch(Duration::ZERO, &mut state).unwrap();
+        let _ = resume.send(());
+        while !reader.is_finished() {
+            event_loop
+                .dispatch(Duration::from_millis(10), &mut state)
+                .unwrap();
+        }
+        let received = reader.join().unwrap();
+        assert_eq!(received.len(), text.len());
+        assert!(
+            received == text.as_bytes(),
+            "copied text changed during transfer"
+        );
+    }
+
     fn keymap_fd(contents: &[u8]) -> OwnedFd {
         let path = temp_keymap_path();
         let mut file = OpenOptions::new()

@@ -1,11 +1,11 @@
 use std::{
-    fs::File,
     io::{ErrorKind, Write},
     os::fd::{AsRawFd, BorrowedFd, OwnedFd},
 };
 
 use calloop::{LoopHandle, PostAction};
-use filedescriptor::Pipe;
+use filedescriptor::{FileDescriptor, Pipe};
+use gpui_util::ResultExt as _;
 use strum::IntoEnumIterator;
 use wayland_client::{Connection, protocol::wl_data_offer::WlDataOffer};
 use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1;
@@ -236,7 +236,7 @@ impl Clipboard {
             return;
         }
         if let Some(text) = self.contents.as_ref().and_then(|contents| contents.text()) {
-            self.send_bytes(fd, text.as_bytes().to_owned());
+            self.send_bytes(fd, text.into_bytes());
         }
     }
 
@@ -246,7 +246,7 @@ impl Clipboard {
             .as_ref()
             .and_then(|contents| contents.text())
         {
-            self.send_bytes(fd, text.as_bytes().to_owned());
+            self.send_bytes(fd, text.into_bytes());
         }
     }
 
@@ -303,32 +303,43 @@ impl Clipboard {
     }
 
     pub fn send_bytes(&self, fd: OwnedFd, bytes: Vec<u8>) {
+        // A writable pipe may only have room for part of the selection.
+        let mut file = FileDescriptor::new(fd);
+        if bytes.is_empty() || file.set_non_blocking(true).log_err().is_none() {
+            return;
+        }
         let mut written = 0;
         self.loop_handle
             .insert_source(
                 calloop::generic::Generic::new(
-                    File::from(fd),
+                    file,
                     calloop::Interest::WRITE,
                     calloop::Mode::Level,
                 ),
                 move |_, file, _| {
+                    // Yield to input and rendering between chunks, even for a fast reader.
+                    let end = (written + 64 * 1024).min(bytes.len());
+                    // SAFETY: writing leaves the registered descriptor in place.
                     let file = unsafe { file.get_mut() };
-                    loop {
-                        match file.write(&bytes[written..]) {
-                            Ok(n) if written + n == bytes.len() => {
-                                written += n;
-                                break Ok(PostAction::Remove);
-                            }
-                            Ok(n) => written += n,
-                            Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                                break Ok(PostAction::Continue);
-                            }
-                            Err(_) => break Ok(PostAction::Remove),
+                    Ok(match file.write(&bytes[written..end]) {
+                        Ok(n) if n == 0 || written + n == bytes.len() => PostAction::Remove,
+                        Ok(n) => {
+                            written += n;
+                            PostAction::Continue
                         }
-                    }
+                        Err(err)
+                            if matches!(
+                                err.kind(),
+                                ErrorKind::WouldBlock | ErrorKind::Interrupted
+                            ) =>
+                        {
+                            PostAction::Continue
+                        }
+                        Err(_) => PostAction::Remove,
+                    })
                 },
             )
-            .unwrap();
+            .log_err();
     }
 
     /// File formats the *clipboard* data source should advertise, on top of the
