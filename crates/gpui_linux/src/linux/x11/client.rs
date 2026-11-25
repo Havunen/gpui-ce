@@ -3061,6 +3061,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn server_disconnect_reaches_shutdown_observers() {
+        use crate::linux::LinuxPlatform;
+        use gpui::Platform as _;
+        use std::io::{BufRead as _, Write as _};
+        const CHILD: &str = "GPUI_TEST_PRIVATE_X11_DISCONNECT";
+        if std::env::var_os(CHILD).is_none() {
+            let Some(server) = super::super::test_display::Xvfb::start() else {
+                eprintln!("Xvfb is not available; skipping");
+                return;
+            };
+            // The clipboard and platform both connect through DISPLAY. Isolate that
+            // environment change from other tests, and disconnect only our server.
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "server_disconnect_reaches_shutdown_observers",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("DISPLAY", &server.display)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+            assert!(
+                (&mut output)
+                    .lines()
+                    .map_while(Result::ok)
+                    .any(|line| line.contains("PRIVATE_X11_CONNECTED"))
+            );
+            drop(server);
+            assert!(child.wait().unwrap().success());
+            return;
+        }
+        let platform = Rc::new(LinuxPlatform {
+            inner: X11Client::new().unwrap(),
+        });
+        assert_eq!(platform.event_loop_error(), None);
+        let observed = Rc::new(std::cell::Cell::new(None));
+        platform.on_quit(Box::new({
+            let platform = Rc::downgrade(&platform);
+            let observed = observed.clone();
+            move || {
+                observed.set(platform.upgrade().unwrap().event_loop_error());
+                true
+            }
+        }));
+        platform.run(Box::new(|| {
+            println!("PRIVATE_X11_CONNECTED");
+            std::io::stdout().flush().unwrap();
+        }));
+        assert_eq!(observed.get(), Some(gpui::EventLoopError::X11));
+        assert_eq!(platform.event_loop_error(), observed.get());
+    }
+
+    #[test]
     fn incremental_selection_keeps_every_chunk_from_a_fast_owner() {
         use xproto::{CreateWindowAux, PropMode, Property, WindowClass};
         let Some(server) = super::super::test_display::Xvfb::start() else {
