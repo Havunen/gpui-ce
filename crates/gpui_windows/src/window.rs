@@ -1593,6 +1593,12 @@ unsafe extern "system" fn window_procedure(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    gpui::with_native_callback("Win32 window procedure", || unsafe {
+        handle_window_message(hwnd, msg, wparam, lparam)
+    })
+}
+
+unsafe fn handle_window_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if msg == (WM_NCCREATE as u32) {
         let window_params = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
         let window_creation_context = window_params.lpCreateParams as *mut WindowCreateContext;

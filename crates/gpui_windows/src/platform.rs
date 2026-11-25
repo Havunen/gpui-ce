@@ -1596,6 +1596,12 @@ unsafe extern "system" fn window_procedure(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    gpui::with_native_callback("Win32 platform window procedure", || unsafe {
+        handle_window_message(hwnd, msg, wparam, lparam)
+    })
+}
+
+unsafe fn handle_window_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if msg == (WM_NCCREATE as u32) {
         let params = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
         let creation_context = params.lpCreateParams as *mut PlatformWindowCreateContext;
@@ -1631,15 +1637,7 @@ unsafe extern "system" fn window_procedure(
     }
     let inner = unsafe { &*ptr };
     let result = if let Some(inner) = inner.upgrade() {
-        if cfg!(debug_assertions) {
-            let inner = std::panic::AssertUnwindSafe(inner);
-            match std::panic::catch_unwind(|| { inner }.handle_msg(hwnd, msg, wparam, lparam)) {
-                Ok(result) => result,
-                Err(_) => std::process::abort(),
-            }
-        } else {
-            inner.handle_msg(hwnd, msg, wparam, lparam)
-        }
+        inner.handle_msg(hwnd, msg, wparam, lparam)
     } else {
         unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
     };

@@ -1323,9 +1323,11 @@ impl MetalRenderer {
         let instance_buffer_pool = self.instance_buffer_pool.clone();
         let instance_buffer = Cell::new(Some(instance_buffer));
         let block = ConcreteBlock::new(move |_| {
-            if let Some(instance_buffer) = instance_buffer.take() {
-                instance_buffer_pool.lock().release(instance_buffer);
-            }
+            gpui::with_native_callback("Metal command buffer completion", || {
+                if let Some(instance_buffer) = instance_buffer.take() {
+                    instance_buffer_pool.lock().release(instance_buffer);
+                }
+            });
         });
         command_buffer.add_completed_handler(&block.copy());
     }

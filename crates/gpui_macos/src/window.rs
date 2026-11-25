@@ -2737,15 +2737,21 @@ unsafe extern "C" fn handle_key_equivalent(
     _: Sel,
     native_event: ObjcId,
 ) -> Bool {
-    unsafe { handle_key_event(this, native_event, true) }
+    gpui::with_native_callback("AppKit key event", || unsafe {
+        handle_key_event(this, native_event, true)
+    })
 }
 
 unsafe extern "C" fn handle_key_down(this: &Objc2Object, _: Sel, native_event: ObjcId) {
-    unsafe { handle_key_event(this, native_event, false) };
+    gpui::with_native_callback("AppKit key event", || unsafe {
+        handle_key_event(this, native_event, false)
+    });
 }
 
 unsafe extern "C" fn handle_key_up(this: &Objc2Object, _: Sel, native_event: ObjcId) {
-    unsafe { handle_key_event(this, native_event, false) };
+    gpui::with_native_callback("AppKit key event", || unsafe {
+        handle_key_event(this, native_event, false)
+    });
 }
 
 // Things to test if you're modifying this method:
@@ -2812,11 +2818,7 @@ unsafe fn is_ime_input_source_active() -> bool {
     }
 }
 
-unsafe extern "C" fn handle_key_event(
-    this: &Objc2Object,
-    native_event: ObjcId,
-    key_equivalent: bool,
-) -> Bool {
+unsafe fn handle_key_event(this: &Objc2Object, native_event: ObjcId, key_equivalent: bool) -> Bool {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
 
@@ -2958,6 +2960,12 @@ unsafe extern "C" fn handle_key_event(
 }
 
 unsafe extern "C" fn handle_view_event(this: &Objc2Object, _: Sel, native_event: ObjcId) {
+    gpui::with_native_callback("AppKit view event", || unsafe {
+        dispatch_view_event(this, native_event)
+    });
+}
+
+unsafe fn dispatch_view_event(this: &Objc2Object, native_event: ObjcId) {
     let window_state = unsafe { get_window_state(this) };
     let weak_window_state = Arc::downgrade(&window_state);
     let mut lock = window_state.as_ref().lock();
@@ -3235,6 +3243,12 @@ unsafe extern "C" fn window_did_change_screen(this: &Objc2Object, _: Sel, _: Obj
 }
 
 unsafe extern "C" fn window_did_change_key_status(this: &Objc2Object, selector: Sel, _: ObjcId) {
+    gpui::with_native_callback("AppKit window activation", || unsafe {
+        change_key_status(this, selector)
+    });
+}
+
+unsafe fn change_key_status(this: &Objc2Object, selector: Sel) {
     let window_state = unsafe { get_window_state(this) };
     let lock = window_state.lock();
     let is_active = unsafe { lock.native_window.isKeyWindow() == Bool::new(true) };
@@ -3406,6 +3420,10 @@ unsafe extern "C" fn set_frame_size(this: &Objc2Object, _: Sel, size: NSSize) {
 }
 
 unsafe extern "C" fn display_layer(this: &Objc2Object, _: Sel, _: ObjcId) {
+    gpui::with_native_callback("AppKit display layer", || unsafe { draw_layer(this) });
+}
+
+unsafe fn draw_layer(this: &Objc2Object) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.lock();
     if let Some(mut callback) = lock.request_frame_callback.take() {
@@ -3423,7 +3441,7 @@ unsafe extern "C" fn display_layer(this: &Objc2Object, _: Sel, _: ObjcId) {
 }
 
 extern "C" fn step(view: *mut c_void) {
-    unsafe {
+    gpui::with_native_callback("AppKit display link", || unsafe {
         let view = view as ObjcId;
         let window_state = get_window_state(&*view);
         let mut lock = window_state.lock();
@@ -3434,7 +3452,7 @@ extern "C" fn step(view: *mut c_void) {
             callback(request);
             window_state.lock().request_frame_callback = Some(callback);
         }
-    }
+    })
 }
 
 unsafe extern "C" fn valid_attributes_for_marked_text(_: &Objc2Object, _: Sel) -> ObjcId {

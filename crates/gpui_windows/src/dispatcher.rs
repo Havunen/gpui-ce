@@ -197,8 +197,11 @@ unsafe extern "system" fn run_work_callback(
     _instance: PTP_CALLBACK_INSTANCE,
     context: *mut c_void,
 ) {
-    let runnable = unsafe { RunnableVariant::from_raw(NonNull::new_unchecked(context as *mut ())) };
-    WindowsDispatcher::execute_runnable(runnable);
+    gpui::with_native_callback("Win32 threadpool task", || {
+        let runnable =
+            unsafe { RunnableVariant::from_raw(NonNull::new_unchecked(context as *mut ())) };
+        WindowsDispatcher::execute_runnable(runnable);
+    });
 }
 
 unsafe extern "system" fn run_timer_callback(
@@ -206,9 +209,12 @@ unsafe extern "system" fn run_timer_callback(
     context: *mut c_void,
     timer: PTP_TIMER,
 ) {
-    let runnable = unsafe { RunnableVariant::from_raw(NonNull::new_unchecked(context as *mut ())) };
-    WindowsDispatcher::execute_runnable(runnable);
-    unsafe { CloseThreadpoolTimer(timer) };
+    gpui::with_native_callback("Win32 threadpool timer", || {
+        let runnable =
+            unsafe { RunnableVariant::from_raw(NonNull::new_unchecked(context as *mut ())) };
+        WindowsDispatcher::execute_runnable(runnable);
+        unsafe { CloseThreadpoolTimer(timer) };
+    });
 }
 
 #[cfg(test)]

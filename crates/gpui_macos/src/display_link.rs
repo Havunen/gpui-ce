@@ -123,14 +123,16 @@ unsafe extern "C" fn display_link_output_callback(
     _flags_out: *mut i64,
     display_id: *mut c_void,
 ) -> i32 {
-    let display_id = display_id as usize as CGDirectDisplayID;
-    let registry = lock_registry();
-    if let Some(entry) = registry.displays.get(&display_id) {
-        for (_, frame_requests) in &entry.subscribers {
-            frame_requests.merge_data(1);
+    gpui::with_native_callback("CoreVideo display link", || {
+        let display_id = display_id as usize as CGDirectDisplayID;
+        let registry = lock_registry();
+        if let Some(entry) = registry.displays.get(&display_id) {
+            for (_, frame_requests) in &entry.subscribers {
+                frame_requests.merge_data(1);
+            }
         }
-    }
-    0
+        0
+    })
 }
 
 fn subscribe(
