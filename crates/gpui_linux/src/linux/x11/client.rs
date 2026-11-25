@@ -1995,6 +1995,18 @@ impl LinuxClient for X11Client {
             .log_with_level(log::Level::Debug)
     }
 
+    fn read_image_from_clipboard(&self, max_bytes: usize) -> gpui::ClipboardImageRead {
+        let state = self.0.borrow();
+        if state
+            .clipboard
+            .is_owner(clipboard::ClipboardKind::Clipboard)
+        {
+            gpui::ClipboardImageRead::from_item(state.clipboard_item.as_ref(), max_bytes)
+        } else {
+            state.clipboard.read_image_bounded(max_bytes)
+        }
+    }
+
     fn read_from_clipboard(&self) -> Option<gpui::ClipboardItem> {
         let state = self.0.borrow_mut();
         // if the last copy was from this app, return our cached item

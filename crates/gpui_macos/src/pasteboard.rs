@@ -7,9 +7,7 @@ use objc2_foundation::{NSArray, NSData, NSString, NSURL};
 use smallvec::SmallVec;
 use strum::IntoEnumIterator as _;
 
-use gpui::{
-    ClipboardEntry, ClipboardItem, ClipboardString, ExternalPaths, Image, ImageFormat, hash,
-};
+use gpui::{ClipboardEntry, ClipboardItem, ClipboardString, ExternalPaths, Image, ImageFormat};
 
 pub struct Pasteboard {
     inner: Retained<NSPasteboard>,
@@ -88,34 +86,30 @@ impl Pasteboard {
             });
         }
 
-        // Finally, try the various supported image types.
-        for format in ImageFormat::iter() {
-            if let Some(item) = self.read_image(format) {
-                return Some(item);
-            }
+        match self.read_image_bounded(usize::MAX) {
+            gpui::ClipboardImageRead::Image(image) => Some(image.into()),
+            _ => None,
         }
-
-        None
     }
 
-    fn read_image(&self, format: ImageFormat) -> Option<ClipboardItem> {
-        let ut_type: UTType = format.into();
-
-        if self.inner.types().is_some_and(|types| {
-            types
+    pub fn read_image_bounded(&self, max_bytes: usize) -> gpui::ClipboardImageRead {
+        let Some(types) = self.inner.types() else {
+            return gpui::ClipboardImageRead::Unavailable;
+        };
+        for format in ImageFormat::iter() {
+            let ut_type: UTType = format.into();
+            if types
                 .iter()
                 .any(|kind| kind.isEqualToString(ut_type.inner()))
-        }) {
-            self.data_for_type(ut_type.inner()).map(|bytes| {
-                let id = hash(&bytes);
-
-                ClipboardItem {
-                    entries: vec![ClipboardEntry::Image(Image { format, bytes, id })],
+                && let Some(data) = self.inner.dataForType(ut_type.inner())
+            {
+                if data.len() > max_bytes {
+                    return gpui::ClipboardImageRead::TooLarge;
                 }
-            })
-        } else {
-            None
+                return gpui::ClipboardImageRead::Image(Image::from_bytes(format, data.to_vec()));
+            }
         }
+        gpui::ClipboardImageRead::Unavailable
     }
 
     fn read_string_from_pasteboard(&self) -> Option<ClipboardEntry> {
@@ -728,6 +722,23 @@ mod tests {
             .setData_forType(Some(&data), unsafe { NSPasteboardTypePNG });
 
         let item = pasteboard.read().expect("should read PNG image");
+
+        pasteboard
+            .inner
+            .setString_forType(&NSString::from_str("image caption"), unsafe {
+                NSPasteboardTypeString
+            });
+        assert_eq!(
+            pasteboard.read_image_bounded(png_bytes.len() - 1),
+            gpui::ClipboardImageRead::TooLarge
+        );
+        assert_eq!(
+            pasteboard.read_image_bounded(png_bytes.len()),
+            gpui::ClipboardImageRead::Image(Image::from_bytes(
+                ImageFormat::Png,
+                png_bytes.to_vec()
+            ))
+        );
 
         // Test Image entry exists
         assert_eq!(item.entries.len(), 1);

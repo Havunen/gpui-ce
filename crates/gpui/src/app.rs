@@ -1773,6 +1773,11 @@ impl App {
         self.platform.read_from_clipboard()
     }
 
+    /// Reads only an image from the native clipboard, up to the given encoded byte limit.
+    pub fn read_image_from_clipboard(&self, max_bytes: usize) -> crate::ClipboardImageRead {
+        self.platform.read_image_from_clipboard(max_bytes)
+    }
+
     /// Reads the system clipboard and resolves once the contents are available.
     ///
     /// Prefer this over [`App::read_from_clipboard`] in code that can await. On

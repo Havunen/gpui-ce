@@ -1402,6 +1402,10 @@ impl LinuxClient for WaylandClient {
         self.0.borrow_mut().clipboard.read_primary()
     }
 
+    fn read_image_from_clipboard(&self, max_bytes: usize) -> gpui::ClipboardImageRead {
+        self.0.borrow().clipboard.read_image_bounded(max_bytes)
+    }
+
     fn read_from_clipboard(&self) -> Option<gpui::ClipboardItem> {
         self.0.borrow_mut().clipboard.read()
     }

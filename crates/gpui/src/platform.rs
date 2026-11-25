@@ -349,6 +349,11 @@ pub trait Platform: 'static {
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem>;
 
+    /// Reads an encoded image without requesting text or files from the clipboard.
+    fn read_image_from_clipboard(&self, _max_bytes: usize) -> ClipboardImageRead {
+        ClipboardImageRead::Unavailable
+    }
+
     /// Capture native paste ownership before a filesystem transfer begins.
     fn capture_file_paste(&self, _files: &crate::FileTransfer) -> Option<crate::FilePaste> {
         None
@@ -3441,6 +3446,36 @@ pub enum CursorStyle {
 pub struct ClipboardItem {
     /// The entries in this clipboard item.
     pub entries: Vec<ClipboardEntry>,
+}
+
+/// The result of requesting only an encoded image from the clipboard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClipboardImageRead {
+    /// The original encoded image, within the caller's limit.
+    Image(Image),
+    /// The offered image exceeds the caller's byte limit.
+    TooLarge,
+    /// No readable image is available on this clipboard.
+    Unavailable,
+}
+
+impl ClipboardImageRead {
+    /// Reads an image from an already-owned item without cloning unrelated data.
+    pub fn from_item(item: Option<&ClipboardItem>, max_bytes: usize) -> Self {
+        let Some(image) = item.and_then(|item| {
+            item.entries.iter().find_map(|entry| match entry {
+                ClipboardEntry::Image(image) => Some(image),
+                _ => None,
+            })
+        }) else {
+            return Self::Unavailable;
+        };
+        if image.bytes.len() > max_bytes {
+            Self::TooLarge
+        } else {
+            Self::Image(image.clone())
+        }
+    }
 }
 
 /// An error produced by [`Platform::read_from_clipboard_async`].

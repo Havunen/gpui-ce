@@ -826,6 +826,10 @@ impl Platform for WindowsPlatform {
         crate::file_transfer::capture_paste(files)
     }
 
+    fn read_image_from_clipboard(&self, max_bytes: usize) -> gpui::ClipboardImageRead {
+        crate::clipboard::read_image_from_clipboard(max_bytes)
+    }
+
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
         read_from_clipboard()
     }
@@ -1832,5 +1836,23 @@ mod tests {
         let item = ClipboardItem::new_string_with_json_metadata("abcdef".to_string(), vec![3, 4]);
         write_to_clipboard(item.clone());
         assert_eq!(read_from_clipboard(), Some(item));
+        assert_eq!(
+            crate::clipboard::read_image_from_clipboard(0),
+            gpui::ClipboardImageRead::Unavailable
+        );
+
+        let image = gpui::Image::from_bytes(gpui::ImageFormat::Png, vec![42; 256]);
+        let mut item = ClipboardItem::new_string("caption".into());
+        item.entries
+            .push(gpui::ClipboardEntry::Image(image.clone()));
+        write_to_clipboard(item);
+        assert_eq!(
+            crate::clipboard::read_image_from_clipboard(255),
+            gpui::ClipboardImageRead::TooLarge
+        );
+        assert_eq!(
+            crate::clipboard::read_image_from_clipboard(256),
+            gpui::ClipboardImageRead::Image(image)
+        );
     }
 }

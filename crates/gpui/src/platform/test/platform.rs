@@ -610,6 +610,10 @@ impl Platform for TestPlatform {
         false
     }
 
+    fn read_image_from_clipboard(&self, max_bytes: usize) -> crate::ClipboardImageRead {
+        crate::ClipboardImageRead::from_item(self.current_clipboard_item.lock().as_ref(), max_bytes)
+    }
+
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
         self.current_clipboard_item.lock().clone()
     }

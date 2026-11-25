@@ -216,6 +216,10 @@ impl Platform for VisualTestPlatform {
         self.platform.should_auto_hide_scrollbars()
     }
 
+    fn read_image_from_clipboard(&self, max_bytes: usize) -> crate::ClipboardImageRead {
+        crate::ClipboardImageRead::from_item(self.clipboard.lock().as_ref(), max_bytes)
+    }
+
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
         self.clipboard.lock().clone()
     }

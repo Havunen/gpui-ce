@@ -13,9 +13,7 @@ use gpui_util::defer;
 use itertools::Itertools;
 use windows_core::PCWSTR;
 
-use gpui::{
-    ClipboardEntry, ClipboardItem, ClipboardString, ExternalPaths, Image, ImageFormat, hash,
-};
+use gpui::{ClipboardEntry, ClipboardItem, ClipboardString, ExternalPaths, Image, ImageFormat};
 
 const DRAGDROP_GET_FILES_COUNT: u32 = 0xFFFFFFFF;
 
@@ -302,20 +300,58 @@ fn read_clipboard_metadata(text: &str) -> Option<String> {
     get_clipboard_string(*CLIPBOARD_METADATA_FORMAT)
 }
 
-fn read_image(format: u32) -> Option<ClipboardEntry> {
-    let locked = get_clipboard_data(format)?;
-    let (bytes, image_format) = if format == CF_DIB as u32 {
-        (convert_dib_to_bmp(locked.as_bytes())?, ImageFormat::Bmp)
-    } else {
-        let image_format = *IMAGE_FORMATS_MAP.get(&format)?;
-        (locked.as_bytes().to_vec(), image_format)
+pub(crate) fn read_image_from_clipboard(max_bytes: usize) -> gpui::ClipboardImageRead {
+    let Some(_clip) = ClipboardGuard::open() else {
+        return gpui::ClipboardImageRead::Unavailable;
     };
-    let id = hash(&bytes);
-    Some(ClipboardEntry::Image(Image {
-        format: image_format,
-        bytes,
-        id,
-    }))
+    for format in [
+        *CLIPBOARD_PNG_FORMAT,
+        *CLIPBOARD_JPG_FORMAT,
+        *CLIPBOARD_GIF_FORMAT,
+        *CLIPBOARD_SVG_FORMAT,
+        CF_DIB as u32,
+    ] {
+        match read_image_bounded(format, max_bytes) {
+            gpui::ClipboardImageRead::Unavailable => continue,
+            result => return result,
+        }
+    }
+    gpui::ClipboardImageRead::Unavailable
+}
+
+fn read_image(format: u32) -> Option<ClipboardEntry> {
+    match read_image_bounded(format, usize::MAX) {
+        gpui::ClipboardImageRead::Image(image) => Some(ClipboardEntry::Image(image)),
+        _ => None,
+    }
+}
+
+fn read_image_bounded(format: u32, max_bytes: usize) -> gpui::ClipboardImageRead {
+    let Some(locked) = get_clipboard_data(format) else {
+        return gpui::ClipboardImageRead::Unavailable;
+    };
+    let (bytes, image_format) = if format == CF_DIB as u32 {
+        if locked
+            .size
+            .checked_add(14)
+            .is_none_or(|len| len > max_bytes)
+        {
+            return gpui::ClipboardImageRead::TooLarge;
+        }
+        let Some(bytes) = convert_dib_to_bmp(locked.as_bytes()) else {
+            return gpui::ClipboardImageRead::Unavailable;
+        };
+        (bytes, ImageFormat::Bmp)
+    } else {
+        let Some(&format) = IMAGE_FORMATS_MAP.get(&format) else {
+            return gpui::ClipboardImageRead::Unavailable;
+        };
+        if locked.size > max_bytes {
+            return gpui::ClipboardImageRead::TooLarge;
+        }
+        (locked.as_bytes().to_vec(), format)
+    };
+    gpui::ClipboardImageRead::Image(Image::from_bytes(image_format, bytes))
 }
 
 fn read_files() -> Option<ClipboardEntry> {
@@ -344,15 +380,18 @@ fn convert_dib_to_bmp(dib: &[u8]) -> Option<Vec<u8>> {
             1u32 << bit_count
         } else {
             colors_used
-        }) * 4
+        })
+        .checked_mul(4)?
     } else if compression == 3 {
         12 // BI_BITFIELDS
     } else {
         0
     };
 
-    let pixel_offset = 14 + header_size + color_table_size;
-    let file_size = 14 + dib.len() as u32;
+    let pixel_offset = 14u32
+        .checked_add(header_size)?
+        .checked_add(color_table_size)?;
+    let file_size = 14u32.checked_add(u32::try_from(dib.len()).ok()?)?;
 
     let mut bmp = Vec::with_capacity(file_size as usize);
     bmp.extend_from_slice(b"BM");
