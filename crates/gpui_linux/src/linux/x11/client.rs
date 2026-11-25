@@ -3076,7 +3076,8 @@ mod tests {
     fn server_disconnect_reaches_shutdown_observers() {
         use crate::linux::LinuxPlatform;
         use gpui::Platform as _;
-        use std::io::{BufRead as _, Write as _};
+        use smol::io::{AsyncBufReadExt as _, BufReader};
+        use std::io::Write as _;
         const CHILD: &str = "GPUI_TEST_PRIVATE_X11_DISCONNECT";
         if std::env::var_os(CHILD).is_none() {
             let Some(server) = super::super::test_display::Xvfb::start() else {
@@ -3085,25 +3086,27 @@ mod tests {
             };
             // The clipboard and platform both connect through DISPLAY. Isolate that
             // environment change from other tests, and disconnect only our server.
-            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            let mut child = smol::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "server_disconnect_reaches_shutdown_observers",
                     "--nocapture",
                 ])
                 .env(CHILD, "1")
                 .env("DISPLAY", &server.display)
-                .stdout(std::process::Stdio::piped())
+                .stdout(smol::process::Stdio::piped())
                 .spawn()
                 .unwrap();
-            let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
-            assert!(
-                (&mut output)
-                    .lines()
-                    .map_while(Result::ok)
-                    .any(|line| line.contains("PRIVATE_X11_CONNECTED"))
-            );
+            let mut output = BufReader::new(child.stdout.take().unwrap());
+            let mut line = String::new();
+            loop {
+                assert!(smol::block_on(output.read_line(&mut line)).unwrap() > 0);
+                if line.contains("PRIVATE_X11_CONNECTED") {
+                    break;
+                }
+                line.clear();
+            }
             drop(server);
-            assert!(child.wait().unwrap().success());
+            assert!(smol::block_on(child.status()).unwrap().success());
             return;
         }
         let platform = Rc::new(LinuxPlatform {
