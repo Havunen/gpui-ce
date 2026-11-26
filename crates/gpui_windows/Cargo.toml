@@ -14,13 +14,13 @@ path = "src/gpui_windows.rs"
 
 [features]
 default = ["gpui/default"]
-test-support = ["gpui/test-support", "gpui_wgpu?/test-support"]
+test-support = ["gpui/test-support", "gpui_wgpu?/test-support", "dep:gpui_fonts"]
 windows-wgpu = ["dep:gpui_wgpu"]
 screen-capture = ["gpui/screen-capture"]
 
 [dependencies]
 gpui = { path = "../gpui", version = "0.4.0", package = "gpui-ce", default-features = false }
-gpui_render = { workspace = true, features = ["swash"] }
+gpui_render.workspace = true
 wgsl-rs.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
@@ -32,6 +32,7 @@ collections.workspace = true
 dunce.workspace = true
 etagere.workspace = true
 futures.workspace = true
+gpui_fonts = { path = "../gpui_ce_fonts", version = "0.4.0", package = "gpui-ce-fonts", optional = true }
 gpui_util.workspace = true
 gpui_parley = { workspace = true, features = ["system-fonts"] }
 image.workspace = true
@@ -41,6 +42,7 @@ parking_lot.workspace = true
 rand.workspace = true
 raw-window-handle.workspace = true
 smallvec.workspace = true
+thiserror.workspace = true
 uuid.workspace = true
 windows-collections.workspace = true
 windows-core.workspace = true

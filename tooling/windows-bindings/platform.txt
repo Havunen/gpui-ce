@@ -65,12 +65,15 @@ Windows.Win32.CredReadW
 Windows.Win32.CredWriteW
 Windows.Win32.D2D1CreateFactory
 Windows.Win32.D2D1_ALPHA_MODE_PREMULTIPLIED
+Windows.Win32.D2D1_BITMAP_INTERPOLATION_MODE_LINEAR
 Windows.Win32.D2D1_FACTORY_TYPE_SINGLE_THREADED
 Windows.Win32.D2D1_FEATURE_LEVEL_DEFAULT
 Windows.Win32.D2D1_RENDER_TARGET_PROPERTIES
 Windows.Win32.D2D1_RENDER_TARGET_TYPE_SOFTWARE
 Windows.Win32.D2D1_RENDER_TARGET_USAGE_NONE
 Windows.Win32.D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE
+Windows.Win32.D2D_RECT_F
+Windows.Win32.D2D_SIZE_U
 Windows.Win32.D3D11CreateDevice
 Windows.Win32.D3D11_BIND_CONSTANT_BUFFER
 Windows.Win32.D3D11_BIND_RENDER_TARGET
@@ -177,6 +180,7 @@ Windows.Win32.DWRITE_FONT_STYLE_NORMAL
 Windows.Win32.DWRITE_FONT_STYLE_OBLIQUE
 Windows.Win32.DWRITE_FONT_WEIGHT
 Windows.Win32.DWRITE_FONT_WEIGHT_NORMAL
+Windows.Win32.DWRITE_GLYPH_IMAGE_DATA
 Windows.Win32.DWRITE_GLYPH_IMAGE_FORMATS_CFF
 Windows.Win32.DWRITE_GLYPH_IMAGE_FORMATS_COLR
 Windows.Win32.DWRITE_GLYPH_IMAGE_FORMATS_JPEG
@@ -240,6 +244,7 @@ Windows.Win32.ERROR_INSUFFICIENT_BUFFER
 Windows.Win32.ERROR_NOT_FOUND
 Windows.Win32.E_ABORT
 Windows.Win32.E_INVALIDARG
+Windows.Win32.E_FAIL
 Windows.Win32.E_NOTIMPL
 Windows.Win32.E_OUTOFMEMORY
 Windows.Win32.E_POINTER
@@ -294,13 +299,17 @@ Windows.Win32.GetMonitorInfoW
 Windows.Win32.GetPointerType
 Windows.Win32.GetProcAddress
 Windows.Win32.ID2D1Factory::{CreateWicBitmapRenderTarget}
-Windows.Win32.ID2D1RenderTarget::{BeginDraw, Clear, CreateSolidColorBrush, DrawGlyphRun, EndDraw, GetMaximumBitmapSize, SetTextAntialiasMode, SetTextRenderingParams, SetTransform}
+Windows.Win32.ID2D1RenderTarget::{BeginDraw, Clear, CreateBitmapFromWicBitmap, CreateSolidColorBrush, DrawBitmap, DrawGlyphRun, EndDraw, GetMaximumBitmapSize, SetTextAntialiasMode, SetTextRenderingParams, SetTransform}
 Windows.Win32.ID2D1SolidColorBrush::{SetColor}
 Windows.Win32.IDWriteFactory6::{CreateFontFaceReference}
 Windows.Win32.IDWriteFontFaceReference1::{CreateFontFace}
 Windows.Win32.IWICBitmap::{Lock}
 Windows.Win32.IWICBitmapLock::{GetDataPointer, GetStride}
-Windows.Win32.IWICImagingFactory::{CreateBitmap, CreateBitmapFromMemory}
+Windows.Win32.IWICBitmapDecoder::{GetFrame}
+Windows.Win32.IWICBitmapFrameDecode::{}
+Windows.Win32.IWICBitmapSource::{CopyPixels, GetSize}
+Windows.Win32.IWICImagingFactory::{CreateBitmap, CreateBitmapFromMemory, CreateBitmapFromSource, CreateDecoderFromStream, CreateStream}
+Windows.Win32.IWICStream::{InitializeFromMemory}
 Windows.Win32.KEYEVENTF_EXTENDEDKEY
 Windows.Win32.LoadLibraryA
 Windows.Win32.FreeLibrary
@@ -308,10 +317,13 @@ Windows.Win32.DXGI_ERROR_NOT_FOUND
 Windows.Win32.RPC_E_CHANGED_MODE
 Windows.Win32.SPI_GETFONTSMOOTHING
 Windows.Win32.SW_HIDE
+Windows.Win32.UnionRect
 Windows.Win32.VK_LSHIFT
 Windows.Win32.VK_RSHIFT
 Windows.Win32.WICBitmapCacheOnLoad
 Windows.Win32.WICBitmapLockRead
+Windows.Win32.WICConvertBitmapSource
+Windows.Win32.WICDecodeMetadataCacheOnLoad
 Windows.Win32.WICRect
 Windows.Win32.WS_OVERLAPPED
 Windows.Win32.GetSystemMetrics
@@ -391,7 +403,7 @@ Windows.Win32.IDWriteColorGlyphRunEnumerator1::{GetCurrentRun}
 Windows.Win32.IDWriteColorGlyphRunEnumerator::{GetCurrentRun, MoveNext}
 Windows.Win32.IDWriteFactory1::{}
 Windows.Win32.IDWriteFactory2::{CreateFontFallbackBuilder, CreateGlyphRunAnalysis, GetSystemFontFallback, TranslateColorGlyphRun}
-Windows.Win32.IDWriteFactory3::{CreateFontCollectionFromFontSet, CreateFontFaceReference, CreateFontSetBuilder, CreateGlyphRunAnalysis, GetSystemFontCollection}
+Windows.Win32.IDWriteFactory3::{CreateFontCollectionFromFontSet, CreateFontFaceReference, CreateFontSetBuilder, CreateGlyphRunAnalysis, CreateCustomRenderingParams, GetSystemFontCollection}
 Windows.Win32.IDWriteFactory4::{TranslateColorGlyphRun}
 Windows.Win32.IDWriteFactory5::{CreateFontSetBuilder, CreateInMemoryFontFileLoader}
 Windows.Win32.IDWriteFactory::{CreateFontFace, CreateGlyphRunAnalysis, CreateRenderingParams, CreateTextFormat, CreateTextLayout, CreateTypography, GetSystemFontCollection, RegisterFontFileLoader, UnregisterFontFileLoader}
@@ -400,8 +412,8 @@ Windows.Win32.IDWriteFontCollection::{GetFontFamily, GetFontFamilyCount}
 Windows.Win32.IDWriteFontFace1::{GetMetrics, GetRecommendedRenderingMode, GetUnicodeRanges}
 Windows.Win32.IDWriteFontFace2::{GetRecommendedRenderingMode, IsColorFont}
 Windows.Win32.IDWriteFontFace3::{GetFamilyNames, GetFontFaceReference, GetRecommendedRenderingMode, GetStyle, GetWeight}
-Windows.Win32.IDWriteFontFace4::{}
-Windows.Win32.IDWriteFontFace::{GetDesignGlyphMetrics, GetGlyphIndices, GetMetrics, GetRecommendedRenderingMode}
+Windows.Win32.IDWriteFontFace4::{GetGlyphImageData, GetGlyphImageFormats, ReleaseGlyphImageData}
+Windows.Win32.IDWriteFontFace::{GetDesignGlyphMetrics, GetGlyphCount, GetGlyphIndices, GetMetrics, GetRecommendedRenderingMode}
 Windows.Win32.IDWriteFontFaceReference::{CreateFontFace}
 Windows.Win32.IDWriteFontFallback::{}
 Windows.Win32.IDWriteFontFallbackBuilder::{AddMapping, AddMappings, CreateFontFallback}
@@ -417,7 +429,9 @@ Windows.Win32.IDWriteInlineObject::{Draw, GetMetrics}
 Windows.Win32.IDWriteLocalizedStrings::{FindLocaleName, GetCount, GetString, GetStringLength}
 Windows.Win32.IDWritePixelSnapping
 Windows.Win32.IDWriteRenderingParams1::{GetGrayscaleEnhancedContrast}
-Windows.Win32.IDWriteRenderingParams::{GetEnhancedContrast, GetGamma, GetPixelGeometry}
+Windows.Win32.IDWriteRenderingParams2::{GetGridFitMode}
+Windows.Win32.IDWriteRenderingParams3::{GetRenderingMode1}
+Windows.Win32.IDWriteRenderingParams::{GetClearTypeLevel, GetEnhancedContrast, GetGamma, GetPixelGeometry}
 Windows.Win32.IDWriteTextFormat1::{SetFontFallback}
 Windows.Win32.IDWriteTextFormat::{}
 Windows.Win32.IDWriteTextLayout1::{SetCharacterSpacing}
