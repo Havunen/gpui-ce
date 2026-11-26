@@ -147,6 +147,15 @@ pub enum MacActivationPolicy {
     Prohibited,
 }
 
+/// The native display backend whose main event loop returned an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventLoopError {
+    /// The X11 event loop failed.
+    X11,
+    /// The Wayland event loop failed.
+    Wayland,
+}
+
 #[expect(missing_docs)]
 pub trait Platform: 'static {
     fn background_executor(&self) -> BackgroundExecutor;
@@ -155,6 +164,11 @@ pub trait Platform: 'static {
 
     fn set_mac_activation_policy(&self, _policy: MacActivationPolicy) {}
     fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>);
+
+    /// The main loop failure, when the backend observed one.
+    fn event_loop_error(&self) -> Option<EventLoopError> {
+        None
+    }
     fn quit(&self);
     fn restart(&self, binary_path: Option<PathBuf>, arguments: Vec<OsString>);
     fn activate(&self, ignoring_other_apps: bool);
@@ -334,6 +348,11 @@ pub trait Platform: 'static {
     fn should_auto_hide_scrollbars(&self) -> bool;
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem>;
+
+    /// Reads an encoded image without requesting text or files from the clipboard.
+    fn read_image_from_clipboard(&self, _max_bytes: usize) -> ClipboardImageRead {
+        ClipboardImageRead::Unavailable
+    }
 
     /// Capture native paste ownership before a filesystem transfer begins.
     fn capture_file_paste(&self, _files: &crate::FileTransfer) -> Option<crate::FilePaste> {
@@ -3427,6 +3446,36 @@ pub enum CursorStyle {
 pub struct ClipboardItem {
     /// The entries in this clipboard item.
     pub entries: Vec<ClipboardEntry>,
+}
+
+/// The result of requesting only an encoded image from the clipboard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClipboardImageRead {
+    /// The original encoded image, within the caller's limit.
+    Image(Image),
+    /// The offered image exceeds the caller's byte limit.
+    TooLarge,
+    /// No readable image is available on this clipboard.
+    Unavailable,
+}
+
+impl ClipboardImageRead {
+    /// Reads an image from an already-owned item without cloning unrelated data.
+    pub fn from_item(item: Option<&ClipboardItem>, max_bytes: usize) -> Self {
+        let Some(image) = item.and_then(|item| {
+            item.entries.iter().find_map(|entry| match entry {
+                ClipboardEntry::Image(image) => Some(image),
+                _ => None,
+            })
+        }) else {
+            return Self::Unavailable;
+        };
+        if image.bytes.len() > max_bytes {
+            Self::TooLarge
+        } else {
+            Self::Image(image.clone())
+        }
+    }
 }
 
 /// An error produced by [`Platform::read_from_clipboard_async`].

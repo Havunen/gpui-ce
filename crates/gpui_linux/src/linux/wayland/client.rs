@@ -1327,13 +1327,19 @@ impl LinuxClient for WaylandClient {
             .take()
             .expect("App is already running");
 
-        event_loop
+        if event_loop
             .run(
                 None,
                 &mut WaylandClientStatePtr(Rc::downgrade(&self.0)),
                 |_| {},
             )
-            .log_err();
+            .log_err()
+            .is_none()
+        {
+            self.with_common(|common| {
+                common.event_loop_error = Some(gpui::EventLoopError::Wayland)
+            });
+        }
     }
 
     fn write_to_primary(&self, item: gpui::ClipboardItem) {
@@ -1394,6 +1400,10 @@ impl LinuxClient for WaylandClient {
 
     fn read_from_primary(&self) -> Option<gpui::ClipboardItem> {
         self.0.borrow_mut().clipboard.read_primary()
+    }
+
+    fn read_image_from_clipboard(&self, max_bytes: usize) -> gpui::ClipboardImageRead {
+        self.0.borrow().clipboard.read_image_bounded(max_bytes)
     }
 
     fn read_from_clipboard(&self) -> Option<gpui::ClipboardItem> {
@@ -3312,6 +3322,47 @@ mod tests {
     };
 
     static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn copying_text_keeps_dispatching_while_the_clipboard_reader_is_paused() {
+        let (socket, _compositor) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut event_loop = EventLoop::try_new().unwrap();
+        let mut clipboard = Clipboard::new(
+            Connection::from_socket(socket).unwrap(),
+            event_loop.handle(),
+        );
+        let text = "selected text\n".repeat(128 * 1024);
+        clipboard.set(gpui::ClipboardItem::new_string(text.clone()));
+
+        let (read, write) = std::io::pipe().unwrap();
+        let (resume, paused) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            // Closing the pipe on timeout also releases a regressed blocking writer.
+            paused
+                .recv_timeout(Duration::from_secs(3))
+                .expect("clipboard send blocked the event loop");
+            read_fd_with_timeout(
+                filedescriptor::FileDescriptor::new(read),
+                Duration::from_secs(3),
+            )
+            .unwrap()
+        });
+        clipboard.send("text/plain".into(), write.into());
+        let mut state = WaylandClientStatePtr(Weak::new());
+        event_loop.dispatch(Duration::ZERO, &mut state).unwrap();
+        let _ = resume.send(());
+        while !reader.is_finished() {
+            event_loop
+                .dispatch(Duration::from_millis(10), &mut state)
+                .unwrap();
+        }
+        let received = reader.join().unwrap();
+        assert_eq!(received.len(), text.len());
+        assert!(
+            received == text.as_bytes(),
+            "copied text changed during transfer"
+        );
+    }
 
     fn keymap_fd(contents: &[u8]) -> OwnedFd {
         let path = temp_keymap_path();

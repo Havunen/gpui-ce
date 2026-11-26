@@ -1995,6 +1995,18 @@ impl LinuxClient for X11Client {
             .log_with_level(log::Level::Debug)
     }
 
+    fn read_image_from_clipboard(&self, max_bytes: usize) -> gpui::ClipboardImageRead {
+        let state = self.0.borrow();
+        if state
+            .clipboard
+            .is_owner(clipboard::ClipboardKind::Clipboard)
+        {
+            gpui::ClipboardImageRead::from_item(state.clipboard_item.as_ref(), max_bytes)
+        } else {
+            state.clipboard.read_image_bounded(max_bytes)
+        }
+    }
+
     fn read_from_clipboard(&self) -> Option<gpui::ClipboardItem> {
         let state = self.0.borrow_mut();
         // if the last copy was from this app, return our cached item
@@ -2024,7 +2036,13 @@ impl LinuxClient for X11Client {
             return;
         };
 
-        event_loop.run(None, &mut self.clone(), |_| {}).log_err();
+        if event_loop
+            .run(None, &mut self.clone(), |_| {})
+            .log_err()
+            .is_none()
+        {
+            self.with_common(|common| common.event_loop_error = Some(gpui::EventLoopError::X11));
+        }
     }
 
     fn active_window(&self) -> Option<AnyWindowHandle> {
@@ -3053,6 +3071,64 @@ fn read_xdnd_property(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_disconnect_reaches_shutdown_observers() {
+        use crate::linux::LinuxPlatform;
+        use gpui::Platform as _;
+        use smol::io::{AsyncBufReadExt as _, BufReader};
+        use std::io::Write as _;
+        const CHILD: &str = "GPUI_TEST_PRIVATE_X11_DISCONNECT";
+        if std::env::var_os(CHILD).is_none() {
+            let Some(server) = super::super::test_display::Xvfb::start() else {
+                eprintln!("Xvfb is not available; skipping");
+                return;
+            };
+            // The clipboard and platform both connect through DISPLAY. Isolate that
+            // environment change from other tests, and disconnect only our server.
+            let mut child = smol::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "server_disconnect_reaches_shutdown_observers",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("DISPLAY", &server.display)
+                .stdout(smol::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut output = BufReader::new(child.stdout.take().unwrap());
+            let mut line = String::new();
+            loop {
+                assert!(smol::block_on(output.read_line(&mut line)).unwrap() > 0);
+                if line.contains("PRIVATE_X11_CONNECTED") {
+                    break;
+                }
+                line.clear();
+            }
+            drop(server);
+            assert!(smol::block_on(child.status()).unwrap().success());
+            return;
+        }
+        let platform = Rc::new(LinuxPlatform {
+            inner: X11Client::new().unwrap(),
+        });
+        assert_eq!(platform.event_loop_error(), None);
+        let observed = Rc::new(std::cell::Cell::new(None));
+        platform.on_quit(Box::new({
+            let platform = Rc::downgrade(&platform);
+            let observed = observed.clone();
+            move || {
+                observed.set(platform.upgrade().unwrap().event_loop_error());
+                true
+            }
+        }));
+        platform.run(Box::new(|| {
+            println!("PRIVATE_X11_CONNECTED");
+            std::io::stdout().flush().unwrap();
+        }));
+        assert_eq!(observed.get(), Some(gpui::EventLoopError::X11));
+        assert_eq!(platform.event_loop_error(), observed.get());
+    }
 
     #[test]
     fn incremental_selection_keeps_every_chunk_from_a_fast_owner() {

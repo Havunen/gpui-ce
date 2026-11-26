@@ -1,18 +1,18 @@
 use std::{
-    fs::File,
     io::{ErrorKind, Write},
     os::fd::{AsRawFd, BorrowedFd, OwnedFd},
 };
 
 use calloop::{LoopHandle, PostAction};
-use filedescriptor::Pipe;
+use filedescriptor::{FileDescriptor, Pipe};
+use gpui_util::ResultExt as _;
 use strum::IntoEnumIterator;
 use wayland_client::{Connection, protocol::wl_data_offer::WlDataOffer};
 use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1;
 
 use crate::linux::{
     WaylandClientStatePtr,
-    platform::{PIPE_READ_TIMEOUT, read_fd_with_timeout},
+    platform::{PIPE_READ_TIMEOUT, read_fd_bounded},
 };
 use gpui::{ClipboardEntry, ClipboardItem, Image, ImageFormat, hash};
 
@@ -80,22 +80,32 @@ impl<T: ReceiveData> DataOffer<T> {
     }
 
     fn read_bytes(&self, connection: &Connection, mime_type: &str) -> Option<Vec<u8>> {
-        let pipe = Pipe::new().unwrap();
-        self.inner.receive_data(mime_type.to_string(), unsafe {
-            BorrowedFd::borrow_raw(pipe.write.as_raw_fd())
-        });
-        let fd = pipe.read;
-        drop(pipe.write);
-
-        connection.flush().unwrap();
-
-        match read_fd_with_timeout(fd, PIPE_READ_TIMEOUT) {
-            Ok(bytes) => Some(bytes),
-            Err(err) => {
-                log::error!("error reading clipboard pipe: {err:?}");
+        match self.read_bytes_bounded(connection, mime_type, None) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                log::error!("error reading clipboard pipe: {error:?}");
                 None
             }
         }
+    }
+
+    fn read_bytes_bounded(
+        &self,
+        connection: &Connection,
+        mime_type: &str,
+        max_bytes: Option<usize>,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let pipe = Pipe::new()?;
+        self.inner.receive_data(mime_type.to_string(), unsafe {
+            BorrowedFd::borrow_raw(pipe.write.as_raw_fd())
+        });
+        drop(pipe.write);
+        connection.flush()?;
+        read_fd_bounded(pipe.read, PIPE_READ_TIMEOUT, max_bytes)
+    }
+
+    fn image_format(&self) -> Option<ImageFormat> {
+        ImageFormat::iter().find(|format| self.has_mime_type(format.mime_type()))
     }
 
     fn read_text(&self, read: &mut impl FnMut(&str) -> Option<Vec<u8>>) -> Option<ClipboardItem> {
@@ -226,7 +236,7 @@ impl Clipboard {
             return;
         }
         if let Some(text) = self.contents.as_ref().and_then(|contents| contents.text()) {
-            self.send_bytes(fd, text.as_bytes().to_owned());
+            self.send_bytes(fd, text.into_bytes());
         }
     }
 
@@ -236,7 +246,7 @@ impl Clipboard {
             .as_ref()
             .and_then(|contents| contents.text())
         {
-            self.send_bytes(fd, text.as_bytes().to_owned());
+            self.send_bytes(fd, text.into_bytes());
         }
     }
 
@@ -254,6 +264,23 @@ impl Clipboard {
 
         self.cached_read = Some(item.clone());
         Some(item)
+    }
+
+    pub fn read_image_bounded(&self, max_bytes: usize) -> gpui::ClipboardImageRead {
+        let Some(offer) = self.current_offer.as_ref() else {
+            return gpui::ClipboardImageRead::Unavailable;
+        };
+        if offer.has_mime_type(&self.self_mime) {
+            return gpui::ClipboardImageRead::from_item(self.contents.as_ref(), max_bytes);
+        }
+        let Some(format) = offer.image_format() else {
+            return gpui::ClipboardImageRead::Unavailable;
+        };
+        match offer.read_bytes_bounded(&self.connection, format.mime_type(), Some(max_bytes)) {
+            Ok(Some(bytes)) => gpui::ClipboardImageRead::Image(Image::from_bytes(format, bytes)),
+            Ok(None) => gpui::ClipboardImageRead::TooLarge,
+            Err(_) => gpui::ClipboardImageRead::Unavailable,
+        }
     }
 
     pub fn read_primary(&mut self) -> Option<ClipboardItem> {
@@ -276,32 +303,43 @@ impl Clipboard {
     }
 
     pub fn send_bytes(&self, fd: OwnedFd, bytes: Vec<u8>) {
+        // A writable pipe may only have room for part of the selection.
+        let mut file = FileDescriptor::new(fd);
+        if bytes.is_empty() || file.set_non_blocking(true).log_err().is_none() {
+            return;
+        }
         let mut written = 0;
         self.loop_handle
             .insert_source(
                 calloop::generic::Generic::new(
-                    File::from(fd),
+                    file,
                     calloop::Interest::WRITE,
                     calloop::Mode::Level,
                 ),
                 move |_, file, _| {
+                    // Yield to input and rendering between chunks, even for a fast reader.
+                    let end = (written + 64 * 1024).min(bytes.len());
+                    // SAFETY: writing leaves the registered descriptor in place.
                     let file = unsafe { file.get_mut() };
-                    loop {
-                        match file.write(&bytes[written..]) {
-                            Ok(n) if written + n == bytes.len() => {
-                                written += n;
-                                break Ok(PostAction::Remove);
-                            }
-                            Ok(n) => written += n,
-                            Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                                break Ok(PostAction::Continue);
-                            }
-                            Err(_) => break Ok(PostAction::Remove),
+                    Ok(match file.write(&bytes[written..end]) {
+                        Ok(n) if n == 0 || written + n == bytes.len() => PostAction::Remove,
+                        Ok(n) => {
+                            written += n;
+                            PostAction::Continue
                         }
-                    }
+                        Err(err)
+                            if matches!(
+                                err.kind(),
+                                ErrorKind::WouldBlock | ErrorKind::Interrupted
+                            ) =>
+                        {
+                            PostAction::Continue
+                        }
+                        Err(_) => PostAction::Remove,
+                    })
                 },
             )
-            .unwrap();
+            .log_err();
     }
 
     /// File formats the *clipboard* data source should advertise, on top of the
@@ -350,6 +388,17 @@ mod tests {
                     .map(|(_, bytes)| bytes.to_vec())
             })
             .unwrap()
+    }
+
+    #[test]
+    fn image_clipboard_selects_an_image_from_a_mixed_offer() {
+        let mut offer = DataOffer::new(Offer);
+        offer.add_mime_type("text/plain".into());
+        offer.add_mime_type("text/uri-list".into());
+        assert_eq!(offer.image_format(), None);
+        offer.add_mime_type("image/bmp".into());
+        offer.add_mime_type("image/png".into());
+        assert_eq!(offer.image_format(), Some(ImageFormat::Png));
     }
 
     #[test]

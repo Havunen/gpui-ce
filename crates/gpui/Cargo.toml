@@ -51,6 +51,10 @@ name = "gpui"
 path = "src/gpui.rs"
 doctest = false
 
+[[test]]
+name = "native_panic"
+harness = false
+
 [dependencies]
 accesskit.workspace = true
 anyhow.workspace = true

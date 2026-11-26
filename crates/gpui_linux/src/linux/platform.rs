@@ -69,6 +69,9 @@ pub(crate) trait LinuxClient {
     fn write_to_primary(&self, item: ClipboardItem);
     fn write_to_clipboard(&self, item: ClipboardItem);
     fn read_from_primary(&self) -> Option<ClipboardItem>;
+    fn read_image_from_clipboard(&self, _max_bytes: usize) -> gpui::ClipboardImageRead {
+        gpui::ClipboardImageRead::Unavailable
+    }
     fn read_from_clipboard(&self) -> Option<ClipboardItem>;
     fn active_window(&self) -> Option<AnyWindowHandle>;
     fn window_stack(&self) -> Option<Vec<AnyWindowHandle>>;
@@ -96,6 +99,7 @@ pub(crate) struct PlatformHandlers {
 }
 
 pub(crate) struct LinuxCommon {
+    pub(crate) event_loop_error: Option<gpui::EventLoopError>,
     pub(crate) background_executor: BackgroundExecutor,
     pub(crate) foreground_executor: ForegroundExecutor,
     pub(crate) text_system: Arc<dyn PlatformTextSystem>,
@@ -149,6 +153,7 @@ impl LinuxCommon {
         let background_executor = BackgroundExecutor::new(dispatcher.clone());
 
         let common = LinuxCommon {
+            event_loop_error: None,
             background_executor,
             foreground_executor: ForegroundExecutor::new(dispatcher),
             text_system,
@@ -267,6 +272,10 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
         if let Some(mut fun) = quit {
             fun();
         }
+    }
+
+    fn event_loop_error(&self) -> Option<gpui::EventLoopError> {
+        self.inner.with_common(|common| common.event_loop_error)
     }
 
     fn quit(&self) {
@@ -749,6 +758,10 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
         self.inner.read_from_primary()
     }
 
+    fn read_image_from_clipboard(&self, max_bytes: usize) -> gpui::ClipboardImageRead {
+        self.inner.read_image_from_clipboard(max_bytes)
+    }
+
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
         self.inner.read_from_clipboard()
     }
@@ -883,9 +896,19 @@ pub(super) const PIPE_READ_TIMEOUT: Duration = Duration::from_secs(4);
 
 #[cfg(feature = "wayland")]
 pub(super) fn read_fd_with_timeout(
-    mut fd: filedescriptor::FileDescriptor,
+    fd: filedescriptor::FileDescriptor,
     timeout: Duration,
 ) -> Result<Vec<u8>> {
+    read_fd_bounded(fd, timeout, None)?.context("clipboard data exceeded addressable memory")
+}
+
+#[cfg(feature = "wayland")]
+pub(super) fn read_fd_bounded(
+    mut fd: filedescriptor::FileDescriptor,
+    timeout: Duration,
+    max_bytes: Option<usize>,
+) -> Result<Option<Vec<u8>>> {
+    let deadline = max_bytes.map(|_| std::time::Instant::now() + timeout);
     fd.set_non_blocking(true)?;
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 8192];
@@ -895,7 +918,13 @@ pub(super) fn read_fd_with_timeout(
             events: filedescriptor::POLLIN,
             revents: 0,
         }];
-        let ready = match filedescriptor::poll(&mut poll_fds, Some(timeout)) {
+        let poll_timeout = deadline.map_or(timeout, |end| {
+            end.saturating_duration_since(std::time::Instant::now())
+        });
+        if poll_timeout.is_zero() {
+            anyhow::bail!("clipboard read timed out");
+        }
+        let ready = match filedescriptor::poll(&mut poll_fds, Some(poll_timeout)) {
             Ok(ready) => ready,
             Err(filedescriptor::Error::Poll(err))
                 if err.kind() == std::io::ErrorKind::Interrupted =>
@@ -907,8 +936,11 @@ pub(super) fn read_fd_with_timeout(
         if ready == 0 {
             anyhow::bail!("timed out waiting for data on pipe after {timeout:?}");
         }
-        match fd.read(&mut chunk) {
-            Ok(0) => return Ok(buffer),
+        let remaining = max_bytes.unwrap_or(usize::MAX) - buffer.len();
+        let read_len = chunk.len().min(remaining.saturating_add(1));
+        match fd.read(&mut chunk[..read_len]) {
+            Ok(0) => return Ok(Some(buffer)),
+            Ok(len) if len > remaining => return Ok(None),
             Ok(len) => buffer.extend_from_slice(&chunk[..len]),
             Err(err)
                 if err.kind() == std::io::ErrorKind::WouldBlock
@@ -1340,6 +1372,27 @@ mod tests {
         use super::super::{PIPE_READ_TIMEOUT, read_fd_with_timeout};
         use std::io::Write as _;
         use std::time::{Duration, Instant};
+
+        #[test]
+        fn image_clipboard_pipe_stops_at_the_byte_limit() {
+            let mut pipe = filedescriptor::Pipe::new().unwrap();
+            pipe.write.write_all(b"oversize").unwrap();
+            // The writer remains open. Oversize must return without waiting for EOF.
+            assert_eq!(
+                super::super::read_fd_bounded(pipe.read, PIPE_READ_TIMEOUT, Some(3)).unwrap(),
+                None
+            );
+
+            let mut pipe = filedescriptor::Pipe::new().unwrap();
+            pipe.write.write_all(b"fit").unwrap();
+            drop(pipe.write);
+            assert_eq!(
+                super::super::read_fd_bounded(pipe.read, PIPE_READ_TIMEOUT, Some(3))
+                    .unwrap()
+                    .as_deref(),
+                Some(b"fit".as_slice())
+            );
+        }
 
         #[test]
         fn reads_data_written_before_close() {

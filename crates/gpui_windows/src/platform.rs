@@ -826,6 +826,10 @@ impl Platform for WindowsPlatform {
         crate::file_transfer::capture_paste(files)
     }
 
+    fn read_image_from_clipboard(&self, max_bytes: usize) -> gpui::ClipboardImageRead {
+        crate::clipboard::read_image_from_clipboard(max_bytes)
+    }
+
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
         read_from_clipboard()
     }
@@ -1592,6 +1596,12 @@ unsafe extern "system" fn window_procedure(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    gpui::with_native_callback("Win32 platform window procedure", || unsafe {
+        handle_window_message(hwnd, msg, wparam, lparam)
+    })
+}
+
+unsafe fn handle_window_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if msg == (WM_NCCREATE as u32) {
         let params = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
         let creation_context = params.lpCreateParams as *mut PlatformWindowCreateContext;
@@ -1627,15 +1637,7 @@ unsafe extern "system" fn window_procedure(
     }
     let inner = unsafe { &*ptr };
     let result = if let Some(inner) = inner.upgrade() {
-        if cfg!(debug_assertions) {
-            let inner = std::panic::AssertUnwindSafe(inner);
-            match std::panic::catch_unwind(|| { inner }.handle_msg(hwnd, msg, wparam, lparam)) {
-                Ok(result) => result,
-                Err(_) => std::process::abort(),
-            }
-        } else {
-            inner.handle_msg(hwnd, msg, wparam, lparam)
-        }
+        inner.handle_msg(hwnd, msg, wparam, lparam)
     } else {
         unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
     };
@@ -1832,5 +1834,23 @@ mod tests {
         let item = ClipboardItem::new_string_with_json_metadata("abcdef".to_string(), vec![3, 4]);
         write_to_clipboard(item.clone());
         assert_eq!(read_from_clipboard(), Some(item));
+        assert_eq!(
+            crate::clipboard::read_image_from_clipboard(0),
+            gpui::ClipboardImageRead::Unavailable
+        );
+
+        let image = gpui::Image::from_bytes(gpui::ImageFormat::Png, vec![42; 256]);
+        let mut item = ClipboardItem::new_string("caption".into());
+        item.entries
+            .push(gpui::ClipboardEntry::Image(image.clone()));
+        write_to_clipboard(item);
+        assert_eq!(
+            crate::clipboard::read_image_from_clipboard(255),
+            gpui::ClipboardImageRead::TooLarge
+        );
+        assert_eq!(
+            crate::clipboard::read_image_from_clipboard(256),
+            gpui::ClipboardImageRead::Image(image)
+        );
     }
 }

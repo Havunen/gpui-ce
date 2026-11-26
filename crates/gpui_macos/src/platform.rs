@@ -1122,6 +1122,13 @@ impl Platform for MacPlatform {
         NSScroller::preferredScrollerStyle(self.1).0 == 1
     }
 
+    fn read_image_from_clipboard(&self, max_bytes: usize) -> gpui::ClipboardImageRead {
+        self.0
+            .lock()
+            .general_pasteboard
+            .read_image_bounded(max_bytes)
+    }
+
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
         let state = self.0.lock();
         state.general_pasteboard.read()

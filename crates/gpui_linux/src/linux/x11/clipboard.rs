@@ -206,6 +206,21 @@ struct ClipboardData {
     format: Atom,
 }
 
+#[derive(Clone, Copy)]
+struct ReadTarget {
+    format: Atom,
+    max_bytes: usize,
+}
+
+impl ReadTarget {
+    fn property_words(self, used: usize) -> u32 {
+        self.max_bytes
+            .saturating_sub(used)
+            .div_ceil(4)
+            .clamp(1, (u32::MAX / 4) as usize) as u32
+    }
+}
+
 enum ReadSelNotifyResult {
     GotData(ClipboardData),
     IncrStarted,
@@ -289,6 +304,17 @@ impl Inner {
     /// The first format from `formats`, which the clipboard owner supports will be the
     /// format of the return value.
     fn read(&self, formats: &[Atom], selection: ClipboardKind) -> Result<ClipboardData> {
+        self.read_bounded(formats, selection, None, LONG_TIMEOUT_DUR)
+    }
+
+    fn read_bounded(
+        &self,
+        formats: &[Atom],
+        selection: ClipboardKind,
+        max_bytes: Option<usize>,
+        timeout: Duration,
+    ) -> Result<ClipboardData> {
+        let byte_limit = max_bytes.unwrap_or(usize::MAX);
         // if we are the current owner, we can get the current clipboard ourselves
         if self.is_owner(selection)? {
             let data = self.selection_of(selection).data.read();
@@ -296,6 +322,9 @@ impl Inner {
                 for data in data_list {
                     for format in formats {
                         if *format == data.format {
+                            if data.bytes.len() > byte_limit {
+                                return Err(Error::TooLarge);
+                            }
                             return Ok(data.clone());
                         }
                     }
@@ -305,30 +334,40 @@ impl Inner {
         }
         let reader = XContext::new(self.display.as_deref())?;
 
-        let highest_precedence_format =
-            match self.read_single(&reader, selection, self.atoms.TARGETS) {
-                Err(err) => {
-                    log::trace!("Clipboard TARGETS query failed with {err:?}");
+        // Image format discovery and conversion share a budget. Ordinary reads can
+        // still try direct conversion when an owner leaves TARGETS unanswered.
+        let shared_deadline = max_bytes.map(|_| Instant::now() + timeout);
+        let convert = |format, max_bytes| {
+            let deadline = shared_deadline.unwrap_or_else(|| Instant::now() + timeout);
+            self.read_single(&reader, selection, format, max_bytes, deadline)
+        };
+        let highest_precedence_format = match convert(self.atoms.TARGETS, Some(64 * 1024)) {
+            Err(err) => {
+                log::trace!("Clipboard TARGETS query failed with {err:?}");
+                None
+            }
+            Ok(ClipboardData { bytes, format }) => {
+                if format == self.atoms.ATOM {
+                    let available_formats = Self::parse_formats(&bytes);
+                    let matching = formats
+                        .iter()
+                        .find(|format| available_formats.contains(format));
+                    if matching.is_none() && byte_limit != usize::MAX {
+                        return Err(Error::ContentNotAvailable);
+                    }
+                    matching
+                } else {
+                    log::trace!(
+                        "Unexpected clipboard TARGETS format {}",
+                        self.atom_name(format)
+                    );
                     None
                 }
-                Ok(ClipboardData { bytes, format }) => {
-                    if format == self.atoms.ATOM {
-                        let available_formats = Self::parse_formats(&bytes);
-                        formats
-                            .iter()
-                            .find(|format| available_formats.contains(format))
-                    } else {
-                        log::trace!(
-                            "Unexpected clipboard TARGETS format {}",
-                            self.atom_name(format)
-                        );
-                        None
-                    }
-                }
-            };
+            }
+        };
 
         if let Some(&format) = highest_precedence_format {
-            let data = self.read_single(&reader, selection, format)?;
+            let data = convert(format, max_bytes)?;
             if !formats.contains(&data.format) {
                 // This shouldn't happen since the format is from the TARGETS list.
                 log::trace!(
@@ -343,7 +382,7 @@ impl Inner {
 
         log::trace!("Falling back on attempting to convert clipboard to each format.");
         for format in formats {
-            match self.read_single(&reader, selection, *format) {
+            match convert(*format, max_bytes) {
                 Ok(data) => {
                     if formats.contains(&data.format) {
                         return Ok(data);
@@ -380,8 +419,17 @@ impl Inner {
         &self,
         reader: &XContext,
         selection: ClipboardKind,
-        target_format: Atom,
+        format: Atom,
+        max_bytes: Option<usize>,
+        deadline: Instant,
     ) -> Result<ClipboardData> {
+        if Instant::now() >= deadline {
+            return Err(Error::ContentNotAvailable);
+        }
+        let target = ReadTarget {
+            format,
+            max_bytes: max_bytes.unwrap_or(usize::MAX),
+        };
         // Delete the property so that we can detect (using property notify)
         // when the selection owner receives our request.
         reader
@@ -395,7 +443,7 @@ impl Inner {
             .convert_selection(
                 reader.win_id,
                 self.atom_of(selection),
-                target_format,
+                format,
                 self.atoms.ARBOARD_CLIPBOARD,
                 Time::CURRENT_TIME,
             )
@@ -407,9 +455,8 @@ impl Inner {
         let mut incr_data: Vec<u8> = Vec::new();
         let mut using_incr = false;
 
-        let mut timeout_end = Instant::now() + LONG_TIMEOUT_DUR;
-
-        while Instant::now() < timeout_end {
+        let mut timeout_end = deadline;
+        while Instant::now() < timeout_end && (max_bytes.is_none() || Instant::now() < deadline) {
             let event = reader.conn.poll_for_event().map_err(into_unknown)?;
             let event = match event {
                 Some(e) => e,
@@ -422,13 +469,8 @@ impl Inner {
                 // The first response after requesting a selection.
                 Event::SelectionNotify(event) => {
                     log::trace!("Read SelectionNotify");
-                    let result = self.handle_read_selection_notify(
-                        reader,
-                        target_format,
-                        &mut using_incr,
-                        &mut incr_data,
-                        event,
-                    )?;
+                    let result =
+                        self.handle_read_selection_notify(reader, target, &mut using_incr, event)?;
                     match result {
                         ReadSelNotifyResult::GotData(data) => return Ok(data),
                         ReadSelNotifyResult::IncrStarted => {
@@ -446,7 +488,7 @@ impl Inner {
                 Event::PropertyNotify(event) => {
                     let result = self.handle_read_property_notify(
                         reader,
-                        target_format,
+                        target,
                         using_incr,
                         &mut incr_data,
                         &mut timeout_end,
@@ -455,7 +497,7 @@ impl Inner {
                     if result {
                         return Ok(ClipboardData {
                             bytes: incr_data,
-                            format: target_format,
+                            format,
                         });
                     }
                 }
@@ -540,9 +582,8 @@ impl Inner {
     fn handle_read_selection_notify(
         &self,
         reader: &XContext,
-        target_format: u32,
+        target: ReadTarget,
         using_incr: &mut bool,
-        incr_data: &mut Vec<u8>,
         event: SelectionNotifyEvent,
     ) -> Result<ReadSelNotifyResult> {
         // The property being set to NONE means that the `convert_selection`
@@ -550,7 +591,7 @@ impl Inner {
 
         // According to: https://tronche.com/gui/x/icccm/sec-2.html#s-2.4
         // the target must be set to the same as what we requested.
-        if event.property == NONE || event.target != target_format {
+        if event.property == NONE || event.target != target.format {
             return Err(Error::ContentNotAvailable);
         }
         if self.kind_of(event.selection).is_none() {
@@ -570,7 +611,7 @@ impl Inner {
         // is provided.
         let property_type = AtomEnum::ANY;
         // request the selection
-        let mut reply = reader
+        let reply = reader
             .conn
             .get_property(
                 true,
@@ -578,7 +619,7 @@ impl Inner {
                 event.property,
                 property_type,
                 0,
-                u32::MAX / 4,
+                target.property_words(0),
             )
             .map_err(into_unknown)?
             .reply()
@@ -586,33 +627,18 @@ impl Inner {
 
         // we found something
         if reply.type_ == self.atoms.INCR {
-            // Note that we call the get_property again because we are
-            // indicating that we are ready to receive the data by deleting the
-            // property, however deleting only works if the type matches the
-            // property type. But the type didn't match in the previous call.
-            reply = reader
-                .conn
-                .get_property(
-                    true,
-                    event.requestor,
-                    event.property,
-                    self.atoms.INCR,
-                    0,
-                    u32::MAX / 4,
-                )
-                .map_err(into_unknown)?
-                .reply()
-                .map_err(into_unknown)?;
-            log::trace!("Receiving INCR segments");
-            *using_incr = true;
-            if reply.value_len == 4 {
-                let min_data_len = reply
+            if reply.bytes_after != 0
+                || reply
                     .value32()
-                    .and_then(|mut vals| vals.next())
-                    .unwrap_or(0);
-                incr_data.reserve(min_data_len as usize);
+                    .and_then(|mut values| values.next())
+                    .is_some_and(|size| size as usize > target.max_bytes)
+            {
+                return Err(Error::TooLarge);
             }
+            *using_incr = true;
             Ok(ReadSelNotifyResult::IncrStarted)
+        } else if reply.bytes_after != 0 || reply.value.len() > target.max_bytes {
+            Err(Error::TooLarge)
         } else {
             Ok(ReadSelNotifyResult::GotData(ClipboardData {
                 bytes: reply.value,
@@ -625,7 +651,7 @@ impl Inner {
     fn handle_read_property_notify(
         &self,
         reader: &XContext,
-        target_format: u32,
+        target: ReadTarget,
         using_incr: bool,
         incr_data: &mut Vec<u8>,
         timeout_end: &mut Instant,
@@ -645,19 +671,22 @@ impl Inner {
                 true,
                 event.window,
                 event.atom,
-                if target_format == self.atoms.TARGETS {
+                if target.format == self.atoms.TARGETS {
                     self.atoms.ATOM
                 } else {
-                    target_format
+                    target.format
                 },
                 0,
-                u32::MAX / 4,
+                target.property_words(incr_data.len()),
             )
             .map_err(into_unknown)?
             .reply()
             .map_err(into_unknown)?;
 
         // log::trace!("Received segment. value_len {}", reply.value_len,);
+        if reply.bytes_after != 0 || reply.value.len() > target.max_bytes - incr_data.len() {
+            return Err(Error::TooLarge);
+        }
         if reply.value_len == 0 {
             // This indicates that all the data has been sent.
             return Ok(true);
@@ -1073,6 +1102,29 @@ impl Clipboard {
         self.inner.write(data, selection, wait)
     }
 
+    pub(crate) fn read_image_bounded(&self, max_bytes: usize) -> gpui::ClipboardImageRead {
+        let formats = ImageFormat::iter()
+            .map(|format| self.image_format_atom(format))
+            .collect::<Vec<_>>();
+        match self.inner.read_bounded(
+            &formats,
+            ClipboardKind::Clipboard,
+            Some(max_bytes),
+            LONG_TIMEOUT_DUR,
+        ) {
+            Ok(data) => {
+                let Some(format) = ImageFormat::iter()
+                    .find(|format| self.image_format_atom(*format) == data.format)
+                else {
+                    return gpui::ClipboardImageRead::Unavailable;
+                };
+                gpui::ClipboardImageRead::Image(Image::from_bytes(format, data.bytes))
+            }
+            Err(Error::TooLarge) => gpui::ClipboardImageRead::TooLarge,
+            Err(_) => gpui::ClipboardImageRead::Unavailable,
+        }
+    }
+
     pub(crate) fn get_any(&self, selection: ClipboardKind) -> Result<ClipboardItem> {
         let image_entries = ImageFormat::iter()
             .map(|format| (self.image_format_atom(format), format))
@@ -1281,6 +1333,9 @@ pub enum Error {
     /// an incompatible format to the requested one (eg when calling `get_image` on text)
     ContentNotAvailable,
 
+    /// The selected representation exceeds the read limit.
+    TooLarge,
+
     /// The native clipboard is not accessible due to being held by an other party.
     ///
     /// This "other party" could be a different process or it could be within
@@ -1306,6 +1361,7 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+			Error::TooLarge => f.write_str("Clipboard data exceeds the byte limit."),
 			Error::ContentNotAvailable => f.write_str("The clipboard contents were not available in the requested format or the clipboard is empty."),
 			Error::ClipboardOccupied => f.write_str("The native clipboard is not accessible due to being held by an other party."),
 			Error::ConversionFailure => f.write_str("The image or the text that was about the be transferred to/from the clipboard could not be converted to the appropriate format."),
@@ -1330,6 +1386,7 @@ impl std::fmt::Debug for Error {
 		}
         let name = kind_to_str!(
             ContentNotAvailable,
+            TooLarge,
             ClipboardOccupied,
             ConversionFailure,
             Unknown { .. }
@@ -1366,6 +1423,208 @@ mod tests {
     use crate::linux::x11::test_display::Xvfb;
     use gpui::{FileTransfer, FileTransferOperation};
     use std::path::PathBuf;
+
+    #[test]
+    fn image_clipboard_stops_probing_when_the_owner_times_out() {
+        let Some(server) = Xvfb::start() else {
+            eprintln!("Xvfb is not available; skipping");
+            return;
+        };
+        let reader = Clipboard::connect(&server.display).unwrap();
+        let owner = XContext::new(Some(&server.display)).unwrap();
+        let atoms = &reader.inner.atoms;
+        owner
+            .conn
+            .set_selection_owner(owner.win_id, atoms.CLIPBOARD, Time::CURRENT_TIME)
+            .unwrap()
+            .check()
+            .unwrap();
+
+        for max_bytes in [1024, usize::MAX] {
+            let result = reader.inner.read_bounded(
+                &[atoms.PNG__MIME, atoms.JPEG_MIME],
+                ClipboardKind::Clipboard,
+                Some(max_bytes),
+                Duration::from_millis(100),
+            );
+            assert!(matches!(result, Err(Error::ContentNotAvailable)));
+            let mut requested = Vec::new();
+            while let Some(event) = owner.conn.poll_for_event().unwrap() {
+                if let Event::SelectionRequest(event) = event {
+                    requested.push(event.target);
+                }
+            }
+            assert_eq!(requested, [atoms.TARGETS]);
+        }
+    }
+
+    #[test]
+    fn text_clipboard_can_read_from_an_owner_that_ignores_targets() {
+        let Some(server) = Xvfb::start() else {
+            eprintln!("Xvfb is not available; skipping");
+            return;
+        };
+        let reader = Clipboard::connect(&server.display).unwrap();
+        let owner = Inner::new(Some(&server.display)).unwrap();
+        let text = ClipboardData {
+            format: owner.atoms.UTF8_STRING,
+            bytes: b"copied text".to_vec(),
+        };
+        owner
+            .write(
+                vec![text.clone()],
+                ClipboardKind::Clipboard,
+                WaitConfig::None,
+            )
+            .unwrap();
+        owner.server.conn.sync().unwrap();
+
+        std::thread::scope(|scope| {
+            let read = scope.spawn(|| {
+                reader.inner.read_bounded(
+                    &[text.format],
+                    ClipboardKind::Clipboard,
+                    None,
+                    Duration::from_millis(100),
+                )
+            });
+            while !read.is_finished() {
+                if let Some(Event::SelectionRequest(request)) =
+                    owner.server.conn.poll_for_event().unwrap()
+                    && request.target == text.format
+                {
+                    owner.handle_selection_request(request).unwrap();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(read.join().unwrap().unwrap().bytes, text.bytes);
+        });
+    }
+
+    #[test]
+    fn image_clipboard_requests_only_image_bytes_and_enforces_exact_limit() {
+        let Some(server) = Xvfb::start() else {
+            eprintln!("Xvfb is not available; skipping");
+            return;
+        };
+        let owner = Clipboard::connect(&server.display).unwrap();
+        let reader = Clipboard::connect(&server.display).unwrap();
+        let text = ClipboardData {
+            format: owner.inner.atoms.UTF8_STRING,
+            bytes: vec![b't'; 20000],
+        };
+        owner
+            .inner
+            .write(
+                vec![text.clone()],
+                ClipboardKind::Clipboard,
+                WaitConfig::None,
+            )
+            .unwrap();
+        assert_eq!(
+            reader.read_image_bounded(4),
+            gpui::ClipboardImageRead::Unavailable
+        );
+        let image = ClipboardData {
+            format: owner.image_format_atom(ImageFormat::Png),
+            bytes: b"image".to_vec(),
+        };
+        owner
+            .inner
+            .write(
+                vec![text, image],
+                ClipboardKind::Clipboard,
+                WaitConfig::None,
+            )
+            .unwrap();
+        for clipboard in [&owner, &reader] {
+            assert_eq!(
+                clipboard.read_image_bounded(5),
+                gpui::ClipboardImageRead::Image(Image::from_bytes(
+                    ImageFormat::Png,
+                    b"image".to_vec()
+                ))
+            );
+            for max_bytes in [0, 1, 4] {
+                assert_eq!(
+                    clipboard.read_image_bounded(max_bytes),
+                    gpui::ClipboardImageRead::TooLarge
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_image_clipboard_checks_announced_and_actual_size() {
+        let Some(server) = Xvfb::start() else {
+            eprintln!("Xvfb is not available; skipping");
+            return;
+        };
+        let clipboard = Clipboard::connect(&server.display).unwrap();
+        let inner = &clipboard.inner;
+        let peer = XContext::new(Some(&server.display)).unwrap();
+        let target = ReadTarget {
+            format: clipboard.image_format_atom(ImageFormat::Png),
+            max_bytes: 5,
+        };
+        let selection = SelectionNotifyEvent {
+            response_type: SELECTION_NOTIFY_EVENT,
+            sequence: 0,
+            time: Time::CURRENT_TIME.into(),
+            requestor: peer.win_id,
+            selection: inner.atoms.CLIPBOARD,
+            target: target.format,
+            property: inner.atoms.ARBOARD_CLIPBOARD,
+        };
+        let property = PropertyNotifyEvent {
+            response_type: x11rb::protocol::xproto::PROPERTY_NOTIFY_EVENT,
+            sequence: 0,
+            window: peer.win_id,
+            atom: selection.property,
+            time: Time::CURRENT_TIME.into(),
+            state: Property::NEW_VALUE,
+        };
+        let announce = |len| {
+            peer.conn
+                .change_property32(
+                    PropMode::REPLACE,
+                    peer.win_id,
+                    selection.property,
+                    inner.atoms.INCR,
+                    &[len],
+                )
+                .unwrap();
+            inner.handle_read_selection_notify(&peer, target, &mut false, selection)
+        };
+        assert!(matches!(announce(u32::MAX), Err(Error::TooLarge)));
+        assert!(matches!(announce(0), Ok(ReadSelNotifyResult::IncrStarted)));
+        let mut bytes = Vec::new();
+        let mut chunk = |payload: &[u8]| {
+            peer.conn
+                .change_property8(
+                    PropMode::REPLACE,
+                    peer.win_id,
+                    selection.property,
+                    target.format,
+                    payload,
+                )
+                .unwrap();
+            inner.handle_read_property_notify(
+                &peer,
+                target,
+                true,
+                &mut bytes,
+                &mut Instant::now(),
+                property,
+            )
+        };
+        assert!(!chunk(b"123").unwrap());
+        assert!(!chunk(b"45").unwrap());
+        assert!(chunk(b"").unwrap());
+        assert!(matches!(chunk(b"6"), Err(Error::TooLarge)));
+        assert_eq!(bytes, b"12345");
+    }
 
     #[test]
     fn file_clipboard_preserves_its_advertised_text() {

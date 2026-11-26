@@ -159,6 +159,10 @@ fn set_audio_thread_priority() -> anyhow::Result<()> {
 }
 
 extern "C" fn trampoline(context: *mut c_void) {
+    gpui::with_native_callback("GCD task", || unsafe { run_dispatched_task(context) });
+}
+
+unsafe fn run_dispatched_task(context: *mut c_void) {
     let runnable =
         unsafe { Runnable::<RunnableMeta>::from_raw(NonNull::new_unchecked(context as *mut ())) };
 
