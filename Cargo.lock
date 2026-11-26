@@ -2936,6 +2936,7 @@ dependencies = [
  "rand 0.10.4",
  "raw-window-handle",
  "smallvec",
+ "thiserror 2.0.21",
  "uuid",
  "wgsl-rs",
  "windows-collections 0.100.0",
