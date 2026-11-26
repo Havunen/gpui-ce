@@ -267,7 +267,7 @@ smol_str = "0.3"
 spin = "0.12"
 svgtypes = "0.16"
 swash = "0.2"
-taffy = { version = "=0.15.1", default-features = false, features = ["std", "taffy_tree", "flexbox", "grid", "block_layout", "calc", "content_size", "detailed_layout_info"] }
+taffy = { version = "=0.16.0", default-features = false, features = ["std", "taffy_tree", "flexbox", "grid", "block_layout", "calc", "content_size", "detailed_layout_info"] }
 skrifa = "0.50"
 usvg = { version = "0.50", default-features = false }
 waker-fn = "1.2"
