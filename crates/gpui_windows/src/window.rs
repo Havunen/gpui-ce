@@ -617,6 +617,14 @@ impl Drop for WindowsWindow {
     }
 }
 
+fn cursor_position_error_level(code: HRESULT) -> log::Level {
+    if code == E_ACCESSDENIED {
+        log::Level::Debug
+    } else {
+        log::Level::Error
+    }
+}
+
 impl PlatformWindow for WindowsWindow {
     fn can_start_external_drag(&self) -> bool {
         true
@@ -711,10 +719,16 @@ impl PlatformWindow for WindowsWindow {
         let scale_factor = self.scale_factor();
         let point = unsafe {
             let mut point: POINT = std::mem::zeroed();
-            GetCursorPos(&mut point)
-                .ok()
+            let cursor_position = GetCursorPos(&mut point).ok();
+            let log_level = cursor_position
+                .as_ref()
+                .err()
+                .map_or(log::Level::Error, |error| {
+                    cursor_position_error_level(error.code())
+                });
+            cursor_position
                 .context("unable to get cursor position")
-                .log_err();
+                .log_with_level(log_level);
             ScreenToClient(self.0.hwnd, &mut point).ok().log_err();
             point
         };
@@ -1876,12 +1890,29 @@ fn character_palette_inputs(held_modifiers: &[i32], win_held: bool) -> Vec<INPUT
 
 #[cfg(test)]
 mod tests {
-    use super::{ClickState, character_palette_inputs};
+    use super::{ClickState, character_palette_inputs, cursor_position_error_level};
     use crate::bindings::Windows::Win32::{
         KEYEVENTF_KEYUP, VK_LCONTROL, VK_LWIN, VK_OEM_PERIOD, VK_RSHIFT,
     };
     use gpui::{DevicePixels, MouseButton, point};
     use std::time::Duration;
+    use windows_core::{HRESULT, WIN32_ERROR};
+
+    #[test]
+    fn cursor_position_access_denied_logs_at_debug_level() {
+        assert_eq!(
+            cursor_position_error_level(HRESULT::from(WIN32_ERROR(5))),
+            log::Level::Debug,
+        );
+    }
+
+    #[test]
+    fn cursor_position_invalid_handle_logs_at_error_level() {
+        assert_eq!(
+            cursor_position_error_level(HRESULT::from(WIN32_ERROR(6))),
+            log::Level::Error,
+        );
+    }
 
     #[test]
     fn character_palette_preserves_held_modifiers() {

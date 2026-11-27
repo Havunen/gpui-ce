@@ -4225,6 +4225,8 @@ pub mod Windows {
         pub const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
         pub const ERROR_NOT_FOUND: i32 = 1168;
         pub const E_ABORT: windows_core::HRESULT = windows_core::HRESULT(0x80004004_u32 as _);
+        pub const E_ACCESSDENIED: windows_core::HRESULT =
+            windows_core::HRESULT(0x80070005_u32 as _);
         pub const E_FAIL: windows_core::HRESULT = windows_core::HRESULT(0x80004005_u32 as _);
         pub const E_INVALIDARG: windows_core::HRESULT = windows_core::HRESULT(0x80070057_u32 as _);
         pub const E_NOTIMPL: windows_core::HRESULT = windows_core::HRESULT(0x80004001_u32 as _);
